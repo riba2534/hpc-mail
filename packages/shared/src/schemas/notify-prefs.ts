@@ -13,7 +13,7 @@ export type ForwardConfig = z.infer<typeof gmailForwardSettingSchema>;
 /**
  * 每用户的转发与通知偏好。语义：
  * - 作用于「该用户认领地址收到的邮件」。
- * - 管理员的这一份**还**作用于未认领地址收到的邮件（catch-all）与系统级通知。
+ * - 管理员的这一份**还**作用于收信当时尚未认领的地址（catch-all）与系统级通知。
  * - forward（转发到外部邮箱）：已验证 destination 走原生 forward（原样转发）；
  *   未验证目标降级为 no-reply@收件域名 中转重发，任意邮箱均可送达。
  */

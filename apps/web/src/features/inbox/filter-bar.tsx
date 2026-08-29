@@ -63,16 +63,18 @@ export function FilterBar({
       )}
 
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <div className="sm:w-64">
-          <Combobox
-            aria-label={addressLabel}
-            value={filters.address}
-            onChange={onAddressChange}
-            options={addressOptions}
-            placeholder={addressLabel}
-            searchPlaceholder="搜索地址…"
-          />
-        </div>
+        {addressOptions.length > 0 && (
+          <div className="sm:w-64">
+            <Combobox
+              aria-label={addressLabel}
+              value={filters.address}
+              onChange={onAddressChange}
+              options={addressOptions}
+              placeholder={addressLabel}
+              searchPlaceholder="搜索地址…"
+            />
+          </div>
+        )}
         {showUnread && (
           <SegmentedControl
             aria-label="已读状态"

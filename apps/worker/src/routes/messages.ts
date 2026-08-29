@@ -31,18 +31,33 @@ import type { AppContext } from '../types.js';
 const app = new Hono<AppContext>();
 app.use('*', requireAuth);
 
+function parseListScope(raw: string | undefined): Viewer['scope'] {
+  return raw === 'mine' || raw === 'unclaimed' || raw === 'user' ? raw : undefined;
+}
+
 function viewerOf(c: Context<AppContext>): Viewer {
   const user = c.get('user')!;
-  const q = c.req.query('scope');
-  const scope = q === 'mine' ? 'mine' : q === 'all' ? 'all' : undefined;
-  return { userId: user.id, role: user.role, scope };
+  const scope = parseListScope(c.req.query('scope'));
+  const userIdRaw = Number(c.req.query('userId'));
+  return {
+    userId: user.id,
+    role: user.role,
+    scope,
+    targetUserId: Number.isInteger(userIdRaw) && userIdRaw > 0 ? userIdRaw : undefined,
+  };
+}
+
+function viewerFromListQuery(
+  user: { id: number; role: Viewer['role'] },
+  query: { scope?: Viewer['scope']; userId?: number },
+): Viewer {
+  return { userId: user.id, role: user.role, scope: query.scope, targetUserId: query.userId };
 }
 
 app.get('/', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  const viewer: Viewer = { userId: user.id, role: user.role, scope: query.scope };
-  return ok(c, await listMessages(c.env, viewer, query));
+  return ok(c, await listMessages(c.env, viewerFromListQuery(user, query), query));
 });
 
 app.post('/send', async (c) => {
@@ -79,7 +94,7 @@ app.post('/read', async (c) => {
   return ok(c, { changed });
 });
 
-/** 一键全读：可见范围内全部未读收件标为已读（admin 需显式 scope=all 才作用全站） */
+/** 一键全读：可见范围内全部未读收件标为已读（admin 需显式 scope=unclaimed 才动未认领） */
 app.post('/read-all', async (c) => {
   const changed = await markAllRead(c.env, viewerOf(c));
   return ok(c, { changed });

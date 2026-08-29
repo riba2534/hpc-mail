@@ -99,22 +99,34 @@ export const mailboxApi = {
 export const messageApi = {
   list: (query: Partial<ListMessagesQuery>) =>
     api.get<Page<MessageSummary>>('/messages', { query: query as unknown as QueryParams }),
-  detail: (id: number) => api.get<MessageDetail>(`/messages/${id}`),
-  thread: (id: number) => api.get<{ items: MessageSummary[] }>(`/messages/${id}/thread`),
+  detail: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }) =>
+    api.get<MessageDetail>(`/messages/${id}`, { query: { scope: view?.scope, userId: view?.userId } }),
+  thread: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }) =>
+    api.get<{ items: MessageSummary[] }>(`/messages/${id}/thread`, {
+      query: { scope: view?.scope, userId: view?.userId },
+    }),
   contacts: () => api.get<{ contacts: string[] }>('/messages/contacts'),
   send: (body: InternalSendMailRequest) =>
     api.post<MessageSummary, InternalSendMailRequest>('/messages/send', body),
   unreadCount: () => api.get<{ unread: number }>('/messages/unread-count'),
-  markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'all') =>
+  markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed') =>
     api.post<void, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
   markAllRead: () => api.post<{ changed: number }, Record<string, never>>('/messages/read-all', {}),
-  star: (ids: number[], starred: boolean, scope?: 'mine' | 'all') =>
-    api.post<void, { ids: number[]; starred: boolean }>('/messages/star', { ids, starred }, { query: { scope } }),
-  remove: (ids: number[], scope?: 'mine' | 'all') =>
+  star: (
+    ids: number[],
+    starred: boolean,
+    view?: { scope?: ListMessagesQuery['scope']; userId?: number },
+  ) =>
+    api.post<void, { ids: number[]; starred: boolean }>(
+      '/messages/star',
+      { ids, starred },
+      { query: { scope: view?.scope, userId: view?.userId } },
+    ),
+  remove: (ids: number[], scope?: 'mine' | 'unclaimed') =>
     api.post<void, { ids: number[] }>('/messages/delete', { ids }, { query: { scope } }),
-  restore: (ids: number[], scope?: 'mine' | 'all') =>
+  restore: (ids: number[], scope?: 'mine' | 'unclaimed') =>
     api.post<void, { ids: number[] }>('/messages/restore', { ids }, { query: { scope } }),
-  purge: (ids: number[], scope?: 'mine' | 'all') =>
+  purge: (ids: number[], scope?: 'mine' | 'unclaimed') =>
     api.post<void, { ids: number[] }>('/messages/purge', { ids }, { query: { scope } }),
 };
 

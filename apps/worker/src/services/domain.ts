@@ -1,4 +1,6 @@
 import type { Settings } from '@hpc-mail/shared';
+import { createDb } from '../db/client.js';
+import { mailboxes } from '../db/schema.js';
 import type { Env } from '../types.js';
 import { getSettings } from './setting.js';
 
@@ -41,4 +43,17 @@ export function isDomainPublic(settings: Settings, domain: string): boolean {
 /** 该域名下每个普通用户的认领上限（0=不限，仅受全局上限约束）。 */
 export function domainPerUserLimit(settings: Settings, domain: string): number {
   return settings.domains.list.find((e) => e.domain === domain)?.perUserLimit ?? 0;
+}
+
+/**
+ * 站内投递 / 已领地址发件白名单：settings 列表 ∪ 已有 mailbox 的 domain。
+ * 管理员从列表拿掉某个域后，已认领用户仍应按站内互投，而不是被当成外发。
+ */
+export async function getRoutableDomains(env: Env, settings?: Settings): Promise<string[]> {
+  const listed = await getDomains(env, settings);
+  const db = createDb(env);
+  const rows = await db.select({ domain: mailboxes.domain }).from(mailboxes).all();
+  const set = new Set(listed);
+  for (const row of rows) set.add(row.domain);
+  return [...set];
 }

@@ -9,11 +9,10 @@ import { htmlToText, makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByAi, extractCodeByRegex } from './code-extract.js';
 import { sendFeishuNotification } from './feishu.js';
-import { getMailboxOwner } from './mailbox.js';
+import { resolveNotifyOwnerIds } from './mailbox.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
-import { getActiveAdminIds } from './user.js';
 import { sendNotifyWebhook } from './webhook-notify.js';
 import { attachmentKey, bodyKey, getExt, putJson, putObject, sha256Hex16 } from './storage.js';
 
@@ -320,8 +319,7 @@ export async function handleInbound(
   // （同一封信在收件箱里出现多份，验证码邮件尤其容易误判）。约定是只有落库失败才 throw。
   let ownerPrefs: Awaited<ReturnType<typeof getUserNotifyPrefs>>[] = [];
   try {
-    const ownerId = await getMailboxOwner(env, toAddress);
-    const ownerIds = ownerId !== null ? [ownerId] : await getActiveAdminIds(env);
+    const ownerIds = await resolveNotifyOwnerIds(env, toAddress);
     ownerPrefs = await Promise.all(ownerIds.map((id) => getUserNotifyPrefs(env, id)));
   } catch (e) {
     console.error('归属/通知偏好解析失败，跳过转发与通知（邮件已入库）:', e);

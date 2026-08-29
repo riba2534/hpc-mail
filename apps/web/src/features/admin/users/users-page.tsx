@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { MoreHorizontal, Search } from 'lucide-react';
 import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import type { AdminUser } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
@@ -107,6 +108,7 @@ function MailboxListDialog({ target, onClose }: { target: AdminUser | null; onCl
 
 export function UsersPage() {
   const currentUser = useCurrentUser();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { data, isLoading } = useQuery({ queryKey: queryKeys.admin.users, queryFn: () => adminApi.listUsers() });
   const [resetting, setResetting] = useState<AdminUser | null>(null);
@@ -212,6 +214,9 @@ export function UsersPage() {
                           </IconButton>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent>
+                          <DropdownMenuItem onSelect={() => navigate(`/admin/users/${user.id}/mail`)}>
+                            查看邮件
+                          </DropdownMenuItem>
                           <DropdownMenuItem onSelect={() => setViewingMailboxes(user)}>查看绑定邮箱</DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem

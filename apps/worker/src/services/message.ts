@@ -6,7 +6,22 @@ import type {
   Page,
   Role,
 } from '@hpc-mail/shared';
-import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  notInArray,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { attachments as attachmentsTable, mailboxes, messages, stars } from '../db/schema.js';
 import { signAttachment } from '../lib/crypto.js';
@@ -19,26 +34,44 @@ import { deleteMessageObjects, getJson } from './storage.js';
 export interface Viewer {
   userId: number;
   role: Role;
-  scope?: 'mine' | 'all';
+  scope?: 'mine' | 'unclaimed' | 'user';
+  /** admin + scope=user 时的目标用户 */
+  targetUserId?: number;
 }
 
 type MessageRow = typeof messages.$inferSelect;
 
-/** 可见范围：全站，或限定为某用户认领的地址集合（以 mailboxes 子查询表达，不展开成数组） */
-type Scope = 'all' | { ownerId: number };
+/** 可见范围：未认领地址，或限定为某用户认领的地址集合（以 mailboxes 子查询表达，不展开成数组） */
+type Scope = 'unclaimed' | { ownerId: number };
 
-/** 解析可见范围：admin 默认全站，scope=mine 或 user → 自己认领地址 */
+function assertAdminScope(viewer: Viewer): void {
+  if (viewer.role === 'admin') return;
+  if (viewer.scope === 'unclaimed' || viewer.scope === 'user') {
+    throw new AppError('forbidden', '无权使用该可见范围');
+  }
+}
+
+/** 解析列表/只读可见范围：admin 缺省 = 自己认领，不再默认全表 */
 function resolveScope(viewer: Viewer): Scope {
-  if (viewer.role === 'admin' && viewer.scope !== 'mine') return 'all';
+  assertAdminScope(viewer);
+  if (viewer.role === 'admin' && viewer.scope === 'unclaimed') return 'unclaimed';
+  if (viewer.role === 'admin' && viewer.scope === 'user') {
+    if (!viewer.targetUserId) throw new AppError('validation_failed', '查看指定用户邮件需要 userId');
+    return { ownerId: viewer.targetUserId };
+  }
   return { ownerId: viewer.userId };
 }
 
 /**
- * 变更类操作（标记/星标/删除）的可见范围：与只读相反，admin 必须**显式** scope='all'
- * 才作用全站，否则默认只作用自己认领地址——防止 API 调用方漏传 scope 误删/误改他人邮件。
+ * 变更类操作的可见范围：admin 必须显式 scope='unclaimed' 才动未认领地址；
+ * 不能改其他用户已认领的邮件。漏传则只作用自己。
  */
 function resolveMutationScope(viewer: Viewer): Scope {
-  if (viewer.role === 'admin' && viewer.scope === 'all') return 'all';
+  assertAdminScope(viewer);
+  if (viewer.role === 'admin' && viewer.scope === 'user') {
+    throw new AppError('forbidden', '不能修改其他用户的邮件');
+  }
+  if (viewer.role === 'admin' && viewer.scope === 'unclaimed') return 'unclaimed';
   return { ownerId: viewer.userId };
 }
 
@@ -47,13 +80,17 @@ function resolveMutationScope(viewer: Viewer): Scope {
  * D1 单条查询最多 100 个绑定参数，展开时认领地址一多就会整条语句被拒；
  * 子查询无论认领多少地址都只占 1 个绑定值（ownerId），顺带省掉一次 userAddresses 查询。
  */
-function scopeCondition(db: Db, scope: Scope): SQL | undefined {
-  if (scope === 'all') return undefined;
+function scopeCondition(db: Db, scope: Scope): SQL {
+  if (scope === 'unclaimed') {
+    return notInArray(messages.address, db.select({ address: mailboxes.address }).from(mailboxes));
+  }
   return inArray(
     messages.address,
     db.select({ address: mailboxes.address }).from(mailboxes).where(eq(mailboxes.userId, scope.ownerId)),
   );
 }
+
+
 
 function summarize(row: MessageRow, hasAttachments: boolean, isStarred: boolean): MessageSummary {
   return {
@@ -245,7 +282,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
   };
   if (!core) return summarizeRows([target]);
 
-  const scope = resolveScope(viewer);
+  const scope = await threadScope(db, viewer, target);
   const escaped = core.replace(/[\\%_]/g, (ch) => `\\${ch}`);
   const rows = await db
     .select()
@@ -264,21 +301,46 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
   return summarizeRows(thread.length ? thread : [target]);
 }
 
+async function isAddressClaimed(db: Db, address: string): Promise<boolean> {
+  const row = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, address)).get();
+  return row !== undefined;
+}
+
+/**
+ * 单封可见性：
+ * - scope=unclaimed → 仅未认领
+ * - scope=user → 仅该用户认领
+ * - 其余（含 admin 裸开无 query）→ 自己认领；admin 无 scope 时额外允许未认领
+ */
 async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
   const db = createDb(env);
   const row = await db.select().from(messages).where(eq(messages.id, id)).get();
   if (!row) throw new AppError('not_found', '邮件不存在');
   const scope = resolveScope(viewer);
-  if (scope !== 'all') {
-    // 单行归属校验直接查 mailboxes，不再把全部认领地址读进内存比对
-    const owned = await db
-      .select({ id: mailboxes.id })
-      .from(mailboxes)
-      .where(and(eq(mailboxes.userId, scope.ownerId), eq(mailboxes.address, row.address)))
-      .get();
-    if (!owned) throw new AppError('not_found', '邮件不存在');
+  if (scope === 'unclaimed') {
+    if (await isAddressClaimed(db, row.address)) throw new AppError('not_found', '邮件不存在');
+    return row;
   }
-  return row;
+  const owned = await db
+    .select({ id: mailboxes.id })
+    .from(mailboxes)
+    .where(and(eq(mailboxes.userId, scope.ownerId), eq(mailboxes.address, row.address)))
+    .get();
+  if (owned) return row;
+  if (viewer.role === 'admin' && viewer.scope === undefined && !(await isAddressClaimed(db, row.address))) {
+    return row;
+  }
+  throw new AppError('not_found', '邮件不存在');
+}
+
+/** 详情线程跟目标邮件同一可见桶，避免 admin 裸开未认领信时线程掉回「自己认领」 */
+async function threadScope(db: Db, viewer: Viewer, target: MessageRow): Promise<Scope> {
+  const scope = resolveScope(viewer);
+  if (scope === 'unclaimed') return 'unclaimed';
+  if (viewer.role === 'admin' && viewer.scope === undefined && !(await isAddressClaimed(db, target.address))) {
+    return 'unclaimed';
+  }
+  return scope;
 }
 
 function rewriteCidUrls(

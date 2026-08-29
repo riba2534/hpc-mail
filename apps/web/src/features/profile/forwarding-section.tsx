@@ -97,7 +97,8 @@ export function ForwardingSection() {
         <h2 className="text-sm font-semibold text-ink">转发与通知</h2>
         <p className="mt-0.5 text-[13px] text-ink-secondary">
           你认领地址收到的邮件会按下面的配置转发与通知。
-          {isAdmin && '作为管理员，这份配置还会作用于未认领地址收到的邮件与系统通知。'}
+          {isAdmin &&
+            '作为管理员，这份配置还会作用于未认领地址收到的邮件（按收信当时是否已认领结算）与系统通知。'}
         </p>
       </div>
 

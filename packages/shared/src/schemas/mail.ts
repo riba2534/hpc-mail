@@ -49,16 +49,28 @@ export const listMessagesQuerySchema = z.object({
   trash: boolFlag(),
   /** 搜索主题 / 发件人 / 正文 */
   q: z.string().trim().max(256).optional(),
-  /** admin 专用：'mine' 只看自己认领地址（默认全站） */
-  scope: z.enum(['mine', 'all']).optional(),
+  /**
+   * 可见范围。普通用户忽略（永远只看自己认领地址）。
+   * admin：缺省/'mine' = 自己认领；'unclaimed' = 未认领地址；'user' = 指定用户（需 userId）。
+   */
+  scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
+  /** admin + scope=user 时指定目标用户 */
+  userId: emptyAsUndefined(z.coerce.number().int().positive()),
   /** 增量拉取：只返回 id 大于该值的邮件（配合轮询/长轮询等码，避免漏检） */
   afterId: z.coerce.number().int().positive().optional(),
   cursor: emptyAsUndefined(z.string().max(128)),
   limit: emptyAsUndefined(z.coerce.number().int().min(1).max(MAX_PAGE_SIZE)).default(
     DEFAULT_PAGE_SIZE,
   ),
-});
+})
+  .superRefine((q, ctx) => {
+    if (q.scope === 'user' && q.userId === undefined) {
+      ctx.addIssue({ code: 'custom', message: 'scope=user 需要 userId', path: ['userId'] });
+    }
+  });
 export type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>;
+export type MessageListScope = NonNullable<ListMessagesQuery['scope']>;
+export type MessageMutationScope = 'mine' | 'unclaimed';
 
 /** 附件文件名：禁路径分隔符与 .. 遍历 */
 export const attachmentFilenameSchema = z
@@ -242,11 +254,11 @@ export interface DraftAttachmentMeta {
 }
 
 /**
- * 变更类操作的作用范围。admin 必须显式传 'all' 才作用全站（防漏传误改他人邮件）。
- * /api 从 query 读，/v1 没有 query 入口，所以放进 body——此前 /v1 完全传不了 scope，
- * 未认领任何地址的 admin key 调批量已读/删除只会拿到 200 + changed:0，没有任何信号。
+ * 变更类操作的作用范围。admin 必须显式传 'unclaimed' 才动未认领地址下的邮件
+ * （防漏传参数误改他人已认领邮件）。不能改其他用户已认领地址。
+ * /api 从 query 读，/v1 放进 body。
  */
-const mutationScopeSchema = z.enum(['mine', 'all']).optional();
+const mutationScopeSchema = z.enum(['mine', 'unclaimed']).optional();
 
 export const markReadRequestSchema = z.object({
   ids: z.array(z.number().int().positive()).min(1).max(500),

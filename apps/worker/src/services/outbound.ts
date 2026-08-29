@@ -18,13 +18,12 @@ import { encodeBodyBase64, foldBase64, sanitizeFilename, sanitizeMimeType } from
 import { makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
-import { getDomains } from './domain.js';
+import { getRoutableDomains } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
-import { getMailboxOwner } from './mailbox.js';
+import { resolveNotifyOwnerIds } from './mailbox.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
-import { getActiveAdminIds } from './user.js';
 import { sendNotifyWebhook } from './webhook-notify.js';
 import { signAttachment } from '../lib/crypto.js';
 import { attachmentKey, getExt, sha256Hex16 } from './storage.js';
@@ -456,7 +455,7 @@ export async function sendMail(
   assertNoHeaderInjection(req.subject);
   const settings = await getSettings(env);
   const db = createDb(env);
-  const domains = await getDomains(env, settings);
+  const domains = await getRoutableDomains(env, settings);
   const from = await resolveFrom(env, sender, req, domains);
 
   // 转发携带原附件：从来源邮件读回（校验可见性），追加到本次发送
@@ -635,8 +634,7 @@ export async function sendMail(
         for (let i = 0; i < internalTargets.length; i++) {
           const target = internalTargets[i]!;
           const messageId = internalRows[i]!;
-          const ownerId = await getMailboxOwner(env, target);
-          const ownerIds = ownerId !== null ? [ownerId] : await getActiveAdminIds(env);
+          const ownerIds = await resolveNotifyOwnerIds(env, target);
           for (const id of ownerIds) {
             const prefs = await getUserNotifyPrefs(env, id);
             try {

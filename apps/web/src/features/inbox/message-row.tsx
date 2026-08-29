@@ -24,12 +24,14 @@ function outboundRecipientLabel(message: MessageSummary): string {
 
 export function MessageRow({
   message,
+  href,
   onToggleStar,
   selected = false,
   selectionActive = false,
   onToggleSelect,
 }: {
   message: MessageSummary;
+  href: string;
   onToggleStar: (message: MessageSummary) => void;
   selected?: boolean;
   selectionActive?: boolean;
@@ -72,7 +74,7 @@ export function MessageRow({
           </button>
         )}
 
-        <Link to={`/mail/${message.id}`} className="block min-w-0 flex-1">
+        <Link to={href} className="block min-w-0 flex-1">
           <div className="flex items-baseline justify-between gap-3">
             <span className="flex min-w-0 items-center gap-1.5">
               {unread && <span className="size-2 shrink-0 rounded-full bg-accent" aria-label="未读" />}

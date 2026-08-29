@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Download, FileDown, Forward, ImageOff, MailOpen, Paperclip, Reply, ReplyAll, Star, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import type { MessageDetail } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
@@ -12,9 +12,9 @@ import { IconButton } from '@/components/ui/icon-button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { toast } from '@/components/ui/toast';
 import { buildForward, buildReply, buildReplyAll, buildResend } from '@/features/compose/compose-init';
+import { mailHref } from '@/features/inbox/mail-view';
 import { useStarMutation } from '@/features/inbox/use-star';
 import { cn } from '@/lib/cn';
-import { useCurrentUser } from '@/lib/use-session';
 import { countRemoteImages } from './count-remote-images';
 import { EmailHtml } from '@/lib/email-html';
 import { formatBytes, formatDateTime } from '@/lib/format';
@@ -26,34 +26,40 @@ import { OtpBanner } from './otp-banner';
 export function MessagePage() {
   const { id } = useParams();
   const messageId = Number(id);
+  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const currentUser = useCurrentUser();
-  // admin 可打开全站邮件；对自己显式打开的这封邮件执行标记/删除时按全站生效
-  const opScope = currentUser.role === 'admin' ? ('all' as const) : undefined;
+  const scopeRaw = searchParams.get('scope');
+  const scope: 'mine' | 'unclaimed' | 'user' | undefined =
+    scopeRaw === 'unclaimed' || scopeRaw === 'user' || scopeRaw === 'mine' ? scopeRaw : undefined;
+  const userIdRaw = Number(searchParams.get('userId'));
+  const userId = Number.isInteger(userIdRaw) && userIdRaw > 0 ? userIdRaw : undefined;
+  const view = scope ? { scope, userId } : undefined;
+  const auditUser = scope === 'user';
+  const mutationScope = scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showRemoteImages, setShowRemoteImages] = useState(false);
   const markedRef = useRef(false);
 
   const { data: message, isLoading, isError } = useQuery({
-    queryKey: queryKeys.messages.detail(messageId),
-    queryFn: () => messageApi.detail(messageId),
+    queryKey: queryKeys.messages.detail(messageId, view),
+    queryFn: () => messageApi.detail(messageId, view),
     enabled: Number.isFinite(messageId),
   });
 
-  const star = useStarMutation();
+  const star = useStarMutation(view);
 
   const { data: threadData } = useQuery({
-    queryKey: ['messages', 'thread', messageId],
-    queryFn: () => messageApi.thread(messageId),
+    queryKey: ['messages', 'thread', messageId, view],
+    queryFn: () => messageApi.thread(messageId, view),
     enabled: Number.isFinite(messageId),
   });
   const thread = threadData?.items ?? [];
 
   const markRead = useMutation({
-    mutationFn: (isRead: boolean) => messageApi.markRead([messageId], isRead, opScope),
+    mutationFn: (isRead: boolean) => messageApi.markRead([messageId], isRead, mutationScope),
     onSuccess: (_data, isRead) => {
-      queryClient.setQueryData<MessageDetail>(queryKeys.messages.detail(messageId), (prev) =>
+      queryClient.setQueryData<MessageDetail>(queryKeys.messages.detail(messageId, view), (prev) =>
         prev ? { ...prev, isRead } : prev,
       );
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
@@ -61,13 +67,14 @@ export function MessagePage() {
   });
 
   useEffect(() => {
+    if (auditUser) return;
     if (message && !message.isRead && !markedRef.current) {
       markedRef.current = true;
       markRead.mutate(true);
     }
     // 只在消息首次加载为未读时触发一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [message?.id, message?.isRead]);
+  }, [message?.id, message?.isRead, auditUser]);
 
   // 该发件人此前被信任过 → 自动显示其远程图片
   useEffect(() => {
@@ -81,7 +88,7 @@ export function MessagePage() {
   };
 
   const deleteMutation = useMutation({
-    mutationFn: () => messageApi.remove([messageId], opScope),
+    mutationFn: () => messageApi.remove([messageId], mutationScope),
     onSuccess: () => {
       toast({ title: '邮件已删除', variant: 'success' });
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
@@ -98,7 +105,8 @@ export function MessagePage() {
   // 下载原始 .eml：带鉴权头 fetch → blob → 触发下载
   const downloadEml = async () => {
     try {
-      const res = await fetch(`/api/messages/${messageId}/raw`, {
+      const qs = searchParams.toString();
+      const res = await fetch(`/api/messages/${messageId}/raw${qs ? `?${qs}` : ''}`, {
         headers: { Authorization: `Bearer ${getAuthToken() ?? ''}` },
       });
       if (!res.ok) {
@@ -160,24 +168,28 @@ export function MessagePage() {
           <ArrowLeft className="size-5" />
         </IconButton>
         <div className="ml-auto flex items-center gap-1.5">
-          <Button variant="secondary" size="sm" onClick={() => navigate('/compose', { state: buildReply(message) })}>
-            <Reply className="size-4" />
-            回复
-          </Button>
-          {message.recipients.to.length + message.recipients.cc.length > 1 && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => navigate('/compose', { state: buildReplyAll(message) })}
-            >
-              <ReplyAll className="size-4" />
-              回复全部
-            </Button>
+          {!auditUser && (
+            <>
+              <Button variant="secondary" size="sm" onClick={() => navigate('/compose', { state: buildReply(message) })}>
+                <Reply className="size-4" />
+                回复
+              </Button>
+              {message.recipients.to.length + message.recipients.cc.length > 1 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => navigate('/compose', { state: buildReplyAll(message) })}
+                >
+                  <ReplyAll className="size-4" />
+                  回复全部
+                </Button>
+              )}
+              <Button variant="ghost" size="sm" onClick={() => navigate('/compose', { state: buildForward(message) })}>
+                <Forward className="size-4" />
+                转发
+              </Button>
+            </>
           )}
-          <Button variant="ghost" size="sm" onClick={() => navigate('/compose', { state: buildForward(message) })}>
-            <Forward className="size-4" />
-            转发
-          </Button>
           <IconButton
             aria-label={message.isStarred ? '取消星标' : '加星标'}
             aria-pressed={message.isStarred}
@@ -185,17 +197,21 @@ export function MessagePage() {
           >
             <Star className={cn('size-4', message.isStarred ? 'fill-caution text-caution' : 'text-ink-tertiary')} />
           </IconButton>
-          <IconButton aria-label="标为未读" onClick={handleMarkUnread}>
-            <MailOpen className="size-4" />
-          </IconButton>
+          {!auditUser && (
+            <IconButton aria-label="标为未读" onClick={handleMarkUnread}>
+              <MailOpen className="size-4" />
+            </IconButton>
+          )}
           {message.hasRaw && (
             <IconButton aria-label="下载原始邮件 (.eml)" onClick={downloadEml}>
               <FileDown className="size-4" />
             </IconButton>
           )}
-          <IconButton aria-label="删除邮件" onClick={() => setConfirmDelete(true)}>
-            <Trash2 className="size-4 text-critical" />
-          </IconButton>
+          {!auditUser && (
+            <IconButton aria-label="删除邮件" onClick={() => setConfirmDelete(true)}>
+              <Trash2 className="size-4 text-critical" />
+            </IconButton>
+          )}
         </div>
       </div>
 
@@ -308,7 +324,7 @@ export function MessagePage() {
             {thread.map((item) => (
               <li key={item.id}>
                 <Link
-                  to={`/mail/${item.id}`}
+                  to={mailHref(item.id, view ?? {})}
                   className={cn(
                     'flex items-center justify-between gap-3 rounded-md px-2.5 py-2 text-sm transition-colors hover:bg-surface-hover',
                     item.id === messageId && 'bg-accent-soft',

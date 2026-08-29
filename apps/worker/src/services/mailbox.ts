@@ -8,6 +8,7 @@ import type { Env } from '../types.js';
 import { domainPerUserLimit, getDomains, isDomainPublic } from './domain.js';
 import { getSettings } from './setting.js';
 import { deleteMessageObjects } from './storage.js';
+import { getActiveAdminIds } from './user.js';
 
 type MailboxRow = typeof mailboxes.$inferSelect;
 
@@ -220,6 +221,13 @@ export async function getMailboxOwner(env: Env, address: string): Promise<number
     .where(eq(mailboxes.address, address))
     .get();
   return row?.userId ?? null;
+}
+
+/** 通知归属：已认领 → 主人；未认领 → 全部启用中的管理员。收信当时结算。 */
+export async function resolveNotifyOwnerIds(env: Env, address: string): Promise<number[]> {
+  const ownerId = await getMailboxOwner(env, address);
+  if (ownerId !== null) return [ownerId];
+  return getActiveAdminIds(env);
 }
 
 /** 校验地址归属（发件身份校验用） */

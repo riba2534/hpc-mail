@@ -30,8 +30,7 @@ app.get('/', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const query = parseQuery(c, listMessagesQuerySchema);
-  const viewer: Viewer = { userId: key.userId, role: key.role, scope: query.scope };
-  return ok(c, await listMessages(c.env, viewer, query));
+  return ok(c, await listMessages(c.env, viewerFromKey(key, query), query));
 });
 
 app.post('/', async (c) => {
@@ -118,12 +117,30 @@ app.get('/wait', async (c) => {
   }
 });
 
+function viewerFromKey(
+  key: { userId: number; role: Viewer['role'] },
+  query: { scope?: Viewer['scope']; userId?: number },
+): Viewer {
+  return { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId };
+}
+
+function viewerFromQueryString(c: { req: { query: (k: string) => string | undefined } }, key: { userId: number; role: Viewer['role'] }): Viewer {
+  const q = c.req.query('scope');
+  const scope = q === 'mine' || q === 'unclaimed' || q === 'user' ? q : undefined;
+  const userIdRaw = Number(c.req.query('userId'));
+  return {
+    userId: key.userId,
+    role: key.role,
+    scope,
+    targetUserId: Number.isInteger(userIdRaw) && userIdRaw > 0 ? userIdRaw : undefined,
+  };
+}
+
 app.get('/:id', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
-  const viewer: Viewer = { userId: key.userId, role: key.role };
-  return ok(c, await getMessageDetail(c.env, viewer, id));
+  return ok(c, await getMessageDetail(c.env, viewerFromQueryString(c, key), id));
 });
 
 app.get('/:id/attachments/:attId', async (c) => {
@@ -131,7 +148,7 @@ app.get('/:id/attachments/:attId', async (c) => {
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
   const attId = parseId(c.req.param('attId'));
-  const viewer: Viewer = { userId: key.userId, role: key.role };
+  const viewer: Viewer = viewerFromQueryString(c, key);
   const att = await loadAttachmentForViewer(c.env, viewer, attId);
   if (att.messageId !== id) throw new AppError('not_found', '附件不存在');
   const obj = await getObject(c.env, att.r2Key);

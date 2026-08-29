@@ -5,9 +5,16 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createDb } from '../src/db/client.js';
 import { messages, settings as settingsTable, users } from '../src/db/schema.js';
 import { AppError } from '../src/lib/errors.js';
-import { getDomains, getPublicDomains, getVisibleDomains } from '../src/services/domain.js';
+import { getDomains, getPublicDomains, getRoutableDomains, getVisibleDomains } from '../src/services/domain.js';
 import { claimMailbox } from '../src/services/mailbox.js';
-import { countUnread, listMessages, markAllRead, markMessages, starMessages } from '../src/services/message.js';
+import {
+  countUnread,
+  getMessageDetail,
+  listMessages,
+  markAllRead,
+  markMessages,
+  starMessages,
+} from '../src/services/message.js';
 import {
   getUserNotifyPrefs,
   maskUserNotifyPrefs,
@@ -165,17 +172,70 @@ describe('message 可见性 user vs admin', () => {
     expect(page.items[0]!.address).toBe('carol@inbox.test');
   });
 
-  it('admin 默认看全站，scope=mine 只看自己', async () => {
+  it('admin 默认只看自己认领，unclaimed 看未认领，user 看指定用户', async () => {
     const adminId = await seedUser('root', 'admin');
-    const all = await listMessages(env, { userId: adminId, role: 'admin' }, { limit: 30 } as never);
-    expect(all.items.length).toBeGreaterThanOrEqual(2);
+    const uid = await seedUser('vis-bob', 'user');
+    await seedInbound('vis-bob@inbox.test', 'bob mail');
+    await claimMailbox(env, uid, 'user', { localPart: 'vis-bob', domain: 'inbox.test' });
 
-    const mine = await listMessages(
+    const mine = await listMessages(env, { userId: adminId, role: 'admin' }, { limit: 30 } as never);
+    expect(mine.items.every((m) => m.address !== 'vis-bob@inbox.test')).toBe(true);
+    expect(mine.items.every((m) => m.address !== 'other@hpc.email')).toBe(true);
+
+    const unclaimed = await listMessages(
       env,
-      { userId: adminId, role: 'admin', scope: 'mine' },
+      { userId: adminId, role: 'admin', scope: 'unclaimed' },
+      { limit: 50 } as never,
+    );
+    expect(unclaimed.items.some((m) => m.address === 'other@hpc.email')).toBe(true);
+    expect(unclaimed.items.some((m) => m.address === 'vis-bob@inbox.test')).toBe(false);
+
+    const asUser = await listMessages(
+      env,
+      { userId: adminId, role: 'admin', scope: 'user', targetUserId: uid },
       { limit: 30 } as never,
     );
-    expect(mine.items).toHaveLength(0);
+    expect(asUser.items.every((m) => m.address === 'vis-bob@inbox.test')).toBe(true);
+    expect(asUser.items.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('admin 无上下文打不开他人已认领邮件', async () => {
+    const adminId = await seedUser('detail-admin', 'admin');
+    const uid = await seedUser('detail-bob', 'user');
+    await seedInbound('detail-bob@inbox.test', 'claimed for detail');
+    await claimMailbox(env, uid, 'user', { localPart: 'detail-bob', domain: 'inbox.test' });
+    const claimedId = (
+      await listMessages(env, { userId: uid, role: 'user' }, { limit: 5 } as never)
+    ).items[0]!.id;
+    const unclaimedId = (
+      await listMessages(env, { userId: adminId, role: 'admin', scope: 'unclaimed' }, { limit: 50 } as never)
+    ).items.find((m) => m.address === 'other@hpc.email')!.id;
+
+    await expect(getMessageDetail(env, { userId: adminId, role: 'admin' }, claimedId)).rejects.toMatchObject({
+      code: 'not_found',
+    });
+    const openUnclaimed = await getMessageDetail(env, { userId: adminId, role: 'admin' }, unclaimedId);
+    expect(openUnclaimed.address).toBe('other@hpc.email');
+    const asUser = await getMessageDetail(
+      env,
+      { userId: adminId, role: 'admin', scope: 'user', targetUserId: uid },
+      claimedId,
+    );
+    expect(asUser.address).toBe('detail-bob@inbox.test');
+  });
+
+  it('普通用户不能使用 unclaimed/user 范围', async () => {
+    const uid = await seedUser('scope-user', 'user');
+    await expect(
+      listMessages(env, { userId: uid, role: 'user', scope: 'unclaimed' }, { limit: 10 } as never),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(
+      listMessages(
+        env,
+        { userId: uid, role: 'user', scope: 'user', targetUserId: uid },
+        { limit: 10 } as never,
+      ),
+    ).rejects.toMatchObject({ code: 'forbidden' });
   });
 });
 
@@ -185,30 +245,39 @@ describe('星标与正文搜索', () => {
     const other = await seedUser('star-other', 'admin');
     const mid = await seedInbound('star@hpc.email', 'hello star');
 
-    await starMessages(env, { userId: admin, role: 'admin' }, [mid], true);
+    const unclaimed = { scope: 'unclaimed' as const };
+    await starMessages(env, { userId: admin, role: 'admin', ...unclaimed }, [mid], true);
 
-    const adminList = await listMessages(env, { userId: admin, role: 'admin' }, { limit: 30 } as never);
+    const adminList = await listMessages(
+      env,
+      { userId: admin, role: 'admin', ...unclaimed },
+      { limit: 30 } as never,
+    );
     const starredForAdmin = adminList.items.find((m) => m.id === mid);
     expect(starredForAdmin?.isStarred).toBe(true);
 
     // 另一个用户看到的同一封邮件未被星标
-    const otherList = await listMessages(env, { userId: other, role: 'admin' }, { limit: 30 } as never);
+    const otherList = await listMessages(
+      env,
+      { userId: other, role: 'admin', ...unclaimed },
+      { limit: 30 } as never,
+    );
     expect(otherList.items.find((m) => m.id === mid)?.isStarred).toBe(false);
 
     // starred=true 过滤只返回星标邮件
     const onlyStarred = await listMessages(
       env,
-      { userId: admin, role: 'admin' },
+      { userId: admin, role: 'admin', ...unclaimed },
       { limit: 30, starred: true } as never,
     );
     expect(onlyStarred.items.every((m) => m.isStarred)).toBe(true);
     expect(onlyStarred.items.some((m) => m.id === mid)).toBe(true);
 
     // 取消星标
-    await starMessages(env, { userId: admin, role: 'admin' }, [mid], false);
+    await starMessages(env, { userId: admin, role: 'admin', ...unclaimed }, [mid], false);
     const afterUnstar = await listMessages(
       env,
-      { userId: admin, role: 'admin' },
+      { userId: admin, role: 'admin', ...unclaimed },
       { limit: 30, starred: true } as never,
     );
     expect(afterUnstar.items.some((m) => m.id === mid)).toBe(false);
@@ -221,7 +290,7 @@ describe('星标与正文搜索', () => {
 
     const hit = await listMessages(
       env,
-      { userId: admin, role: 'admin' },
+      { userId: admin, role: 'admin', scope: 'unclaimed' },
       { limit: 30, q: 'UNIQUETOKEN9' } as never,
     );
     expect(hit.items).toHaveLength(1);
@@ -317,6 +386,42 @@ describe('域名可见性与按域名认领上限', () => {
     const box = await claimMailbox(env, aid, 'admin', { localPart: 'lima2', domain: 'example.com' });
     expect(box.address).toBe('lima2@example.com');
   });
+
+  it('从列表移除域名后，已认领地址仍按站内互投', async () => {
+    await updateSettings(env, {
+      domains: { list: [{ domain: 'kept.example', public: true, perUserLimit: 0 }] },
+    });
+    const uid = await seedUser('kept-route', 'user');
+    const box = await claimMailbox(env, uid, 'user', { localPart: 'kept', domain: 'kept.example' });
+    await updateSettings(env, { domains: { list: [] } });
+    expect(await getDomains(env)).toEqual([]);
+    expect(await getRoutableDomains(env)).toContain('kept.example');
+
+    const ctx = { waitUntil: () => {} };
+    await sendMail(
+      env,
+      ctx,
+      { userId: uid, role: 'user' },
+      {
+        from: { mailboxId: box.id },
+        to: ['kept@kept.example'],
+        cc: [],
+        bcc: [],
+        subject: 'still internal',
+        text: 'hi',
+      } as never,
+      [],
+      'https://hpc.email',
+    );
+
+    const db = createDb(env);
+    const inbound = await db
+      .select()
+      .from(messages)
+      .where(and(eq(messages.address, 'kept@kept.example'), eq(messages.direction, 'inbound')))
+      .get();
+    expect(inbound?.sendChannel).toBe('internal');
+  });
 });
 
 describe('收件箱未读数 countUnread', () => {
@@ -373,7 +478,7 @@ describe('一键全读 markAllRead', () => {
     expect(other!.isRead).toBe(false);
   });
 
-  it('admin 默认 scope=mine 只标自己，显式 scope=all 才作用全站', async () => {
+  it('admin 默认只标自己，显式 scope=unclaimed 才标未认领', async () => {
     await setDomains();
     const adminId = await seedUser('readall-admin', 'admin');
     await claimMailbox(env, adminId, 'admin', { localPart: 'ra-boss', domain: 'hpc.email' });
@@ -385,8 +490,7 @@ describe('一键全读 markAllRead', () => {
     const db = createDb(env);
     const before = await db.select().from(messages).where(eq(messages.id, elsewhereId)).get();
     expect(before!.isRead).toBe(false);
-    // scope=all 作用全站；同文件其他用例会遗留未读行，不断言总数、只验证目标行为
-    await markAllRead(env, { userId: adminId, role: 'admin', scope: 'all' });
+    await markAllRead(env, { userId: adminId, role: 'admin', scope: 'unclaimed' });
     const after = await db.select().from(messages).where(eq(messages.id, elsewhereId)).get();
     expect(after!.isRead).toBe(true);
   });

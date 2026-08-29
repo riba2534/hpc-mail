@@ -1,12 +1,10 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { PageHeader } from '@/components/page-header';
-import type { ComboboxOption } from '@/components/ui/combobox';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { FilterBar } from '@/features/inbox/filter-bar';
 import { MailList } from '@/features/inbox/mail-list';
 import { useInboxFilters } from '@/features/inbox/use-inbox-filters';
-import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import { useDomains } from '@/lib/use-config';
 
 type Direction = 'inbound' | 'outbound';
@@ -18,19 +16,17 @@ const DIRECTION_OPTIONS = [
 
 const DIRECTION_COPY: Record<
   Direction,
-  { description: string; addressLabel: string; emptyTitle: string; emptyDescription: string }
+  { description: string; emptyTitle: string; emptyDescription: string }
 > = {
   inbound: {
-    description: '所有域名 catch-all 收到的邮件，包含未认领地址。',
-    addressLabel: '全站收件地址',
-    emptyTitle: '暂无邮件',
-    emptyDescription: '全站还没有收到任何邮件。',
+    description: '尚未被任何人认领的地址收到的邮件（catch-all）。已认领地址的信请到对应用户页查看。',
+    emptyTitle: '暂无未认领收件',
+    emptyDescription: '目前没有未认领地址收到的邮件。',
   },
   outbound: {
-    description: '全站所有用户与系统发出的邮件，包含未认领地址发件。',
-    addressLabel: '全站发件地址',
-    emptyTitle: '暂无已发送邮件',
-    emptyDescription: '全站还没有发出过任何邮件。',
+    description: '从未认领地址发出的邮件（通常是管理员用任意前缀试投）。用户已发送请到对应用户页查看。',
+    emptyTitle: '暂无未认领发件',
+    emptyDescription: '目前没有从未认领地址发出的邮件。',
   },
 };
 
@@ -66,30 +62,16 @@ export function AdminMailPage() {
   const { filters, setDomain, setAddress, setUnread, setQuery, reset } = useInboxFilters();
   const { direction, setDirection } = useAdminMailDirection();
   const { data: visibleDomains } = useDomains();
-  const { data: mailboxes } = useMailboxesQuery(true);
 
   const isInbound = direction === 'inbound';
   const copy = DIRECTION_COPY[direction];
 
-  const addressOptions = useMemo<ComboboxOption[]>(
-    () =>
-      (mailboxes ?? []).map((mailbox) => ({
-        value: mailbox.address,
-        label: mailbox.address,
-        description: mailbox.ownerUsername,
-      })),
-    [mailboxes],
-  );
-
-  const hasActiveFilters = Boolean(
-    filters.domain || filters.address || (isInbound && filters.unread) || filters.q,
-  );
+  const hasActiveFilters = Boolean(filters.domain || (isInbound && filters.unread) || filters.q);
 
   const query = {
     direction,
-    scope: 'all' as const,
+    scope: 'unclaimed' as const,
     domain: filters.domain ?? undefined,
-    address: filters.address ?? undefined,
     unread: (isInbound && filters.unread) || undefined,
     q: filters.q || undefined,
   };
@@ -107,8 +89,7 @@ export function AdminMailPage() {
         <FilterBar
           filters={filters}
           domains={visibleDomains ?? []}
-          addressOptions={addressOptions}
-          addressLabel={copy.addressLabel}
+          addressOptions={[]}
           showUnread={isInbound}
           onDomainChange={setDomain}
           onAddressChange={setAddress}

@@ -148,6 +148,7 @@ function DomainRow({
           <Switch checked={entry.public} disabled={busy} onCheckedChange={(v) => onTogglePublic(entry.domain, v)} />
           <span>{entry.public ? '公开给普通用户' : '仅管理员可用'}</span>
         </label>
+        <span className="text-xs text-ink-tertiary">关掉后不能再被新认领，已认领的人仍可收发</span>
         {entry.public && (
           <div className="flex items-center gap-1.5 text-ink-secondary">
             <span>每人可认领</span>

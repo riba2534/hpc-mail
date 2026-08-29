@@ -11,6 +11,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import type { MessageSummary } from '@hpc-mail/shared';
+import { mailHref } from './mail-view';
 import { MessageRow } from './message-row';
 import { useMessagesQuery } from './use-messages';
 import { useStarMutation } from './use-star';
@@ -23,6 +24,8 @@ export interface MailListProps {
   emptyDescription?: string;
   /** trash 模式：批量工具栏改为恢复/永久删除 */
   variant?: 'inbox' | 'trash';
+  /** 审计他人已认领邮件：可看、可星标，不能标已读/删除 */
+  readOnly?: boolean;
 }
 
 function ListSkeleton() {
@@ -48,13 +51,18 @@ export function MailList({
   emptyTitle,
   emptyDescription,
   variant = 'inbox',
+  readOnly = false,
 }: MailListProps) {
   const queryClient = useQueryClient();
   const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } =
     useMessagesQuery(query);
   const items = data?.pages.flatMap((page) => page.items) ?? [];
 
-  const star = useStarMutation();
+  const starView =
+    query.scope === 'unclaimed' || query.scope === 'user'
+      ? { scope: query.scope, userId: query.userId }
+      : undefined;
+  const star = useStarMutation(starView);
   const handleToggleStar = (message: MessageSummary) =>
     star.mutate({ id: message.id, starred: !message.isStarred });
 
@@ -104,8 +112,8 @@ export function MailList({
     void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
   };
 
-  // admin 全站视图（scope=all）的批量操作需带上 scope 才作用全站；其余默认只作用自己
-  const mutationScope = query.scope === 'all' ? 'all' : undefined;
+  // 未认领视图的批量已读/删除必须显式带 scope，否则后端只动自己认领的地址
+  const mutationScope = query.scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
 
   const batchRead = useMutation({
     mutationFn: ({ ids, isRead }: { ids: number[]; isRead: boolean }) =>
@@ -119,7 +127,7 @@ export function MailList({
   });
 
   const batchStar = useMutation({
-    mutationFn: (ids: number[]) => messageApi.star(ids, true, mutationScope),
+    mutationFn: (ids: number[]) => messageApi.star(ids, true, starView),
     onSuccess: () => {
       toast({ title: '已加星标', variant: 'success' });
       clearSelection();
@@ -329,10 +337,11 @@ export function MailList({
             >
               <MessageRow
                 message={message}
+                href={mailHref(message.id, query)}
                 onToggleStar={handleToggleStar}
                 selected={selection.has(message.id)}
                 selectionActive={selectionActive}
-                onToggleSelect={toggleSelect}
+                onToggleSelect={readOnly ? undefined : toggleSelect}
               />
             </div>
           );

@@ -75,6 +75,12 @@ describe('listMessagesQuerySchema', () => {
   it('limit 超上限被拒', () => {
     expect(listMessagesQuerySchema.safeParse({ limit: '101' }).success).toBe(false);
   });
+  it('scope=user 必须带 userId，不再接受 all', () => {
+    expect(listMessagesQuerySchema.safeParse({ scope: 'user' }).success).toBe(false);
+    expect(listMessagesQuerySchema.safeParse({ scope: 'user', userId: '3' }).success).toBe(true);
+    expect(listMessagesQuerySchema.safeParse({ scope: 'unclaimed' }).success).toBe(true);
+    expect(listMessagesQuerySchema.safeParse({ scope: 'all' }).success).toBe(false);
+  });
 });
 
 describe('sendMailRequestSchema', () => {

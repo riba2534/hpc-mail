@@ -23,6 +23,6 @@ describe('useStarMutation', () => {
     await waitFor(() =>
       expect(queryClient.getQueryData(queryKeys.messages.detail(7))).toMatchObject({ isStarred: true }),
     );
-    expect(starMock).toHaveBeenCalledWith([7], true);
+    expect(starMock).toHaveBeenCalledWith([7], true, undefined);
   });
 });

@@ -166,9 +166,11 @@ curl -s -X POST $BASE/api/messages/delete -H "Authorization: Bearer $TOKEN" -H '
 ```
 
 **管理员注意**：这三个批量接口默认只作用于**你自己认领的地址**下的邮件（防止漏传参数误改他人邮件）。
-管理员要作用于全站，需显式加 `"scope":"all"`，例如 `{"ids":[123],"isRead":true,"scope":"all"}`；
-不加时会正常返回 `200` 但 `changed`/`deleted` 为 `0`。`/v1` 的同名接口用法一致。
-一次最多传 500 个 id。
+清理未认领地址的信时显式加 `"scope":"unclaimed"`（或 query `?scope=unclaimed`），例如 `{"ids":[123],"isRead":true,"scope":"unclaimed"}`。
+不再支持 `scope=all`（会 400）。`/v1` 的同名接口用法一致。一次最多传 500 个 id。
+
+管理员列未认领收件：`GET /api/messages?scope=unclaimed&direction=inbound`。
+查看某用户已认领地址：`GET /api/messages?scope=user&userId=20`。
 
 搜索用 `GET /api/messages` 的 query 参数组合：`direction`（inbound/outbound）、`address`、`domain`、`unread=1`、`starred=1`、`q`（关键词，匹配主题/发件人/**正文**）、`cursor`/`limit`（limit 最大 100）。例：搜正文含 invoice 的未读收件 → `?direction=inbound&unread=1&q=invoice`。
 
