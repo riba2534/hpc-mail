@@ -62,5 +62,5 @@ BEGIN
     AND `status` = 'active'
     AND `used_count` < `max_uses`
     AND (`expires_at` IS NULL OR `expires_at` > (unixepoch() * 1000));
-  SELECT CASE WHEN changes() = 0 THEN RAISE(ABORT, 'invite_invalid') END;
+  SELECT (CASE WHEN changes() = 0 THEN RAISE(ABORT, 'invite_invalid') END);
 END;
