@@ -4,6 +4,7 @@ import {
   listMessagesQuerySchema,
   markReadRequestSchema,
   starMessagesRequestSchema,
+  type MessageSummary,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { ok, parseBody, parseId, parseQuery } from '../lib/http.js';
@@ -25,6 +26,11 @@ import {
 } from '../services/message.js';
 import { AppError } from '../lib/errors.js';
 import { decodeInlineAttachments, sendMail } from '../services/outbound.js';
+import {
+  beginIdempotentSend,
+  completeIdempotentSend,
+  failIdempotentSend,
+} from '../services/idempotency.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
 import type { AppContext } from '../types.js';
 
@@ -63,19 +69,33 @@ app.get('/', async (c) => {
 app.post('/send', async (c) => {
   const user = c.get('user')!;
   const req = await parseBody(c, internalSendMailSchema);
-  // 兼容两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端），合并后送 sendMail
-  const decoded = decodeInlineAttachments(req.attachments);
-  const fromTokens = await resolveDraftAttachments(c.env, user.id, req.attachmentTokens);
-  const attachments = [...decoded, ...fromTokens];
-  const origin = new URL(c.req.url).origin;
-  const summary = await sendMail(
+  const idem = await beginIdempotentSend(
     c.env,
-    c.executionCtx,
-    { userId: user.id, role: user.role },
+    { type: 'user', id: user.id },
+    c.req.header('Idempotency-Key'),
     req,
-    attachments,
-    origin,
   );
+  if (idem.kind === 'replay') return ok(c, idem.response, 201);
+  let summary: MessageSummary;
+  try {
+    // 兼容两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端），合并后送 sendMail
+    const decoded = decodeInlineAttachments(req.attachments);
+    const fromTokens = await resolveDraftAttachments(c.env, user.id, req.attachmentTokens);
+    const attachments = [...decoded, ...fromTokens];
+    const origin = new URL(c.req.url).origin;
+    summary = await sendMail(
+      c.env,
+      c.executionCtx,
+      { userId: user.id, role: user.role },
+      req,
+      attachments,
+      origin,
+    );
+    await completeIdempotentSend(c.env, idem.handle, summary);
+  } catch (error) {
+    await failIdempotentSend(c.env, idem.handle, error);
+    throw error;
+  }
   // 发送成功后回收 token 引用的草稿附件（base64 内联的无草稿，跳过）。
   // 不能让回收失败翻转整个请求的结果：邮件此刻已经真发出去了，这里再抛 500 会让前端提示
   // 「发送失败，请重试」，用户一重发、token 又还在，收件人就收到两封。回收失败留给

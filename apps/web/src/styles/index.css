@@ -12,14 +12,14 @@
 
   /* 中性 */
   --color-canvas: oklch(97.8% 0.002 247);
-  --color-surface: oklch(100% 0 0);
+  --color-surface: oklch(99.5% 0.002 247);
   --color-surface-hover: oklch(96.6% 0.003 247);
   --color-surface-active: oklch(94.4% 0.005 247);
 
   /* 文字 */
   --color-ink: oklch(22% 0.012 260);
   --color-ink-secondary: oklch(45% 0.012 260);
-  --color-ink-tertiary: oklch(60% 0.01 260);
+  --color-ink-tertiary: oklch(51% 0.012 260);
 
   /* 线 */
   --color-line: oklch(92% 0.004 260);
@@ -29,13 +29,13 @@
   --color-accent: oklch(50% 0.19 268);
   --color-accent-hover: oklch(44% 0.19 268);
   --color-accent-soft: oklch(95% 0.03 268);
-  --color-on-accent: oklch(100% 0 0);
+  --color-on-accent: oklch(98.5% 0.004 268);
   --color-focus: oklch(55% 0.19 268);
 
   /* 语义状态 */
-  --color-positive: oklch(56% 0.13 155);
+  --color-positive: oklch(43% 0.12 155);
   --color-positive-soft: oklch(95% 0.04 155);
-  --color-caution: oklch(64% 0.13 70);
+  --color-caution: oklch(43% 0.12 70);
   --color-caution-soft: oklch(96% 0.05 80);
   --color-critical: oklch(55% 0.2 25);
   --color-critical-soft: oklch(96% 0.03 25);

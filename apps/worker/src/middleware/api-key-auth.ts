@@ -1,4 +1,9 @@
-import { API_KEY_PREFIX, type ApiScope } from '@hpc-mail/shared';
+import {
+  API_KEY_PREFIX,
+  MAX_API_GLOBAL_REQUESTS_PER_MINUTE,
+  MAX_API_USER_REQUESTS_PER_MINUTE,
+  type ApiScope,
+} from '@hpc-mail/shared';
 import { eq, sql } from 'drizzle-orm';
 import type { Context, MiddlewareHandler } from 'hono';
 import { createDb } from '../db/client.js';
@@ -7,6 +12,7 @@ import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { getSettings } from '../services/setting.js';
+import { bumpCounter, minuteWindow } from '../services/rate-counter.js';
 import type { AppContext } from '../types.js';
 
 const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
@@ -84,6 +90,16 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     c.header('X-RateLimit-Remaining', String(Math.max(0, row.rateLimit - requestCount)));
     c.header('X-RateLimit-Reset', String((windowStart + 1) * 60));
     if (requestCount > row.rateLimit) throw new AppError('rate_limited', 'API 调用频率超限');
+
+    // Key 级限制之外再加用户级与实例级总桶，避免创建多个 Key 横向放大额度。
+    const minute = minuteWindow(1);
+    const [userRate, globalRate] = await Promise.all([
+      bumpCounter(c.env, 'api-user', String(row.userId), minute),
+      bumpCounter(c.env, 'api-global', 'instance', minute),
+    ]);
+    if (userRate.count > MAX_API_USER_REQUESTS_PER_MINUTE || globalRate.count > MAX_API_GLOBAL_REQUESTS_PER_MINUTE) {
+      throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
+    }
 
     await db
       .update(apiKeys)

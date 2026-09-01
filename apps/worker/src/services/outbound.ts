@@ -103,18 +103,18 @@ async function assertOutboundQuota(
   env: Env,
   quota: { dailyOutbound: number; dailyRecipients: number },
   sender: Sender,
-  externalCount: number,
+  recipientCount: number,
 ): Promise<void> {
   if (sender.role === 'admin') return;
   if (quota.dailyOutbound === 0 && quota.dailyRecipients === 0) return;
   const subject = String(sender.userId);
   const window = dayWindow();
-  const cur = await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, subject, window, 1, externalCount);
+  const cur = await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, subject, window, 1, recipientCount);
   const overMails = quota.dailyOutbound > 0 && cur.count > quota.dailyOutbound;
   const overRecipients = quota.dailyRecipients > 0 && cur.units > quota.dailyRecipients;
   if (overMails || overRecipients) {
     // 拒绝的这次不该占额度，立即回退
-    await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, subject, window, -1, -externalCount);
+    await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, subject, window, -1, -recipientCount);
     throw new AppError(
       'rate_limited',
       overMails
@@ -129,11 +129,11 @@ async function releaseOutboundQuota(
   env: Env,
   quota: { dailyOutbound: number; dailyRecipients: number },
   sender: Sender,
-  externalCount: number,
+  recipientCount: number,
 ): Promise<void> {
   if (sender.role === 'admin') return;
   if (quota.dailyOutbound === 0 && quota.dailyRecipients === 0) return;
-  await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, String(sender.userId), dayWindow(), -1, -externalCount);
+  await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, String(sender.userId), dayWindow(), -1, -recipientCount);
 }
 
 async function resolveFrom(
@@ -233,33 +233,57 @@ async function persistAttachments(
   db: Db,
   messageId: number,
   atts: DecodedAttachment[],
-): Promise<{ id: number; filename: string; size: number }[]> {
+): Promise<{
+  id: number;
+  r2Key: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  contentId: string;
+  disposition: string;
+}[]> {
   if (!atts.length) return [];
   const rows = [];
-  for (let seq = 0; seq < atts.length; seq++) {
-    const att = atts[seq]!;
-    const hash16 = await sha256Hex16(att.bytes);
-    const key = attachmentKey(messageId, seq, hash16, getExt(att.filename));
-    await env.r2.put(key, att.bytes, { httpMetadata: { contentType: att.mimeType } });
-    rows.push({
-      messageId,
-      r2Key: key,
-      filename: att.filename,
-      mimeType: att.mimeType,
-      size: att.bytes.byteLength,
-      contentId: att.contentId,
-      disposition: att.disposition,
-    });
+  const uploadedKeys: string[] = [];
+  try {
+    for (let seq = 0; seq < atts.length; seq++) {
+      const att = atts[seq]!;
+      const hash16 = await sha256Hex16(att.bytes);
+      const key = attachmentKey(messageId, seq, hash16, getExt(att.filename));
+      await env.r2.put(key, att.bytes, { httpMetadata: { contentType: att.mimeType } });
+      uploadedKeys.push(key);
+      rows.push({
+        messageId,
+        r2Key: key,
+        filename: att.filename,
+        mimeType: att.mimeType,
+        size: att.bytes.byteLength,
+        contentId: att.contentId,
+        disposition: att.disposition,
+      });
+    }
+    return await db
+      .insert(attachmentsTable)
+      .values(rows)
+      .returning({
+        id: attachmentsTable.id,
+        r2Key: attachmentsTable.r2Key,
+        filename: attachmentsTable.filename,
+        mimeType: attachmentsTable.mimeType,
+        size: attachmentsTable.size,
+        contentId: attachmentsTable.contentId,
+        disposition: attachmentsTable.disposition,
+      });
+  } catch (error) {
+    if (uploadedKeys.length) {
+      try {
+        await env.r2.delete(uploadedKeys);
+      } catch (cleanupError) {
+        console.error('外发附件失败补偿清理异常:', cleanupError);
+      }
+    }
+    throw error;
   }
-  const inserted = await db
-    .insert(attachmentsTable)
-    .values(rows)
-    .returning({
-      id: attachmentsTable.id,
-      filename: attachmentsTable.filename,
-      size: attachmentsTable.size,
-    });
-  return inserted;
 }
 
 /** Cloudflare 原生发信（send_email binding），逐收件人发送 */
@@ -272,6 +296,7 @@ async function sendViaCloudflare(
   reply: ReplyContext | null,
   text: string,
   html: string,
+  messageId: string,
 ): Promise<void> {
   // 动态 import：`cloudflare:email` 在 vitest workerd 里静态加载会崩，
   // 且集成测试不发外部邮件，延迟到真实发送时才加载
@@ -287,6 +312,7 @@ async function sendViaCloudflare(
   msg.setRecipients(req.to.length ? req.to : [toAddr]);
   if (req.cc.length) msg.setCc(req.cc);
   msg.setSubject(req.subject);
+  msg.setHeader('Message-ID', messageId);
   if (reply) {
     msg.setHeader('In-Reply-To', reply.inReplyTo);
     msg.setHeader('References', reply.references);
@@ -356,10 +382,10 @@ async function resolveReply(
   db: Db,
   sender: Sender,
   replyToMessageId: number | undefined,
-): Promise<{ reply: ReplyContext | null; inReplyTo: string | null }> {
-  if (!replyToMessageId) return { reply: null, inReplyTo: null };
+): Promise<{ reply: ReplyContext | null; inReplyTo: string | null; references: string }> {
+  if (!replyToMessageId) return { reply: null, inReplyTo: null, references: '' };
   const orig = await db.select().from(messages).where(eq(messages.id, replyToMessageId)).get();
-  if (!orig) return { reply: null, inReplyTo: null };
+  if (!orig) return { reply: null, inReplyTo: null, references: '' };
   if (sender.role !== 'admin') {
     const owned = await db
       .select({ id: mailboxes.id })
@@ -368,9 +394,9 @@ async function resolveReply(
       .get();
     if (!owned) throw new AppError('forbidden', '无权回复该邮件');
   }
-  if (!orig.messageId) return { reply: null, inReplyTo: null };
-  const references = [orig.inReplyTo, orig.messageId].filter(Boolean).join(' ');
-  return { reply: { inReplyTo: orig.messageId, references }, inReplyTo: orig.messageId };
+  if (!orig.messageId) return { reply: null, inReplyTo: null, references: '' };
+  const references = [orig.references, orig.inReplyTo, orig.messageId].filter(Boolean).join(' ');
+  return { reply: { inReplyTo: orig.messageId, references }, inReplyTo: orig.messageId, references };
 }
 
 function fmtBytes(n: number): string {
@@ -488,9 +514,11 @@ export async function sendMail(
   const isInternal = (addr: string) => domains.includes(getEmailDomain(addr));
   const externalTargets = [...new Set(allRecipients.filter((a) => !isInternal(a)))];
   const internalTargets = [...new Set(allRecipients.filter(isInternal))];
+  const uniqueTargets = [...new Set([...externalTargets, ...internalTargets])];
   const hasExternal = externalTargets.length > 0;
 
-  const { reply, inReplyTo } = await resolveReply(db, sender, req.replyToMessageId);
+  const { reply, inReplyTo, references } = await resolveReply(db, sender, req.replyToMessageId);
+  const outgoingMessageId = `<${crypto.randomUUID()}@${from.domain}>`;
 
   const text = req.text ?? '';
   const html = req.html ?? '';
@@ -500,130 +528,167 @@ export async function sendMail(
 
   const sendChannel = hasExternal ? 'cloudflare' : 'internal';
 
-  // 外发日配额必须在落库**之前**校验：放在落库之后的话，被限流时异常直接冒泡出去，
+  // 日配额覆盖站内与站外全部唯一收件人，避免站内群发绕过资源总闸门。
+  // 必须在落库**之前**校验：放在落库之后的话，被限流时异常直接冒泡出去，
   // 而状态回填在更后面够不着，于是每限流一次就多留一封 status=sent 的「幽灵已发送」
-  if (hasExternal) {
-    await assertOutboundQuota(env, settings.quota, sender, externalTargets.length);
-  }
+  await assertOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
 
   // outbound 行落库（status 占位）：拿到 id 后持久化附件，再决定外发正文/附件。
   // 外发超大附件需转为下载链接注入正文，而链接要附件 id、附件 id 要 message id。
-  const outbound = await db
-    .insert(messages)
-    .values({
-      direction: 'outbound',
-      address: from.address,
-      domain: from.domain,
-      fromAddress: from.address,
-      fromName: from.displayName,
-      recipients: { to: req.to, cc: req.cc, bcc: req.bcc },
-      subject: req.subject,
-      preview,
-      bodyText: text,
-      bodyHtml: html,
-      verificationCode: code,
-      inReplyTo,
-      status: hasExternal ? 'sent' : 'delivered',
-      sendChannel,
-      errorDetail: '',
-      isRead: true,
-      size,
-      createdAt: new Date(),
-    })
-    .returning()
-    .get();
-  let status = hasExternal ? 'sent' : 'delivered';
+  let outbound: typeof messages.$inferSelect | undefined;
+  try {
+    outbound = await db
+      .insert(messages)
+      .values({
+        direction: 'outbound',
+        address: from.address,
+        domain: from.domain,
+        fromAddress: from.address,
+        fromName: from.displayName,
+        recipients: { to: req.to, cc: req.cc, bcc: req.bcc },
+        subject: req.subject,
+        preview,
+        bodyText: text,
+        bodyHtml: html,
+        verificationCode: code,
+        messageId: outgoingMessageId,
+        inReplyTo,
+        references,
+        status: 'pending',
+        sendChannel,
+        errorDetail: '',
+        isRead: true,
+        size,
+        createdAt: new Date(),
+      })
+      .returning()
+      .get();
+  } catch (error) {
+    await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
+    throw error;
+  }
+  if (!outbound) {
+    await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
+    throw new AppError('internal', '发送记录创建失败');
+  }
+  let status = 'pending';
   let errorDetail = '';
   let bodyText = text;
   let bodyHtml = html;
+  let deliveredCount = 0;
+  const failures: string[] = [];
+  const internalDeliveries: { target: string; messageId: number }[] = [];
   try {
     // 附件持久化到 outbound 行（发件人「已发送」可见、可下载）
     const outboundAtts = await persistAttachments(env, db, outbound!.id, attachments);
     if (hasExternal) {
       // 外发负载：正文+附件 ≤ 阈值直发附件；超限则附件转下载链接注入正文，MIME 不带附件
       const payload = await buildExternalPayload(env, origin, text, html, attachments, outboundAtts);
-      const failures: string[] = [];
       for (const addr of externalTargets) {
         try {
-          await sendViaCloudflare(env, from, addr, req, payload.atts, reply, payload.text, payload.html);
+          await sendViaCloudflare(
+            env,
+            from,
+            addr,
+            req,
+            payload.atts,
+            reply,
+            payload.text,
+            payload.html,
+            outgoingMessageId,
+          );
+          deliveredCount += 1;
         } catch (cfErr) {
           const cfMsg = cfErr instanceof Error ? cfErr.message : String(cfErr);
           failures.push(`${addr}: ${cfMsg}`);
         }
       }
-      if (failures.length === externalTargets.length) {
-        status = 'failed';
-        errorDetail = failures.join('; ');
-      } else if (failures.length) {
-        status = 'sent';
-        errorDetail = `部分收件人失败: ${failures.join('; ')}`;
-      }
       // 外发实际正文（可能含链接）回填，让发件人「已发送」看到真实发出内容
       bodyText = payload.text;
       bodyHtml = payload.html;
     }
-  } catch (e) {
-    // 落库之后的任何步骤抛错（附件写 R2、链接签名等）都要把这一行标成 failed，
-    // 否则留下的是一封永不回滚、状态却是「已发送」的假记录
-    const msg = e instanceof Error ? e.message : String(e);
+    // 站内互投引用 outbound 已持久化的附件对象，不再为每个收件人重复写一份 R2。
+    for (const target of internalTargets) {
+      try {
+        const inbound = await db
+          .insert(messages)
+          .values({
+            direction: 'inbound',
+            address: target,
+            domain: getEmailDomain(target),
+            fromAddress: from.address,
+            fromName: from.displayName,
+            // BCC 名单不写入收件方记录：密送收件人的副本不应暴露其他被密送者
+            recipients: { to: req.to, cc: req.cc, bcc: [] },
+            subject: req.subject,
+            preview,
+            bodyText: text,
+            bodyHtml: html,
+            verificationCode: code,
+            messageId: outgoingMessageId,
+            inReplyTo,
+            references,
+            status: 'received',
+            sendChannel: 'internal',
+            isRead: false,
+            size,
+            createdAt: new Date(),
+          })
+          .returning({ id: messages.id })
+          .get();
+        if (outboundAtts.length) {
+          try {
+            await db.insert(attachmentsTable).values(
+              outboundAtts.map((att) => ({
+                messageId: inbound!.id,
+                r2Key: att.r2Key,
+                filename: att.filename,
+                mimeType: att.mimeType,
+                size: att.size,
+                contentId: att.contentId,
+                disposition: att.disposition,
+              })),
+            );
+          } catch (attachmentError) {
+            const detail = attachmentError instanceof Error ? attachmentError.message : String(attachmentError);
+            await db
+              .update(messages)
+              .set({ status: 'degraded', errorDetail: `附件引用保存失败: ${detail}` })
+              .where(eq(messages.id, inbound!.id));
+          }
+        }
+        deliveredCount += 1;
+        internalDeliveries.push({ target, messageId: inbound!.id });
+      } catch (internalError) {
+        failures.push(`${target}: ${internalError instanceof Error ? internalError.message : String(internalError)}`);
+      }
+    }
+
+    status = deliveredCount === 0 ? 'failed' : hasExternal ? 'sent' : 'delivered';
+    errorDetail = failures.length ? `部分收件人失败: ${failures.join('; ')}` : '';
     await db
       .update(messages)
-      .set({ status: 'failed', errorDetail: msg })
+      .set({ status, errorDetail, bodyText, bodyHtml })
       .where(eq(messages.id, outbound!.id));
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    const fallbackStatus = deliveredCount > 0 ? (hasExternal ? 'sent' : 'delivered') : 'failed';
+    try {
+      await db
+        .update(messages)
+        .set({ status: fallbackStatus, errorDetail: detail, bodyText, bodyHtml })
+        .where(eq(messages.id, outbound!.id));
+    } catch (updateError) {
+      console.error('外发状态回填失败:', updateError);
+    }
+    if (deliveredCount === 0) {
+      await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
+    }
     throw e;
   }
 
-  // 额度在发送前已原子占用；全部收件人失败时还回去（全失败不烧信誉，不计数）
-  if (hasExternal && status === 'failed') {
-    await releaseOutboundQuota(env, settings.quota, sender, externalTargets.length);
-  }
-
-  // 站内互投：逐地址构造 inbound 行（含提码），同步落库保证即时可见。
-  // 必须放在「外发失败即 throw」之前——站内投递是纯 D1 insert，不该被站外链路失败连坐
-  const internalRows: number[] = [];
-  for (const target of internalTargets) {
-    const inbound = await db
-      .insert(messages)
-      .values({
-        direction: 'inbound',
-        address: target,
-        domain: getEmailDomain(target),
-        fromAddress: from.address,
-        fromName: from.displayName,
-        // BCC 名单不写入收件方记录：密送收件人的副本不应暴露其他被密送者
-        recipients: { to: req.to, cc: req.cc, bcc: [] },
-        subject: req.subject,
-        preview,
-        bodyText: text,
-        bodyHtml: html,
-        verificationCode: code,
-        inReplyTo,
-        status: 'received',
-        sendChannel: 'internal',
-        isRead: false,
-        size,
-        createdAt: new Date(),
-      })
-      .returning({ id: messages.id })
-      .get();
-    internalRows.push(inbound!.id);
-    await persistAttachments(env, db, inbound!.id, attachments);
-  }
-
-  // 站外全失败但有站内收件人：整封不算失败，站内那份已经送到，站外失败只体现在 errorDetail
-  if (status === 'failed' && internalTargets.length > 0) {
-    status = 'sent';
-    errorDetail = `站外收件人全部失败: ${errorDetail}`;
-  }
-
-  // 回填 outbound 状态与（外发）正文
-  await db
-    .update(messages)
-    .set({ status, errorDetail, bodyText, bodyHtml })
-    .where(eq(messages.id, outbound!.id));
-
-  // 一个收件人都没送达才算整封失败
-  if (status === 'failed') {
+  if (deliveredCount === 0) {
+    await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
     throw new AppError('internal', errorDetail || '发送失败');
   }
 
@@ -631,9 +696,8 @@ export async function sendMail(
   if (internalTargets.length) {
     ctx.waitUntil(
       (async () => {
-        for (let i = 0; i < internalTargets.length; i++) {
-          const target = internalTargets[i]!;
-          const messageId = internalRows[i]!;
+        for (const delivery of internalDeliveries) {
+          const { target, messageId } = delivery;
           const ownerIds = await resolveNotifyOwnerIds(env, target);
           for (const id of ownerIds) {
             const prefs = await getUserNotifyPrefs(env, id);

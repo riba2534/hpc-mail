@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `auth_version_migrated` integer DEFAULT false NOT NULL;

@@ -2,9 +2,8 @@ import {
   deleteMessagesRequestSchema,
   listMessagesQuerySchema,
   markReadRequestSchema,
+  MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
   sendMailRequestSchema,
-  type ListMessagesQuery,
-  type MessageSummary,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
@@ -13,6 +12,7 @@ import { ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
 import {
   deleteMessages,
+  findNextMessage,
   getMessageDetail,
   listMessages,
   loadAttachmentForViewer,
@@ -20,8 +20,14 @@ import {
   type Viewer,
 } from '../../services/message.js';
 import { decodeInlineAttachments, sendMail } from '../../services/outbound.js';
+import {
+  beginIdempotentSend,
+  completeIdempotentSend,
+  failIdempotentSend,
+} from '../../services/idempotency.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
+import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
 
 const app = new Hono<AppContext>();
 app.use('*', apiKeyAuth);
@@ -37,31 +43,30 @@ app.post('/', async (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
   const req = await parseBody(c, sendMailRequestSchema);
-  // 幂等：带 Idempotency-Key 时按 (key, idemKey) 缓存结果 24h，超时重试不会重复发信
-  const idemKey = c.req.header('Idempotency-Key')?.trim();
-  const cacheKey = idemKey ? `idem:${key.id}:${idemKey}` : null;
-  if (cacheKey) {
-    const cached = await c.env.kv.get(cacheKey, { type: 'json' });
-    if (cached) return ok(c, cached as MessageSummary, 201);
-  }
-  const attachments = decodeInlineAttachments(req.attachments);
-  const origin = new URL(c.req.url).origin;
-  const summary = await sendMail(
+  const idem = await beginIdempotentSend(
     c.env,
-    c.executionCtx,
-    { userId: key.userId, role: key.role },
+    { type: 'api_key', id: key.id },
+    c.req.header('Idempotency-Key'),
     req,
-    attachments,
-    origin,
   );
-  if (cacheKey) {
-    try {
-      await c.env.kv.put(cacheKey, JSON.stringify(summary), { expirationTtl: 24 * 3600 });
-    } catch {
-      // 缓存写失败不影响发送结果
-    }
+  if (idem.kind === 'replay') return ok(c, idem.response, 201);
+  try {
+    const attachments = decodeInlineAttachments(req.attachments);
+    const origin = new URL(c.req.url).origin;
+    const summary = await sendMail(
+      c.env,
+      c.executionCtx,
+      { userId: key.userId, role: key.role },
+      req,
+      attachments,
+      origin,
+    );
+    await completeIdempotentSend(c.env, idem.handle, summary);
+    return ok(c, summary, 201);
+  } catch (error) {
+    await failIdempotentSend(c.env, idem.handle, error);
+    throw error;
   }
-  return ok(c, summary, 201);
 });
 
 /** 标记已读/未读——Agent 处理完邮件后维护状态用（需 mail.write） */
@@ -86,7 +91,7 @@ app.post('/delete', async (c) => {
 
 /**
  * 长轮询等新邮件：hold 到出现 id>afterId 的 inbound 邮件即返回，最长 timeout 秒。
- * 优先返回带验证码的那封；专为 AI Agent 等验证码设计，省去客户端轮询循环。
+ * 严格返回 afterId 之后最早的一封，避免突发邮件把游标推进到较新 id 后永久漏信。
  * 须在 /:id 之前注册，否则 "wait" 会被当作 :id。
  */
 app.get('/wait', async (c) => {
@@ -99,14 +104,11 @@ app.get('/wait', async (c) => {
   const deadline = Date.now() + timeoutSec * 1000;
 
   const poll = async () => {
-    const query: ListMessagesQuery = { direction: 'inbound', limit: 20 };
-    if (address) query.address = address;
-    if (afterId) query.afterId = afterId;
-    const page = await listMessages(c.env, viewer, query);
-    if (page.items.length === 0) return null;
-    // items 按 id 降序；优先取带验证码的（从旧到新找第一封），否则取最旧的那封新邮件
-    const reversed = [...page.items].reverse();
-    return reversed.find((m) => m.verificationCode) ?? reversed[0]!;
+    const rate = await bumpCounter(c.env, 'api-wait', String(key.userId), minuteWindow(1));
+    if (rate.count > MAX_WAIT_POLLS_PER_USER_PER_MINUTE) {
+      throw new AppError('rate_limited', '长轮询查询频率超限，请稍后重试');
+    }
+    return findNextMessage(c.env, viewer, { afterId, address });
   };
 
   for (;;) {

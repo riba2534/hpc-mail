@@ -1,7 +1,7 @@
 import type { AdminUser, CreateUserRequest, UpdateUserRequest } from '@hpc-mail/shared';
 import { and, desc, eq, ne, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
-import { apiKeys, mailboxes, stars, users } from '../db/schema.js';
+import { mailboxes, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
 import type { Env } from '../types.js';
@@ -9,6 +9,10 @@ import { avatarUrl } from './avatar.js';
 import { bumpUserEpoch } from './session.js';
 
 type UserRow = typeof users.$inferSelect;
+
+function isLastAdminConstraint(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('last_active_admin');
+}
 
 /** 保证不会移除最后一个可用 admin（禁用/降级/删除该 admin 前调用） */
 async function assertNotLastAdmin(db: Db, targetId: number): Promise<void> {
@@ -127,7 +131,15 @@ export async function updateUser(
     bumpEpoch = true;
   }
 
-  const [row] = await db.update(users).set(patch).where(eq(users.id, id)).returning();
+  let row: UserRow | undefined;
+  try {
+    [row] = await db.update(users).set(patch).where(eq(users.id, id)).returning();
+  } catch (error) {
+    if (isLastAdminConstraint(error)) {
+      throw new AppError('forbidden', '至少保留一个可用管理员，无法执行此操作');
+    }
+    throw error;
+  }
   if (bumpEpoch) await bumpUserEpoch(env, id);
 
   const count = await db
@@ -153,10 +165,20 @@ export async function deleteUser(env: Env, actingUserId: number, id: number): Pr
   if (!target) throw new AppError('not_found', '用户不存在');
   if (target.role === 'admin') await assertNotLastAdmin(db, id);
 
-  await db.delete(mailboxes).where(eq(mailboxes.userId, id));
-  await db.delete(apiKeys).where(eq(apiKeys.userId, id));
-  await db.delete(stars).where(eq(stars.userId, id));
-  await db.delete(users).where(eq(users.id, id));
+  // D1 batch 作为一个事务提交：最后管理员触发器若拒绝 DELETE，前面的关联清理也会整体回滚。
+  try {
+    await env.db.batch([
+      env.db.prepare('DELETE FROM mailboxes WHERE user_id = ?').bind(id),
+      env.db.prepare('DELETE FROM api_keys WHERE user_id = ?').bind(id),
+      env.db.prepare('DELETE FROM stars WHERE user_id = ?').bind(id),
+      env.db.prepare('DELETE FROM users WHERE id = ?').bind(id),
+    ]);
+  } catch (error) {
+    if (isLastAdminConstraint(error)) {
+      throw new AppError('forbidden', '至少保留一个可用管理员，无法执行此操作');
+    }
+    throw error;
+  }
   if (target.avatarKey) {
     try {
       await env.r2.delete(target.avatarKey);
@@ -164,5 +186,5 @@ export async function deleteUser(env: Env, actingUserId: number, id: number): Pr
       console.error('删除用户头像对象失败:', e);
     }
   }
-  await bumpUserEpoch(env, id);
+  // 用户行已删除，鉴权中间件会立即拒绝旧 token；KV 兼容版本不再需要额外 bump。
 }

@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { index, integer, primaryKey, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import type { MessageRecipients, UserNotifyPrefs } from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
@@ -18,6 +18,10 @@ export const users = sqliteTable('users', {
   status: text('status', { enum: ['active', 'disabled'] })
     .notNull()
     .default('active'),
+  /** 强一致鉴权版本：改密/禁用时原子 +1，旧 JWT 立即失效 */
+  authVersion: integer('auth_version').notNull().default(0),
+  /** 是否已把旧 KV uepoch 惰性迁入 D1；避免版本 0 用户每请求读取 KV */
+  authVersionMigrated: integer('auth_version_migrated', { mode: 'boolean' }).notNull().default(false),
   inviteId: integer('invite_id'),
   /** 头像 R2 key（null 表示无头像）；随每次上传变化，用于 URL 版本号防缓存 */
   avatarKey: text('avatar_key'),
@@ -70,11 +74,14 @@ export const messages = sqliteTable(
     bodyR2Key: text('body_r2_key'),
     /** 原始 .eml 落 R2 的 key（inbound 收件时存档，供下载/排查 DKIM）；null 表示未存档 */
     rawR2Key: text('raw_r2_key'),
+    /** 入站幂等键（recipient + Message-ID + raw digest）；站内/外发为 null */
+    ingestKey: text('ingest_key'),
     /** 软删除时间；null=正常，有值=在回收站（scheduled 到期后硬删） */
     deletedAt: integer('deleted_at', { mode: 'timestamp_ms' }),
     verificationCode: text('verification_code').notNull().default(''),
     messageId: text('message_id'),
     inReplyTo: text('in_reply_to'),
+    references: text('references').notNull().default(''),
     status: text('status').notNull(),
     sendChannel: text('send_channel').notNull().default(''),
     errorDetail: text('error_detail').notNull().default(''),
@@ -92,6 +99,45 @@ export const messages = sqliteTable(
     // 巨大的等值组倒扫、把地址当残余过滤，代价随全表行数线性增长（20 万行实测 62ms）
     index('idx_messages_address_deleted_id').on(t.address, t.deletedAt, t.id),
     index('idx_messages_direction_read').on(t.direction, t.isRead, t.deletedAt),
+    index('idx_messages_created_id').on(t.createdAt, t.id),
+    index('idx_messages_message_id').on(t.messageId),
+    index('idx_messages_in_reply_to').on(t.inReplyTo),
+    uniqueIndex('idx_messages_ingest_key').on(t.ingestKey),
+  ],
+);
+
+/** 强一致会话表。KV 仅在过渡期双写，鉴权以本表为准。 */
+export const sessions = sqliteTable(
+  'sessions',
+  {
+    id: text('id').primaryKey(),
+    userId: integer('user_id').notNull(),
+    expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+    revokedAt: integer('revoked_at', { mode: 'timestamp_ms' }),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [index('idx_sessions_user').on(t.userId), index('idx_sessions_expiry').on(t.expiresAt)],
+);
+
+/** 发信幂等记录：先原子占位，再执行真实副作用；完成结果可安全重放。 */
+export const idempotencyRecords = sqliteTable(
+  'idempotency_records',
+  {
+    actorType: text('actor_type', { enum: ['user', 'api_key'] }).notNull(),
+    actorId: integer('actor_id').notNull(),
+    key: text('key').notNull(),
+    requestHash: text('request_hash').notNull(),
+    status: text('status', { enum: ['pending', 'completed', 'failed'] })
+      .notNull()
+      .default('pending'),
+    responseJson: text('response_json'),
+    errorDetail: text('error_detail').notNull().default(''),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.actorType, t.actorId, t.key] }),
+    index('idx_idempotency_created').on(t.createdAt),
   ],
 );
 

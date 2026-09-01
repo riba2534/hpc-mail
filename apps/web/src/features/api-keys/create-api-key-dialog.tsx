@@ -7,6 +7,7 @@ import {
   type CreateApiKeyRequest,
   type CreatedApiKey,
   DEFAULT_API_RATE_LIMIT,
+  MAX_API_RATE_LIMIT,
   createApiKeyRequestSchema,
 } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -145,7 +146,7 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
                         {...field}
                         type="number"
                         min={1}
-                        max={10000}
+                        max={MAX_API_RATE_LIMIT}
                         value={rateLimit}
                         onChange={(event) => setRateLimit(Number(event.target.value))}
                       />

@@ -5,7 +5,7 @@ import type {
   RegisterRequest,
   SessionUser,
 } from '@hpc-mail/shared';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
@@ -18,9 +18,8 @@ import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { avatarUrl } from './avatar.js';
 import { getSystemFromAddress } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
-import { consumeInvite } from './invite.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
-import { getInstanceEpoch, getUserEpoch, bumpUserEpoch, createSession, destroySession } from './session.js';
+import { getUserEpoch, bumpUserEpoch, createSession, destroySession } from './session.js';
 import { getSettings } from './setting.js';
 
 const LOGIN_WINDOW_SECONDS = 15 * 60;
@@ -125,23 +124,24 @@ async function verifyLoginTwoFactor(
     const hash = await hashRecoveryCode(cleaned.toLowerCase());
     if (codes.includes(hash)) {
       const db = createDb(env);
-      await db
+      const result = await db
         .update(users)
         .set({ totpRecoveryCodes: codes.filter((c) => c !== hash) })
-        .where(eq(users.id, user.id));
-      return;
+        .where(and(eq(users.id, user.id), eq(users.totpRecoveryCodes, codes)))
+        .run();
+      // 带旧 JSON 条件的单条 UPDATE：两个并发请求只有一个能消费同一恢复码。
+      if ((result.meta.changes ?? 0) === 1) return;
     }
   }
   throw new AppError('bad_credentials', '两步验证码错误');
 }
 
 async function issueToken(env: Env, userId: number): Promise<string> {
-  const [sid, epoch, uepoch] = await Promise.all([
+  const [sid, uepoch] = await Promise.all([
     createSession(env, userId),
-    getInstanceEpoch(env),
     getUserEpoch(env, userId),
   ]);
-  return signToken(env.jwt_secret, { sub: userId, sid, epoch, uepoch });
+  return signToken(env.jwt_secret, { sub: userId, sid, epoch: 0, uepoch });
 }
 
 export async function login(
@@ -209,29 +209,57 @@ export async function register(env: Env, req: RegisterRequest, ip: string): Prom
   const mode = settings.register_mode;
   if (mode === 'closed') throw new AppError('registration_closed', '注册已关闭');
 
-  let inviteId: number | null = null;
-  if (mode === 'invite') {
-    if (!req.inviteCode) throw new AppError('invite_invalid', '需要邀请码');
-    inviteId = await consumeInvite(env, req.inviteCode);
-  }
-
   const db = createDb(env);
   const existing = await db.select({ id: users.id }).from(users).where(eq(users.username, req.username)).get();
   if (existing) throw new AppError('conflict', '用户名已存在');
 
   const passwordHash = await hashPassword(req.password);
-  const [row] = await db
-    .insert(users)
-    .values({
-      username: req.username,
-      passwordHash,
-      role: 'user',
-      status: 'active',
-      inviteId,
-      lastLoginAt: new Date(),
-      lastLoginIp: ip,
-    })
-    .returning();
+  let row: typeof users.$inferSelect | undefined;
+  if (mode === 'invite') {
+    if (!req.inviteCode) throw new AppError('invite_invalid', '需要邀请码');
+    try {
+      // INSERT ... SELECT 与迁移中的 AFTER INSERT trigger 处于同一 SQLite 写事务：
+      // 只有仍可用的邀请码能建户，建户失败也不会消耗次数。
+      const inserted = await env.db
+        .prepare(
+          `INSERT INTO users
+            (username, password_hash, role, status, invite_id, last_login_at, last_login_ip)
+           SELECT ?, ?, 'user', 'active', id, ?, ?
+           FROM invites
+           WHERE code = ? AND status = 'active' AND used_count < max_uses
+             AND (expires_at IS NULL OR expires_at > ?)
+           RETURNING id`,
+        )
+        .bind(req.username, passwordHash, Date.now(), ip, req.inviteCode, Date.now())
+        .first<{ id: number }>();
+      if (!inserted) throw new AppError('invite_invalid', '邀请码无效或已用尽');
+      row = await db.select().from(users).where(eq(users.id, inserted.id)).get();
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('UNIQUE constraint failed: users.username')) {
+        throw new AppError('conflict', '用户名已存在');
+      }
+      if (message.includes('invite_invalid')) {
+        throw new AppError('invite_invalid', '邀请码无效或已用尽');
+      }
+      throw error;
+    }
+  } else {
+    [row] = await db
+      .insert(users)
+      .values({
+        username: req.username,
+        passwordHash,
+        role: 'user',
+        status: 'active',
+        inviteId: null,
+        lastLoginAt: new Date(),
+        lastLoginIp: ip,
+      })
+      .returning();
+  }
+  if (!row) throw new AppError('internal', '用户创建失败');
   const token = await issueToken(env, row!.id);
   return { token, user: toSessionUser(row!) };
 }

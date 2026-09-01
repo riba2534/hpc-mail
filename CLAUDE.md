@@ -53,7 +53,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 - **转发/通知按「收件地址所属用户」分流（三层归属）**：域名（默认仅管理员，可 `public` 开放）→ 地址（已认领 / 未认领，**未认领归管理员**）→ 收件后按归属人的**个人偏好**处理。个人偏好存 `users.notify_prefs`（JSON：飞书 / 通用 webhook / 邮箱转发），端点 `/api/me/notify-prefs`。`inbound.ts` / `outbound.ts` 用 `resolveNotifyOwnerIds(address)` 解析 owner（未认领→`getActiveAdminIds`），**按收信当时认领状态结算**。**gmail_forward/feishu/notify_webhook 已从系统设置移除、下放为个人偏好**；管理员未配置时惰性继承旧全局值（`readLegacyGlobalNotify`）。别退回「一份全局配置套所有入站邮件」的老路。
 - **管理员看邮件的入口**：个人 `/inbox` 只看自己认领；`/admin/mail` 只看未认领地址（`scope=unclaimed`）；已认领用户的收发件走 `/admin/users/:id/mail`（`scope=user&userId=`）。读接口 admin 缺省不再等于全表；`scope=all` 已删除。
 - **收件链路（`inbound.ts`）失败隔离**：只有 D1 落库失败才 throw（触发 SMTP 重试）；邮箱转发同步执行（按 owner 个人转发目标）：原生 `message.forward()` 优先（仅对已验证 destination 生效、原样转发），失败降级 `relayForward`——以 `no-reply@收件域名` 经 `send_email` 中转重发（保留原始标题/正文/附件，Reply-To 指回原发件人）；AI 提码 + 按 owner 个人偏好的飞书/webhook 通知走 `ctx.waitUntil` 且逐个 try/catch。
-- **鉴权**：JWT（`sub/sid/epoch/uepoch`）+ KV 会话；改密/禁用 bump `uepoch` 即时踢线，清库 bump `instance_epoch` 全员下线。**RBAC 只有 admin/user 两角色 + `requireAuth`/`requireAdmin` 两中间件**，无 perm 表。
+- **鉴权**：JWT（`sub/sid/epoch/uepoch`）+ D1 `sessions` 强一致会话；改密/禁用原子 bump `users.auth_version` 即时踢线。KV 仅在升级/回滚过渡期双写，不再作为鉴权真源。**RBAC 只有 admin/user 两角色 + `requireAuth`/`requireAdmin` 两中间件**，无 perm 表。
 - **`cloudflare:email` 和 `mimetext` 必须在 `outbound.ts` 里动态 `import()`**（静态 import 会让 vitest 的 workerd 加载即崩）；mimetext 用 `mimetext/browser` 入口（避免 nodejs_compat 依赖）。
 
 ## 测试注意事项

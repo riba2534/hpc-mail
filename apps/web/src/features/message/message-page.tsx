@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Download, FileDown, Forward, ImageOff, MailOpen, Paperclip, Reply, ReplyAll, Star, Trash2 } from 'lucide-react';
+import { ArrowLeft, Download, FileDown, Forward, ImageOff, MailOpen, MoreHorizontal, Paperclip, Reply, ReplyAll, Star, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import type { MessageDetail } from '@hpc-mail/shared';
@@ -7,6 +7,12 @@ import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { EmptyState } from '@/components/ui/empty-state';
 import { IconButton } from '@/components/ui/icon-button';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -163,11 +169,11 @@ export function MessagePage() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <div className="mb-4 flex items-center gap-2">
+      <div className="mb-4 flex flex-wrap items-center gap-2">
         <IconButton aria-label="返回" onClick={() => navigate(-1)}>
           <ArrowLeft className="size-5" />
         </IconButton>
-        <div className="ml-auto flex items-center gap-1.5">
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
           {!auditUser && (
             <>
               <Button variant="secondary" size="sm" onClick={() => navigate('/compose', { state: buildReply(message) })}>
@@ -178,16 +184,41 @@ export function MessagePage() {
                 <Button
                   variant="ghost"
                   size="sm"
+                  className="hidden sm:inline-flex"
                   onClick={() => navigate('/compose', { state: buildReplyAll(message) })}
                 >
                   <ReplyAll className="size-4" />
                   回复全部
                 </Button>
               )}
-              <Button variant="ghost" size="sm" onClick={() => navigate('/compose', { state: buildForward(message) })}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="hidden sm:inline-flex"
+                onClick={() => navigate('/compose', { state: buildForward(message) })}
+              >
                 <Forward className="size-4" />
                 转发
               </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <IconButton className="sm:hidden" aria-label="更多回复操作">
+                    <MoreHorizontal className="size-4" />
+                  </IconButton>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent>
+                  {message.recipients.to.length + message.recipients.cc.length > 1 && (
+                    <DropdownMenuItem onSelect={() => navigate('/compose', { state: buildReplyAll(message) })}>
+                      <ReplyAll className="size-4" />
+                      回复全部
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem onSelect={() => navigate('/compose', { state: buildForward(message) })}>
+                    <Forward className="size-4" />
+                    转发
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </>
           )}
           <IconButton

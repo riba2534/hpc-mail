@@ -5,6 +5,7 @@ import type { ApiKeyStatus, ApiKeySummary } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { apiKeyApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -34,7 +35,7 @@ export function ApiKeysPage() {
   const [deleting, setDeleting] = useState<ApiKeySummary | null>(null);
   const [auditKey, setAuditKey] = useState<ApiKeySummary | null>(null);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: queryKeys.apiKeys.list(view === 'all' ? 'admin' : 'mine'),
     queryFn: () => (view === 'all' ? apiKeyApi.listAll() : apiKeyApi.list()),
   });
@@ -88,6 +89,8 @@ export function ApiKeysPage() {
 
       {isLoading ? (
         <Skeleton className="h-40 w-full rounded-lg" />
+      ) : isError ? (
+        <QueryErrorState error={error} onRetry={() => void refetch()} />
       ) : items.length === 0 ? (
         <EmptyState
           icon={KeyRound}

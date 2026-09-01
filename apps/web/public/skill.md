@@ -105,6 +105,7 @@ done
 ```bash
 curl -s -X POST $BASE/api/messages/send \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(python3 -c 'import uuid;print(uuid.uuid4())')" \
   -d '{
     "from": { "localPart": "bot", "domain": "hpc.email" },
     "to": ["someone@example.com"],
@@ -118,6 +119,7 @@ curl -s -X POST $BASE/api/messages/send \
 - **附件结构**：`attachments` 是数组，每项 `{"filename":"a.pdf","contentType":"application/pdf","content":"<base64>"}`，`content` 为不含 `data:` 前缀的 base64（**允许换行**，`base64 file.pdf` / Python `base64.encodebytes()` 那种 76 字符折行的多行输出可直接用）；单次 ≤10 个、单文件 ≤50MB、合计 ≤50MB。
 - **外发大小限制**：发到本系统域名之外的邮箱（外部地址）走 Cloudflare 发信通道，单封邮件（含附件、base64 编码后）阈值 4MiB —— 因为 base64 会把体积撑大约 1/3，**原始附件超过约 3MB 就会走转链接**。未超阈值的附件直接内嵌发出；超出则附件自动转为 90 天有效的下载链接注入正文（收件人点链接下载），不会报错。注意该链接指向这封「已发送」邮件的附件，发件人若把这封邮件彻底删除，链接会提前失效。站内 `@<系统域名>` 地址走站内存储，附件内嵌、不受此限。
 - 收件人若也是本站域名，即时站内投递；站外地址经 Cloudflare 发送到任意外部邮箱，个别收件人失败会在 `errorDetail` 里注明。
+- **自动化发送务必带唯一 `Idempotency-Key`**。网络超时后使用原 key 重试，已完成请求会重放原结果；相同 key 不能用于不同正文。
 - **判断是否真的发出去了**：成功响应的 `data` 是一封 outbound 邮件，看它的 `status` 与 `errorDetail`——`status:"failed"` 表示全部失败（此时 HTTP 也是错误码）；`status:"sent"` 但 `errorDetail` 非空表示**部分收件人失败**（`errorDetail` 里列出失败地址与原因），别把它当作全部送达。
 
 ## 任务：回复邮件
@@ -188,7 +190,7 @@ curl -s -X POST $BASE/api/messages/delete -H "Authorization: Bearer $TOKEN" -H '
 | DELETE | `/api/mailboxes/:id` | 释放地址 |
 | GET | `/api/messages` | 收发件列表（过滤参数见「搜索」）|
 | GET | `/api/messages/:id` | 邮件详情（正文 + 验证码 + 附件）|
-| POST | `/api/messages/send` | 发送 / 回复（带 `replyToMessageId`）|
+| POST | `/api/messages/send` | 发送 / 回复（建议带 `Idempotency-Key`）|
 | POST | `/api/messages/read` `/star` `/delete` | 批量已读 / 星标 / 删除 `{ids,...}` |
 | GET | `/api/attachments/:id` | 下载附件 |
 
@@ -236,7 +238,7 @@ curl -s -X POST $BASE/api/api-keys -H "Authorization: Bearer $TOKEN" \
 | GET | `/v1/messages/wait?address=&afterId=&timeout=25` | mail.read | **长轮询**：hold 到有 `id>afterId` 的新邮件即返回，专为等验证码设计 |
 | GET | `/v1/messages/:id` | mail.read | 详情（含 verificationCode）|
 | GET | `/v1/messages/:id/attachments/:attId` | mail.read | 下载附件 |
-| POST | `/v1/messages` | mail.send | 发送 / 回复（body 同上；带 `Idempotency-Key: <唯一串>` 头可去重，24h 内同 key 重试不重复发信）|
+| POST | `/v1/messages` | mail.send | 发送 / 回复（body 同上；带 `Idempotency-Key: <唯一串>` 头可去重；相同 key 不得更换请求内容）|
 | POST | `/v1/messages/read` | mail.write | 批量标记已读 `{ids,isRead}` |
 | POST | `/v1/messages/delete` | mail.write | 批量删除 `{ids}` |
 

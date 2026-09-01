@@ -5,6 +5,7 @@ import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
@@ -89,7 +90,10 @@ function NumberRow({
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
-  const { data, isLoading } = useQuery({ queryKey: queryKeys.admin.settings, queryFn: () => adminApi.getSettings() });
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: queryKeys.admin.settings,
+    queryFn: () => adminApi.getSettings(),
+  });
   const [draft, setDraft] = useState<Settings | null>(null);
 
   useEffect(() => {
@@ -115,12 +119,21 @@ export function SettingsPage() {
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' }),
   });
 
-  if (isLoading || !draft || !data) {
+  if (isLoading || (data !== undefined && draft === null)) {
     return (
       <div className="mx-auto max-w-3xl space-y-4">
         <Skeleton className="h-8 w-40" />
         <Skeleton className="h-40 w-full rounded-lg" />
         <Skeleton className="h-40 w-full rounded-lg" />
+      </div>
+    );
+  }
+
+  if (isError || !data || !draft) {
+    return (
+      <div className="mx-auto max-w-3xl">
+        <PageHeader title="系统设置" description="站点级配置，保存后立即生效。" />
+        <QueryErrorState error={error} onRetry={() => void refetch()} />
       </div>
     );
   }
@@ -220,7 +233,7 @@ export function SettingsPage() {
           />
           <NumberRow
             label="每日外发收件人上限"
-            description="站外收件人总数（站内互投不计）。"
+            description="站内与站外唯一收件人总数，防止站内群发放大存储。"
             value={draft.quota.dailyRecipients}
             onChange={(v) => patch((s) => void (s.quota.dailyRecipients = v))}
             max={1000000}

@@ -106,8 +106,10 @@ export const messageApi = {
       query: { scope: view?.scope, userId: view?.userId },
     }),
   contacts: () => api.get<{ contacts: string[] }>('/messages/contacts'),
-  send: (body: InternalSendMailRequest) =>
-    api.post<MessageSummary, InternalSendMailRequest>('/messages/send', body),
+  send: (body: InternalSendMailRequest, idempotencyKey?: string) =>
+    api.post<MessageSummary, InternalSendMailRequest>('/messages/send', body, {
+      headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+    }),
   unreadCount: () => api.get<{ unread: number }>('/messages/unread-count'),
   markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed') =>
     api.post<void, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),

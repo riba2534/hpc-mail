@@ -51,7 +51,8 @@ function splitLocalPart(address: string | undefined): { localPart: string; domai
   return at > 0 ? { localPart: address.slice(0, at), domain: address.slice(at + 1) } : { localPart: '', domain: '' };
 }
 
-const DRAFT_KEY = 'hpc-compose-draft';
+const LEGACY_DRAFT_KEY = 'hpc-compose-draft';
+const draftKeyForUser = (userId: number) => `hpc-compose-draft:${userId}`;
 interface ComposeDraft {
   to: string[];
   cc: string[];
@@ -61,18 +62,18 @@ interface ComposeDraft {
   isHtml: boolean;
 }
 
-function readDraft(): ComposeDraft | null {
+function readDraft(key: string): ComposeDraft | null {
   try {
-    const raw = localStorage.getItem(DRAFT_KEY);
+    const raw = localStorage.getItem(key);
     return raw ? (JSON.parse(raw) as ComposeDraft) : null;
   } catch {
     return null;
   }
 }
 
-function clearDraft() {
+function clearDraft(key: string) {
   try {
-    localStorage.removeItem(DRAFT_KEY);
+    localStorage.removeItem(key);
   } catch {
     // ignore
   }
@@ -93,11 +94,22 @@ export function ComposePage() {
   });
   const contacts = contactsData?.contacts;
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const sendIdempotencyKeyRef = useRef<string | null>(null);
+  const draftKey = useMemo(() => draftKeyForUser(user.id), [user.id]);
 
   const initial = useMemo<ComposeInitial>(() => (location.state as ComposeInitial | null) ?? {}, [location.state]);
   const initialIdentity = useMemo(() => splitLocalPart(initial.fromAddress), [initial.fromAddress]);
   // 全新写信（无回复/转发预填）时恢复本地草稿；回复/转发有 location.state 则不覆盖
-  const savedDraft = useMemo(() => (location.state ? null : readDraft()), []); // eslint-disable-line react-hooks/exhaustive-deps
+  const savedDraft = useMemo(() => (location.state ? null : readDraft(draftKey)), [draftKey, location.state]);
+
+  // 旧版本使用全站共享 key，无法判断内容属于哪个账户。为避免跨账户泄露，只清理、不迁移。
+  useEffect(() => {
+    try {
+      localStorage.removeItem(LEGACY_DRAFT_KEY);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const [mailboxId, setMailboxId] = useState<number | null>(null);
   const [localPart, setLocalPart] = useState(() => (isAdmin ? initialIdentity.localPart : ''));
@@ -113,6 +125,13 @@ export function ComposePage() {
   const [attachments, setAttachments] = useState<AttachmentUpload[]>([]);
   const [error, setError] = useState<string | null>(null);
   const replyToMessageId = initial.replyToMessageId;
+
+  const attachmentVersion = attachments
+    .map((attachment) => `${attachment.token ?? attachment.key}:${attachment.status}`)
+    .join('|');
+  useEffect(() => {
+    sendIdempotencyKeyRef.current = null;
+  }, [mailboxId, localPart, adminDomain, to, cc, bcc, subject, body, isHtml, attachmentVersion]);
 
   // 预填了发件地址则选中匹配项；否则只有一个认领地址时自动选中（省一步手选）
   useEffect(() => {
@@ -131,15 +150,15 @@ export function ComposePage() {
     const hasContent =
       to.length > 0 || cc.length > 0 || bcc.length > 0 || subject.trim() !== '' || body.trim() !== '';
     if (!hasContent) {
-      clearDraft();
+      clearDraft(draftKey);
       return;
     }
     try {
-      localStorage.setItem(DRAFT_KEY, JSON.stringify({ to, cc, bcc, subject, body, isHtml }));
+      localStorage.setItem(draftKey, JSON.stringify({ to, cc, bcc, subject, body, isHtml }));
     } catch {
       // 存储不可用时静默
     }
-  }, [to, cc, bcc, subject, body, isHtml]);
+  }, [draftKey, to, cc, bcc, subject, body, isHtml]);
 
   // 有未发送内容时离开页面/刷新给出浏览器原生拦截
   useEffect(() => {
@@ -154,14 +173,28 @@ export function ComposePage() {
   }, [to.length, subject, body]);
 
   const sendMutation = useMutation({
-    mutationFn: (payload: InternalSendMailRequest) => messageApi.send(payload),
+    mutationFn: (payload: InternalSendMailRequest) => {
+      sendIdempotencyKeyRef.current ??= crypto.randomUUID();
+      return messageApi.send(payload, sendIdempotencyKeyRef.current);
+    },
     onSuccess: () => {
+      sendIdempotencyKeyRef.current = null;
       toast({ title: '邮件已发送', variant: 'success' });
-      clearDraft();
+      clearDraft(draftKey);
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
       navigate('/sent');
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : '发送失败，请重试'),
+    onError: (err) => {
+      // 网络/超时可能发生在服务端已经发送之后，保留同一个 key 可安全查询/重放结果；
+      // 明确的业务错误则允许用户修正后使用新 key。
+      if (
+        !(err instanceof ApiError) ||
+        (err.code !== 'network' && err.code !== 'timeout' && err.code !== 'conflict')
+      ) {
+        sendIdempotencyKeyRef.current = null;
+      }
+      setError(err instanceof ApiError ? err.message : '发送失败，请重试');
+    },
   });
 
   const updateAttachment = (

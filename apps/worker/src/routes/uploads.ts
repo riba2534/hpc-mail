@@ -1,5 +1,7 @@
 import {
   MAX_ATTACHMENT_FILE_BYTES,
+  MAX_DRAFT_ATTACHMENTS_PER_USER,
+  MAX_DRAFT_ATTACHMENT_BYTES_PER_USER,
   SINGLE_UPLOAD_THRESHOLD_BYTES,
   MULTIPART_PART_BYTES,
   attachmentFilenameSchema,
@@ -9,7 +11,7 @@ import {
   type InitMultipartUploadRequest,
 } from '@hpc-mail/shared';
 import { eq } from 'drizzle-orm';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { createDb } from '../db/client.js';
 import { draftAttachments } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
@@ -20,6 +22,42 @@ import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
 app.use('*', requireAuth);
+
+async function reserveDraft(
+  c: Context<AppContext>,
+  input: { userId: number; token: string; filename: string; mimeType: string; size: number; r2Key: string },
+): Promise<number> {
+  const inserted = await c.env.db
+    .prepare(
+      `INSERT INTO draft_attachments
+        (user_id, token, filename, mime_type, size, r2_key, status)
+       SELECT ?, ?, ?, ?, ?, ?, 'uploading'
+       WHERE (SELECT COUNT(*) FROM draft_attachments WHERE user_id = ?) < ?
+         AND COALESCE((SELECT SUM(size) FROM draft_attachments WHERE user_id = ?), 0) + ? <= ?
+       RETURNING id`,
+    )
+    .bind(
+      input.userId,
+      input.token,
+      input.filename,
+      input.mimeType,
+      input.size,
+      input.r2Key,
+      input.userId,
+      MAX_DRAFT_ATTACHMENTS_PER_USER,
+      input.userId,
+      input.size,
+      MAX_DRAFT_ATTACHMENT_BYTES_PER_USER,
+    )
+    .first<{ id: number }>();
+  if (!inserted) {
+    throw new AppError(
+      'rate_limited',
+      `待发送附件最多 ${MAX_DRAFT_ATTACHMENTS_PER_USER} 个、合计 ${Math.floor(MAX_DRAFT_ATTACHMENT_BYTES_PER_USER / 1024 / 1024)}MB`,
+    );
+  }
+  return inserted.id;
+}
 
 /** 单片流式直传：filename/mimeType 走 query，二进制内容走 body → R2 put 流式 */
 app.post('/', async (c) => {
@@ -48,19 +86,22 @@ app.post('/', async (c) => {
   const db = createDb(c.env);
   // 先落 D1 占位行再写 R2：反过来的话，put 成功而 insert 失败就留下一个没有任何行指向的
   // R2 对象，而清理任务是遍历 draft_attachments 表的，永远扫不到它 → 永久计费
-  await db.insert(draftAttachments).values({
+  const draftId = await reserveDraft(c, {
     userId: user.id,
     token,
     filename: filenameParsed.data,
     mimeType,
     size: declaredSize,
     r2Key: key,
-    status: 'uploading',
   });
   try {
-    await c.env.r2.put(key, stream, { httpMetadata: { contentType: mimeType } });
+    const stored = await c.env.r2.put(key, stream, { httpMetadata: { contentType: mimeType } });
+    if (stored.size !== declaredSize) {
+      await c.env.r2.delete(key);
+      throw new AppError('validation_failed', '上传大小与 Content-Length 不一致');
+    }
   } catch (e) {
-    await db.delete(draftAttachments).where(eq(draftAttachments.token, token));
+    await db.delete(draftAttachments).where(eq(draftAttachments.id, draftId));
     throw e;
   }
   await db
@@ -79,14 +120,13 @@ app.post('/multipart', async (c) => {
   const db = createDb(c.env);
   // 同单片直传：先占位行再建 multipart upload，避免 create 成功、insert 失败时
   // uploadId 丢失——R2 binding 没有 list-multipart-uploads，丢了就再也 abort 不掉
-  await db.insert(draftAttachments).values({
+  const draftId = await reserveDraft(c, {
     userId: user.id,
     token,
     filename: req.filename,
     mimeType: req.mimeType,
     size: req.size,
     r2Key: key,
-    status: 'uploading',
   });
   let mpu;
   try {
@@ -94,7 +134,7 @@ app.post('/multipart', async (c) => {
       httpMetadata: { contentType: req.mimeType },
     });
   } catch (e) {
-    await db.delete(draftAttachments).where(eq(draftAttachments.token, token));
+    await db.delete(draftAttachments).where(eq(draftAttachments.id, draftId));
     throw e;
   }
   await db
@@ -130,10 +170,21 @@ app.put('/multipart/:token/parts/:partNumber', async (c) => {
   if (row.status !== 'uploading' || !row.uploadId) {
     throw new AppError('validation_failed', '该上传会话不可续传');
   }
+  const expectedSize = Math.min(
+    MULTIPART_PART_BYTES,
+    row.size - (partNumber - 1) * MULTIPART_PART_BYTES,
+  );
+  const declaredSize = Number(c.req.header('content-length') || '0');
+  if (!Number.isInteger(declaredSize) || declaredSize !== expectedSize) {
+    throw new AppError('validation_failed', `第 ${partNumber} 片大小应为 ${expectedSize} 字节`);
+  }
   const stream = c.req.raw.body;
   if (!stream) throw new AppError('validation_failed', '分片内容为空');
   const part = await c.env.r2.resumeMultipartUpload(row.r2Key, row.uploadId).uploadPart(partNumber, stream);
-  const parts = [...(row.parts ?? []), { partNumber, etag: part.etag }];
+  const parts = [
+    ...(row.parts ?? []).filter((item) => item.partNumber !== partNumber),
+    { partNumber, etag: part.etag },
+  ];
   await db.update(draftAttachments).set({ parts }).where(eq(draftAttachments.id, row.id));
   return ok(c, { partNumber, etag: part.etag });
 });
@@ -150,11 +201,18 @@ app.post('/multipart/:token/complete', async (c) => {
     throw new AppError('validation_failed', '该上传会话不可完成');
   }
   const parts = [...req.parts].sort((a, b) => a.partNumber - b.partNumber);
+  const expectedParts = Math.ceil(row.size / MULTIPART_PART_BYTES);
+  if (
+    parts.length !== expectedParts ||
+    parts.some((part, index) => part.partNumber !== index + 1)
+  ) {
+    throw new AppError('validation_failed', '分片列表不完整或顺序非法');
+  }
   const mpu = c.env.r2.resumeMultipartUpload(row.r2Key, row.uploadId);
   const obj = await mpu.complete(parts);
   // 到这里才知道真实大小：init 校验的是客户端**声明**的 size，uploadPart 不限单片也不限累计，
   // 只信声明值等于没有上限——任何登录用户都能靠 {size:1} + 猛灌分片在 R2 写出任意大的对象
-  if (obj.size > MAX_ATTACHMENT_FILE_BYTES) {
+  if (obj.size > MAX_ATTACHMENT_FILE_BYTES || obj.size !== row.size) {
     try {
       await c.env.r2.delete(row.r2Key);
     } catch (e) {
@@ -163,7 +221,9 @@ app.post('/multipart/:token/complete', async (c) => {
     await db.delete(draftAttachments).where(eq(draftAttachments.id, row.id));
     throw new AppError(
       'payload_too_large',
-      `单文件超过 ${Math.floor(MAX_ATTACHMENT_FILE_BYTES / 1024 / 1024)}MB 上限`,
+      obj.size > MAX_ATTACHMENT_FILE_BYTES
+        ? `单文件超过 ${Math.floor(MAX_ATTACHMENT_FILE_BYTES / 1024 / 1024)}MB 上限`
+        : '上传完成后的文件大小与声明不一致',
     );
   }
   await db

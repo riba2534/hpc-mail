@@ -1,9 +1,84 @@
 import type { WebhookConfig } from '@hpc-mail/shared';
 import { hmacSha256Base64 } from '../lib/crypto.js';
 
-// 阻止指向内网/回环的 host（基础 SSRF 防护；仅 admin 可配，DNS-rebinding 残余风险接受）
-const BLOCKED_HOST =
-  /^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.|::1|fc|fd|fe80)/i;
+const BLOCKED_SUFFIXES = [
+  '.localhost',
+  '.local',
+  '.internal',
+  '.lan',
+  '.home',
+  '.home.arpa',
+  '.nip.io',
+  '.sslip.io',
+  '.localtest.me',
+  '.lvh.me',
+  '.vcap.me',
+];
+
+function parseIpv4(host: string): number[] | null {
+  const parts = host.split('.');
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return null;
+  const values = parts.map(Number);
+  return values.every((value) => value >= 0 && value <= 255) ? values : null;
+}
+
+function isBlockedIpv4(parts: number[]): boolean {
+  const [a, b, c] = parts;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b! >= 64 && b! <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b! >= 16 && b! <= 31) ||
+    (a === 192 && (b === 0 || b === 168)) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a! >= 224
+  );
+}
+
+function parseIpv6(host: string): number[] | null {
+  const input = host.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!input.includes(':')) return null;
+  const pieces = input.split('::');
+  if (pieces.length > 2) return null;
+  const left = pieces[0] ? pieces[0].split(':') : [];
+  const right = pieces[1] ? pieces[1].split(':') : [];
+  const parse = (part: string) => (/^[0-9a-f]{1,4}$/.test(part) ? Number.parseInt(part, 16) : NaN);
+  const leftValues = left.map(parse);
+  const rightValues = right.map(parse);
+  if ([...leftValues, ...rightValues].some(Number.isNaN)) return null;
+  if (pieces.length === 1) return leftValues.length === 8 ? leftValues : null;
+  const zeros = 8 - leftValues.length - rightValues.length;
+  if (zeros < 1) return null;
+  return [...leftValues, ...Array.from({ length: zeros }, () => 0), ...rightValues];
+}
+
+function isBlockedIpv6(parts: number[]): boolean {
+  const first = parts[0]!;
+  if (parts.every((part) => part === 0)) return true;
+  if (parts.slice(0, 7).every((part) => part === 0) && parts[7] === 1) return true;
+  if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00) {
+    return true;
+  }
+  if (first === 0x2001 && parts[1] === 0x0db8) return true;
+  if (parts.slice(0, 5).every((part) => part === 0) && parts[5] === 0xffff) {
+    const ipv4 = [parts[6]! >> 8, parts[6]! & 0xff, parts[7]! >> 8, parts[7]! & 0xff];
+    return isBlockedIpv4(ipv4);
+  }
+  return false;
+}
+
+function isBlockedHost(rawHost: string): boolean {
+  const host = rawHost.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (host === 'localhost' || host === 'metadata.google.internal') return true;
+  if (BLOCKED_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true;
+  const ipv4 = parseIpv4(host);
+  if (ipv4) return isBlockedIpv4(ipv4);
+  const ipv6 = parseIpv6(host);
+  return ipv6 ? isBlockedIpv6(ipv6) : false;
+}
 
 /** 校验通用 webhook URL：必须 https 且非内网 host */
 export function validateNotifyWebhookUrl(value: string): URL | null {
@@ -11,7 +86,7 @@ export function validateNotifyWebhookUrl(value: string): URL | null {
     const url = new URL(value.trim());
     if (url.protocol !== 'https:') return null;
     if (url.username || url.password) return null;
-    if (BLOCKED_HOST.test(url.hostname)) return null;
+    if (isBlockedHost(url.hostname)) return null;
     return url;
   } catch {
     return null;

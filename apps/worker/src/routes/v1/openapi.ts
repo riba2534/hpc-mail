@@ -7,7 +7,7 @@ const OPENAPI_SPEC = {
   openapi: '3.1.0',
   info: {
     title: 'HPC Mail Open API',
-    version: '1.0.0',
+    version: '1.1.0',
     description: '多域名邮箱系统的开放 API。用 API Key（Bearer hpcm_...）鉴权。',
   },
   security: [{ apiKey: [] }],
@@ -22,6 +22,7 @@ const OPENAPI_SPEC = {
       },
       MessageSummary: {
         type: 'object',
+        required: ['id', 'direction', 'address', 'subject', 'preview', 'verificationCode', 'status', 'errorDetail', 'isRead', 'createdAt'],
         properties: {
           id: { type: 'integer' },
           direction: { type: 'string', enum: ['inbound', 'outbound'] },
@@ -32,8 +33,31 @@ const OPENAPI_SPEC = {
           preview: { type: 'string' },
           verificationCode: { type: 'string' },
           status: { type: 'string' },
+          errorDetail: { type: 'string' },
           isRead: { type: 'boolean' },
           createdAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      SendMailRequest: {
+        type: 'object',
+        required: ['from', 'to', 'subject'],
+        properties: {
+          from: {
+            type: 'object',
+            properties: {
+              mailboxId: { type: 'integer' },
+              localPart: { type: 'string' },
+              domain: { type: 'string' },
+              displayName: { type: 'string' },
+            },
+          },
+          to: { type: 'array', items: { type: 'string', format: 'email' } },
+          cc: { type: 'array', items: { type: 'string', format: 'email' }, default: [] },
+          bcc: { type: 'array', items: { type: 'string', format: 'email' }, default: [] },
+          subject: { type: 'string' },
+          text: { type: 'string' },
+          html: { type: 'string' },
+          replyToMessageId: { type: 'integer' },
         },
       },
     },
@@ -60,6 +84,18 @@ const OPENAPI_SPEC = {
       },
       post: {
         summary: '发送/回复邮件（支持 Idempotency-Key 头）',
+        parameters: [
+          {
+            name: 'Idempotency-Key',
+            in: 'header',
+            required: false,
+            schema: { type: 'string', minLength: 1, maxLength: 128 },
+          },
+        ],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/SendMailRequest' } } },
+        },
         responses: { 201: { description: 'created' } },
       },
     },
@@ -71,7 +107,7 @@ const OPENAPI_SPEC = {
           { name: 'afterId', in: 'query', schema: { type: 'integer' } },
           { name: 'timeout', in: 'query', schema: { type: 'integer', maximum: 50 } },
         ],
-        responses: { 200: { description: '返回首封新邮件或 message:null' } },
+        responses: { 200: { description: '严格返回 afterId 后最早的一封新邮件，或 message:null' } },
       },
     },
     '/messages/{id}': { get: { summary: '邮件详情（含 verificationCode）', responses: { 200: { description: 'ok' } } } },

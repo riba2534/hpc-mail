@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   API_SCOPES,
   DEFAULT_API_RATE_LIMIT,
+  MAX_API_RATE_LIMIT,
   type ApiKeyStatus,
   type ApiScope,
 } from '../constants.js';
@@ -17,7 +18,7 @@ const ipOrCidrSchema = z
 export const createApiKeyRequestSchema = z.object({
   name: z.string().trim().min(1).max(64),
   scopes: z.array(z.enum(API_SCOPES)).min(1),
-  rateLimit: z.number().int().min(1).max(10000).default(DEFAULT_API_RATE_LIMIT),
+  rateLimit: z.number().int().min(1).max(MAX_API_RATE_LIMIT).default(DEFAULT_API_RATE_LIMIT),
   allowedIps: z.array(ipOrCidrSchema).max(32).default([]),
   /** ISO 时间；不传则永不过期 */
   expiresAt: z.iso.datetime({ offset: true }).optional(),
@@ -28,7 +29,7 @@ export const updateApiKeyRequestSchema = z
   .object({
     name: z.string().trim().min(1).max(64).optional(),
     scopes: z.array(z.enum(API_SCOPES)).min(1).optional(),
-    rateLimit: z.number().int().min(1).max(10000).optional(),
+    rateLimit: z.number().int().min(1).max(MAX_API_RATE_LIMIT).optional(),
     allowedIps: z.array(ipOrCidrSchema).max(32).optional(),
     status: z.enum(['active', 'disabled']).optional(),
     /** 续期：ISO 时间；显式传 null 表示改为永不过期 */

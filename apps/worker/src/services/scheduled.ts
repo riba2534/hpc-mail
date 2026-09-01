@@ -4,10 +4,13 @@ import { createDb } from '../db/client.js';
 import {
   apiRateLimits,
   apiRequestLogs,
+  adminAuditLogs,
   attachments as attachmentsTable,
   draftAttachments,
+  idempotencyRecords,
   mailboxes,
   messages,
+  sessions,
   stars,
 } from '../db/schema.js';
 import { chunk, D1_ID_BATCH } from '../lib/d1.js';
@@ -24,6 +27,7 @@ const TRASH_RETENTION_DAYS = 7;
 const RETENTION_BATCH = 1000;
 /** 单次 cron 最多清几批审计日志（每批 D1_ID_BATCH 行） */
 const LOG_PURGE_BATCHES = 20;
+const RETENTION_MAX_BATCHES = 10;
 
 /** 按 where 条件删除邮件（D1 行 + R2 对象：正文/附件/原始 .eml），返回删除条数；限批量 */
 async function purgeMessagesWhere(env: Env, cond: SQL): Promise<number> {
@@ -36,18 +40,7 @@ async function purgeMessagesWhere(env: Env, cond: SQL): Promise<number> {
     .all();
   if (targets.length === 0) return 0;
   const ids = targets.map((t) => t.id);
-  // 先删 R2 再删 D1：反过来的话，删除中途中断（CPU 超时等）就留下一批没有任何行指向的
-  // R2 对象，再也定位不到；这个顺序下中断只会留下指向空对象的 D1 行，下次清理还能扫到重试
-  for (const t of targets) {
-    await deleteMessageObjects(env, t.id, t.bodyR2Key);
-    if (t.rawR2Key) {
-      try {
-        await env.r2.delete(t.rawR2Key);
-      } catch (e) {
-        console.error('删除原始邮件对象失败:', e);
-      }
-    }
-  }
+  await deleteMessageObjects(env, db, targets);
   // 分批：D1 单条查询最多 100 个绑定参数。RETENTION_BATCH=1000 时整条语句会被 D1 拒绝，
   // 而 runScheduled 的 try/catch 只打日志——结果是待清理一旦超过 100 封，清理永久卡死、一封删不掉
   for (const batch of chunk(ids)) {
@@ -69,15 +62,20 @@ async function runRetention(env: Env): Promise<void> {
       const cutoff = new Date(Date.now() - unclaimedDays * DAY_MS);
       // 未被任何用户认领的地址收到的 inbound 邮件（catch-all 垃圾的主要来源）
       const claimed = db.select({ address: mailboxes.address }).from(mailboxes);
-      const n = await purgeMessagesWhere(
-        env,
-        and(
-          eq(messages.direction, 'inbound'),
-          lt(messages.createdAt, cutoff),
-          notInArray(messages.address, claimed),
-        )!,
-      );
-      if (n > 0) console.log(`保留清理：删除未认领地址邮件 ${n} 封`);
+      let total = 0;
+      for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
+        const n = await purgeMessagesWhere(
+          env,
+          and(
+            eq(messages.direction, 'inbound'),
+            lt(messages.createdAt, cutoff),
+            notInArray(messages.address, claimed),
+          )!,
+        );
+        total += n;
+        if (n < RETENTION_BATCH) break;
+      }
+      if (total > 0) console.log(`保留清理：删除未认领地址邮件 ${total} 封`);
     } catch (e) {
       console.error('未认领地址保留清理失败:', e);
     }
@@ -86,8 +84,13 @@ async function runRetention(env: Env): Promise<void> {
   if (allMessagesDays > 0) {
     try {
       const cutoff = new Date(Date.now() - allMessagesDays * DAY_MS);
-      const n = await purgeMessagesWhere(env, lt(messages.createdAt, cutoff));
-      if (n > 0) console.log(`保留清理：删除超期邮件 ${n} 封`);
+      let total = 0;
+      for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
+        const n = await purgeMessagesWhere(env, lt(messages.createdAt, cutoff));
+        total += n;
+        if (n < RETENTION_BATCH) break;
+      }
+      if (total > 0) console.log(`保留清理：删除超期邮件 ${total} 封`);
     } catch (e) {
       console.error('全局保留清理失败:', e);
     }
@@ -154,9 +157,31 @@ export async function runScheduled(env: Env): Promise<void> {
     console.error('审计日志清理失败:', e);
   }
   try {
+    for (let i = 0; i < LOG_PURGE_BATCHES; i++) {
+      const stale = await db
+        .select({ id: adminAuditLogs.id })
+        .from(adminAuditLogs)
+        .where(lt(adminAuditLogs.createdAt, cutoff))
+        .limit(D1_ID_BATCH)
+        .all();
+      if (stale.length === 0) break;
+      await db.delete(adminAuditLogs).where(inArray(adminAuditLogs.id, stale.map((row) => row.id)));
+    }
+  } catch (e) {
+    console.error('管理员审计日志清理失败:', e);
+  }
+  try {
     await db.delete(apiRateLimits).where(lt(apiRateLimits.windowStart, staleWindow));
   } catch (e) {
     console.error('限流窗口清理失败:', e);
+  }
+  try {
+    await db.delete(sessions).where(lt(sessions.expiresAt, new Date()));
+    await db
+      .delete(idempotencyRecords)
+      .where(lt(idempotencyRecords.createdAt, new Date(Date.now() - 2 * DAY_MS)));
+  } catch (e) {
+    console.error('会话/幂等记录清理失败:', e);
   }
   try {
     await runRetention(env);
@@ -183,7 +208,14 @@ export async function runScheduled(env: Env): Promise<void> {
   // 计数器：外发/转发配额按天、登录失败与注册限流按分钟窗口，各自回收过期行
   try {
     await purgeCounters(env, 'out', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
-    await purgeCounters(env, 'fwd', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, 'fwd-domain', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, 'fwd-target', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, 'api-user', minuteWindow(1) - 120);
+    await purgeCounters(env, 'api-global', minuteWindow(1) - 120);
+    await purgeCounters(env, 'api-wait', minuteWindow(1) - 120);
+    await purgeCounters(env, 'auth-user', minuteWindow(1) - 120);
+    await purgeCounters(env, 'auth-global', minuteWindow(1) - 120);
+    await purgeCounters(env, 'ai-extract', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   } catch (e) {

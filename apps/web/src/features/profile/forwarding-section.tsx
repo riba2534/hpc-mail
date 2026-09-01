@@ -5,6 +5,7 @@ import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { notifyPrefsApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
@@ -50,7 +51,10 @@ export function ForwardingSection() {
   const user = useCurrentUser();
   const isAdmin = user.role === 'admin';
   const queryClient = useQueryClient();
-  const { data } = useQuery({ queryKey: queryKeys.notifyPrefs, queryFn: () => notifyPrefsApi.get() });
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: queryKeys.notifyPrefs,
+    queryFn: () => notifyPrefsApi.get(),
+  });
   const [draft, setDraft] = useState<UserNotifyPrefs | null>(null);
 
   useEffect(() => {
@@ -74,12 +78,17 @@ export function ForwardingSection() {
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '发送失败', variant: 'error' }),
   });
 
-  if (!draft || !data) {
+  if (isLoading || (data !== undefined && draft === null)) {
     return (
       <section className="rounded-lg border border-line bg-surface p-5">
         <Skeleton className="h-40 w-full rounded-md" />
       </section>
     );
+  }
+
+
+  if (isError || !draft || !data) {
+    return <QueryErrorState error={error} onRetry={() => void refetch()} />;
   }
 
   const dirty = JSON.stringify(draft) !== JSON.stringify(data);

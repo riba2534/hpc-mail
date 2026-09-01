@@ -63,6 +63,8 @@ export async function claimMailbox(
     throw new AppError('validation_failed', '域名不在系统域名列表内');
   }
   const db = createDb(env);
+  let perUserLimit = 0;
+  let perDomainLimit = 0;
 
   // 普通用户：域名可见性 + 保留前缀 + 全局上限 + 按域名上限（管理员全部豁免）
   if (role !== 'admin') {
@@ -71,6 +73,7 @@ export async function claimMailbox(
       throw new AppError('forbidden', '该域名未对普通用户开放');
     }
     const policy = settings.mailbox_policy;
+    perUserLimit = policy.perUserLimit;
     // 保留前缀禁止认领（防冒充官方身份）
     if (policy.reservedLocalParts.includes(req.localPart)) {
       throw new AppError('forbidden', `前缀 ${req.localPart} 为系统保留，无法认领`);
@@ -88,6 +91,7 @@ export async function claimMailbox(
     }
     // 按域名上限：统计该用户在此域名下已认领数
     const domainLimit = domainPerUserLimit(settings, req.domain);
+    perDomainLimit = domainLimit;
     if (domainLimit > 0) {
       const ownedInDomain = await db
         .select({ value: sql<number>`COUNT(*)` })
@@ -104,12 +108,44 @@ export async function claimMailbox(
   const existing = await db.select().from(mailboxes).where(eq(mailboxes.address, address)).get();
   if (existing) throw new AppError('address_taken', '该地址已被占用');
   try {
-    const [row] = await db
-      .insert(mailboxes)
-      .values({ address, domain: req.domain, userId, displayName: '' })
-      .returning();
-    return serialize(row!, 0);
-  } catch {
+    if (role === 'admin') {
+      const [row] = await db
+        .insert(mailboxes)
+        .values({ address, domain: req.domain, userId, displayName: '' })
+        .returning();
+      return serialize(row!, 0);
+    }
+
+    // COUNT 与 INSERT 合并为一条 SQLite 写语句，避免并发认领同时越过配额检查。
+    const inserted = await env.db
+      .prepare(
+        `INSERT INTO mailboxes (address, domain, user_id, display_name)
+         SELECT ?, ?, ?, ''
+         WHERE (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?) < ?)
+           AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
+         RETURNING id`,
+      )
+      .bind(
+        address,
+        req.domain,
+        userId,
+        perUserLimit,
+        userId,
+        perUserLimit,
+        perDomainLimit,
+        userId,
+        req.domain,
+        perDomainLimit,
+      )
+      .first<{ id: number }>();
+    if (!inserted) {
+      throw new AppError('forbidden', '认领配额已在并发请求中用尽，请刷新后重试');
+    }
+    const row = await db.select().from(mailboxes).where(eq(mailboxes.id, inserted.id)).get();
+    if (!row) throw new AppError('internal', '地址认领失败');
+    return serialize(row, 0);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
     throw new AppError('address_taken', '该地址已被占用');
   }
 }
@@ -124,18 +160,7 @@ async function purgeAddressMessages(env: Env, address: string): Promise<number> 
     .all();
   if (targets.length === 0) return 0;
   const ids = targets.map((t) => t.id);
-  // 先删 R2 再删 D1：反过来的话，删除中途中断（CPU 超时等）就留下一批没有任何行指向的
-  // R2 对象，再也定位不到；这个顺序下中断只会留下指向空对象的 D1 行，下次清理还能扫到重试
-  for (const t of targets) {
-    await deleteMessageObjects(env, t.id, t.bodyR2Key);
-    if (t.rawR2Key) {
-      try {
-        await env.r2.delete(t.rawR2Key);
-      } catch (e) {
-        console.error('删除原始邮件对象失败:', e);
-      }
-    }
-  }
+  await deleteMessageObjects(env, db, targets);
   // 分批：D1 单条查询最多 100 个绑定参数，地址下邮件多时整条语句会被拒
   for (const batch of chunk(ids)) {
     await db.delete(attachmentsTable).where(inArray(attachmentsTable.messageId, batch));

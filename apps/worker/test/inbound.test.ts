@@ -110,7 +110,7 @@ describe('收件链路 handleInbound', () => {
     expect(forward).not.toHaveBeenCalledWith('admin-box@gmail.com');
   });
 
-  it('中转副本（带 X-HPC-Mail-Relay 头）不再触发转发，防环路', async () => {
+  it('外部伪造 X-HPC-Mail-Relay 头不能压制正常转发', async () => {
     await updateSettings(env, { code_extract: { enabled: true, aiEnabled: false } });
     const userId = await seedUser('inb-relay', 'user');
     await claim(userId, 'relayed@example.com');
@@ -124,7 +124,7 @@ describe('收件链路 handleInbound', () => {
     msg.headers = new Headers({ 'X-HPC-Mail-Relay': '1' });
     await run(msg);
 
-    expect(forward).not.toHaveBeenCalled();
+    expect(forward).toHaveBeenCalledWith('target@gmail.com');
   });
 
   it('原生 forward 失败时尝试中转降级，且不阻断收件落库', async () => {
@@ -191,5 +191,26 @@ describe('收件链路 handleInbound', () => {
       .where(eq(messages.address, 'link-only@inbox.test'))
       .get();
     expect(row?.verificationCode).toBe('');
+  });
+
+  it('同一原始邮件重复投递只落一行且只转发一次', async () => {
+    await updateSettings(env, { code_extract: { enabled: true, aiEnabled: false } });
+    const userId = await seedUser('inb-dedupe', 'user');
+    await claim(userId, 'dedupe@example.com');
+    await updateUserNotifyPrefs(env, userId, {
+      forward: { enabled: true, addresses: ['dedupe-target@example.net'] },
+    });
+    const forward = vi.fn(async () => {});
+    await run(mockMessage('dedupe@example.com', 'Same delivery', 'same body', forward));
+    await run(mockMessage('dedupe@example.com', 'Same delivery', 'same body', forward));
+
+    const db = createDb(env);
+    const rows = await db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.address, 'dedupe@example.com'))
+      .all();
+    expect(rows).toHaveLength(1);
+    expect(forward).toHaveBeenCalledTimes(1);
   });
 });

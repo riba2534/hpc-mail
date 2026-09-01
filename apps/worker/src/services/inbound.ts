@@ -1,9 +1,14 @@
-import { EXTERNAL_MESSAGE_MAX_BYTES } from '@hpc-mail/shared';
+import {
+  EXTERNAL_MESSAGE_MAX_BYTES,
+  MAX_ATTACHMENTS,
+  MAX_ATTACHMENT_TOTAL_BYTES,
+} from '@hpc-mail/shared';
 import PostalMime from 'postal-mime';
 import { eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { attachments as attachmentsTable, messages } from '../db/schema.js';
 import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-address.js';
+import { hmacSha256Base64, sha256Hex } from '../lib/crypto.js';
 import { encodeBodyBase64, foldBase64, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
 import { htmlToText, makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
@@ -16,10 +21,10 @@ import { getSettings } from './setting.js';
 import { sendNotifyWebhook } from './webhook-notify.js';
 import { attachmentKey, bodyKey, getExt, putJson, putObject, sha256Hex16 } from './storage.js';
 
-/** 单个收件地址每日可触发的转发上限（防「1 进 N 出」放大式滥用） */
-const DAILY_FORWARD_LIMIT = 200;
-/** 转发计数类别（rate_counters.scope） */
-const FORWARD_SCOPE = 'fwd';
+/** 未认领 catch-all 转发必须按稳定主体限额，不能让随机 local-part 刷新额度。 */
+const DAILY_FORWARD_DOMAIN_LIMIT = 500;
+const DAILY_FORWARD_TARGET_LIMIT = 200;
+const DAILY_AI_EXTRACT_LIMIT = 500;
 
 const D1_BODY_LIMIT = 256 * 1024;
 const TRUNCATE_BYTES = 64 * 1024;
@@ -80,6 +85,10 @@ interface RelayMail {
   attachments: ParsedAttachment[];
 }
 
+async function relayMarker(env: Env): Promise<string> {
+  return hmacSha256Base64(new TextEncoder().encode(env.jwt_secret), 'hpc-mail-relay:v1');
+}
+
 /**
  * 中转转发：原生 forward() 仅对 Email Routing 已验证 destination 生效，目标未验证时
  * 降级为 send_email binding 以 no-reply@收件域名 重新打包发送——保留原始标题/正文/附件，
@@ -120,7 +129,7 @@ async function relayForward(env: Env, target: string, mail: RelayMail): Promise<
   msg.setSender({ name: `${mail.fromName || mail.fromAddress} (via HPC Mail)`, addr: sender });
   msg.setRecipient(target);
   msg.setSubject(mail.subject || '(无主题)');
-  msg.setHeader('X-HPC-Mail-Relay', '1');
+  msg.setHeader('X-HPC-Mail-Relay', await relayMarker(env));
   // mimetext 对 Reply-To 这类已知头校验值类型，必须传 Mailbox 对象（传字符串会抛错）
   if (mail.fromAddress) msg.setHeader('Reply-To', new Mailbox(mail.fromAddress));
   msg.addMessage({
@@ -169,17 +178,9 @@ export async function handleInbound(
 ): Promise<void> {
   const settings = await getSettings(env);
 
-  // 先缓冲原始 .eml（stream 只能读一次），解析用缓冲区；同时存档到 R2 供下载/排查 DKIM。
-  // 存档在解析**之前**：畸形 MIME 解析失败时也要留下原文
+  // 先缓冲原始 .eml（stream 只能读一次），解析与幂等摘要共用这一份字节。
   const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
-  let rawR2Key: string | null = null;
-  try {
-    const key = `raw/${crypto.randomUUID().replace(/-/g, '')}.eml`;
-    await env.r2.put(key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } });
-    rawR2Key = key;
-  } catch (e) {
-    console.error('原始邮件存档失败:', e);
-  }
+  const rawDigest = await sha256Hex(rawBytes);
 
   // 解析失败降级为最小记录，不再 throw：抛出去会让 SMTP 一直重投直到超时退信，
   // 这封信一次都进不了库，管理员看不到任何痕迹。原文已在 R2，可下载排查
@@ -204,10 +205,10 @@ export async function handleInbound(
   const toAddress = normalizeEmail(message.to);
   const domain = getEmailDomain(toAddress);
   const fromAddress = normalizeEmail(email.from?.address);
-  const fromName = (email.from?.name || getNameFromEmail(fromAddress)).trim();
+  const fromName = (email.from?.name || getNameFromEmail(fromAddress)).trim().slice(0, 512);
 
   const mapAddrs = (list: { address?: string }[] | undefined): string[] =>
-    (list ?? []).map((x) => normalizeEmail(x.address)).filter(Boolean);
+    (list ?? []).map((x) => normalizeEmail(x.address)).filter(Boolean).slice(0, 200);
   const toList = mapAddrs(email.to);
   const recipients = {
     to: toList.length ? toList : [toAddress],
@@ -215,9 +216,29 @@ export async function handleInbound(
     bcc: mapAddrs(email.bcc),
   };
 
-  const subject = email.subject || '';
+  const subject = (email.subject || '').slice(0, 2048);
   const text = email.text || '';
   const html = email.html || '';
+  const sourceMessageId = (email.messageId || '').slice(0, 998);
+  const sourceReferences = (email.references || '').slice(0, 4096);
+  const ingestKey = await sha256Hex(`${toAddress}\n${sourceMessageId}\n${rawDigest}`);
+  const db = createDb(env);
+  const duplicate = await db
+    .select({ id: messages.id })
+    .from(messages)
+    .where(eq(messages.ingestKey, ingestKey))
+    .get();
+  if (duplicate) return;
+
+  // 幂等检查完成后再存原文；确定性 key 让并发重投覆盖同一对象，而不是制造随机孤儿。
+  let rawR2Key: string | null = null;
+  try {
+    const key = `raw/${ingestKey}.eml`;
+    await env.r2.put(key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } });
+    rawR2Key = key;
+  } catch (e) {
+    console.error('原始邮件存档失败:', e);
+  }
 
   // 同步正则提码
   let code = '';
@@ -226,10 +247,21 @@ export async function handleInbound(
   }
 
   // 附件落 R2 前先算内容
-  const parsedAttachments: ParsedAttachment[] = (email.attachments ?? []).map((att, seq) => {
+  let attachmentBytes = 0;
+  let attachmentsDropped = false;
+  const parsedAttachments: ParsedAttachment[] = [];
+  for (const [seq, att] of (email.attachments ?? []).entries()) {
     const raw = att.content as string | ArrayBuffer;
     const content = typeof raw === 'string' ? encoder.encode(raw) : new Uint8Array(raw);
-    return {
+    if (
+      parsedAttachments.length >= MAX_ATTACHMENTS ||
+      attachmentBytes + content.byteLength > MAX_ATTACHMENT_TOTAL_BYTES
+    ) {
+      attachmentsDropped = true;
+      continue;
+    }
+    attachmentBytes += content.byteLength;
+    parsedAttachments.push({
       seq,
       content,
       filename: att.filename || 'download',
@@ -237,8 +269,8 @@ export async function handleInbound(
       contentId: (att.contentId || '').replace(/^<|>$/g, ''),
       disposition: att.disposition === 'inline' ? 'inline' : 'attachment',
       size: content.byteLength,
-    };
-  });
+    });
+  }
   const attachmentsSize = parsedAttachments.reduce((sum, a) => sum + a.size, 0);
 
   // 正文分层：>256KB 存 64KB 截断 + 完整 JSON 落 R2
@@ -246,7 +278,7 @@ export async function handleInbound(
   let bodyHtml = html;
   let bodyR2Key: string | null = null;
   if (byteLen(text) + byteLen(html) > D1_BODY_LIMIT) {
-    const key = bodyKey();
+    const key = bodyKey(ingestKey);
     try {
       await putJson(env, key, { text, html });
       bodyR2Key = key;
@@ -260,11 +292,10 @@ export async function handleInbound(
   const preview = makePreview(text, html);
   const size = byteLen(text) + byteLen(html) + attachmentsSize;
 
-  const db = createDb(env);
   // 消息落库：失败向上抛出触发 SMTP 重试
-  const inserted = await db
-    .insert(messages)
-    .values({
+  let inserted: { id: number } | undefined;
+  try {
+    inserted = await db.insert(messages).values({
       direction: 'inbound',
       address: toAddress,
       domain,
@@ -277,26 +308,48 @@ export async function handleInbound(
       bodyHtml,
       bodyR2Key,
       rawR2Key,
+      ingestKey,
       verificationCode: code,
-      messageId: email.messageId ?? null,
-      inReplyTo: email.inReplyTo ?? null,
-      status: 'received',
+      messageId: sourceMessageId || null,
+      inReplyTo: (email.inReplyTo || '').slice(0, 998) || null,
+      references: sourceReferences,
+      status: attachmentsDropped ? 'degraded' : 'received',
+      errorDetail: attachmentsDropped ? '部分附件超过数量或总大小上限，请下载原始邮件查看' : '',
       isRead: false,
       size,
       createdAt: new Date(),
-    })
-    .returning({ id: messages.id })
-    .get();
+    }).returning({ id: messages.id }).get();
+  } catch (error) {
+    // 并发重复投递：另一请求已成功落库，确定性 R2 key 属于那条记录，不能删除。
+    const raced = await db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.ingestKey, ingestKey))
+      .get();
+    if (raced) return;
+    const cleanup = [rawR2Key, bodyR2Key].filter((key): key is string => !!key);
+    if (cleanup.length) {
+      try {
+        await env.r2.delete(cleanup);
+      } catch (cleanupError) {
+        console.error('入站落库失败补偿清理异常:', cleanupError);
+      }
+    }
+    throw error;
+  }
+  if (!inserted) throw new Error('入站邮件落库未返回 id');
   const messageId = inserted!.id;
 
   // 附件上传 + 落库（best-effort，不阻断收件成功）
   if (parsedAttachments.length) {
+    const uploadedKeys: string[] = [];
     try {
       const rows = [];
       for (const att of parsedAttachments) {
         const hash16 = await sha256Hex16(att.content);
         const key = attachmentKey(messageId, att.seq, hash16, getExt(att.filename));
         await putObject(env, key, att.content, att.mimeType);
+        uploadedKeys.push(key);
         rows.push({
           messageId,
           r2Key: key,
@@ -310,6 +363,17 @@ export async function handleInbound(
       await db.insert(attachmentsTable).values(rows);
     } catch (e) {
       console.error('附件入库失败:', e);
+      if (uploadedKeys.length) {
+        try {
+          await env.r2.delete(uploadedKeys);
+        } catch (cleanupError) {
+          console.error('附件失败补偿清理异常:', cleanupError);
+        }
+      }
+      await db
+        .update(messages)
+        .set({ status: 'degraded', errorDetail: '附件保存失败，请下载原始邮件查看' })
+        .where(eq(messages.id, messageId));
     }
   }
 
@@ -329,7 +393,7 @@ export async function handleInbound(
   // 已验证 destination 走原生 forward()（原样转发，保留原始邮件头/签名）；
   // 未验证目标 forward() 会抛错，降级 relayForward 中转重发，任意外部邮箱均可送达。
   // 防环路：中转副本带 X-HPC-Mail-Relay 头，再次入站不重复转发；目标为收件地址自身时跳过。
-  const isRelayedCopy = message.headers.get('x-hpc-mail-relay') !== null;
+  const isRelayedCopy = message.headers.get('x-hpc-mail-relay') === await relayMarker(env);
   const forwardTargets = isRelayedCopy
     ? []
     : [
@@ -342,14 +406,20 @@ export async function handleInbound(
   for (const target of forwardTargets) {
     let quotaOk = true;
     try {
-      const used = await bumpCounter(env, FORWARD_SCOPE, toAddress, relayWindow, 1);
-      quotaOk = used.count <= DAILY_FORWARD_LIMIT;
+      const [domainUsage, targetUsage] = await Promise.all([
+        bumpCounter(env, 'fwd-domain', domain, relayWindow, 1),
+        bumpCounter(env, 'fwd-target', normalizeEmail(target), relayWindow, 1),
+      ]);
+      quotaOk =
+        domainUsage.count <= DAILY_FORWARD_DOMAIN_LIMIT &&
+        targetUsage.count <= DAILY_FORWARD_TARGET_LIMIT;
     } catch (e) {
-      // 计数失败不阻断转发（可用性优先），但要留痕
-      console.error('转发配额计数失败，本次放行:', e);
+      // 通知转发不是收件主链路；计数器异常时 fail closed，避免公开 catch-all 变成外发放大器。
+      quotaOk = false;
+      console.error('转发配额计数失败，本次跳过:', e);
     }
     if (!quotaOk) {
-      console.warn(`转发到 ${target} 跳过：${toAddress} 今日转发已达 ${DAILY_FORWARD_LIMIT} 封上限`);
+      console.warn(`转发到 ${target} 跳过：域名或目标地址今日额度已用尽`);
       continue;
     }
     try {
@@ -378,13 +448,18 @@ export async function handleInbound(
       let finalCode = code;
       if (!finalCode && settings.code_extract.enabled && settings.code_extract.aiEnabled) {
         try {
-          const aiCode = await extractCodeByAi(env, { subject, text, html });
-          if (aiCode) {
-            finalCode = aiCode;
-            await db
-              .update(messages)
-              .set({ verificationCode: aiCode })
-              .where(eq(messages.id, messageId));
+          const usage = await bumpCounter(env, 'ai-extract', domain, dayWindow(), 1);
+          if (usage.count <= DAILY_AI_EXTRACT_LIMIT) {
+            const aiCode = await extractCodeByAi(env, { subject, text, html });
+            if (aiCode) {
+              finalCode = aiCode;
+              await db
+                .update(messages)
+                .set({ verificationCode: aiCode })
+                .where(eq(messages.id, messageId));
+            }
+          } else {
+            console.warn(`域名 ${domain} 今日 AI 提码额度已用尽，跳过兜底识别`);
           }
         } catch (e) {
           console.error('AI 提码失败:', e);

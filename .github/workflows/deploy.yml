@@ -95,9 +95,8 @@ jobs:
           pnpm --filter @hpc-mail/worker test
           pnpm --filter @hpc-mail/worker typecheck
 
-      - name: 依赖安全审计（尽力而为）
-        # npm 旧 audit endpoint 已退役（410），该门控不再可靠，仅告警不阻断部署
-        run: pnpm audit --prod || echo "::warning::pnpm audit 端点不可用或报告漏洞，请人工复核"
+      - name: 依赖安全审计
+        run: pnpm audit --prod --audit-level high
 
       - name: 注入 Cloudflare 资源配置
         working-directory: apps/worker
@@ -136,6 +135,19 @@ jobs:
             npx wrangler kv bulk delete /tmp/kv-del.json --namespace-id "$KV_NAMESPACE_ID" --force
           fi
           echo "已清空 D1 旧表与 $count 个 KV key"
+
+      - name: 记录 D1 回滚书签
+        if: github.event_name != 'workflow_dispatch' || !inputs.reset_database
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx wrangler d1 time-travel info "$D1_NAME" --json > /tmp/d1-time-travel.json
+          bookmark=$(jq -r '.. | .bookmark? // empty' /tmp/d1-time-travel.json | head -n 1)
+          [ -n "$bookmark" ] || { echo '::error::未能取得 D1 Time Travel bookmark'; exit 1; }
+          echo "D1 rollback bookmark: $bookmark" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::D1 rollback bookmark 已写入 Job Summary"
 
       - name: 应用数据库迁移
         working-directory: apps/worker

@@ -1,10 +1,11 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, Search, Trash2 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { Mailbox } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { EmptyState } from '@/components/ui/empty-state';
@@ -19,6 +20,10 @@ import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [deleteHistory, setDeleteHistory] = useState(false);
+
+  useEffect(() => {
+    setDeleteHistory(false);
+  }, [mailbox?.id]);
 
   const release = useMutation({
     mutationFn: (args: { id: number; deleteHistory: boolean }) =>
@@ -37,7 +42,7 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
   });
 
   return (
-    <Dialog open={mailbox !== null} onOpenChange={(next) => (!next ? onClose() : setDeleteHistory(false))}>
+    <Dialog open={mailbox !== null} onOpenChange={(next) => !next && onClose()}>
       <DialogContent className="max-w-md">
         <DialogHeader title="强制释放地址" description={mailbox?.address} />
         <DialogBody>
@@ -76,7 +81,7 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
 }
 
 export function AddressesPage() {
-  const { data: mailboxes, isLoading } = useMailboxesQuery(true);
+  const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
   const [q, setQ] = useState('');
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
 
@@ -99,6 +104,8 @@ export function AddressesPage() {
 
       {isLoading ? (
         <Skeleton className="h-40 w-full rounded-lg" />
+      ) : isError ? (
+        <QueryErrorState error={error} onRetry={() => void refetch()} />
       ) : filtered.length === 0 ? (
         <EmptyState
           icon={AtSign}

@@ -1,5 +1,6 @@
 import {
   API_KEY_PREFIX,
+  MAX_API_KEYS_PER_USER,
   type ApiKeySummary,
   type ApiRequestLogEntry,
   type ApiScope,
@@ -65,22 +66,34 @@ export async function createApiKey(
   const { key, keyPrefix, keySuffix } = generateKey();
   const keyHash = await hashApiKey(key);
   const expiresAt = normalizeExpiry(req.expiresAt);
-  const [row] = await db
-    .insert(apiKeys)
-    .values({
-      name: req.name,
+  const inserted = await env.db
+    .prepare(
+      `INSERT INTO api_keys
+        (name, key_prefix, key_suffix, key_hash, user_id, scopes, allowed_ips, rate_limit, status, expires_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?
+       WHERE (SELECT COUNT(*) FROM api_keys WHERE user_id = ? AND status <> 'revoked') < ?
+       RETURNING id`,
+    )
+    .bind(
+      req.name,
       keyPrefix,
       keySuffix,
       keyHash,
       userId,
-      scopes: req.scopes,
-      allowedIps: req.allowedIps,
-      rateLimit: req.rateLimit,
-      status: 'active',
-      expiresAt,
-    })
-    .returning();
-  return { ...serialize(row!), key };
+      JSON.stringify(req.scopes),
+      JSON.stringify(req.allowedIps),
+      req.rateLimit,
+      expiresAt?.getTime() ?? null,
+      userId,
+      MAX_API_KEYS_PER_USER,
+    )
+    .first<{ id: number }>();
+  if (!inserted) {
+    throw new AppError('forbidden', `每个用户最多保留 ${MAX_API_KEYS_PER_USER} 个 API Key`);
+  }
+  const row = await db.select().from(apiKeys).where(eq(apiKeys.id, inserted.id)).get();
+  if (!row) throw new AppError('internal', 'API Key 创建失败');
+  return { ...serialize(row), key };
 }
 
 /** userId 传入 = 只看自己的；不传 = admin 全站视图（含 ownerUsername） */

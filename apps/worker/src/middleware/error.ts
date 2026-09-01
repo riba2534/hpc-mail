@@ -16,10 +16,25 @@ export const requestId: MiddlewareHandler<AppContext> = async (c, next) => {
 export function onError(err: Error, c: Context<AppContext>): Response {
   const rid = c.get('requestId') ?? crypto.randomUUID();
   if (err instanceof AppError) {
+    if (err.status >= 500) {
+      console.error(JSON.stringify({
+        level: 'error',
+        requestId: rid,
+        operation: `${c.req.method} ${c.req.path}`,
+        errorClass: err.code,
+        message: err.message,
+      }));
+    }
     const body: ApiErrorBody = { error: { code: err.code, message: err.message }, requestId: rid };
     return c.json(body, err.status as ContentfulStatusCode);
   }
-  console.error('unhandled error:', err);
+  console.error(JSON.stringify({
+    level: 'error',
+    requestId: rid,
+    operation: `${c.req.method} ${c.req.path}`,
+    errorClass: err.name || 'Error',
+    message: err.message || 'unhandled error',
+  }));
   const body: ApiErrorBody = {
     error: { code: 'internal', message: '服务器内部错误' },
     requestId: rid,

@@ -84,7 +84,7 @@ export const retentionSettingSchema = z.object({
 export const quotaSettingSchema = z.object({
   /** 普通用户每日外发邮件条数上限 */
   dailyOutbound: z.number().int().min(0).max(100000),
-  /** 普通用户每日外发收件人（站外地址）总数上限 */
+  /** 普通用户每日外发唯一收件人（站内 + 站外）总数上限 */
   dailyRecipients: z.number().int().min(0).max(1000000),
 });
 

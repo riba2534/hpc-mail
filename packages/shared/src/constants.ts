@@ -37,7 +37,7 @@ export const MAX_PAGE_SIZE = 100;
 
 export const MAX_RECIPIENTS = 100;
 export const MAX_ATTACHMENTS = 10;
-/** 单个附件上限（站内互投走 R2，可放大；外发另受 EXTERNAL_MESSAGE_MAX_BYTES 约束） */
+/** 单个附件上限（站内互投共享 R2 对象；外发另受 EXTERNAL_MESSAGE_MAX_BYTES 约束） */
 export const MAX_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 /** 单封邮件附件合计上限 */
 export const MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024;
@@ -63,6 +63,15 @@ export const EXTERNAL_MESSAGE_MAX_BYTES = 4 * 1024 * 1024;
 
 export const API_KEY_PREFIX = 'hpcm_';
 export const DEFAULT_API_RATE_LIMIT = 120;
+export const MAX_API_RATE_LIMIT = 600;
+export const MAX_API_KEYS_PER_USER = 10;
+export const MAX_API_USER_REQUESTS_PER_MINUTE = 1200;
+export const MAX_API_GLOBAL_REQUESTS_PER_MINUTE = 10000;
+export const MAX_WAIT_POLLS_PER_USER_PER_MINUTE = 120;
+export const MAX_AUTH_USER_REQUESTS_PER_MINUTE = 600;
+export const MAX_AUTH_GLOBAL_REQUESTS_PER_MINUTE = 5000;
+export const MAX_DRAFT_ATTACHMENTS_PER_USER = 20;
+export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */
 export const USERNAME_REGEX = /^[a-z0-9][a-z0-9_-]{2,31}$/;

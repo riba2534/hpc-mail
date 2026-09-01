@@ -1,15 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { MoreHorizontal, Search } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { MoreHorizontal, Search, UserPlus } from 'lucide-react';
+import { type FormEvent, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { AdminUser } from '@hpc-mail/shared';
+import { createUserRequestSchema, type AdminUser, type Role } from '@hpc-mail/shared';
+import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Avatar } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { FormField } from '@/components/ui/form-field';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { CopyButton } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
@@ -36,9 +40,13 @@ function generatePassword(length = 14): string {
   return result;
 }
 
-function ResetPasswordDialog({ target, onClose }: { target: AdminUser | null; onClose: () => void }) {
+export function ResetPasswordDialog({ target, onClose }: { target: AdminUser | null; onClose: () => void }) {
   const queryClient = useQueryClient();
-  const [password] = useState(generatePassword);
+  const [password, setPassword] = useState('');
+
+  useEffect(() => {
+    setPassword(target ? generatePassword() : '');
+  }, [target?.id]);
 
   const mutation = useMutation({
     mutationFn: (id: number) => adminApi.updateUser(id, { password }),
@@ -71,6 +79,102 @@ function ResetPasswordDialog({ target, onClose }: { target: AdminUser | null; on
             确认重置
           </Button>
         </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CreateUserDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+  const queryClient = useQueryClient();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState<Role>('user');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setUsername('');
+    setPassword(generatePassword());
+    setRole('user');
+    setError(null);
+  }, [open]);
+
+  const create = useMutation({
+    mutationFn: () => adminApi.createUser({ username: username.trim(), password, role }),
+    onSuccess: (created) => {
+      toast({ title: `用户 ${created.username} 已创建`, variant: 'success' });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.users });
+      onOpenChange(false);
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : '创建失败，请重试'),
+  });
+
+  const handleSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    const parsed = createUserRequestSchema.safeParse({ username: username.trim(), password, role });
+    if (!parsed.success) {
+      setError(parsed.error.issues[0]?.message ?? '请检查输入');
+      return;
+    }
+    create.mutate();
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader title="创建用户" description="为用户创建平台账户，并安全交付临时密码。" />
+        <form onSubmit={handleSubmit}>
+          <DialogBody className="flex flex-col gap-4">
+            <FormField label="用户名" required>
+              {(field) => (
+                <Input
+                  {...field}
+                  autoFocus
+                  autoComplete="off"
+                  placeholder="小写字母/数字，3-32 位"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                />
+              )}
+            </FormField>
+            <div className="flex flex-col gap-1.5">
+              <span className="text-sm font-medium text-ink">角色</span>
+              <SegmentedControl
+                aria-label="用户角色"
+                value={role}
+                onValueChange={(value) => setRole(value as Role)}
+                options={[
+                  { value: 'user', label: '普通用户' },
+                  { value: 'admin', label: '管理员' },
+                ]}
+              />
+            </div>
+            <FormField label="临时密码" required>
+              {(field) => (
+                <div className="flex items-center gap-2">
+                  <Input
+                    {...field}
+                    autoComplete="new-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                  />
+                  <CopyButton value={password} size="sm" />
+                </div>
+              )}
+            </FormField>
+            <p className="text-xs text-ink-secondary">密码只在当前弹窗中展示，请复制后通过安全渠道交付。</p>
+            {error && <p className="text-sm text-critical">{error}</p>}
+          </DialogBody>
+          <DialogFooter>
+            <Button type="button" variant="secondary" onClick={() => onOpenChange(false)}>
+              取消
+            </Button>
+            <Button type="submit" loading={create.isPending}>
+              创建用户
+            </Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   );
@@ -110,7 +214,11 @@ export function UsersPage() {
   const currentUser = useCurrentUser();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { data, isLoading } = useQuery({ queryKey: queryKeys.admin.users, queryFn: () => adminApi.listUsers() });
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: queryKeys.admin.users,
+    queryFn: () => adminApi.listUsers(),
+  });
+  const [createOpen, setCreateOpen] = useState(false);
   const [resetting, setResetting] = useState<AdminUser | null>(null);
   const [deleting, setDeleting] = useState<AdminUser | null>(null);
   const [viewingMailboxes, setViewingMailboxes] = useState<AdminUser | null>(null);
@@ -141,7 +249,16 @@ export function UsersPage() {
 
   return (
     <div className="mx-auto max-w-5xl">
-      <PageHeader title="用户管理" description="管理平台账户的角色、状态与密码。" />
+      <PageHeader
+        title="用户管理"
+        description="管理平台账户的角色、状态与密码。"
+        actions={
+          <Button onClick={() => setCreateOpen(true)}>
+            <UserPlus className="size-4" />
+            创建用户
+          </Button>
+        }
+      />
 
       <div className="relative mb-4 max-w-xs">
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-tertiary" />
@@ -155,6 +272,8 @@ export function UsersPage() {
 
       {isLoading ? (
         <Skeleton className="h-48 w-full rounded-lg" />
+      ) : isError ? (
+        <QueryErrorState error={error} onRetry={() => void refetch()} />
       ) : (
         <Table>
           <TableHeader>
@@ -256,6 +375,7 @@ export function UsersPage() {
 
       <MailboxListDialog target={viewingMailboxes} onClose={() => setViewingMailboxes(null)} />
       <ResetPasswordDialog target={resetting} onClose={() => setResetting(null)} />
+      <CreateUserDialog open={createOpen} onOpenChange={setCreateOpen} />
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(next) => !next && setDeleting(null)}

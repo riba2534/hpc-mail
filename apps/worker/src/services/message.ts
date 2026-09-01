@@ -13,10 +13,12 @@ import {
   desc,
   eq,
   gt,
+  gte,
   inArray,
   isNotNull,
   isNull,
   lt,
+  lte,
   notInArray,
   or,
   sql,
@@ -42,6 +44,42 @@ export interface Viewer {
 }
 
 type MessageRow = typeof messages.$inferSelect;
+type MessageSummaryRow = Pick<
+  MessageRow,
+  | 'id'
+  | 'direction'
+  | 'address'
+  | 'domain'
+  | 'fromAddress'
+  | 'fromName'
+  | 'recipients'
+  | 'subject'
+  | 'preview'
+  | 'verificationCode'
+  | 'status'
+  | 'errorDetail'
+  | 'isRead'
+  | 'size'
+  | 'createdAt'
+>;
+
+const summarySelection = {
+  id: messages.id,
+  direction: messages.direction,
+  address: messages.address,
+  domain: messages.domain,
+  fromAddress: messages.fromAddress,
+  fromName: messages.fromName,
+  recipients: messages.recipients,
+  subject: messages.subject,
+  preview: messages.preview,
+  verificationCode: messages.verificationCode,
+  status: messages.status,
+  errorDetail: messages.errorDetail,
+  isRead: messages.isRead,
+  size: messages.size,
+  createdAt: messages.createdAt,
+};
 
 /** 可见范围：未认领地址，或限定为某用户认领的地址集合（以 mailboxes 子查询表达，不展开成数组） */
 type Scope = 'unclaimed' | { ownerId: number };
@@ -94,10 +132,10 @@ function scopeCondition(db: Db, scope: Scope): SQL {
 
 
 
-function summarize(row: MessageRow, hasAttachments: boolean, isStarred: boolean): MessageSummary {
+function summarize(row: MessageSummaryRow, hasAttachments: boolean, isStarred: boolean): MessageSummary {
   const verificationCode = resolveVerificationCode(
     row.subject,
-    row.bodyText || htmlToText(row.bodyHtml),
+    row.preview,
     row.verificationCode,
   );
   return {
@@ -193,7 +231,7 @@ export async function listMessages(
 
   const where = and(...conds.filter((x): x is SQL => x !== undefined));
   const rows = await db
-    .select()
+    .select(summarySelection)
     .from(messages)
     .where(where)
     .orderBy(desc(messages.id))
@@ -212,6 +250,36 @@ export async function listMessages(
     items: page.map((r) => summarize(r, attSet.has(r.id), starSet.has(r.id))),
     nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.id) : null,
   };
+}
+
+/** 增量读取严格返回 afterId 之后最早的一封，保证游标推进时不会跳过突发邮件。 */
+export async function findNextMessage(
+  env: Env,
+  viewer: Viewer,
+  input: { afterId: number; address?: string },
+): Promise<MessageSummary | null> {
+  const db = createDb(env);
+  const scope = resolveScope(viewer);
+  const conditions: SQL[] = [
+    scopeCondition(db, scope),
+    eq(messages.direction, 'inbound'),
+    isNull(messages.deletedAt),
+    gt(messages.id, input.afterId),
+  ];
+  if (input.address) conditions.push(eq(messages.address, input.address));
+  const row = await db
+    .select(summarySelection)
+    .from(messages)
+    .where(and(...conditions))
+    .orderBy(asc(messages.id))
+    .limit(1)
+    .get();
+  if (!row) return null;
+  const [attSet, starSet] = await Promise.all([
+    attachmentFlags(db, [row.id]),
+    starFlags(db, viewer.userId, [row.id]),
+  ]);
+  return summarize(row, attSet.has(row.id), starSet.has(row.id));
 }
 
 /**
@@ -278,7 +346,6 @@ function normalizeSubject(subject: string): string {
 export async function getThread(env: Env, viewer: Viewer, id: number): Promise<MessageSummary[]> {
   const db = createDb(env);
   const target = await loadVisible(env, viewer, id);
-  const core = normalizeSubject(target.subject);
   const summarizeRows = async (rows: MessageRow[]) => {
     const ids = rows.map((r) => r.id);
     const [attSet, starSet] = await Promise.all([
@@ -287,10 +354,51 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
     ]);
     return rows.map((r) => summarize(r, attSet.has(r.id), starSet.has(r.id)));
   };
-  if (!core) return summarizeRows([target]);
-
   const scope = await threadScope(db, viewer, target);
+  const related = new Map<number, MessageRow>([[target.id, target]]);
+  const messageKeys = new Set<string>();
+  const addKeys = (row: MessageRow) => {
+    if (row.messageId) messageKeys.add(row.messageId);
+    if (row.inReplyTo) messageKeys.add(row.inReplyTo);
+    for (const ref of row.references.match(/<[^>]+>/g) ?? []) messageKeys.add(ref);
+  };
+  addKeys(target);
+
+  // 优先按标准邮件头构建连通分量，最多扩展 10 轮/100 封，避免同主题邮件误合并。
+  for (let round = 0; round < 10 && messageKeys.size > 0 && related.size < 100; round++) {
+    let changed = false;
+    for (const keys of chunk([...messageKeys], 40)) {
+      const rows = await db
+        .select()
+        .from(messages)
+        .where(
+          and(
+            scopeCondition(db, scope),
+            isNull(messages.deletedAt),
+            or(inArray(messages.messageId, keys), inArray(messages.inReplyTo, keys)),
+          ),
+        )
+        .orderBy(asc(messages.id))
+        .limit(100)
+        .all();
+      for (const row of rows) {
+        if (related.has(row.id)) continue;
+        related.set(row.id, row);
+        addKeys(row);
+        changed = true;
+        if (related.size >= 100) break;
+      }
+    }
+    if (!changed) break;
+  }
+  if (related.size > 1) {
+    return summarizeRows([...related.values()].sort((a, b) => a.id - b.id));
+  }
+
+  const core = normalizeSubject(target.subject);
+  if (!core) return summarizeRows([target]);
   const escaped = core.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+  const windowMs = 30 * 24 * 60 * 60 * 1000;
   const rows = await db
     .select()
     .from(messages)
@@ -298,6 +406,9 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
       and(
         scopeCondition(db, scope),
         isNull(messages.deletedAt),
+        eq(messages.address, target.address),
+        gte(messages.createdAt, new Date(target.createdAt.getTime() - windowMs)),
+        lte(messages.createdAt, new Date(target.createdAt.getTime() + windowMs)),
         sql`${messages.subject} LIKE ${`%${escaped}%`} ESCAPE '\\'`,
       ),
     )
@@ -572,24 +683,14 @@ export async function purgeMessages(env: Env, viewer: Viewer, ids: number[]): Pr
     const rows = await db
       .select({ id: messages.id, bodyR2Key: messages.bodyR2Key, rawR2Key: messages.rawR2Key })
       .from(messages)
-      .where(scopedIdsCondition(db, scope, batch))
+      .where(and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt)))
       .all();
     targets.push(...rows);
   }
   if (targets.length === 0) return 0;
   const targetIds = targets.map((t) => t.id);
-  // 先删 R2 再删 D1：反过来的话，删除中途中断（CPU 超时等）就留下一批没有任何行指向的
-  // R2 对象，再也定位不到；这个顺序下中断只会留下指向空对象的 D1 行，下次清理还能扫到重试
-  for (const t of targets) {
-    await deleteMessageObjects(env, t.id, t.bodyR2Key);
-    if (t.rawR2Key) {
-      try {
-        await env.r2.delete(t.rawR2Key);
-      } catch (e) {
-        console.error('删除原始邮件对象失败:', e);
-      }
-    }
-  }
+  // 先删 R2 再删 D1；删除失败时保留 D1 引用，下次仍可重试。
+  await deleteMessageObjects(env, db, targets);
   for (const batch of chunk(targetIds)) {
     await db.delete(attachmentsTable).where(inArray(attachmentsTable.messageId, batch));
     await db.delete(stars).where(inArray(stars.messageId, batch));

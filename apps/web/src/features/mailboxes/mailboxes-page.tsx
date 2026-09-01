@@ -1,10 +1,11 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, Pencil, Plus, Trash2 } from 'lucide-react';
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import type { Mailbox } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { EmptyState } from '@/components/ui/empty-state';
@@ -23,6 +24,10 @@ function EditMailboxDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onCl
   const queryClient = useQueryClient();
   const [displayName, setDisplayName] = useState('');
 
+  useEffect(() => {
+    setDisplayName(mailbox?.displayName ?? '');
+  }, [mailbox?.id, mailbox?.displayName]);
+
   const mutation = useMutation({
     mutationFn: (id: number) => mailboxApi.update(id, { displayName: displayName.trim() }),
     onSuccess: () => {
@@ -39,13 +44,7 @@ function EditMailboxDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onCl
   };
 
   return (
-    <Dialog
-      open={mailbox !== null}
-      onOpenChange={(next) => {
-        if (!next) onClose();
-        else setDisplayName(mailbox?.displayName ?? '');
-      }}
-    >
+    <Dialog open={mailbox !== null} onOpenChange={(next) => !next && onClose()}>
       <DialogContent className="max-w-md">
         <DialogHeader title="编辑备注" description={mailbox?.address} />
         <form onSubmit={handleSubmit}>
@@ -88,6 +87,10 @@ function ReleaseDialog({
 }) {
   const [deleteHistory, setDeleteHistory] = useState(false);
 
+  useEffect(() => {
+    setDeleteHistory(false);
+  }, [mailbox?.id]);
+
   const release = useMutation({
     mutationFn: (args: { id: number; deleteHistory: boolean }) =>
       mailboxApi.release(args.id, args.deleteHistory),
@@ -105,13 +108,7 @@ function ReleaseDialog({
   });
 
   return (
-    <Dialog
-      open={mailbox !== null}
-      onOpenChange={(next) => {
-        if (!next) onClose();
-        else setDeleteHistory(false);
-      }}
-    >
+    <Dialog open={mailbox !== null} onOpenChange={(next) => !next && onClose()}>
       <DialogContent className="max-w-md">
         <DialogHeader title="释放这个地址？" description={mailbox?.address} />
         <DialogBody>
@@ -158,7 +155,7 @@ function ReleaseDialog({
 export function MailboxesPage() {
   const queryClient = useQueryClient();
   const { data: visibleDomains } = useDomains();
-  const { data: mailboxes, isLoading } = useMailboxesQuery(false);
+  const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(false);
   const [claimOpen, setClaimOpen] = useState(false);
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [editing, setEditing] = useState<Mailbox | null>(null);
@@ -183,6 +180,8 @@ export function MailboxesPage() {
 
       {isLoading ? (
         <Skeleton className="h-40 w-full rounded-lg" />
+      ) : isError ? (
+        <QueryErrorState error={error} onRetry={() => void refetch()} />
       ) : items.length === 0 ? (
         <EmptyState
           icon={AtSign}

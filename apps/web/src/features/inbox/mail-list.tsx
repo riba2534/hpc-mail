@@ -6,6 +6,7 @@ import type { ListMessagesQuery } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
@@ -68,6 +69,7 @@ export function MailList({
 
   // ---- 批量选择 ----
   const [selection, setSelection] = useState<Set<number>>(new Set());
+  const [purgeIds, setPurgeIds] = useState<number[]>([]);
   const lastClickedRef = useRef<number | null>(null);
   const loadedIds = useMemo(() => items.map((m) => m.id), [items]);
 
@@ -160,6 +162,7 @@ export function MailList({
     mutationFn: (ids: number[]) => messageApi.purge(ids, mutationScope),
     onSuccess: (_d, ids) => {
       toast({ title: `已永久删除 ${ids.length} 封`, variant: 'success' });
+      setPurgeIds([]);
       clearSelection();
       invalidateMessages();
     },
@@ -276,7 +279,7 @@ export function MailList({
                   size="sm"
                   variant="ghost"
                   disabled={batchPending}
-                  onClick={() => batchPurge.mutate(selectedIds)}
+                  onClick={() => setPurgeIds(selectedIds)}
                 >
                   <Trash2 className="size-4 text-critical" />
                   永久删除
@@ -352,6 +355,16 @@ export function MailList({
           <Spinner className="size-5 text-ink-tertiary" />
         </div>
       )}
+      <ConfirmDialog
+        open={purgeIds.length > 0}
+        onOpenChange={(next) => !next && setPurgeIds([])}
+        title={`永久删除 ${purgeIds.length} 封邮件？`}
+        description="邮件正文、原始邮件和附件会被永久删除，此操作无法撤销。"
+        confirmLabel={`永久删除 ${purgeIds.length} 封`}
+        tone="danger"
+        loading={batchPurge.isPending}
+        onConfirm={() => batchPurge.mutate(purgeIds)}
+      />
     </div>
   );
 }
