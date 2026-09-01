@@ -12,8 +12,8 @@ const ALLOWED_TAGS = [
 ]
 
 const ALLOWED_ATTR = [
-  'abbr', 'align', 'alt', 'aria-label', 'aria-labelledby', 'checked', 'class',
-  'cols', 'colspan', 'dir', 'disabled', 'for', 'height', 'href', 'id', 'lang',
+  'abbr', 'align', 'alt', 'aria-label', 'aria-labelledby', 'bgcolor', 'checked',
+  'class', 'cols', 'colspan', 'dir', 'disabled', 'for', 'height', 'href', 'id', 'lang',
   'label', 'max', 'maxlength', 'min', 'minlength', 'multiple', 'name', 'placeholder',
   'readonly', 'rel', 'required', 'role', 'rows', 'rowspan', 'scope', 'selected',
   'size', 'span', 'src', 'srcset', 'start', 'step', 'style', 'summary', 'target',

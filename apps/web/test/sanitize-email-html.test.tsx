@@ -130,6 +130,27 @@ describe('email HTML safety boundary', () => {
     expect(cta).not.toHaveAttribute('onclick')
   })
 
+  it('keeps legacy bgcolor used as the default paint for table-based email buttons', () => {
+    const content = sanitizeToElement(`
+      <style>table.button:hover table td { background: #0d18fc; color: #fff; }</style>
+      <table class="themed-link-button radius button">
+        <tr><td><table><tr>
+          <td bgcolor="#3f48fd" style="color:#fff;border-radius:4px">
+            <a href="https://example.test/verify" style="color:#fff;display:inline-block;padding:14px 32px">
+              Verify identity
+            </a>
+          </td>
+        </tr></table></td></tr>
+      </table>
+    `)
+
+    const link = [...content.querySelectorAll('a')]
+      .find((anchor) => anchor.textContent?.trim() === 'Verify identity')
+    const buttonCell = link?.parentElement
+    expect(buttonCell).toHaveAttribute('bgcolor', '#3f48fd')
+    expect(content.innerHTML).toContain('table.button:hover table td')
+  })
+
   it('neutralizes clobbering form controls without losing their content', () => {
     const content = sanitizeToElement(`
       <form id="clobbered">
