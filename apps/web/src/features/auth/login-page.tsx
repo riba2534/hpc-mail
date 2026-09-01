@@ -14,7 +14,7 @@ import { FormField } from '@/components/ui/form-field';
 import { GITHUB_REPO_URL, GithubIcon } from '@/components/ui/github-link';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import { toast } from '@/components/ui/toast';
 import { setAuthToken } from '@/lib/auth-token';
 import { usePublicConfig } from '@/lib/use-config';
@@ -127,12 +127,16 @@ export function LoginPage() {
 
         <div className="rounded-lg border border-line bg-surface p-6 shadow-xs">
           {canRegister && (
-            <Tabs value={mode} onValueChange={(value) => switchMode(value as Mode)} className="mb-5">
-              <TabsList className="grid w-full grid-cols-2">
-                <TabsTrigger value="login">登录</TabsTrigger>
-                <TabsTrigger value="register">注册</TabsTrigger>
-              </TabsList>
-            </Tabs>
+            <SegmentedControl
+              aria-label="账户操作"
+              value={mode}
+              onValueChange={(value) => switchMode(value as Mode)}
+              options={[
+                { value: 'login', label: '登录' },
+                { value: 'register', label: '注册' },
+              ]}
+              className="mb-5 w-full [&>button]:flex-1"
+            />
           )}
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-4">

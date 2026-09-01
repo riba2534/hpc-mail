@@ -31,7 +31,7 @@ describe('LoginPage 注册模式分支', () => {
   it('closed 模式不显示注册入口', () => {
     config.mode = 'closed';
     renderPage();
-    expect(screen.queryByRole('tab', { name: '注册' })).toBeNull();
+    expect(screen.queryByRole('radio', { name: '注册' })).toBeNull();
     expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument();
   });
 
@@ -39,7 +39,7 @@ describe('LoginPage 注册模式分支', () => {
     config.mode = 'invite';
     const user = userEvent.setup();
     renderPage();
-    await user.click(screen.getByRole('tab', { name: '注册' }));
+    await user.click(screen.getByRole('radio', { name: '注册' }));
     expect(screen.getByText('邀请码')).toBeInTheDocument();
   });
 
@@ -47,7 +47,7 @@ describe('LoginPage 注册模式分支', () => {
     config.mode = 'open';
     const user = userEvent.setup();
     renderPage();
-    await user.click(screen.getByRole('tab', { name: '注册' }));
+    await user.click(screen.getByRole('radio', { name: '注册' }));
     expect(screen.queryByText('邀请码')).toBeNull();
   });
 });
