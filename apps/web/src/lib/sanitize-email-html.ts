@@ -2,26 +2,31 @@ import createDOMPurify from 'dompurify'
 
 const ALLOWED_TAGS = [
   'a', 'abbr', 'address', 'article', 'aside', 'b', 'blockquote', 'br', 'caption',
-  'center', 'cite', 'code', 'col', 'colgroup', 'dd', 'del', 'details', 'div',
-  'dl', 'dt', 'em', 'figcaption', 'figure', 'footer', 'h1', 'h2', 'h3', 'h4',
-  'h5', 'h6', 'header', 'hr', 'i', 'img', 'ins', 'kbd', 'li', 'main', 'mark',
-  'ol', 'p', 'pre', 'q', 's', 'samp', 'section', 'small', 'span', 'strong',
-  'sub', 'summary', 'sup', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead',
-  'time', 'tr', 'u', 'ul', 'var', 'wbr',
+  'button', 'center', 'cite', 'code', 'col', 'colgroup', 'dd', 'del', 'details',
+  'div', 'dl', 'dt', 'em', 'fieldset', 'figcaption', 'figure', 'footer', 'h1',
+  'form', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'i', 'img', 'input',
+  'ins', 'kbd', 'label', 'legend', 'li', 'main', 'mark', 'ol', 'optgroup',
+  'option', 'p', 'pre', 'q', 's', 'samp', 'section', 'select', 'small', 'span',
+  'strong', 'sub', 'summary', 'sup', 'table', 'tbody', 'td', 'textarea', 'tfoot',
+  'th', 'thead', 'time', 'tr', 'u', 'ul', 'var', 'wbr',
 ]
 
 const ALLOWED_ATTR = [
-  'abbr', 'align', 'alt', 'aria-label', 'aria-labelledby', 'class', 'colspan',
-  'dir', 'height', 'href', 'id', 'lang', 'name', 'rel', 'role', 'rowspan',
-  'scope', 'span', 'src', 'srcset', 'start', 'style', 'summary', 'target',
-  'title', 'valign', 'value', 'width',
+  'abbr', 'align', 'alt', 'aria-label', 'aria-labelledby', 'checked', 'class',
+  'cols', 'colspan', 'dir', 'disabled', 'for', 'height', 'href', 'id', 'lang',
+  'label', 'max', 'maxlength', 'min', 'minlength', 'multiple', 'name', 'placeholder',
+  'readonly', 'rel', 'required', 'role', 'rows', 'rowspan', 'scope', 'selected',
+  'size', 'span', 'src', 'srcset', 'start', 'step', 'style', 'summary', 'target',
+  'title', 'type', 'valign', 'value', 'width', 'wrap',
 ]
 
 const FORBIDDEN_TAGS = [
-  'applet', 'audio', 'base', 'button', 'canvas', 'embed', 'form', 'frame',
-  'frameset', 'iframe', 'input', 'link', 'meta', 'object', 'script', 'select',
-  'source', 'style', 'svg', 'template', 'textarea', 'video',
+  'applet', 'audio', 'base', 'canvas', 'embed', 'frame', 'frameset', 'iframe',
+  'link', 'math', 'meta', 'noscript', 'object', 'script', 'source', 'style',
+  'svg', 'template', 'video',
 ]
+
+const MAX_INLINE_IMAGE_LENGTH = 2_000_000
 
 // Email markup needs layout CSS, but never network-loading or app-overlay capabilities.
 const SAFE_CSS_PROPERTIES = new Set([
@@ -67,6 +72,8 @@ const SAFE_CSS_PROPERTIES = new Set([
 ])
 
 const UNSAFE_CSS_VALUE = /(?:\b(?:expression|javascript|vbscript|behavior)\b|@import|(?:url|image-set|cross-fade|paint)\s*\(|-moz-binding)/i
+const HEIGHT_LAYOUT_PROPERTIES = new Set(['height', 'min-height', 'max-height', 'block-size', 'min-block-size', 'max-block-size'])
+const VIEWPORT_HEIGHT_VALUE = /(?:^|[^a-z])(?:\d+(?:\.\d+)?|\.\d+)(?:d|l|s)?vh\b/i
 
 export interface SanitizeEmailHtmlOptions {
   window?: Window
@@ -99,6 +106,7 @@ function sanitizeStyleDeclaration(windowObject: Window, cssText: string | null |
     const normalizedProperty = property.toLowerCase()
     const value = parser.style.getPropertyValue(property)
     if (!SAFE_CSS_PROPERTIES.has(normalizedProperty) || !isSafeCssValue(value)) continue
+    if (HEIGHT_LAYOUT_PROPERTIES.has(normalizedProperty) && VIEWPORT_HEIGHT_VALUE.test(value)) continue
     safe.style.setProperty(normalizedProperty, value, parser.style.getPropertyPriority(property))
   }
   return safe.style.cssText
@@ -133,7 +141,9 @@ function sanitizeCssRules(windowObject: Window, rules: CSSRuleList | undefined, 
     if (rule.type === 4) {
       const mediaRule = rule as CSSMediaRule
       const mediaQuery = String(mediaRule.conditionText || '')
-      if (mediaQuery.length <= 500 && /^[a-z\d\s():.,/%<>=_-]+$/i.test(mediaQuery)) {
+      if (mediaQuery.length <= 500
+        && !/\b(?:min-|max-)?height\b/i.test(mediaQuery)
+        && /^[a-z\d\s():.,/%<>=_-]+$/i.test(mediaQuery)) {
         const nested = sanitizeCssRules(windowObject, mediaRule.cssRules, depth + 1)
         if (nested) output.push(`@media ${mediaQuery}{${nested}}`)
       }
@@ -200,12 +210,17 @@ function isSafeImage(
 ): boolean {
   const source = String(value || '').trim()
   if (!source) return false
-  if (/^(cid:|blob:|data:image\/(?:avif|gif|jpeg|png|webp);base64,)/i.test(source)) return true
+  if (/^cid:/i.test(source)) return true
+  if (/^data:image\/(?:avif|gif|jpeg|png|webp);base64,/i.test(source)) {
+    return source.length <= MAX_INLINE_IMAGE_LENGTH
+  }
   if (!/^(?:https:|\/)/i.test(source)) return false
   try {
     const parsed = new URL(source, baseOrigin)
     if (parsed.protocol !== 'https:') return false
-    return allowRemoteImages || parsed.origin === baseOrigin || trustedOrigins.has(parsed.origin)
+    if (allowRemoteImages) return true
+    if (parsed.origin === baseOrigin) return parsed.pathname.startsWith('/api/attachments/')
+    return trustedOrigins.has(parsed.origin)
   } catch {
     return false
   }
@@ -228,6 +243,28 @@ function sanitizeSourceSet(
 }
 
 /**
+ * 邮件里的表单常被当作布局容器，直接删除会连同按钮布局一起破坏。参考 Roundcube：
+ * 先由 DOMPurify 清掉 action/事件等危险属性，再把 form 降级成保留 class/style/子节点的 div。
+ * 这里显式调用原型方法，避免敌对 name/id 触发 DOM clobbering。
+ */
+function neutralizeForms(windowObject: Window, root: ParentNode): void {
+  const elementPrototype = (windowObject as Window & typeof globalThis).Element.prototype
+  const nodePrototype = (windowObject as Window & typeof globalThis).Node.prototype
+  root.querySelectorAll<HTMLFormElement>('form').forEach((form) => {
+    const replacement = windowObject.document.createElement('div')
+    for (const name of elementPrototype.getAttributeNames.call(form)) {
+      const value = elementPrototype.getAttribute.call(form, name)
+      if (value !== null) replacement.setAttribute(name, value)
+    }
+    replacement.classList.add('email-form')
+    const childNodesGetter = Object.getOwnPropertyDescriptor(nodePrototype, 'childNodes')?.get
+    const childNodes = childNodesGetter?.call(form) as NodeListOf<ChildNode> | undefined
+    replacement.replaceChildren(...Array.from(childNodes || []))
+    elementPrototype.replaceWith.call(form, replacement)
+  })
+}
+
+/**
  * Sanitizes hostile email markup for an isolated rendering surface.
  * HTTPS images render by default without a referrer; callers may disable
  * third-party images while retaining CID, data, blob and trusted-origin media.
@@ -240,23 +277,26 @@ export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOption
   const trustedOrigins = new Set((options.trustedImageOrigins || []).map((value) => {
     try { return new URL(value, baseOrigin).origin } catch { return '' }
   }).filter(Boolean))
-  const safeStyles = extractStyleBlocks(String(html || ''))
+  const sourceHtml = String(html || '')
+  const safeStyles = extractStyleBlocks(sourceHtml)
     .map((cssText) => sanitizeStylesheet(windowObject, cssText))
     .filter(Boolean)
   const purifier = createDOMPurify(windowObject as unknown as Parameters<typeof createDOMPurify>[0])
-  const clean = purifier.sanitize(String(html || ''), {
+  const clean = purifier.sanitize(sourceHtml, {
     ALLOWED_TAGS,
     ALLOWED_ATTR,
     ALLOW_ARIA_ATTR: true,
     ALLOW_DATA_ATTR: false,
     FORBID_TAGS: FORBIDDEN_TAGS,
-    FORBID_ATTR: ['formaction', 'xlink:href'],
+    FORBID_ATTR: ['action', 'autofocus', 'form', 'formaction', 'formenctype',
+      'formmethod', 'formnovalidate', 'formtarget', 'method', 'xlink:href'],
     KEEP_CONTENT: true,
     RETURN_TRUSTED_TYPE: false,
   })
 
   const template = windowObject.document.createElement('template')
   template.innerHTML = String(clean)
+  neutralizeForms(windowObject, template.content)
   if (safeStyles.length) {
     const style = windowObject.document.createElement('style')
     // 二次兜底：任何带 `</style` 的内容都不允许进入 raw-text 元素
@@ -270,13 +310,25 @@ export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOption
     else element.removeAttribute('style')
   })
 
+  // image 类型 input 会绕过 img 的远程资源策略；保留其 CTA 外观/文案但不主动加载资源。
+  template.content.querySelectorAll<HTMLInputElement>('input[type="image"]').forEach((input) => {
+    input.removeAttribute('src')
+    input.type = 'button'
+    if (!input.value && input.alt) input.value = input.alt
+  })
+
+  // 文件选择器在邮件正文中没有合法提交路径，禁用以免制造无效或钓鱼式交互。
+  template.content.querySelectorAll<HTMLInputElement>('input[type="file"]').forEach((input) => {
+    input.disabled = true
+  })
+
   template.content.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((link) => {
     if (!isSafeLink(link.getAttribute('href'), baseOrigin)) {
       link.removeAttribute('href')
       link.removeAttribute('target')
       return
     }
-    if (/^https?:/i.test(link.href)) {
+    if (!String(link.getAttribute('href') || '').startsWith('#')) {
       link.target = '_blank'
       link.rel = 'noopener noreferrer'
     } else {

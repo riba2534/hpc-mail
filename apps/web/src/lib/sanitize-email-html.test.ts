@@ -55,4 +55,20 @@ describe('sanitizeEmailHtml：正常内容不被误伤', () => {
     expect(host.querySelector('p')?.getAttribute('onclick')).toBeNull()
     expect(host.querySelector('img')?.getAttribute('src')).toBeNull()
   })
+
+  it('二次解析后仍拦截嵌套表单与命名空间 mXSS 载荷', () => {
+    const host = reparse(`
+      <form id="outer"><math><mtext></form><form><mglyph><style></math>
+      <img src="x" onerror="globalThis.pwned=true">
+      <noscript><iframe srcdoc="<script>globalThis.pwned=true</script>"></iframe></noscript>
+    `)
+
+    expect(host.querySelector('form, math, svg, script, iframe, noscript')).toBeNull()
+    expect(host.innerHTML).not.toMatch(/onerror|srcdoc|globalThis\.pwned/i)
+    for (const element of host.querySelectorAll('*')) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.name.toLowerCase().startsWith('on')).toBe(false)
+      }
+    }
+  })
 })
