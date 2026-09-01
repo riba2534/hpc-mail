@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { constantTimeEqual, hashPassword, verifyPassword } from '../src/lib/password.js';
 import { signToken, verifyToken } from '../src/lib/jwt.js';
 import { decodeCursor, encodeCursor } from '../src/lib/pagination.js';
@@ -8,7 +8,7 @@ import {
   normalizeEmail,
   validateLocalPart,
 } from '../src/lib/email-address.js';
-import { extractCodeByRegex } from '../src/services/code-extract.js';
+import { extractCodeByAi, extractCodeByRegex, resolveVerificationCode } from '../src/services/code-extract.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -111,6 +111,55 @@ describe('code-extract 正则', () => {
   });
   it('无候选返回空', () => {
     expect(extractCodeByRegex('', 'your verification code is coming soon')).toBe('');
+  });
+  it('one-time link 邮件不把 URL token 识别为验证码', () => {
+    const body = [
+      'Continue verifying your identity',
+      'To continue verifying your identity, please click the link below.',
+      'https://withpersona.example/verify?code=VGHH62D',
+      'This link will expire in 1 hour.',
+      'Persona Identities, Inc. 981 Mission Street, San Francisco, CA 94103',
+    ].join('\n');
+    expect(extractCodeByRegex('Anthropic one-time link', body)).toBe('');
+    expect(resolveVerificationCode('Anthropic one-time link', body, 'VGHH62D')).toBe('');
+  });
+  it('URL 内的 code 关键词不能激活附近邮编或年份', () => {
+    const body = 'Click the link below: https://example.test/verify?code=A1B2C3\nAddress 94103, year 2026.';
+    expect(extractCodeByRegex('Verification link', body)).toBe('');
+  });
+  it('generic verification 文案和长 ID 不产生截断误报', () => {
+    expect(extractCodeByRegex('Verification completed', 'Completed on 2026-08-31.')).toBe('');
+    expect(extractCodeByRegex('Account notice', 'Tracking ID ABCD1234567890XYZ')).toBe('');
+  });
+  it('同时提供链接和明确验证码时仍保留验证码', () => {
+    const body = 'Your verification code is 482913. Or click the link below: https://example.test/verify/A1B2C3';
+    expect(extractCodeByRegex('Verify your account', body)).toBe('482913');
+    expect(resolveVerificationCode('Verify your account', body, '')).toBe('482913');
+  });
+  it('非 link-only 邮件保留无法被正则覆盖的历史/AI 验证码', () => {
+    expect(resolveVerificationCode('Account alert', 'Use the password shown in the app.', '739204')).toBe('739204');
+  });
+  it('AI 不接受只存在于 URL 中的 token', async () => {
+    const run = vi.fn(async () => ({ response: '{"code":"A1B2C3"}' }));
+    const fakeEnv = { ai: { run }, ai_model: 'test-model' } as never;
+    const result = await extractCodeByAi(fakeEnv, {
+      subject: 'Account notice',
+      text: 'Open https://example.test/session/A1B2C3 to continue.',
+      html: '',
+    });
+    expect(run).toHaveBeenCalledOnce();
+    expect(result).toBe('');
+  });
+  it('link-only 邮件不会调用 AI 兜底', async () => {
+    const run = vi.fn(async () => ({ response: '{"code":"VGHH62D"}' }));
+    const fakeEnv = { ai: { run }, ai_model: 'test-model' } as never;
+    const result = await extractCodeByAi(fakeEnv, {
+      subject: 'Anthropic one-time link',
+      text: 'Please click the link below: https://example.test/verify/VGHH62D',
+      html: '',
+    });
+    expect(run).not.toHaveBeenCalled();
+    expect(result).toBe('');
   });
 });
 

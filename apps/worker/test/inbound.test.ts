@@ -173,4 +173,23 @@ describe('收件链路 handleInbound', () => {
     expect(row!.verificationCode).toBe('');
     expect(forward).not.toHaveBeenCalled();
   });
+
+  it('one-time link 的 URL token 不会作为验证码落库', async () => {
+    await updateSettings(env, { code_extract: { enabled: true, aiEnabled: false } });
+    const body = [
+      'Continue verifying your identity',
+      'Please click the link below.',
+      'https://withpersona.example/verify?code=VGHH62D',
+      'This link will expire in 1 hour.',
+    ].join('\n');
+    await run(mockMessage('link-only@inbox.test', 'Anthropic one-time link', body, async () => {}));
+
+    const db = createDb(env);
+    const row = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.address, 'link-only@inbox.test'))
+      .get();
+    expect(row?.verificationCode).toBe('');
+  });
 });

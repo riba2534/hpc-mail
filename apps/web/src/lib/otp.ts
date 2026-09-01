@@ -11,10 +11,15 @@ export interface OtpMatch {
 const PROXIMITY = 120;
 
 const KEYWORD_PATTERN =
-  /验证码|校验码|动态密码|一次性密码|动态验证码|安全码|verification code|verification|passcode|security code|access code|login code|one[-\s]?time|\bcode\b|\botp\b|\bpin\b|2fa/gi;
+  /验证码|校验码|动态码|动态密码|一次性密码|动态验证码|安全码|确认码|验证代码|口令|one[-\s]?time\s+(?:password|passcode)|passcode|pass\s?code|security\s?code|access\s?code|login\s?code|authentication\s?code|\bcode\b|\botp\b|\bpin\b|2fa/gi;
 
-const DIGIT_PATTERN = /\d{4,8}/g;
-const ALNUM_PATTERN = /[A-Z0-9]{6,8}/g;
+const DIGIT_PATTERN = /(?<![\w])\d{4,8}(?![\w])/g;
+const ALNUM_PATTERN = /(?<![\w])[A-Z0-9]{6,8}(?![\w])/g;
+const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"']+/gi;
+const LINK_ONLY_PATTERN =
+  /(?:(?:one[-\s]?time|single[-\s]?use|magic|verification)\s+link|\b(?:click|follow|open|tap)\b[^\n]{0,60}\b(?:link|button)\b|\blink\s+below\b|点击[^\n]{0,30}(?:链接|按钮)|(?:链接|按钮)[^\n]{0,30}(?:验证|继续))/i;
+const EXPLICIT_CODE_PATTERN =
+  /验证码|校验码|动态码|动态密码|一次性密码|动态验证码|安全码|确认码|验证代码|口令|one[-\s]?time\s+(?:password|passcode)|passcode|pass\s?code|security\s?code|access\s?code|login\s?code|authentication\s?code|\bcode\b|\botp\b|\bpin\b|2fa/i;
 
 interface Range {
   start: number;
@@ -27,11 +32,32 @@ interface Candidate {
   end: number;
 }
 
+function urlRanges(text: string): Range[] {
+  const ranges: Range[] = [];
+  URL_PATTERN.lastIndex = 0;
+  let url: RegExpExecArray | null;
+  while ((url = URL_PATTERN.exec(text))) {
+    ranges.push({ start: url.index, end: url.index + url[0].length });
+  }
+  return ranges;
+}
+
+function insideRange(index: number, ranges: Range[]): boolean {
+  return ranges.some((range) => index >= range.start && index < range.end);
+}
+
+function withoutUrls(text: string): string {
+  URL_PATTERN.lastIndex = 0;
+  return text.replace(URL_PATTERN, ' ');
+}
+
 function keywordRanges(text: string): Range[] {
   const ranges: Range[] = [];
+  const excluded = urlRanges(text);
   KEYWORD_PATTERN.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = KEYWORD_PATTERN.exec(text))) {
+    if (insideRange(match.index, excluded)) continue;
     ranges.push({ start: match.index, end: match.index + match[0].length });
     if (match.index === KEYWORD_PATTERN.lastIndex) KEYWORD_PATTERN.lastIndex += 1;
   }
@@ -40,14 +66,17 @@ function keywordRanges(text: string): Range[] {
 
 function candidates(text: string): Candidate[] {
   const found: Candidate[] = [];
+  const excluded = urlRanges(text);
   DIGIT_PATTERN.lastIndex = 0;
   let digit: RegExpExecArray | null;
   while ((digit = DIGIT_PATTERN.exec(text))) {
+    if (insideRange(digit.index, excluded)) continue;
     found.push({ code: digit[0], start: digit.index, end: digit.index + digit[0].length });
   }
   ALNUM_PATTERN.lastIndex = 0;
   let alnum: RegExpExecArray | null;
   while ((alnum = ALNUM_PATTERN.exec(text))) {
+    if (insideRange(alnum.index, excluded)) continue;
     const value = alnum[0];
     if (!/\d/.test(value) || !/[A-Z]/.test(value)) continue;
     found.push({ code: value, start: alnum.index, end: alnum.index + value.length });
@@ -87,7 +116,11 @@ function rankField(text: string, source: OtpMatch['source']): Ranked[] {
 }
 
 export function extractOtp(subject: string | null | undefined, text: string | null | undefined): OtpMatch | null {
-  const ranked = [...rankField(subject ?? '', 'subject'), ...rankField(text ?? '', 'body')];
+  const normalizedSubject = subject ?? '';
+  const normalizedText = text ?? '';
+  const corpus = `${normalizedSubject}\n${normalizedText}`;
+  if (LINK_ONLY_PATTERN.test(corpus) && !EXPLICIT_CODE_PATTERN.test(withoutUrls(corpus))) return null;
+  const ranked = [...rankField(normalizedSubject, 'subject'), ...rankField(normalizedText, 'body')];
   if (ranked.length === 0) return null;
   ranked.sort((a, b) => {
     if (a.distance !== b.distance) return a.distance - b.distance;

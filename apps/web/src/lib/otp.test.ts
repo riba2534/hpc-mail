@@ -30,4 +30,29 @@ describe('extractOtp', () => {
     const result = extractOtp('验证码 246810 请查收', '正文无关内容');
     expect(result).toEqual({ code: '246810', source: 'subject' });
   });
+
+  it('one-time link 邮件不把 URL token 或页脚数字识别为验证码', () => {
+    const body = [
+      'Continue verifying your identity',
+      'Please click the link below.',
+      'https://withpersona.example/verify?code=VGHH62D',
+      'This link will expire in 1 hour.',
+      '981 Mission Street, San Francisco, CA 94103',
+    ].join('\n');
+    expect(extractOtp('Anthropic one-time link', body)).toBeNull();
+  });
+
+  it('URL 内的 code 关键词不能激活附近数字', () => {
+    expect(extractOtp('Verification link', 'Open https://example.test/?code=A1B2C3 then visit ZIP 94103.')).toBeNull();
+  });
+
+  it('generic verification 文案和长 ID 不产生截断误报', () => {
+    expect(extractOtp('Verification completed', 'Completed on 2026-08-31.')).toBeNull();
+    expect(extractOtp('Account notice', 'Tracking ID ABCD1234567890XYZ')).toBeNull();
+  });
+
+  it('同时提供链接和明确验证码时仍提取验证码', () => {
+    const body = 'Your verification code is 482913. Or click https://example.test/verify/A1B2C3';
+    expect(extractOtp('Verify your account', body)).toEqual({ code: '482913', source: 'body' });
+  });
 });

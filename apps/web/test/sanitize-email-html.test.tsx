@@ -210,6 +210,37 @@ describe('email HTML safety boundary', () => {
     expect(clean).not.toMatch(/tracker\.test|@import|position:|z-index:|background-image|url\s*\(/i)
   })
 
+  it('keeps safe CSS variables used by default button styles and blocks network values', () => {
+    const crlfEscapedUrl = 'u\\72\r\nl(https://tracker.test/crlf)'
+    const clean = sanitize(`
+      <style>
+        :root {
+          --ButtonColor: #1747ff;
+          --ButtonText: #ffffff;
+          --spacing-100vh: 12px;
+          --tracking: url(https://tracker.test/pixel);
+          --escaped-tracking: \\75 rl(https://tracker.test/escaped);
+          --crlf-escaped-tracking: ${crlfEscapedUrl};
+          --viewport-height: 100vh;
+          --escaped-viewport-height: 100v\\000068;
+          --scientific-viewport-height: 1e2vh;
+          --block-viewport-height: 100vb;
+          --container-height: 100cqh;
+        }
+        .cta { background-color: var(--ButtonColor); color: var(--ButtonText); padding: var(--spacing-100vh); }
+        .cta:hover { background-color: #002bd6; }
+      </style>
+      <input class="cta" type="submit" value="Verify identity">
+    `)
+
+    expect(clean).toContain('--ButtonColor: #1747ff')
+    expect(clean).toContain('--ButtonText: #ffffff')
+    expect(clean).toContain('var(--ButtonColor)')
+    expect(clean).toContain('var(--ButtonText)')
+    expect(clean).toContain('var(--spacing-100vh)')
+    expect(clean).not.toMatch(/--tracking|--(?:crlf-)?escaped-tracking|--(?:escaped-|scientific-)?viewport-height|--block-viewport-height|--container-height|tracker\.test|url\s*\(/i)
+  })
+
   it('drops iframe-height-dependent CSS that can create resize feedback loops', () => {
     const clean = sanitize(`
       <style>
@@ -217,11 +248,13 @@ describe('email HTML safety boundary', () => {
         @media (min-height: 300px) { .viewport { padding: 20px; } }
       </style>
       <div class="viewport" style="max-height: 90svh; color: blue">Content</div>
+      <div class="escaped" style="height: 100v\\000068; padding-top: 5cqh; color: green">Escaped</div>
     `)
 
     expect(clean).toContain('color: red')
     expect(clean).toContain('color: blue')
-    expect(clean).not.toMatch(/(?:d|l|s)?vh\b|@media\s*\([^)]*height/i)
+    expect(clean).toContain('color: green')
+    expect(clean).not.toMatch(/(?:[dls]?v(?:h|b|min|max)|cq(?:h|b|min|max))\b|@media\s*\([^)]*height/i)
   })
 
   it('normalizes safe links and strips executable or relative URLs', () => {

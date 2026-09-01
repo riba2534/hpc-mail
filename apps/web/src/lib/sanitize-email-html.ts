@@ -72,8 +72,9 @@ const SAFE_CSS_PROPERTIES = new Set([
 ])
 
 const UNSAFE_CSS_VALUE = /(?:\b(?:expression|javascript|vbscript|behavior)\b|@import|(?:url|image-set|cross-fade|paint)\s*\(|-moz-binding)/i
-const HEIGHT_LAYOUT_PROPERTIES = new Set(['height', 'min-height', 'max-height', 'block-size', 'min-block-size', 'max-block-size'])
-const VIEWPORT_HEIGHT_VALUE = /(?:^|[^a-z])(?:\d+(?:\.\d+)?|\.\d+)(?:d|l|s)?vh\b/i
+const HEIGHT_DEPENDENT_VALUE = /(?:^|[^a-z\d_-])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?:[dls]?v(?:h|b|min|max)|cq(?:h|b|min|max))\b/i
+const SAFE_CUSTOM_PROPERTY = /^--[a-z_][a-z\d_-]{0,127}$/i
+const MAX_CUSTOM_PROPERTY_VALUE_LENGTH = 4_096
 
 export interface SanitizeEmailHtmlOptions {
   window?: Window
@@ -83,17 +84,23 @@ export interface SanitizeEmailHtmlOptions {
 }
 
 function decodeCssEscapes(value: string): string {
-  return value.replace(/\\([\da-f]{1,6})\s?|\\(.)/gi, (_, hex: string | undefined, character: string | undefined) => {
-    if (hex) {
-      const codePoint = Number.parseInt(hex, 16)
-      return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : ''
-    }
-    return character || ''
-  })
+  return value
+    .replace(/\\(?:\r\n|[\n\r\f])/g, '')
+    .replace(/\\([\da-f]{1,6})(?:\r\n|[ \t\n\r\f])?|\\(.)/gi, (_, hex: string | undefined, character: string | undefined) => {
+      if (hex) {
+        const codePoint = Number.parseInt(hex, 16)
+        return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : ''
+      }
+      return character || ''
+    })
+}
+
+function normalizeCssValueForInspection(value: string): string {
+  return decodeCssEscapes(value).replace(/\/\*[\s\S]*?\*\//g, '')
 }
 
 function isSafeCssValue(value: string): boolean {
-  return !UNSAFE_CSS_VALUE.test(decodeCssEscapes(value).replace(/\/\*[\s\S]*?\*\//g, ''))
+  return !UNSAFE_CSS_VALUE.test(normalizeCssValueForInspection(value))
 }
 
 function sanitizeStyleDeclaration(windowObject: Window, cssText: string | null | undefined): string {
@@ -105,9 +112,14 @@ function sanitizeStyleDeclaration(windowObject: Window, cssText: string | null |
   for (const property of Array.from(parser.style)) {
     const normalizedProperty = property.toLowerCase()
     const value = parser.style.getPropertyValue(property)
-    if (!SAFE_CSS_PROPERTIES.has(normalizedProperty) || !isSafeCssValue(value)) continue
-    if (HEIGHT_LAYOUT_PROPERTIES.has(normalizedProperty) && VIEWPORT_HEIGHT_VALUE.test(value)) continue
-    safe.style.setProperty(normalizedProperty, value, parser.style.getPropertyPriority(property))
+    const isCustomProperty = SAFE_CUSTOM_PROPERTY.test(property)
+    if (!isCustomProperty && !SAFE_CSS_PROPERTIES.has(normalizedProperty)) continue
+    if (!isSafeCssValue(value)) continue
+    if (isCustomProperty && value.length > MAX_CUSTOM_PROPERTY_VALUE_LENGTH) continue
+    const inspectionValue = normalizeCssValueForInspection(value)
+    if (HEIGHT_DEPENDENT_VALUE.test(inspectionValue)) continue
+    // CSS 自定义属性区分大小写；保留原名，避免 var(--ButtonColor) 失配。
+    safe.style.setProperty(isCustomProperty ? property : normalizedProperty, value, parser.style.getPropertyPriority(property))
   }
   return safe.style.cssText
 }

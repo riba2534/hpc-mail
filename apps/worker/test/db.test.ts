@@ -239,6 +239,35 @@ describe('message 可见性 user vs admin', () => {
   });
 });
 
+describe('验证码响应时重校验', () => {
+  it('历史 link-only 误识别值不会继续出现在列表和详情', async () => {
+    const adminId = await seedUser('otp-link-admin', 'admin');
+    const body = [
+      'Continue verifying your identity',
+      'Please click the link below.',
+      'https://withpersona.example/verify?code=VGHH62D',
+      'This link will expire in 1 hour.',
+    ].join('\n');
+    const id = await seedInbound('otp-link-only@hpc.email', 'Anthropic one-time link', body);
+    const db = createDb(env);
+    await db.update(messages).set({ verificationCode: 'VGHH62D' }).where(eq(messages.id, id));
+
+    const page = await listMessages(
+      env,
+      { userId: adminId, role: 'admin', scope: 'unclaimed' },
+      { limit: 100 } as never,
+    );
+    expect(page.items.find((message) => message.id === id)?.verificationCode).toBe('');
+
+    const detail = await getMessageDetail(
+      env,
+      { userId: adminId, role: 'admin', scope: 'unclaimed' },
+      id,
+    );
+    expect(detail.verificationCode).toBe('');
+  });
+});
+
 describe('星标与正文搜索', () => {
   it('星标为每用户独立，starred 过滤与 isStarred 标记生效', async () => {
     const admin = await seedUser('star-admin', 'admin');

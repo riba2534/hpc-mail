@@ -28,7 +28,9 @@ import { signAttachment } from '../lib/crypto.js';
 import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor } from '../lib/pagination.js';
+import { htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
+import { resolveVerificationCode } from './code-extract.js';
 import { deleteMessageObjects, getJson } from './storage.js';
 
 export interface Viewer {
@@ -93,6 +95,11 @@ function scopeCondition(db: Db, scope: Scope): SQL {
 
 
 function summarize(row: MessageRow, hasAttachments: boolean, isStarred: boolean): MessageSummary {
+  const verificationCode = resolveVerificationCode(
+    row.subject,
+    row.bodyText || htmlToText(row.bodyHtml),
+    row.verificationCode,
+  );
   return {
     id: row.id,
     direction: row.direction,
@@ -102,7 +109,7 @@ function summarize(row: MessageRow, hasAttachments: boolean, isStarred: boolean)
     fromName: row.fromName,
     subject: row.subject,
     preview: row.preview,
-    verificationCode: row.verificationCode,
+    verificationCode,
     status: row.status,
     errorDetail: row.errorDetail ?? '',
     recipientsTo: row.direction === 'outbound' ? (row.recipients?.to ?? []) : undefined,
@@ -401,6 +408,11 @@ export async function getMessageDetail(
 
   return {
     ...summarize(row, attRows.length > 0, starSet.has(id)),
+    verificationCode: resolveVerificationCode(
+      row.subject,
+      bodyText || htmlToText(bodyHtml),
+      row.verificationCode,
+    ),
     recipients: row.recipients as MessageRecipients,
     bodyText,
     bodyHtml,
