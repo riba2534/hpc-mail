@@ -45,4 +45,3 @@ export function injectAttachmentLinks(
   });
   return { text: text ? text + textBlock : '', html: html ? linkedHtml + htmlBlock : '' };
 }
-
