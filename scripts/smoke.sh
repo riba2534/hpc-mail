@@ -70,7 +70,7 @@ step "最近邮件详情与线程可读"
 message_id=$(echo "$list" | jq -r '.data.items[0].id // empty')
 if [ -n "$message_id" ]; then
   curl -fsS "$BASE_URL/api/messages/$message_id" -H "Authorization: Bearer $TOKEN" | jq -e '.data | (.bodyText | type == "string") and (.attachments | type == "array") and (.replyTo | type == "array")' >/dev/null || fail "邮件详情结构异常"
-  curl -fsS "$BASE_URL/api/messages/$message_id/thread" -H "Authorization: Bearer $TOKEN" | jq -e '.data | type == "array"' >/dev/null || fail "邮件线程结构异常"
+  curl -fsS "$BASE_URL/api/messages/$message_id/thread" -H "Authorization: Bearer $TOKEN" | jq -e '.data.items | type == "array"' >/dev/null || fail "邮件线程结构异常"
 fi
 
 step "OpenAPI 可读"
