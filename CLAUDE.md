@@ -75,6 +75,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 - `/llms.txt`、首页 HTML 链接和 API 响应 `Link` 头提供文档发现入口；`/api/openapi.json` 与 `/v1/openapi.json` 分别描述会话和 API Key 接口，公开返回原始 OpenAPI JSON（不包 `{data}`）。两份描述均以请求站点 origin 为 server，适用于自部署。
 - 邮件 `scope` 必须显式校验，query/body 同时指定时必须一致；非法值不能静默退回个人邮箱。未知 API 返回统一 JSON 错误信封；缺失 Markdown 文档不能返回 SPA HTML 冒充技能正文。
+- `wrangler.toml` 的 `assets.run_worker_first` 必须包含 `/skill.md`、`/references/*` 和 `/llms.txt`，使编码及缺失文档处理在生产生效；新增文档目录时同步维护，不能只测试 Worker handler。
 
 - 域名更新必须带 `expectedDomainsRevision`，旧快照返回 409；管理配置和认领校验直读 D1，避免 KV 陈旧配置允许已移除域名被认领。
 - 发件结果包含每个目标的 `recipientOutcomes`；补发保留 To/Cc/Bcc 分组，只重试失败目标。Idempotency-Key 在副作用开始前关联发件行；完成回填失败不能变成请求发送失败或重新投递。

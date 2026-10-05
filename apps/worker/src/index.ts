@@ -52,15 +52,17 @@ export default {
         headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
       });
     }
-    // .md（如 /skill.md）assets 默认不带 charset，浏览器会按非 UTF-8 解析导致中文乱码，补上
-    if (url.pathname.endsWith('.md')) {
+    // Agent 文档的静态响应默认不带 charset，显式 UTF-8 并拒绝 SPA fallback。
+    if (url.pathname.endsWith('.md') || url.pathname === '/llms.txt') {
       if ((res.headers.get('content-type') || '').includes('text/html')) {
         return withSecurityHeaders(new Response('Not Found', {
           status: 404,
           headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
         }));
       }
-      return withSecurityHeaders(res, { 'Content-Type': 'text/markdown; charset=utf-8' });
+      return withSecurityHeaders(res, {
+        'Content-Type': url.pathname.endsWith('.md') ? 'text/markdown; charset=utf-8' : 'text/plain; charset=utf-8',
+      });
     }
     const hashedAsset = /^\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\.(js|css|woff2?|png|svg|webp)$/.test(url.pathname);
     return withSecurityHeaders(res, hashedAsset && res.ok ? { 'Cache-Control': 'public, max-age=31536000, immutable' } : { 'Cache-Control': 'no-cache' });

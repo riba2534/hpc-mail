@@ -46,7 +46,8 @@ binding = "ai"
 binding = "assets"
 directory = "./dist"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/v1/*", "/skill.md", "/assets/*"]
+# Agent 文档必须经过 Worker：补 UTF-8，并阻止缺失文档回退为成功的 SPA HTML。
+run_worker_first = ["/api", "/api/*", "/v1", "/v1/*", "/skill.md", "/references/*", "/llms.txt", "/assets/*"]
 
 # Secrets（wrangler secret put）：
 #   jwt_secret              JWT 签名密钥（必需）

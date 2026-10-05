@@ -21,25 +21,29 @@ describe('Agent 接口发现与错误契约', () => {
     }
   });
 
-  it('不存在的 Markdown 文档不能作为成功的技能正文返回 SPA HTML', async () => {
-    const response = await worker.fetch(new Request('https://mail.example/agent/missing.md'), {
-      ...env,
-      assets: { fetch: async () => new Response('<html>SPA fallback</html>', { headers: { 'Content-Type': 'text/html' } }) } as unknown as Fetcher,
-    }, createExecutionContext());
-    expect(response.status).toBe(404);
-    expect(response.headers.get('Cache-Control')).toBe('no-store');
-    expect(response.headers.get('Content-Type')).toContain('text/plain');
-    expect(await response.text()).toBe('Not Found');
+  it('不存在的 Agent 文档不能作为成功的技能正文返回 SPA HTML', async () => {
+    for (const path of ['/agent/missing.md', '/references/missing.md', '/llms.txt']) {
+      const response = await worker.fetch(new Request(`https://mail.example${path}`), {
+        ...env,
+        assets: { fetch: async () => new Response('<html>SPA fallback</html>', { headers: { 'Content-Type': 'text/html' } }) } as unknown as Fetcher,
+      }, createExecutionContext());
+      expect(response.status).toBe(404);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(response.headers.get('Content-Type')).toContain('text/plain');
+      expect(await response.text()).toBe('Not Found');
+    }
   });
 
-  it('真实 Markdown 文档保留内容并明确 UTF-8 编码', async () => {
+  it('真实技能、参考文档和发现入口保留内容并明确 UTF-8 编码', async () => {
     const content = '---\nname: hpc-mail\n---\n邮箱操作';
-    const response = await worker.fetch(new Request('https://mail.example/skill.md'), {
-      ...env,
-      assets: { fetch: async () => new Response(content, { headers: { 'Content-Type': 'text/markdown' } }) } as unknown as Fetcher,
-    }, createExecutionContext());
-    expect(response.status).toBe(200);
-    expect(response.headers.get('Content-Type')).toBe('text/markdown; charset=utf-8');
-    expect(await response.text()).toBe(content);
+    for (const path of ['/skill.md', '/references/administration.md', '/llms.txt']) {
+      const response = await worker.fetch(new Request(`https://mail.example${path}`), {
+        ...env,
+        assets: { fetch: async () => new Response(content, { headers: { 'Content-Type': path.endsWith('.md') ? 'text/markdown' : 'text/plain' } }) } as unknown as Fetcher,
+      }, createExecutionContext());
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Content-Type')).toBe(path.endsWith('.md') ? 'text/markdown; charset=utf-8' : 'text/plain; charset=utf-8');
+      expect(await response.text()).toBe(content);
+    }
   });
 });

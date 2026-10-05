@@ -19,6 +19,7 @@
 | OpenAPI 缺请求及响应契约，JWT 无完整机器规格 | API 客户端无法可靠构造请求和解析结果 | 完整 `/v1/openapi.json`，新增 `/api/openapi.json`，请求从共享 schema 导出并补跨字段约束 |
 | 未知 API 返回纯文本 404；缺失 `.md` 可被 SPA HTML 当正文返回 | Agent JSON 解析失败或把错误页当技能 | 统一 JSON 错误信封，缺失 Markdown 明确 404 |
 | 技能缺发现入口 | 从首页或 API 进入时难以找到说明 | 新增 `/llms.txt`、HTML 描述链接及 API 响应 Link 头 |
+| 生产静态资产优先路由未覆盖参考文档 | 中文文档缺少 UTF-8 声明；缺失参考文档返回 200 HTML，即使 Worker 单测通过 | 补齐 worker-first 路由、发现入口编码，以及部署冒烟中的六份参考文档和缺失文档验证 |
 
 ## 功能与认证覆盖
 
@@ -54,5 +55,6 @@
 - API Key 规格：26 个路径、29 个 HTTP 操作；JWT 规格：56 个路径、69 个 HTTP 操作。共 98 个操作与 Hono 实际挂载路由双向匹配，且两份规格的 operationId 全部唯一。
 - 正式测试：shared 25、web 103、worker 218，共 346 项通过；类型检查通过。新增 workerd HTTP 集成覆盖 Key 创建、认领/释放、附件上传与下载、站内回复、幂等重放、线程/原文、邮件维护、共享与 scope 边界、取消长轮询、布尔参数及非法 base64。
 - 两份 OpenAPI 的 Redocly recommended lint 均无错误和警告；技能 frontmatter、30 个本地参考链接、shell/Python/JSON 示例语法通过。
+- 本地 Wrangler 启用实际静态资源绑定及 worker-first 配置，11 个 HTTP 检查通过：技能、发现入口、全部六份参考文档内容及 UTF-8，缺失参考文档 404，两个 API 根路径 JSON 404；这些文档检查也纳入部署冒烟。
 - 独立 Agent 执行 20 项本地 HTTP fixture 检验，另复测登录失败停止、迟到验证码截止、错误码/requestId 保留和上传失败取消。附件回复在模拟提交后断开响应、刷新进程及同用户 JWT 续期时只投递一次。
 - 示例本地 fixture 与隔离 workerd 不证明外部真实邮件/通知送达。生产版本、文档和只读 API 的验证以本次 main 提交的自动部署与冒烟记录为准。

@@ -82,6 +82,12 @@ agent_skill=$(curl -fsS "$BASE_URL/skill.md")
 grep -q '^name: hpc-mail$' <<< "$agent_skill" || fail "Agent 技能元数据缺失"
 agent_index=$(curl -fsS "$BASE_URL/llms.txt")
 grep -q '/skill.md' <<< "$agent_index" || fail "Agent 发现入口缺失"
+for reference in auth-and-http mail attachments mailboxes-and-domains notifications administration; do
+  doc_metadata=$(curl -fsS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL/references/$reference.md")
+  [ "$doc_metadata" = "200 text/markdown; charset=utf-8" ] || fail "参考文档响应异常: $reference $doc_metadata"
+done
+missing_document=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL/references/missing-smoke-document.md")
+[ "$missing_document" = "404 text/plain; charset=utf-8" ] || fail "缺失参考文档未返回明确 404: $missing_document"
 
 step "未知 API 返回结构化错误"
 unknown=$(curl -sS -w '\n%{http_code}' "$BASE_URL/v1/missing-smoke-endpoint")
