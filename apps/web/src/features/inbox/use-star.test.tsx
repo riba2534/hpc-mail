@@ -3,7 +3,7 @@ import { renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
-const starMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const starMock = vi.hoisted(() => vi.fn().mockResolvedValue({changed:1}));
 vi.mock('@/api/resources', () => ({ messageApi: { star: starMock } }));
 
 import { queryKeys } from '@/api/query-keys';

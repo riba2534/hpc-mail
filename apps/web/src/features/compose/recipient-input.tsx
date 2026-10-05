@@ -1,9 +1,7 @@
 import { X } from 'lucide-react';
-import { type ClipboardEvent, type KeyboardEvent, useState } from 'react';
+import { type ClipboardEvent, type KeyboardEvent, useId, useState } from 'react';
 import { emailAddressSchema } from '@hpc-mail/shared';
 import { cn } from '@/lib/cn';
-
-let datalistSeq = 0;
 
 export interface RecipientInputProps {
   value: string[];
@@ -13,6 +11,8 @@ export interface RecipientInputProps {
   /** 近期联系人建议（原生 datalist 自动补全） */
   suggestions?: string[];
   'aria-describedby'?: string;
+  'aria-label'?: string;
+  'aria-invalid'?: boolean;
 }
 
 export function RecipientInput({
@@ -25,7 +25,8 @@ export function RecipientInput({
 }: RecipientInputProps) {
   const [text, setText] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [listId] = useState(() => `recip-dl-${++datalistSeq}`);
+  const listId = useId();
+  const errorId = `${listId}-error`;
 
   const addToken = (raw: string) => {
     const candidate = raw.trim().replace(/[,;\s]+$/, '');
@@ -96,6 +97,8 @@ export function RecipientInput({
         <input
           id={id}
           {...aria}
+          aria-invalid={error ? true : aria['aria-invalid']}
+          aria-describedby={[aria['aria-describedby'], error ? errorId : undefined].filter(Boolean).join(' ') || undefined}
           value={text}
           list={suggestions && suggestions.length ? listId : undefined}
           placeholder={value.length === 0 ? placeholder : undefined}
@@ -116,7 +119,7 @@ export function RecipientInput({
           </datalist>
         )}
       </div>
-      {error && <p className="text-xs text-critical">{error}</p>}
+      {error && <p id={errorId} role="alert" className="text-xs text-critical">{error}</p>}
     </div>
   );
 }

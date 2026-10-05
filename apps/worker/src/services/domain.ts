@@ -52,7 +52,7 @@ export function domainPerUserLimit(settings: Settings, domain: string): number {
 export async function getRoutableDomains(env: Env, settings?: Settings): Promise<string[]> {
   const listed = await getDomains(env, settings);
   const db = createDb(env);
-  const rows = await db.select({ domain: mailboxes.domain }).from(mailboxes).all();
+  const rows = await db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes).all();
   const set = new Set(listed);
   for (const row of rows) set.add(row.domain);
   return [...set];

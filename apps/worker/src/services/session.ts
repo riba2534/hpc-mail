@@ -1,6 +1,7 @@
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { sessions, users } from '../db/schema.js';
+import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
@@ -9,16 +10,24 @@ const uepochKey = (userId: number) => `uepoch:${userId}`;
 const INSTANCE_EPOCH_KEY = 'instance_epoch';
 
 /** 创建会话：D1 是鉴权真源；KV 过渡期双写，确保回滚旧 Worker 时新会话仍可用。 */
-export async function createSession(env: Env, userId: number): Promise<string> {
+export async function createSession(env: Env, userId: number, verified?: {
+  authVersion: number; passwordHash: string; totpEnabledAt?: Date | null; totpSecret?: string | null;
+}): Promise<string> {
   const sid = crypto.randomUUID();
   const now = Date.now();
   const db = createDb(env);
-  await db.insert(sessions).values({
-    id: sid,
-    userId,
-    createdAt: new Date(now),
-    expiresAt: new Date(now + SESSION_TTL_SECONDS * 1000),
-  });
+  if (verified) {
+    const inserted = await env.db.prepare(`INSERT INTO sessions (id, user_id, created_at, expires_at)
+      SELECT ?, id, ?, ? FROM users
+      WHERE id = ? AND status = 'active' AND auth_version = ? AND password_hash = ?
+        AND totp_enabled_at IS ? AND totp_secret IS ? RETURNING id`)
+      .bind(sid, now, now + SESSION_TTL_SECONDS * 1000, userId, verified.authVersion, verified.passwordHash,
+        verified.totpEnabledAt?.getTime() ?? null, verified.totpSecret ?? null)
+      .first<{ id: string }>();
+    if (!inserted) throw new AppError('bad_credentials', '账号凭据已改变，请重新登录');
+  } else {
+    await db.insert(sessions).values({ id: sid, userId, createdAt: new Date(now), expiresAt: new Date(now + SESSION_TTL_SECONDS * 1000) });
+  }
   try {
     await env.kv.put(sessKey(sid), JSON.stringify({ userId, createdAt: now }), {
       expirationTtl: SESSION_TTL_SECONDS,
@@ -84,9 +93,10 @@ export async function getUserEpoch(env: Env, userId: number): Promise<number> {
   }
   await db
     .update(users)
-    .set({ authVersion: legacy, authVersionMigrated: true })
-    .where(eq(users.id, userId));
-  return legacy;
+    .set({ authVersion: Math.max(row.authVersion, legacy), authVersionMigrated: true })
+    .where(and(eq(users.id, userId), eq(users.authVersionMigrated, false), eq(users.authVersion, row.authVersion)));
+  const current = await db.select({ version: users.authVersion }).from(users).where(eq(users.id, userId)).get();
+  return current?.version ?? 0;
 }
 
 export async function bumpUserEpoch(env: Env, userId: number): Promise<number> {
@@ -98,13 +108,13 @@ export async function bumpUserEpoch(env: Env, userId: number): Promise<number> {
     .returning({ authVersion: users.authVersion })
     .get();
   const next = updated?.authVersion ?? ((Number(await env.kv.get(uepochKey(userId))) || 0) + 1);
-  // 兼容回滚旧 Worker；新 Worker 不再以 KV 为鉴权真源。
-  try {
-    await env.kv.put(uepochKey(userId), String(next));
-  } catch (e) {
-    console.error('用户鉴权版本 KV 兼容写入失败:', e);
-  }
+  await mirrorUserEpoch(env, userId, next);
   return next;
+}
+
+export async function mirrorUserEpoch(env: Env, userId: number, next: number): Promise<void> {
+  try { await env.kv.put(uepochKey(userId), String(next)); }
+  catch (e) { console.error('用户鉴权版本 KV 兼容写入失败:', e); }
 }
 
 /** 实例代（清库全员下线）；缺省视为 0 */

@@ -42,6 +42,7 @@ import type {
   UploadAvatarRequest,
   UploadedPart,
   UserNotifyPrefs,
+  NotificationHealth,
   TwoFactorEnabled,
   TwoFactorSetup,
 } from '@hpc-mail/shared';
@@ -83,6 +84,8 @@ export const notifyPrefsApi = {
     api.put<UserNotifyPrefs, UpdateNotifyPrefsRequest>('/me/notify-prefs', body),
   testFeishu: () => api.post<{ ok: boolean }>('/me/notify-prefs/feishu-test'),
   testPushdeer: () => api.post<{ ok: boolean }>('/me/notify-prefs/pushdeer-test'),
+  health: () => api.get<NotificationHealth>('/me/notify-prefs/health'),
+  retry: (id: number) => api.post<{ ok: boolean }>(`/me/notify-prefs/jobs/${id}/retry`),
 };
 
 // ---- 邮箱 ----
@@ -102,13 +105,14 @@ export const mailboxApi = {
 
 // ---- 邮件 ----
 export const messageApi = {
-  list: (query: Partial<ListMessagesQuery>) =>
-    api.get<Page<MessageSummary>>('/messages', { query: query as unknown as QueryParams }),
-  detail: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }) =>
-    api.get<MessageDetail>(`/messages/${id}`, { query: { scope: view?.scope, userId: view?.userId } }),
-  thread: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }) =>
+  list: (query: Partial<ListMessagesQuery>, signal?: AbortSignal) =>
+    api.get<Page<MessageSummary>>('/messages', { query: query as unknown as QueryParams, signal }),
+  detail: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }, signal?: AbortSignal) =>
+    api.get<MessageDetail>(`/messages/${id}`, { query: { scope: view?.scope, userId: view?.userId }, signal }),
+  thread: (id: number, view?: { scope?: ListMessagesQuery['scope']; userId?: number }, signal?: AbortSignal) =>
     api.get<{ items: MessageSummary[] }>(`/messages/${id}/thread`, {
       query: { scope: view?.scope, userId: view?.userId },
+      signal,
     }),
   contacts: () => api.get<{ contacts: string[] }>('/messages/contacts'),
   send: (body: InternalSendMailRequest, idempotencyKey?: string) =>
@@ -117,14 +121,14 @@ export const messageApi = {
     }),
   unreadCount: () => api.get<{ unread: number }>('/messages/unread-count'),
   markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed') =>
-    api.post<void, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
+    api.post<{ changed: number }, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
   markAllRead: () => api.post<{ changed: number }, Record<string, never>>('/messages/read-all', {}),
   star: (
     ids: number[],
     starred: boolean,
     view?: { scope?: ListMessagesQuery['scope']; userId?: number },
   ) =>
-    api.post<void, { ids: number[]; starred: boolean }>(
+    api.post<{ changed: number }, { ids: number[]; starred: boolean }>(
       '/messages/star',
       { ids, starred },
       { query: { scope: view?.scope, userId: view?.userId } },
@@ -132,9 +136,9 @@ export const messageApi = {
   remove: (ids: number[], scope?: 'mine' | 'unclaimed') =>
     api.post<{ deleted: number }, { ids: number[] }>('/messages/delete', { ids }, { query: { scope } }),
   restore: (ids: number[], scope?: 'mine' | 'unclaimed') =>
-    api.post<void, { ids: number[] }>('/messages/restore', { ids }, { query: { scope } }),
+    api.post<{ changed: number }, { ids: number[] }>('/messages/restore', { ids }, { query: { scope } }),
   purge: (ids: number[], scope?: 'mine' | 'unclaimed') =>
-    api.post<void, { ids: number[] }>('/messages/purge', { ids }, { query: { scope } }),
+    api.post<{ changed: number }, { ids: number[] }>('/messages/purge', { ids }, { query: { scope } }),
 };
 
 // ---- 附件上传（先落 R2 草稿区，发送时引用 token）----

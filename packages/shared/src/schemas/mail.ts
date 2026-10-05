@@ -113,7 +113,7 @@ const fromSchema = z
 /** 发送邮件共用字段（附件载体由各 schema 各自定义：base64 内联 或 token 引用） */
 const sendMailBaseShape = {
   from: fromSchema,
-  to: z.array(emailAddressSchema).min(1),
+  to: z.array(emailAddressSchema),
   cc: z.array(emailAddressSchema).default([]),
   bcc: z.array(emailAddressSchema).default([]),
   subject: z.string().trim().min(1).max(998),
@@ -130,6 +130,7 @@ function validateSendCommon(
   v: { to: unknown[]; cc: unknown[]; bcc: unknown[]; text?: string; html?: string },
   ctx: z.RefinementCtx,
 ): void {
+  if (v.to.length + v.cc.length + v.bcc.length === 0) ctx.addIssue({ code: 'custom', message: '至少需要一个收件人', path: ['to'] });
   if (v.to.length + v.cc.length + v.bcc.length > MAX_RECIPIENTS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -137,6 +138,9 @@ function validateSendCommon(
       path: ['to'],
     });
   }
+  const utf8Length = (value: string) => { let bytes = 0; for (const char of value) { const cp = char.codePointAt(0)!; bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4; } return bytes; };
+  const bytes = utf8Length(v.text ?? '') + utf8Length(v.html ?? '');
+  if (bytes > MAX_BODY_BYTES) ctx.addIssue({ code: 'custom', message: '正文 UTF-8 字节合计超过上限', path: ['body'] });
   if ((v.text ?? '').length === 0 && (v.html ?? '').length === 0) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: '正文不能为空', path: ['body'] });
   }
@@ -284,7 +288,14 @@ export const starMessagesRequestSchema = z.object({
 });
 export type StarMessagesRequest = z.infer<typeof starMessagesRequestSchema>;
 
+export interface RecipientOutcome {
+  address: string;
+  status: 'delivered' | 'sent' | 'failed';
+  error?: string;
+}
+
 export interface MessageSummary {
+  recipientOutcomes?: RecipientOutcome[];
   id: number;
   direction: MessageDirection;
   address: string;
@@ -324,6 +335,7 @@ export interface MessageRecipients {
 }
 
 export interface MessageDetail extends MessageSummary {
+  replyTo?: string[];
   recipients: MessageRecipients;
   bodyText: string;
   bodyHtml: string;

@@ -1,11 +1,14 @@
 import type { ListMessagesQuery } from '@hpc-mail/shared';
+import type { QueryClient } from '@tanstack/react-query';
 
 /** 集中式 query key 注册表：前缀分层，失效时按前缀 invalidate。 */
 export const queryKeys = {
   config: ['config', 'public'] as const,
   domains: ['domains', 'visible'] as const,
   notifyPrefs: ['notify-prefs'] as const,
+  notificationHealth: ['notification-health'] as const,
   session: ['session'] as const,
+  sessionForRevision: (revision: number) => ['session', revision] as const,
 
   mailboxes: {
     root: ['mailboxes'] as const,
@@ -36,3 +39,11 @@ export const queryKeys = {
     mailboxShares: ['admin', 'mailbox-shares'] as const,
   },
 } as const;
+
+/** Ownership changes affect visibility, counts and administration together. Drop old private mail first. */
+export function invalidateMailboxOwnership(client: QueryClient): void {
+  void client.resetQueries({ queryKey: queryKeys.messages.root });
+  for (const queryKey of [queryKeys.mailboxes.root, queryKeys.admin.users, queryKeys.admin.mailboxShares]) {
+    void client.invalidateQueries({ queryKey });
+  }
+}

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { type ReactNode, useEffect, useState } from 'react';
-import { SECRET_MASK, type UserNotifyPrefs } from '@hpc-mail/shared';
+import { SECRET_MASK, type UserNotifyPrefs, updateNotifyPrefsRequestSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { notifyPrefsApi } from '@/api/resources';
@@ -55,6 +55,7 @@ export function ForwardingSection() {
     queryKey: queryKeys.notifyPrefs,
     queryFn: () => notifyPrefsApi.get(),
   });
+  const [validationError, setValidationError] = useState<string | null>(null);
   const [draft, setDraft] = useState<UserNotifyPrefs | null>(null);
 
   useEffect(() => {
@@ -66,6 +67,8 @@ export function ForwardingSection() {
     onSuccess: (saved) => {
       queryClient.setQueryData(queryKeys.notifyPrefs, saved);
       setDraft(structuredClone(saved));
+      setValidationError(null);
+      void queryClient.invalidateQueries({queryKey:queryKeys.notificationHealth});
       toast({ title: '转发与通知已保存', variant: 'success' });
     },
     onError: (err) =>
@@ -74,13 +77,13 @@ export function ForwardingSection() {
 
   const testFeishu = useMutation({
     mutationFn: () => notifyPrefsApi.testFeishu(),
-    onSuccess: () => toast({ title: '测试卡片已发送', variant: 'success' }),
+    onSuccess: () => { void queryClient.invalidateQueries({queryKey:queryKeys.notificationHealth}); toast({ title: '测试卡片已发送', variant: 'success' }); },
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '发送失败', variant: 'error' }),
   });
 
   const testPushdeer = useMutation({
     mutationFn: () => notifyPrefsApi.testPushdeer(),
-    onSuccess: () => toast({ title: '测试消息已发送至 PushDeer', variant: 'success' }),
+    onSuccess: () => { void queryClient.invalidateQueries({queryKey:queryKeys.notificationHealth}); toast({ title: '测试消息已发送至 PushDeer', variant: 'success' }); },
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '发送失败', variant: 'error' }),
   });
 
@@ -125,6 +128,7 @@ export function ForwardingSection() {
           onChange={(v) => patch((d) => void (d.forward.enabled = v))}
         />
         <RecipientInput
+          aria-label="转发目标邮箱"
           value={draft.forward.addresses}
           onChange={(addresses) => patch((d) => void (d.forward.addresses = addresses))}
           placeholder="输入目标邮箱地址后回车"
@@ -153,11 +157,12 @@ export function ForwardingSection() {
         <label className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">签名密钥</span>
           <PasswordInput
-            placeholder={draft.feishu.secret === SECRET_MASK ? '已配置（留空保持不变）' : '可选'}
+            placeholder={draft.feishu.secret === SECRET_MASK ? '已配置（输入可替换，清除请用按钮）' : '可选'}
             value={draft.feishu.secret === SECRET_MASK ? '' : draft.feishu.secret}
             onChange={(e) => patch((d) => void (d.feishu.secret = e.target.value))}
           />
         </label>
+        {draft.feishu.secret && <div><Button type="button" variant="ghost" size="sm" onClick={() => patch((d) => void (d.feishu.secret = ''))}>清除飞书签名密钥</Button></div>}
         <div className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">推送内容</span>
           <SegmentedControl
@@ -201,7 +206,7 @@ export function ForwardingSection() {
           <span className="text-sm text-ink-secondary">PushKey</span>
           <PasswordInput
             placeholder={
-              draft.pushdeer.pushkey === SECRET_MASK ? '已配置（留空保持不变）' : '例如 PDU...'
+              draft.pushdeer.pushkey === SECRET_MASK ? '已配置（输入可替换，清除请用按钮）' : '例如 PDU...'
             }
             value={draft.pushdeer.pushkey === SECRET_MASK ? '' : draft.pushdeer.pushkey}
             onChange={(e) => patch((d) => void (d.pushdeer.pushkey = e.target.value))}
@@ -210,6 +215,7 @@ export function ForwardingSection() {
             PushDeer App 内生成的 Key（支持 iOS、Android、Mac 客户端）。
           </span>
         </label>
+        {draft.pushdeer.pushkey && <div><Button type="button" variant="ghost" size="sm" onClick={() => patch((d) => void (d.pushdeer.pushkey = ''))}>清除PushDeer Key</Button></div>}
         <label className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">自定义服务器端点（可选）</span>
           <Input
@@ -245,22 +251,23 @@ export function ForwardingSection() {
         <label className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">Webhook URL</span>
           <Input
-            placeholder="https://...（Bark / ntfy / 自建服务）"
+            placeholder="https://...（接收 HPC 事件的服务）"
             value={draft.webhook.url}
             onChange={(e) => patch((d) => void (d.webhook.url = e.target.value))}
           />
-          <span className="text-xs text-ink-tertiary">仅支持 HTTPS，且不能指向内网地址。</span>
+          <span className="text-xs text-ink-tertiary">仅支持 HTTPS 公网地址；Bark、ntfy 等服务需要适配下方 HPC JSON 事件格式。</span>
         </label>
         <label className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">签名密钥</span>
           <PasswordInput
             placeholder={
-              draft.webhook.secret === SECRET_MASK ? '已配置（留空保持不变）' : '可选，用于 X-HPC-Signature 校验'
+              draft.webhook.secret === SECRET_MASK ? '已配置（输入可替换，清除请用按钮）' : '可选，用于 X-HPC-Signature 校验'
             }
             value={draft.webhook.secret === SECRET_MASK ? '' : draft.webhook.secret}
             onChange={(e) => patch((d) => void (d.webhook.secret = e.target.value))}
           />
         </label>
+        {draft.webhook.secret && <div><Button type="button" variant="ghost" size="sm" onClick={() => patch((d) => void (d.webhook.secret = ''))}>清除Webhook 签名密钥</Button></div>}
 
         {/* 回调请求格式说明 */}
         <details className="rounded-md border border-line bg-canvas text-[13px]">
@@ -276,7 +283,7 @@ export function ForwardingSection() {
                   Content-Type: application/json
                 </code>
               </li>
-              <li>超时 10 秒；失败静默、不重试（通知尽力而为，不阻断收件）</li>
+              <li>超时 10 秒；自动通知失败会记录结果，Webhook 不自动重试，可在下方确认后手动重试（不阻断收件）</li>
             </ul>
             <p className="font-medium text-ink">请求体（JSON）：</p>
             <pre className="overflow-x-auto rounded-md bg-surface-active p-3 font-mono text-xs leading-relaxed text-ink">
@@ -299,9 +306,15 @@ export function ForwardingSection() {
         </details>
       </div>
 
+      {validationError && <p role="alert" className="text-sm text-critical">{validationError}</p>}
       <div className="flex items-center justify-end gap-3 border-t border-line pt-4">
         {dirty && <span className="text-xs text-ink-tertiary">有未保存的改动</span>}
-        <Button disabled={!dirty} loading={save.isPending} onClick={() => save.mutate(draft)}>
+        <Button disabled={!dirty} loading={save.isPending} onClick={() => {
+          const parsed = updateNotifyPrefsRequestSchema.safeParse(draft);
+          if (!parsed.success) { setValidationError(parsed.error.issues[0]?.message ?? '请检查配置'); return; }
+          setValidationError(null);
+          save.mutate(draft);
+        }}>
           保存
         </Button>
       </div>

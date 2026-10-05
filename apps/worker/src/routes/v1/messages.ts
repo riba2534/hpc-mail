@@ -60,8 +60,10 @@ app.post('/', async (c) => {
       req,
       attachments,
       origin,
+      idem.handle,
     );
-    await completeIdempotentSend(c.env, idem.handle, summary);
+    try { await completeIdempotentSend(c.env, idem.handle, summary); }
+    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
     return ok(c, summary, 201);
   } catch (error) {
     await failIdempotentSend(c.env, idem.handle, error);

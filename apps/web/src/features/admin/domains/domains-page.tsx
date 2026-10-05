@@ -9,12 +9,13 @@ import {
   RefreshCw,
   Trash2,
 } from 'lucide-react';
-import { type FormEvent, type ReactNode, useState } from 'react';
+import { type FormEvent, type ReactNode, useEffect, useState } from 'react';
 import { type DomainEntry, type DomainOnboardingStatus, domainSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -75,7 +76,7 @@ function StatusBadge({
     return (
       <Badge tone="positive">
         <CheckCircle2 className="size-3" />
-        已接入
+        MX 已就绪
       </Badge>
     );
   }
@@ -110,8 +111,10 @@ function DomainRow({
   onRemove,
 }: DomainRowProps) {
   const [limitDraft, setLimitDraft] = useState(String(entry.perUserLimit));
+  useEffect(() => setLimitDraft(String(entry.perUserLimit)), [entry.perUserLimit]);
 
   const commitLimit = () => {
+    if (busy) return;
     const parsed = Number.parseInt(limitDraft, 10);
     const next = Number.isNaN(parsed) ? entry.perUserLimit : Math.min(Math.max(parsed, 0), 10000);
     setLimitDraft(String(next));
@@ -137,7 +140,7 @@ function DomainRow({
           <IconButton size="sm" aria-label={`重新检测 ${entry.domain}`} disabled={isFetching} onClick={onRefetch}>
             <RefreshCw className={`size-4 text-ink-tertiary ${isFetching ? 'animate-spin' : ''}`} />
           </IconButton>
-          <IconButton size="sm" aria-label={`移除 ${entry.domain}`} onClick={() => onRemove(entry.domain)}>
+          <IconButton size="sm" aria-label={`移除 ${entry.domain}`} disabled={busy} onClick={() => onRemove(entry.domain)}>
             <Trash2 className="size-4 text-critical" />
           </IconButton>
         </div>
@@ -145,7 +148,7 @@ function DomainRow({
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[13px]">
         <label className="flex cursor-pointer items-center gap-2 text-ink-secondary">
-          <Switch checked={entry.public} disabled={busy} onCheckedChange={(v) => onTogglePublic(entry.domain, v)} />
+          <Switch aria-label={`${entry.domain} 公开给普通用户`} checked={entry.public} disabled={busy} onCheckedChange={(v) => onTogglePublic(entry.domain, v)} />
           <span>{entry.public ? '公开给普通用户' : '仅管理员可用'}</span>
         </label>
         <span className="text-xs text-ink-tertiary">关掉后不能再被新认领，已认领的人仍可收发</span>
@@ -175,7 +178,7 @@ function DomainRow({
 
 export function DomainsPage() {
   const queryClient = useQueryClient();
-  const { data: settings, isLoading } = useQuery({
+  const { data: settings, isLoading, isError, error: settingsError, refetch } = useQuery({
     queryKey: queryKeys.admin.settings,
     queryFn: () => adminApi.getSettings(),
   });
@@ -199,24 +202,36 @@ export function DomainsPage() {
   });
 
   const persist = useMutation({
-    mutationFn: (nextList: DomainEntry[]) => adminApi.updateSettings({ domains: { list: nextList } }),
+    mutationFn: (nextList: DomainEntry[]) => {
+      if (!settings || isError) throw new Error('请先加载完整域名配置');
+      return adminApi.updateSettings({ domains: { list: nextList }, expectedDomainsRevision: settings.domains.revision ?? 0 });
+    },
     onSuccess: (saved) => {
       queryClient.setQueryData(queryKeys.admin.settings, saved);
       // 可见性/公开域名变化会影响公开配置与「可见域名」两处
       void queryClient.invalidateQueries({ queryKey: queryKeys.config });
       void queryClient.invalidateQueries({ queryKey: queryKeys.domains });
     },
-    onError: (err) =>
-      toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' }),
+    onError: (err) => {
+      if (err instanceof ApiError && err.httpStatus === 409) {
+        void refetch();
+        toast({ title: '域名配置已被其他操作更新，正在重新加载，请重试', variant: 'error' });
+        return;
+      }
+      toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' });
+    },
   });
+  const canEdit = settings !== undefined && !isLoading && !isError && !persist.isPending;
 
   /** 局部更新某域名条目并落库 */
   const updateEntry = (domain: string, patch: Partial<DomainEntry>) => {
+    if (!canEdit) return;
     persist.mutate(list.map((e) => (e.domain === domain ? { ...e, ...patch } : e)));
   };
 
   const addDomain = (event: FormEvent) => {
     event.preventDefault();
+    if (!canEdit) return;
     const value = newDomain.trim().toLowerCase();
     const parsed = domainSchema.safeParse(value);
     if (!parsed.success) {
@@ -238,7 +253,7 @@ export function DomainsPage() {
   };
 
   const confirmRemove = () => {
-    if (!removing) return;
+    if (!removing || !canEdit) return;
     persist.mutate(
       list.filter((e) => e.domain !== removing),
       {
@@ -321,7 +336,7 @@ export function DomainsPage() {
         <div>
           <h2 className="text-sm font-semibold text-ink">本站域名</h2>
           <p className="mt-0.5 text-[13px] text-ink-secondary">
-            系统会自动检测每个域名的收件链路（MX 是否已指向 Cloudflare）。
+            系统只检测 MX 是否已指向 Cloudflare；请另外确认 Catch-all 指向本 Worker，并发送测试邮件验证完整链路。
             <b>公开</b>开关决定普通用户是否可见并认领该域名；<b>每人可认领</b>限制普通用户在该域名下的地址数（管理员不受限）。
           </p>
         </div>
@@ -329,6 +344,9 @@ export function DomainsPage() {
         <form onSubmit={addDomain} className="flex items-start gap-2">
           <div className="flex-1">
             <Input
+              aria-label="新增收件域名"
+              aria-describedby={error ? 'new-domain-error' : undefined}
+              disabled={!canEdit}
               placeholder="example.com"
               value={newDomain}
               invalid={error !== null}
@@ -337,9 +355,9 @@ export function DomainsPage() {
                 if (error) setError(null);
               }}
             />
-            {error && <p className="mt-1 text-xs text-critical">{error}</p>}
+            {error && <p id="new-domain-error" role="alert" className="mt-1 text-xs text-critical">{error}</p>}
           </div>
-          <Button type="submit" variant="secondary" loading={persist.isPending}>
+          <Button type="submit" variant="secondary" loading={persist.isPending} disabled={!canEdit}>
             <Plus className="size-4" />
             添加
           </Button>
@@ -347,6 +365,8 @@ export function DomainsPage() {
 
         {isLoading ? (
           <Skeleton className="h-24 w-full rounded-md" />
+        ) : isError ? (
+          <QueryErrorState error={settingsError} onRetry={() => void refetch()} />
         ) : list.length > 0 ? (
           <ul className="flex flex-col gap-2">
             {list.map((entry, i) => {
@@ -357,7 +377,7 @@ export function DomainsPage() {
                   entry={entry}
                   status={q?.data}
                   isFetching={q?.isFetching ?? false}
-                  busy={persist.isPending}
+                  busy={!canEdit}
                   onTogglePublic={(domain, next) => updateEntry(domain, { public: next })}
                   onSetLimit={(domain, next) => updateEntry(domain, { perUserLimit: next })}
                   onRefetch={() => q?.refetch()}
@@ -382,9 +402,9 @@ export function DomainsPage() {
         title="移除这个域名？"
         description={
           removing
-            ? `移除 ${removing} 后，该域名将不再用于地址认领、发件白名单与前端展示。${
+            ? `移除 ${removing} 后将停止新的地址认领。已有邮箱和历史邮件保留，已有邮箱仍可收发；关闭收件还需在 Cloudflare 停用 Catch-all。${
                 affected.length > 0
-                  ? `当前该域下有 ${affected.length} 个已认领地址，移除后这些用户将无法用该域发件（历史邮件仍保留、仍可收信直到 Cloudflare 侧关闭 catch-all）。`
+                  ? `当前已加载 ${affected.length} 个该域的认领地址。`
                   : '（当前该域下暂无已认领地址。）'
               }`
             : undefined

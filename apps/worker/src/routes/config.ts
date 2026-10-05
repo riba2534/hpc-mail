@@ -16,6 +16,8 @@ app.get('/', async (c) => {
     domains: await getPublicDomains(c.env, settings),
     require2fa: settings.security.require2fa,
   };
+  c.header('Cache-Control', 'no-store');
+  c.header('X-HPC-Build', c.env.build_sha ?? 'local');
   return ok(c, config);
 });
 

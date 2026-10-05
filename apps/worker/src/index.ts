@@ -56,7 +56,8 @@ export default {
     if (url.pathname.endsWith('.md')) {
       return withSecurityHeaders(res, { 'Content-Type': 'text/markdown; charset=utf-8' });
     }
-    return withSecurityHeaders(res);
+    const hashedAsset = /^\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\.(js|css|woff2?|png|svg|webp)$/.test(url.pathname);
+    return withSecurityHeaders(res, hashedAsset && res.ok ? { 'Cache-Control': 'public, max-age=31536000, immutable' } : { 'Cache-Control': 'no-cache' });
   },
 
   async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -64,6 +65,6 @@ export default {
   },
 
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
-    await runScheduled(env);
+    await runScheduled(env, _event.cron === '0 16 * * *');
   },
 };

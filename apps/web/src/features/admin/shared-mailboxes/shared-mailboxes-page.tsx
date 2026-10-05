@@ -3,7 +3,7 @@ import { Search, Share2, X } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { MailboxShareGrant } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
+import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
@@ -44,12 +44,21 @@ function ShareDialog({
 
   const candidates = useMemo(() => {
     const term = userQuery.trim().toLowerCase();
-    return (users.data ?? []).filter((user) => {
+    const list: Array<{ id: number; username: string; role: string; status: string }> = [...(users.data ?? [])];
+    const current = grants.find((item) => item.mailboxId === mailboxId);
+    for (const grantee of current?.grantees ?? []) {
+      if (!list.some((user) => user.id === grantee.userId)) {
+        list.push({ id: grantee.userId, username: grantee.username, role: 'user', status: 'disabled' });
+      }
+    }
+    return list.filter((user) => {
+      if (selected.includes(user.id)) return true;
       if (user.role !== 'user' || user.status !== 'active') return false;
       if (!term) return true;
       return user.username.toLowerCase().includes(term);
     });
-  }, [users.data, userQuery]);
+  }, [users.data, userQuery, grants, mailboxId, selected]);
+  const invalidSelected = candidates.some((user) => selected.includes(user.id) && (user.role !== 'user' || user.status !== 'active'));
 
   const save = useMutation({
     mutationFn: () => adminApi.replaceMailboxShares({ mailboxId: mailboxId!, userIds: selected }),
@@ -58,8 +67,7 @@ function ShareDialog({
         title: updated.grantees.length > 0 ? `已共享给 ${updated.grantees.length} 人` : '已清空共享',
         variant: 'success',
       });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.mailboxShares });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.shared });
+      invalidateMailboxOwnership(queryClient);
       onClose();
     },
     onError: (error) => toast({ title: errorText(error, '保存失败，请重试'), variant: 'error' }),
@@ -74,7 +82,7 @@ function ShareDialog({
       <DialogContent className="max-w-md">
         <DialogHeader
           title="分配共享"
-          description="被分享的用户能在自己的收件箱看到这只邮箱的来信。发信、删除和通知仍属于你。"
+          description="共享后用户立即可见该邮箱的全部历史来信和新来信，已读状态由共享者共用。撤销后失去访问权限；发信、删除和通知仍属于你。"
         />
         <DialogBody className="flex flex-col gap-3">
           <Select
@@ -98,6 +106,7 @@ function ShareDialog({
             </SelectContent>
           </Select>
           <Input
+            aria-label="搜索共享用户"
             value={userQuery}
             onChange={(event) => setUserQuery(event.target.value)}
             placeholder="搜索用户名"
@@ -105,6 +114,8 @@ function ShareDialog({
           <div className="max-h-64 overflow-y-auto rounded-md border border-line">
             {users.isLoading ? (
               <p className="px-3 py-4 text-sm text-ink-tertiary">正在加载用户…</p>
+            ) : users.isError ? (
+              <QueryErrorState error={users.error} onRetry={() => void users.refetch()} />
             ) : candidates.length === 0 ? (
               <p className="px-3 py-4 text-sm text-ink-tertiary">没有可共享的普通用户</p>
             ) : (
@@ -120,17 +131,19 @@ function ShareDialog({
                     onChange={() => toggle(user.id)}
                   />
                   <span className="text-ink">{user.username}</span>
+                  {(user.status !== 'active' || user.role !== 'user') && <span className="text-xs text-critical">已失效，请取消选择</span>}
                 </label>
               ))
             )}
           </div>
           <p className="text-xs text-ink-tertiary">已选 {selected.length} 人。保存后会替换这只邮箱当前的共享名单。</p>
+          {invalidSelected && <p role="alert" className="text-sm text-critical">请取消已失效的成员后再保存。</p>}
         </DialogBody>
         <DialogFooter>
           <Button type="button" variant="secondary" onClick={onClose}>
             取消
           </Button>
-          <Button loading={save.isPending} disabled={mailboxId === null} onClick={() => save.mutate()}>
+          <Button loading={save.isPending} disabled={mailboxId === null || !users.isSuccess || invalidSelected} onClick={() => save.mutate()}>
             保存
           </Button>
         </DialogFooter>
@@ -171,8 +184,7 @@ export function SharedMailboxesPage() {
       adminApi.revokeMailboxShare(target.mailboxId, target.userId),
     onSuccess: () => {
       toast({ title: '已取消共享', variant: 'success' });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.mailboxShares });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.shared });
+      invalidateMailboxOwnership(queryClient);
       setRevokeTarget(null);
     },
     onError: (error) => toast({ title: errorText(error, '取消失败，请重试'), variant: 'error' }),

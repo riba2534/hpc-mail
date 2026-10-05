@@ -83,6 +83,7 @@ ADDR="bot@hpc.email"
 LAST=$(curl -s "$BASE/api/messages?direction=inbound&address=$ADDR&limit=1" \
   -H "Authorization: Bearer $TOKEN" \
   | python3 -c "import json,sys;i=json.load(sys.stdin)['data']['items'];print(i[0]['id'] if i else 0)")
+export LAST
 # ……在此触发会产生验证码邮件的操作……
 for i in $(seq 1 20); do
   CODE=$(curl -s "$BASE/api/messages?direction=inbound&address=$ADDR&limit=10" \
@@ -104,9 +105,11 @@ done
 ## 任务：发送邮件
 
 ```bash
+SEND_KEY=$(python3 -c 'import uuid;print(uuid.uuid4())')
+# 若发送超时，保留 SEND_KEY，用完全相同请求重试。
 curl -s -X POST $BASE/api/messages/send \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -H "Idempotency-Key: $(python3 -c 'import uuid;print(uuid.uuid4())')" \
+  -H "Idempotency-Key: $SEND_KEY" \
   -d '{
     "from": { "localPart": "bot", "domain": "hpc.email" },
     "to": ["someone@example.com"],
@@ -118,16 +121,18 @@ curl -s -X POST $BASE/api/messages/send \
 - `from` 二选一：`{"localPart":"bot","domain":"hpc.email"}` 或 `{"mailboxId":5}`（用你认领的地址）。
 - 正文 `text`（纯文本）和 `html` 至少给一个；可选 `cc` / `bcc` 数组、`attachments`。
 - **附件结构**：`attachments` 是数组，每项 `{"filename":"a.pdf","contentType":"application/pdf","content":"<base64>"}`，`content` 为不含 `data:` 前缀的 base64（**允许换行**，`base64 file.pdf` / Python `base64.encodebytes()` 那种 76 字符折行的多行输出可直接用）；单次 ≤10 个、单文件 ≤50MB、合计 ≤50MB。
-- **外发大小限制**：发到本系统域名之外的邮箱（外部地址）走 Cloudflare 发信通道，单封邮件（含附件、base64 编码后）阈值 4MiB —— 因为 base64 会把体积撑大约 1/3，**原始附件超过约 3MB 就会走转链接**。未超阈值的附件直接内嵌发出；超出则附件自动转为 90 天有效的下载链接注入正文（收件人点链接下载），不会报错。注意该链接指向这封「已发送」邮件的附件，发件人若把这封邮件彻底删除，链接会提前失效。站内 `@<系统域名>` 地址走站内存储，附件内嵌、不受此限。
+- **外发大小限制**：发到本系统域名之外的邮箱（外部地址）走 Cloudflare 发信通道，单封邮件（含附件、base64 编码后）阈值 4MiB —— 因为 base64 会把体积撑大约 1/3，**原始附件超过约 3MB 就会走转链接**。未超阈值的附件直接内嵌发出；超出则附件自动转为 90 天有效的下载链接注入正文（收件人点链接下载），不会报错。系统独立保留外部下载链接的附件引用至有效期结束。站内 `@<系统域名>` 地址走站内存储，附件内嵌、不受此限。
 - 收件人若也是本站域名，即时站内投递；站外地址经 Cloudflare 发送到任意外部邮箱，个别收件人失败会在 `errorDetail` 里注明。
 - **自动化发送务必带唯一 `Idempotency-Key`**。网络超时后使用原 key 重试，已完成请求会重放原结果；相同 key 不能用于不同正文。
-- **判断是否真的发出去了**：成功响应的 `data` 是一封 outbound 邮件，看它的 `status` 与 `errorDetail`——`status:"failed"` 表示全部失败（此时 HTTP 也是错误码）；`status:"sent"` 但 `errorDetail` 非空表示**部分收件人失败**（`errorDetail` 里列出失败地址与原因），别把它当作全部送达。
+- **判断投递结果**：成功响应的 `data` 是一封 outbound 邮件，检查 `status`、`errorDetail` 和 `recipientOutcomes`。`status:"failed"` 表示全部目标失败；`errorDetail` 非空时查看逐个目标的失败原因。`sent` 仅表示已提交外部发送，`delivered` 表示站内已落库。补发时只选择 `recipientOutcomes` 中 `status:"failed"` 的地址，并保留它们原来的 To/Cc/Bcc 分组，避免再次发送给成功目标；仅 Cc/Bcc 时 To 可为空。用新的 `Idempotency-Key`，附件可引用 `forwardAttachmentsFrom:原outbound邮件id`，不要重复使用已消费的上传 token。
 
 ## 任务：回复邮件
 
-回复的要点是带上 `replyToMessageId`（原邮件 id），系统会自动注入邮件线程头（In-Reply-To / References），让回复正确挂到原对话上。把 `to` 设为原发件人、主题加 `Re:`：
+回复的要点是带上 `replyToMessageId`（原邮件 id），系统会自动注入邮件线程头（In-Reply-To / References），让回复正确挂到原对话上。详情有非空 `replyTo` 数组时优先使用它，否则使用原发件人；主题加 `Re:`：
 
 ```bash
+SEND_KEY=$(python3 -c 'import uuid;print(uuid.uuid4())')
+# 若发送超时，保留 SEND_KEY，用完全相同请求重试。
 curl -s -X POST $BASE/api/messages/send \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{
@@ -171,6 +176,8 @@ curl -s -X POST $BASE/api/messages/delete -H "Authorization: Bearer $TOKEN" -H '
 ```
 
 已读是这封邮件上的一份状态：共享邮箱里，你标已读，认领它的管理员也会看到已读。删除、恢复和彻底删除只作用于你自己认领的地址，对共享地址无效。
+
+read/star/restore/purge 的 `data.changed` 是实际变更数，delete 的 `data.deleted` 是实际软删数，不要用请求 ids 数量当作成功数。删除先进入 7 天回收站，`POST /api/messages/restore` 可恢复；`POST /api/messages/purge` 才会永久删除。
 
 **管理员注意**：这三个批量接口默认只作用于**你自己认领的地址**下的邮件（防止漏传参数误改他人邮件）。标已读还会带上共享给你的收件。
 清理未认领地址的信时显式加 `"scope":"unclaimed"`（或 query `?scope=unclaimed`），例如 `{"ids":[123],"isRead":true,"scope":"unclaimed"}`。
@@ -274,3 +281,5 @@ curl -s "$BASE/v1/messages/wait?address=$ADDR&afterId=$LAST&timeout=25" \
 ---
 
 **一句话流程**：登录拿 token → 认领地址，或使用管理员共享给你的地址 → `GET /api/messages` 收信读 `verificationCode` → 用自己认领的地址 `POST /api/messages/send` 发信/回复。
+
+脚本 HTTP 客户端应设置明确的 `User-Agent`（例如 `HPC-Mail-Agent/1.0`）。Cloudflare 的浏览器完整性检查可能在应用鉴权之前拒绝默认 Python urllib 的 User-Agent；收到 HTML 403 时，先检查响应来源和客户端 User-Agent。

@@ -58,6 +58,24 @@ step "admin 设置可读且密文脱敏"
 settings=$(curl -sS "$BASE_URL/api/admin/settings" -H "Authorization: Bearer $TOKEN")
 echo "$settings" | jq -e '.data.register_mode' >/dev/null || fail "settings 结构异常: $settings"
 
+step "邮箱与共享邮箱列表可读"
+for endpoint in mailboxes mailboxes/shared admin/mailbox-shares; do
+  curl -fsS "$BASE_URL/api/$endpoint" -H "Authorization: Bearer $TOKEN" | jq -e '.data | type == "array"' >/dev/null || fail "$endpoint 结构异常"
+done
+
+step "通知状态和转发配额可读"
+curl -fsS "$BASE_URL/api/me/notify-prefs/health" -H "Authorization: Bearer $TOKEN" | jq -e '.data | (.channels | type == "array") and (.forward.targets | type == "array")' >/dev/null || fail "通知状态结构异常"
+
+step "最近邮件详情与线程可读"
+message_id=$(echo "$list" | jq -r '.data.items[0].id // empty')
+if [ -n "$message_id" ]; then
+  curl -fsS "$BASE_URL/api/messages/$message_id" -H "Authorization: Bearer $TOKEN" | jq -e '.data | (.bodyText | type == "string") and (.attachments | type == "array") and (.replyTo | type == "array")' >/dev/null || fail "邮件详情结构异常"
+  curl -fsS "$BASE_URL/api/messages/$message_id/thread" -H "Authorization: Bearer $TOKEN" | jq -e '.data | type == "array"' >/dev/null || fail "邮件线程结构异常"
+fi
+
+step "OpenAPI 可读"
+curl -fsS "$BASE_URL/v1/openapi.json" | jq -e '.openapi == "3.1.0"' >/dev/null || fail "OpenAPI 结构异常"
+
 step "注册模式=closed 时注册被拒"
 if [ "$mode" = "closed" ]; then
   rcode=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/api/auth/register" \

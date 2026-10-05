@@ -103,11 +103,14 @@ jobs:
         env:
           D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
           CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
+          BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           sed -i \
             -e "s/__D1_DATABASE_ID__/${D1_DATABASE_ID}/" \
             -e "s/__KV_NAMESPACE_ID__/${KV_NAMESPACE_ID}/" \
+            -e "s|site_origin = \"https://hpc.email\"|site_origin = \"https://${CUSTOM_DOMAIN}\"|" \
+            -e "s|build_sha = \"local\"|build_sha = \"${BUILD_SHA}\"|" \
             -e "s|^workers_dev = true$|workers_dev = false\nroutes = [ { pattern = \"${CUSTOM_DOMAIN}\", custom_domain = true } ]|" \
             wrangler.toml
           grep -qE '__[A-Z0-9_]+__' wrangler.toml && { echo '::error::wrangler.toml 仍有未注入占位符'; exit 1; } || true
@@ -191,11 +194,12 @@ jobs:
 
       - name: 等待新版本全球生效
         env:
+          BUILD_SHA: ${{ github.sha }}
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
         run: |
           set -euo pipefail
           for i in $(seq 1 24); do
-            if curl -sS "$BASE_URL/api/config" | jq -e '.data.registrationMode' >/dev/null 2>&1; then
+            if curl -sS -D /tmp/hpc-config.headers "$BASE_URL/api/config" | jq -e '.data.registrationMode' >/dev/null 2>&1 && tr -d '\r' < /tmp/hpc-config.headers | grep -qi "^x-hpc-build: $BUILD_SHA$"; then
               echo "新版本已生效（第 $i 次探测）"
               exit 0
             fi

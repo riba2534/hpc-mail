@@ -109,7 +109,11 @@ export function SettingsPage() {
     });
 
   const save = useMutation({
-    mutationFn: (payload: Settings) => adminApi.updateSettings(payload),
+    mutationFn: (payload: Settings) => {
+      // Domain edits have their own revision check on the domain page; never resubmit a stale copy here.
+      const { domains: _domains, ...settings } = payload;
+      return adminApi.updateSettings(settings);
+    },
     onSuccess: (saved) => {
       queryClient.setQueryData(queryKeys.admin.settings, saved);
       setDraft(structuredClone(saved));
@@ -202,6 +206,9 @@ export function SettingsPage() {
           title="邮件保留策略"
           description="catch-all 会收下发往任意地址的邮件，需定期清理防止无限膨胀撑爆存储。0 表示不清理。"
         >
+          {(draft.retention.unclaimedDays === 0 || draft.retention.allMessagesDays === 0) && <p className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
+            当前至少一项保留策略为 0，邮件可能持续累积。请定期检查 Cloudflare D1 和 R2 的用量；设置非零天数后会永久清理到期邮件，请按需要决定。
+          </p>}
           <NumberRow
             label="未认领地址邮件保留"
             description="发往无人认领地址的邮件（垃圾邮件主要来源）超期自动删除。建议 90 天。"

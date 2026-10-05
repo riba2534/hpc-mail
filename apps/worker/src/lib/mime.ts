@@ -12,7 +12,7 @@ export function foldBase64(b64: string): string {
   return parts.join('\r\n');
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) {
@@ -32,6 +32,58 @@ function bytesToBase64(bytes: Uint8Array): string {
  */
 export function encodeBodyBase64(s: string): string {
   return foldBase64(bytesToBase64(new TextEncoder().encode(s)));
+}
+
+/** RFC 2047 encoded-word 不超过 75 字符，且每段都包含完整 UTF-8 字符。 */
+function encodeHeaderWords(value: string): string {
+  const encoder = new TextEncoder();
+  const words: string[] = [];
+  let part = '';
+  let size = 0;
+  for (const character of value) {
+    const bytes = encoder.encode(character).length;
+    if (size + bytes > 42 && part) {
+      words.push(`=?utf-8?B?${bytesToBase64(encoder.encode(part))}?=`);
+      part = '';
+      size = 0;
+    }
+    part += character;
+    size += bytes;
+  }
+  if (part) words.push(`=?utf-8?B?${bytesToBase64(encoder.encode(part))}?=`);
+  return words.join(' ');
+}
+
+/** mimetext 不折行 Subject/References；发送前统一修复顶层头，不改 MIME 正文。 */
+export function foldMimeHeaders(raw: string): string {
+  const boundary = raw.indexOf('\r\n\r\n');
+  if (boundary < 0) return raw;
+  const headers = raw.slice(0, boundary).replace(/\r\n[ \t]+/g, ' ');
+  const folded = headers.split('\r\n').map((header) => {
+    const colon = header.indexOf(':');
+    if (colon < 0) return header;
+    const name = header.slice(0, colon + 1);
+    const value = header.slice(colon + 1).trim().replace(
+      /=\?utf-8\?B\?([A-Za-z0-9+/=]+)\?=/gi,
+      (_word, encoded: string) => encodeHeaderWords(
+        new TextDecoder().decode(Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0))),
+      ),
+    );
+    const lines: string[] = [];
+    let line = name;
+    for (const token of value.split(/[ \t]+/)) {
+      if (new TextEncoder().encode(token).length > 997) throw new Error('邮件头字段过长');
+      if (new TextEncoder().encode(`${line} ${token}`).length > 78) {
+        lines.push(line);
+        line = ` ${token}`;
+      } else {
+        line += ` ${token}`;
+      }
+    }
+    lines.push(line);
+    return lines.join('\r\n');
+  }).join('\r\n');
+  return folded + raw.slice(boundary);
 }
 
 /** 清洗后为空时的兜底文件名 */

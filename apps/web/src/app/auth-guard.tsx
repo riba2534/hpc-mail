@@ -58,7 +58,7 @@ export function AuthGuard() {
 
   return (
     <CurrentUserContext.Provider value={user}>
-      <AppShell />
+      <AppShell key={token} />
     </CurrentUserContext.Provider>
   );
 }

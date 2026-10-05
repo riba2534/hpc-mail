@@ -3,21 +3,19 @@ import { and, eq, inArray, isNotNull, lt, notInArray, type SQL } from 'drizzle-o
 import { createDb } from '../db/client.js';
 import {
   apiRateLimits,
-  apiRequestLogs,
-  adminAuditLogs,
-  attachments as attachmentsTable,
   draftAttachments,
   idempotencyRecords,
   mailboxes,
   messages,
   sessions,
-  stars,
 } from '../db/schema.js';
-import { chunk, D1_ID_BATCH } from '../lib/d1.js';
+import { chunk } from '../lib/d1.js';
 import type { Env } from '../types.js';
 import { dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
-import { deleteMessageObjects } from './storage.js';
+import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
+import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
+import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -25,30 +23,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const TRASH_RETENTION_DAYS = 7;
 /** 单次清理批量上限，防止单次 cron 运行过久（下一次继续清剩余） */
 const RETENTION_BATCH = 1000;
-/** 单次 cron 最多清几批审计日志（每批 D1_ID_BATCH 行） */
-const LOG_PURGE_BATCHES = 20;
 const RETENTION_MAX_BATCHES = 10;
 
 /** 按 where 条件删除邮件（D1 行 + R2 对象：正文/附件/原始 .eml），返回删除条数；限批量 */
 async function purgeMessagesWhere(env: Env, cond: SQL): Promise<number> {
-  const db = createDb(env);
-  const targets = await db
-    .select({ id: messages.id, bodyR2Key: messages.bodyR2Key, rawR2Key: messages.rawR2Key })
-    .from(messages)
-    .where(cond)
-    .limit(RETENTION_BATCH)
-    .all();
-  if (targets.length === 0) return 0;
-  const ids = targets.map((t) => t.id);
-  await deleteMessageObjects(env, db, targets);
-  // 分批：D1 单条查询最多 100 个绑定参数。RETENTION_BATCH=1000 时整条语句会被 D1 拒绝，
-  // 而 runScheduled 的 try/catch 只打日志——结果是待清理一旦超过 100 封，清理永久卡死、一封删不掉
-  for (const batch of chunk(ids)) {
-    await db.delete(attachmentsTable).where(inArray(attachmentsTable.messageId, batch));
-    await db.delete(stars).where(inArray(stars.messageId, batch));
-    await db.delete(messages).where(inArray(messages.id, batch));
-  }
-  return ids.length;
+  return purgeMatchingMessages(env, cond, RETENTION_BATCH);
 }
 
 /** 邮件保留清理：未认领地址 + 全局上限；各自独立 try/catch 互不影响 */
@@ -113,62 +92,56 @@ async function runDraftAttachmentCleanup(env: Env): Promise<void> {
     .limit(RETENTION_BATCH)
     .all();
   if (stale.length === 0) return;
+  const cleaned: number[] = [];
   for (const s of stale) {
     if (s.uploadId && s.status === 'uploading') {
       try {
         await env.r2.resumeMultipartUpload(s.r2Key, s.uploadId).abort();
+        cleaned.push(s.id);
       } catch (e) {
         console.error('清理：abort multipart 失败:', e);
       }
     } else {
       try {
         await env.r2.delete(s.r2Key);
+        cleaned.push(s.id);
       } catch (e) {
         console.error('清理：删草稿 R2 失败:', e);
       }
     }
   }
-  for (const batch of chunk(stale.map((s) => s.id))) {
+  for (const batch of chunk(cleaned)) {
     await db.delete(draftAttachments).where(inArray(draftAttachments.id, batch));
   }
-  console.log(`草稿附件清理：删除 ${stale.length} 个过期草稿`);
+  console.log(`草稿附件清理：删除 ${cleaned.length} 个过期草稿`);
 }
 
 /** 每日清理：审计日志 90 天 + 过期限流窗口 + 邮件保留策略 */
-export async function runScheduled(env: Env): Promise<void> {
+export async function runScheduled(env: Env, maintenance = true): Promise<void> {
+  try { await repairUnqueuedNotifications(env); await processNotificationJobs(env); } catch (error) { console.error('通知任务处理失败:', error); }
+  try {
+    // Recover a metadata purge interrupted between reservation and transaction completion.
+    const tokens = await env.db.prepare('SELECT DISTINCT purge_token AS token FROM messages WHERE purge_token IS NOT NULL LIMIT 20').all<{ token: string }>();
+    for (const row of tokens.results) await env.db.batch(purgeStatements(env, row.token));
+    await expireDeliveryObjectLeases(env);
+    await expireExternalAttachmentLinks(env);
+    await processStorageCleanup(env, 100);
+  } catch (error) { console.error('持久化清理任务失败:', error); }
+  if (!maintenance) return;
+  await cleanupNotificationJobs(env);
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
   const staleWindow = Math.floor(Date.now() / 60000) - 120;
 
-  try {
-    // 限批：无界 DELETE 在积压到几十万行时会超 D1 单语句执行上限，失败又被 catch 吞掉，
-    // 越滚越大；分批删到本次上限为止，剩下的下次继续
-    for (let i = 0; i < LOG_PURGE_BATCHES; i++) {
-      const stale = await db
-        .select({ id: apiRequestLogs.id })
-        .from(apiRequestLogs)
-        .where(lt(apiRequestLogs.createdAt, cutoff))
-        .limit(D1_ID_BATCH)
-        .all();
-      if (stale.length === 0) break;
-      await db.delete(apiRequestLogs).where(inArray(apiRequestLogs.id, stale.map((r) => r.id)));
-    }
-  } catch (e) {
-    console.error('审计日志清理失败:', e);
-  }
-  try {
-    for (let i = 0; i < LOG_PURGE_BATCHES; i++) {
-      const stale = await db
-        .select({ id: adminAuditLogs.id })
-        .from(adminAuditLogs)
-        .where(lt(adminAuditLogs.createdAt, cutoff))
-        .limit(D1_ID_BATCH)
-        .all();
-      if (stale.length === 0) break;
-      await db.delete(adminAuditLogs).where(inArray(adminAuditLogs.id, stale.map((row) => row.id)));
-    }
-  } catch (e) {
-    console.error('管理员审计日志清理失败:', e);
+  for (const table of ['api_request_logs', 'admin_audit_logs']) {
+    try {
+      const deadline = Date.now() + 5000;
+      for (let i = 0; i < 300 && Date.now() < deadline; i++) {
+        const result = await env.db.prepare(`DELETE FROM ${table} WHERE id IN
+          (SELECT id FROM ${table} WHERE created_at < ? LIMIT 1000)`).bind(cutoff.getTime()).run();
+        if ((result.meta.changes ?? 0) < 1000) break;
+      }
+    } catch (error) { console.error(`${table} 清理失败:`, error); }
   }
   try {
     await db.delete(apiRateLimits).where(lt(apiRateLimits.windowStart, staleWindow));
@@ -179,7 +152,7 @@ export async function runScheduled(env: Env): Promise<void> {
     await db.delete(sessions).where(lt(sessions.expiresAt, new Date()));
     await db
       .delete(idempotencyRecords)
-      .where(lt(idempotencyRecords.createdAt, new Date(Date.now() - 2 * DAY_MS)));
+      .where(and(lt(idempotencyRecords.createdAt, new Date(Date.now() - 2 * DAY_MS)), eq(idempotencyRecords.status, 'completed')));
   } catch (e) {
     console.error('会话/幂等记录清理失败:', e);
   }

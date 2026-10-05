@@ -13,6 +13,7 @@ import { stripDataUrlPrefix } from '@/lib/data-url';
 import { useCurrentUser } from '@/lib/use-session';
 import { ForwardingSection } from './forwarding-section';
 import { TwoFactorSection } from './two-factor-section';
+import { NotificationHealthPanel } from './notification-health';
 
 const ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const;
 type AllowedType = (typeof ALLOWED_TYPES)[number];
@@ -144,6 +145,7 @@ export function ProfilePage() {
         <TwoFactorSection />
 
         <ForwardingSection />
+        <NotificationHealthPanel />
       </div>
 
       <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />

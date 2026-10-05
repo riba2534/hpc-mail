@@ -60,6 +60,9 @@ export function xhrSend<T>(opts: XhrSendOptions): Promise<T> {
         payload = undefined;
       }
       if (xhr.status >= 200 && xhr.status < 300) {
+        if (token && token !== getAuthToken()) {
+          return reject(new ApiError('登录账户已变化，请重新上传', { code: 'session_changed' }));
+        }
         if (xhr.status === 204) return resolve(undefined as T);
         if (payload && typeof payload === 'object' && 'data' in payload) {
           return resolve(payload.data);
@@ -75,7 +78,7 @@ export function xhrSend<T>(opts: XhrSendOptions): Promise<T> {
         httpStatus: xhr.status,
         requestId: payload?.requestId,
       });
-      if (err.unauthorized) clearAuthToken();
+      if (err.unauthorized && token && token === getAuthToken()) clearAuthToken();
       reject(err);
     };
     xhr.onerror = () => reject(new ApiError('网络请求失败', { code: 'network' }));
@@ -83,7 +86,10 @@ export function xhrSend<T>(opts: XhrSendOptions): Promise<T> {
     xhr.onabort = () => reject(new ApiError('上传已取消', { code: 'timeout' }));
 
     if (opts.signal) {
-      if (opts.signal.aborted) xhr.abort();
+      if (opts.signal.aborted) {
+        reject(new ApiError('上传已取消', { code: 'timeout' }));
+        return;
+      }
       else opts.signal.addEventListener('abort', () => xhr.abort(), { once: true });
     }
 

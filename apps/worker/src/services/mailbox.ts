@@ -1,13 +1,13 @@
 import type { ClaimMailboxRequest, Mailbox, MailboxAvailability, Role } from '@hpc-mail/shared';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, stars, users } from '../db/schema.js';
-import { chunk } from '../lib/d1.js';
+import { mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 import { domainPerUserLimit, getDomains, isDomainPublic } from './domain.js';
-import { getSettings } from './setting.js';
-import { deleteMessageObjects } from './storage.js';
+import { getSettingsFresh } from './setting.js';
+import { purgeStatements } from './message-lifecycle.js';
+import { processStorageCleanup } from './storage-cleanup.js';
 import { getActiveAdminIds } from './user.js';
 
 type MailboxRow = typeof mailboxes.$inferSelect;
@@ -57,7 +57,7 @@ export async function claimMailbox(
   role: Role,
   req: ClaimMailboxRequest,
 ): Promise<Mailbox> {
-  const settings = await getSettings(env);
+  const settings = await getSettingsFresh(env);
   const domains = await getDomains(env, settings);
   if (!domains.includes(req.domain)) {
     throw new AppError('validation_failed', '域名不在系统域名列表内');
@@ -108,21 +108,19 @@ export async function claimMailbox(
   const existing = await db.select().from(mailboxes).where(eq(mailboxes.address, address)).get();
   if (existing) throw new AppError('address_taken', '该地址已被占用');
   try {
-    if (role === 'admin') {
-      const [row] = await db
-        .insert(mailboxes)
-        .values({ address, domain: req.domain, userId, displayName: '' })
-        .returning();
-      return serialize(row!, 0);
-    }
-
-    // COUNT 与 INSERT 合并为一条 SQLite 写语句，避免并发认领同时越过配额检查。
+    // Domain revision and quotas are checked in the same write as INSERT. A
+    // concurrent domain removal/private toggle must not create a stale claim.
     const inserted = await env.db
       .prepare(
         `INSERT INTO mailboxes (address, domain, user_id, display_name)
          SELECT ?, ?, ?, ''
          WHERE (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ?) < ?)
            AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
+           AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ?
+           AND EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
+             WHERE settings.key = 'domains'
+               AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
+                 ELSE json_extract(configured.value, '$.domain') END)) = ?)
          RETURNING id`,
       )
       .bind(
@@ -136,38 +134,28 @@ export async function claimMailbox(
         userId,
         req.domain,
         perDomainLimit,
+        settings.domains.revision ?? 0,
+        req.domain,
       )
       .first<{ id: number }>();
     if (!inserted) {
+      const current = await getSettingsFresh(env);
+      if ((current.domains.revision ?? 0) !== (settings.domains.revision ?? 0)) {
+        throw new AppError('conflict', '域名配置已改变，请刷新后重试');
+      }
       throw new AppError('forbidden', '认领配额已在并发请求中用尽，请刷新后重试');
     }
     const row = await db.select().from(mailboxes).where(eq(mailboxes.id, inserted.id)).get();
     if (!row) throw new AppError('internal', '地址认领失败');
-    return serialize(row, 0);
+    const count = await db.select({ value: sql<number>`COUNT(*)` }).from(messages).where(eq(messages.address, address)).get();
+    return serialize(row, Number(count?.value ?? 0));
   } catch (error) {
     if (error instanceof AppError) throw error;
-    throw new AppError('address_taken', '该地址已被占用');
+    if (error instanceof Error && error.message.includes('UNIQUE constraint failed: mailboxes.address')) {
+      throw new AppError('address_taken', '该地址已被占用');
+    }
+    throw error;
   }
-}
-
-/** 删除某地址名下的全部邮件（D1 行 + R2 对象）——释放地址时可选调用 */
-async function purgeAddressMessages(env: Env, address: string): Promise<number> {
-  const db = createDb(env);
-  const targets = await db
-    .select({ id: messages.id, bodyR2Key: messages.bodyR2Key, rawR2Key: messages.rawR2Key })
-    .from(messages)
-    .where(eq(messages.address, address))
-    .all();
-  if (targets.length === 0) return 0;
-  const ids = targets.map((t) => t.id);
-  await deleteMessageObjects(env, db, targets);
-  // 分批：D1 单条查询最多 100 个绑定参数，地址下邮件多时整条语句会被拒
-  for (const batch of chunk(ids)) {
-    await db.delete(attachmentsTable).where(inArray(attachmentsTable.messageId, batch));
-    await db.delete(stars).where(inArray(stars.messageId, batch));
-    await db.delete(messages).where(inArray(messages.id, batch));
-  }
-  return ids.length;
 }
 
 export async function updateMailbox(
@@ -203,14 +191,20 @@ export async function releaseMailbox(
   const db = createDb(env);
   const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
   if (!row || (!isAdmin && row.userId !== userId)) throw new AppError('not_found', '邮箱不存在');
-  // 先删邮件再释放地址：反过来的话，删除中途失败会留下「地址已回到未认领态、历史邮件还在」
-  // 的状态，下一个认领者就能读到前任的验证码/账单——正是 deleteHistory 要堵的路径
-  let deletedMessages = 0;
+  const token = crypto.randomUUID();
+  const statements: D1PreparedStatement[] = [];
   if (deleteHistory) {
-    deletedMessages = await purgeAddressMessages(env, row.address);
+    statements.push(env.db.prepare(`UPDATE messages SET purge_token = ? WHERE address = ?
+      AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`)
+      .bind(token, row.address, row.id, row.userId));
+    statements.push(...purgeStatements(env, token));
   }
-  await db.delete(mailboxShares).where(eq(mailboxShares.mailboxId, row.id));
-  await db.delete(mailboxes).where(eq(mailboxes.id, id));
+  statements.push(env.db.prepare('DELETE FROM mailbox_shares WHERE mailbox_id = ?').bind(row.id));
+  statements.push(env.db.prepare('DELETE FROM mailboxes WHERE id = ? AND user_id = ?').bind(row.id, row.userId));
+  // One D1 transaction includes every message present at release, including concurrent inbound.
+  const result = await env.db.batch(statements);
+  const deletedMessages = deleteHistory ? (result[4]?.meta.changes ?? 0) : 0;
+  if (deleteHistory) await processStorageCleanup(env, 100);
   return { deletedMessages };
 }
 
@@ -220,7 +214,7 @@ export async function checkAvailability(
   domain: string,
 ): Promise<MailboxAvailability> {
   const address = `${localPart}@${domain}`;
-  const domains = await getDomains(env);
+  const domains = await getDomains(env, await getSettingsFresh(env));
   if (!domains.includes(domain)) return { address, available: false };
   const db = createDb(env);
   const existing = await db.select().from(mailboxes).where(eq(mailboxes.address, address)).get();

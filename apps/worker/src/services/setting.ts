@@ -5,6 +5,7 @@ import {
   type Settings,
   type UpdateSettingsRequest,
 } from '@hpc-mail/shared';
+import { AppError } from '../lib/errors.js';
 import { createDb } from '../db/client.js';
 import { settings as settingsTable } from '../db/schema.js';
 import type { Env } from '../types.js';
@@ -13,7 +14,7 @@ const CACHE_KEY = 'setting-cache';
 const CACHE_TTL_SECONDS = 60;
 
 /** 从 D1 读全部设置并与默认值合并（逐 key safeParse，非法回落默认） */
-async function loadFromDb(env: Env): Promise<Settings> {
+export async function getSettingsFresh(env: Env): Promise<Settings> {
   const db = createDb(env);
   const rows = await db.select().from(settingsTable).all();
   const stored = new Map(rows.map((r) => [r.key, r.value]));
@@ -42,7 +43,7 @@ export async function getSettings(env: Env): Promise<Settings> {
     // 缓存读失败，继续直读 DB
   }
   try {
-    const fresh = await loadFromDb(env);
+    const fresh = await getSettingsFresh(env);
     try {
       await env.kv.put(CACHE_KEY, JSON.stringify(fresh), { expirationTtl: CACHE_TTL_SECONDS });
     } catch {
@@ -67,18 +68,25 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest): Pr
   const db = createDb(env);
   const writes: { key: string; value: string }[] = [];
 
-  for (const key of Object.keys(patch) as SettingKey[]) {
+  for (const key of Object.keys(SETTING_SCHEMAS) as SettingKey[]) {
     const incoming = patch[key];
     if (incoming === undefined) continue;
     const parsed = SETTING_SCHEMAS[key].safeParse(incoming);
-    if (!parsed.success) continue;
-    writes.push({ key, value: JSON.stringify(parsed.data) });
+    if (!parsed.success) throw new AppError('validation_failed', '配置格式非法');
+    if (key === 'domains') {
+      const current = await getSettingsFresh(env);
+      const expected = patch.expectedDomainsRevision ?? current.domains.revision ?? 0;
+      const value = JSON.stringify({ ...parsed.data as object, revision: expected + 1 });
+      const result = await env.db.prepare(`INSERT INTO settings (key, value)
+        SELECT 'domains', ? WHERE ? = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ? RETURNING key`)
+        .bind(value, expected, expected).first();
+      if (!result) throw new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
+    } else writes.push({ key, value: JSON.stringify(parsed.data) });
   }
-
   for (const w of writes) {
-    await db
-      .insert(settingsTable)
-      .values(w)
+    await db.insert(settingsTable).values(w)
       .onConflictDoUpdate({ target: settingsTable.key, set: { value: w.value } });
   }
   await invalidateSettingsCache(env);

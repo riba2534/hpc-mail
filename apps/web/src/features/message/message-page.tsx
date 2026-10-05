@@ -30,8 +30,12 @@ import { getAuthToken } from '@/lib/auth-token';
 import { extractOtp } from '@/lib/otp';
 import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
+import { useCurrentUser } from '@/lib/use-session';
+import { QueryErrorState } from '@/components/query-error-state';
+import { ApiError } from '@/api/errors';
 
 export function MessagePage() {
+  const currentUser = useCurrentUser();
   const { id } = useParams();
   const messageId = Number(id);
   const [searchParams] = useSearchParams();
@@ -46,30 +50,30 @@ export function MessagePage() {
   const auditUser = scope === 'user';
   const mutationScope = scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [showRemoteImages, setShowRemoteImages] = useState(false);
-  const markedRef = useRef(false);
+  const [imagesAllowedFor, setImagesAllowedFor] = useState<number | null>(null);
+  const markedRef = useRef<number | null>(null);
 
   const { data: sharedMailboxes, isPending: sharedPending } = useSharedMailboxesQuery();
-  const { data: message, isLoading, isError } = useQuery({
+  const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
     queryKey: queryKeys.messages.detail(messageId, view),
-    queryFn: () => messageApi.detail(messageId, view),
-    enabled: Number.isFinite(messageId),
+    queryFn: ({ signal }) => messageApi.detail(messageId, view, signal),
+    enabled: Number.isInteger(messageId) && messageId > 0,
   });
 
   const star = useStarMutation(view);
 
   const { data: threadData } = useQuery({
     queryKey: ['messages', 'thread', messageId, view],
-    queryFn: () => messageApi.thread(messageId, view),
-    enabled: Number.isFinite(messageId),
+    queryFn: ({ signal }) => messageApi.thread(messageId, view, signal),
+    enabled: Number.isInteger(messageId) && messageId > 0,
   });
   const thread = threadData?.items ?? [];
 
   const markRead = useMutation({
-    mutationFn: (isRead: boolean) => messageApi.markRead([messageId], isRead, mutationScope),
-    onSuccess: (_data, isRead) => {
-      queryClient.setQueryData<MessageDetail>(queryKeys.messages.detail(messageId, view), (prev) =>
-        prev ? { ...prev, isRead } : prev,
+    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope; view: typeof view }) => messageApi.markRead([args.id], args.isRead, args.scope),
+    onSuccess: (result, { id, isRead, view: targetView }) => {
+      queryClient.setQueryData<MessageDetail>(queryKeys.messages.detail(id, targetView), (prev) =>
+        prev && result.changed > 0 ? { ...prev, isRead } : prev,
       );
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
     },
@@ -77,18 +81,17 @@ export function MessagePage() {
 
   useEffect(() => {
     if (auditUser) return;
-    if (message && !message.isRead && !markedRef.current) {
-      markedRef.current = true;
-      markRead.mutate(true);
+    if (message && !message.isRead && markedRef.current !== message.id) {
+      markedRef.current = message.id;
+      markRead.mutate({ id: message.id, isRead: true, scope: mutationScope, view });
     }
     // 只在消息首次加载为未读时触发一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [message?.id, message?.isRead, auditUser]);
 
-  // 该发件人此前被信任过 → 自动显示其远程图片
-  useEffect(() => {
-    if (message && isTrustedSender(message.fromAddress)) setShowRemoteImages(true);
-  }, [message?.id, message?.fromAddress]);
+  // Permission is bound to the current message, so the next mail cannot render a remote image even for one frame.
+  const showRemoteImages = Boolean(message && (imagesAllowedFor === message.id || isTrustedSender(message.fromAddress, currentUser.id)));
+  useEffect(() => setConfirmDelete(false), [messageId]);
 
   // 直链/新标签页打开时无历史可退，回退到收件箱而非停在已 404 的详情
   const goBack = () => {
@@ -111,7 +114,7 @@ export function MessagePage() {
   });
 
   const handleMarkUnread = () => {
-    markRead.mutate(false);
+    markRead.mutate({ id: messageId, isRead: false, scope: mutationScope, view });
     goBack();
   };
 
@@ -149,6 +152,9 @@ export function MessagePage() {
   }
 
   if (isError || !message) {
+    if (isError && !(detailError instanceof ApiError && (detailError.httpStatus === 404 || detailError.httpStatus === 403))) {
+      return <QueryErrorState error={detailError} onRetry={() => void refetch()} />;
+    }
     return (
       <div className="mx-auto max-w-3xl">
         <EmptyState
@@ -175,6 +181,7 @@ export function MessagePage() {
   const recipients = [...message.recipients.to, ...message.recipients.cc];
   const remoteImageCount = message.bodyHtml ? countRemoteImages(message.bodyHtml) : 0;
   const sendIssue = outbound && (message.errorDetail || message.status === 'failed' || message.status === 'bounced');
+  const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
 
   return (
     <div className="mx-auto max-w-3xl">
@@ -285,6 +292,13 @@ export function MessagePage() {
               {message.errorDetail && (
                 <p className="mt-1 break-words text-ink-secondary">{message.errorDetail}</p>
               )}
+              {failedRecipients.length > 0 && (
+                <ul className="mt-1 list-disc pl-4 text-ink-secondary">
+                  {failedRecipients.map((outcome) => <li key={outcome.address}>{outcome.address}：{outcome.error || '发送失败'}</li>)}
+                </ul>
+              )}
+              {canActAsOwner && failedRecipients.length > 0 && <button type="button" className="mr-4 mt-2 text-sm font-medium text-accent hover:underline" onClick={() => navigate('/compose', { state: buildResend(message, true) })}>仅重试失败收件人</button>}
+              {canActAsOwner && (
               <button
                 type="button"
                 className="mt-2 text-sm font-medium text-accent hover:underline"
@@ -292,8 +306,14 @@ export function MessagePage() {
               >
                 重新编辑并发送
               </button>
+              )}
             </div>
           )}
+          {!outbound && (message.status === 'degraded' || message.errorDetail) && <div role="alert" className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
+            <p className="font-medium text-caution">邮件内容可能不完整</p>
+            <p>{message.errorDetail || '处理邮件时发生异常，部分正文或附件可能缺失。'}</p>
+            <p>{message.hasRaw ? '可下载原始邮件检查完整内容。' : '未保存原始邮件，请联系发件人重新发送。'}</p>
+          </div>}
           {otpCode && <OtpBanner code={otpCode} />}
 
           {remoteImageCount > 0 && !showRemoteImages && (
@@ -307,13 +327,13 @@ export function MessagePage() {
                   type="button"
                   className="text-sm text-ink-tertiary hover:text-ink hover:underline"
                   onClick={() => {
-                    trustSender(message.fromAddress);
-                    setShowRemoteImages(true);
+                    trustSender(message.fromAddress, currentUser.id);
+                    setImagesAllowedFor(message.id);
                   }}
                 >
                   始终信任该发件人
                 </button>
-                <Button variant="secondary" size="sm" onClick={() => setShowRemoteImages(true)}>
+                <Button variant="secondary" size="sm" onClick={() => setImagesAllowedFor(message.id)}>
                   显示图片
                 </Button>
               </div>
@@ -392,7 +412,7 @@ export function MessagePage() {
         open={confirmDelete}
         onOpenChange={setConfirmDelete}
         title="删除这封邮件？"
-        description="删除后无法恢复，附件也会一并移除。"
+        description="邮件将移入回收站，可在 7 天内恢复；之后正文和附件会被永久删除。"
         confirmLabel="删除"
         tone="danger"
         loading={deleteMutation.isPending}

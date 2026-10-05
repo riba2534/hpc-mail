@@ -46,3 +46,17 @@ export const updateNotifyPrefsRequestSchema = z
     message: '至少提供一个待更新项',
   });
 export type UpdateNotifyPrefsRequest = z.infer<typeof updateNotifyPrefsRequestSchema>;
+
+export interface NotificationDeliveryView {
+  id: number; messageId: number | null; target: string; status: 'pending' | 'processing' | 'succeeded' | 'failed' | 'skipped' | 'unknown';
+  attempts: number; maxAttempts: number; lastError: string; lastHttpStatus: number | null;
+  createdAt: string; updatedAt: string; nextAttemptAt: string; lastAttemptAt: string | null;
+}
+export interface NotificationHealth {
+  channels: Array<{ channel: 'feishu' | 'pushdeer' | 'webhook' | 'forward'; enabled: boolean; latest: NotificationDeliveryView | null; pendingCount: number; failedCount: number }>;
+  forward: {
+    domainLimit: number; targetLimit: number; windowEndsAt: string;
+    targets: Array<{ address: string; attempts: number; remaining: number }>;
+    domains: Array<{ domain: string; attempts: number; remaining: number }>;
+  };
+}

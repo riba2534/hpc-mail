@@ -29,7 +29,7 @@ export const codeExtractSettingSchema = z.object({
   aiEnabled: z.boolean(),
 });
 
-/** 通用 webhook：新邮件时 POST JSON 到自定义 https 端点（带 HMAC 签名），供 Bark/ntfy/自建服务 */
+/** 通用 webhook：新邮件时 POST JSON 到自定义 https 端点（带 HMAC 签名），供接收 HPC Mail JSON 的自建服务 */
 export const notifyWebhookSettingSchema = z.object({
   enabled: z.boolean(),
   url: z.union([z.literal(''), z.url().startsWith('https://')]).default(''),
@@ -78,7 +78,8 @@ export type DomainEntry = z.infer<typeof domainEntrySchema>;
 
 /** 系统域名列表：管理端维护，空数组表示未配置任何域名（认领/发件将被拒） */
 export const domainsSettingSchema = z.object({
-  list: z.array(domainEntrySchema).max(64),
+  list: z.array(domainEntrySchema).max(64).refine((entries) => new Set(entries.map((e) => e.domain)).size === entries.length, '域名不能重复'),
+  revision: z.number().int().min(0).optional(),
 });
 
 /** 邮件保留策略：catch-all 全量落库，需定期清理防止无限膨胀撑爆 D1（0=不清理） */
@@ -148,12 +149,13 @@ export const updateSettingsRequestSchema = z
     site: siteSettingSchema.optional(),
     api: apiSettingSchema.optional(),
     domains: domainsSettingSchema.optional(),
+    expectedDomainsRevision: z.number().int().min(0).optional(),
     retention: retentionSettingSchema.optional(),
     quota: quotaSettingSchema.optional(),
     mailbox_policy: mailboxPolicySettingSchema.optional(),
     security: securitySettingSchema.optional(),
   })
-  .refine((v) => Object.values(v).some((x) => x !== undefined), {
+  .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',
   });
 export type UpdateSettingsRequest = z.infer<typeof updateSettingsRequestSchema>;

@@ -6,7 +6,7 @@ import { AppError } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
 import type { Env } from '../types.js';
 import { avatarUrl } from './avatar.js';
-import { bumpUserEpoch } from './session.js';
+import { mirrorUserEpoch } from './session.js';
 
 type UserRow = typeof users.$inferSelect;
 
@@ -133,14 +133,14 @@ export async function updateUser(
 
   let row: UserRow | undefined;
   try {
-    [row] = await db.update(users).set(patch).where(eq(users.id, id)).returning();
+    [row] = await db.update(users).set({ ...patch, ...(bumpEpoch ? { authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true } : {}) }).where(eq(users.id, id)).returning();
   } catch (error) {
     if (isLastAdminConstraint(error)) {
       throw new AppError('forbidden', '至少保留一个可用管理员，无法执行此操作');
     }
     throw error;
   }
-  if (bumpEpoch) await bumpUserEpoch(env, id);
+  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion);
   // 管理员降为普通用户后，名下邮箱不再是「管理员邮箱」，已有分享立即失效
   if (req.role === 'user' && target.role === 'admin') {
     await env.db

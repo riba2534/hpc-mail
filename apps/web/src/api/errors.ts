@@ -1,7 +1,7 @@
 import type { ErrorCode } from '@hpc-mail/shared';
 
 /** 非契约错误码：本地网络/超时/响应格式问题 */
-export type ClientErrorCode = 'network' | 'timeout' | 'malformed';
+export type ClientErrorCode = 'network' | 'timeout' | 'malformed' | 'session_changed';
 export type ApiErrorCode = ErrorCode | ClientErrorCode;
 
 export interface ApiErrorInit {

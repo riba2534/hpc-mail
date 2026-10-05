@@ -90,8 +90,10 @@ app.post('/send', async (c) => {
       req,
       attachments,
       origin,
+      idem.handle,
     );
-    await completeIdempotentSend(c.env, idem.handle, summary);
+    try { await completeIdempotentSend(c.env, idem.handle, summary); }
+    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
   } catch (error) {
     await failIdempotentSend(c.env, idem.handle, error);
     throw error;
@@ -130,14 +132,14 @@ app.post('/delete', async (c) => {
 app.post('/restore', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
   const restored = await restoreMessages(c.env, viewerOf(c), req.ids);
-  return ok(c, { restored });
+  return ok(c, { restored, changed: restored });
 });
 
 /** 永久删除（回收站里彻底删） */
 app.post('/purge', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
   const purged = await purgeMessages(c.env, viewerOf(c), req.ids);
-  return ok(c, { purged });
+  return ok(c, { purged, changed: purged });
 });
 
 app.post('/star', async (c) => {

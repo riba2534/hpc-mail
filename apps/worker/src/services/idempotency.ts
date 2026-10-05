@@ -1,9 +1,10 @@
 import type { MessageSummary } from '@hpc-mail/shared';
 import { and, eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { idempotencyRecords } from '../db/schema.js';
+import { idempotencyRecords, messages, attachments } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
+import { summarize } from './message.js';
 import type { Env } from '../types.js';
 
 export type IdempotencyActor = { type: 'user' | 'api_key'; id: number };
@@ -77,6 +78,16 @@ export async function beginIdempotentSend(
       throw new AppError('conflict', '原发送已完成，但缓存结果损坏，请查询已发送邮件');
     }
   }
+  if (existing.messageId) {
+    const row = await db.select().from(messages).where(eq(messages.id, existing.messageId)).get();
+    if (row && row.status !== 'pending') {
+      const attachment = await db.select({ id: attachments.id }).from(attachments).where(eq(attachments.messageId, row.id)).get();
+      const response = summarize(row, !!attachment, false);
+      try { await completeIdempotentSend(env, handle, response); }
+      catch (error) { console.error('Idempotency recovery persistence deferred:', error); }
+      return { kind: 'replay', response };
+    }
+  }
   if (existing.status === 'failed') {
     throw new AppError('conflict', existing.errorDetail || '该幂等请求此前已失败，请使用新的 Idempotency-Key');
   }
@@ -110,6 +121,10 @@ export async function failIdempotentSend(
   error: unknown,
 ): Promise<void> {
   if (!handle) return;
+  const linked = await createDb(env).select({ id: idempotencyRecords.messageId }).from(idempotencyRecords)
+    .where(and(eq(idempotencyRecords.actorType, handle.actor.type), eq(idempotencyRecords.actorId, handle.actor.id), eq(idempotencyRecords.key, handle.key))).get();
+  // Once the send starts, failure may be ambiguous. Preserve its key for lookup, never authorize a resend.
+  if (linked?.id) return;
   const detail = error instanceof Error ? error.message : String(error);
   const db = createDb(env);
   await db

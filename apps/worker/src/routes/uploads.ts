@@ -217,6 +217,9 @@ app.post('/multipart/:token/complete', async (c) => {
       await c.env.r2.delete(row.r2Key);
     } catch (e) {
       console.error('超限分片对象删除失败:', e);
+      // Keep a durable reference but never make this invalid upload sendable.
+      await db.update(draftAttachments).set({ uploadId: null }).where(eq(draftAttachments.id, row.id));
+      throw new AppError('payload_too_large', '附件大小不符合声明，清理将在后台重试');
     }
     await db.delete(draftAttachments).where(eq(draftAttachments.id, row.id));
     throw new AppError(
@@ -241,17 +244,9 @@ app.delete('/:token', async (c) => {
   const row = await db.select().from(draftAttachments).where(eq(draftAttachments.token, token)).get();
   if (!row || row.userId !== user.id) throw new AppError('not_found', '上传会话不存在');
   if (row.uploadId && row.status === 'uploading') {
-    try {
-      await c.env.r2.resumeMultipartUpload(row.r2Key, row.uploadId).abort();
-    } catch (e) {
-      console.error('abort multipart 失败:', e);
-    }
+    await c.env.r2.resumeMultipartUpload(row.r2Key, row.uploadId).abort();
   } else {
-    try {
-      await c.env.r2.delete(row.r2Key);
-    } catch (e) {
-      console.error('删除草稿 R2 失败:', e);
-    }
+    await c.env.r2.delete(row.r2Key);
   }
   await db.delete(draftAttachments).where(eq(draftAttachments.id, row.id));
   return ok(c, { success: true });

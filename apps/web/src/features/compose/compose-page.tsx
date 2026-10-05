@@ -25,15 +25,19 @@ import { toast } from '@/components/ui/toast';
 import { formatBytes } from '@/lib/format';
 import { useDomains } from '@/lib/use-config';
 import { useCurrentUser } from '@/lib/use-session';
+import { getAuthToken } from '@/lib/auth-token';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import type { ComposeInitial } from './compose-init';
+import { attachmentExpired, clearDraft, draftKeyForUser, identityKeyForUser, readDraft, readIdentity, type SavedAttachment } from './compose-draft';
 import { exceedsExternalLimit, hasExternalRecipient } from './compose-attachments';
 import { IdentityPicker } from './identity-picker';
 import { RecipientInput } from './recipient-input';
+import { clearSendAttempt, hashSendPayload, persistSendAttempt, readSendAttempt } from './send-attempt';
 
 interface AttachmentUpload {
   key: string;
-  file: File;
+  file?: File;
+  createdAt: number;
   filename: string;
   mimeType: string;
   size: number;
@@ -51,35 +55,12 @@ function splitLocalPart(address: string | undefined): { localPart: string; domai
   return at > 0 ? { localPart: address.slice(0, at), domain: address.slice(at + 1) } : { localPart: '', domain: '' };
 }
 
-const LEGACY_DRAFT_KEY = 'hpc-compose-draft';
-const draftKeyForUser = (userId: number) => `hpc-compose-draft:${userId}`;
-interface ComposeDraft {
-  to: string[];
-  cc: string[];
-  bcc: string[];
-  subject: string;
-  body: string;
-  isHtml: boolean;
-}
-
-function readDraft(key: string): ComposeDraft | null {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as ComposeDraft) : null;
-  } catch {
-    return null;
-  }
-}
-
-function clearDraft(key: string) {
-  try {
-    localStorage.removeItem(key);
-  } catch {
-    // ignore
-  }
-}
-
 export function ComposePage() {
+  const location = useLocation();
+  return <ComposeEditor key={location.key} />;
+}
+
+function ComposeEditor() {
   const user = useCurrentUser();
   const navigate = useNavigate();
   const location = useLocation();
@@ -95,74 +76,95 @@ export function ComposePage() {
   const contacts = contactsData?.contacts;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sendIdempotencyKeyRef = useRef<string | null>(null);
+  const sendPayloadHashRef = useRef<string | null>(null);
+  const sendPersistenceWarningRef = useRef(false);
+  const composeSessionTokenRef = useRef(getAuthToken());
+  const [recoveredSendPending, setRecoveredSendPending] = useState(() => Boolean(readSendAttempt(user.id)));
   const draftKey = useMemo(() => draftKeyForUser(user.id), [user.id]);
 
-  const initial = useMemo<ComposeInitial>(() => (location.state as ComposeInitial | null) ?? {}, [location.state]);
-  const initialIdentity = useMemo(() => splitLocalPart(initial.fromAddress), [initial.fromAddress]);
-  // 全新写信（无回复/转发预填）时恢复本地草稿；回复/转发有 location.state 则不覆盖
   const savedDraft = useMemo(() => (location.state ? null : readDraft(draftKey)), [draftKey, location.state]);
+  const initial = useMemo<ComposeInitial>(() => (location.state as ComposeInitial | null) ?? savedDraft ?? {}, [location.state, savedDraft]);
+  const initialIdentity = useMemo(() => splitLocalPart(initial.fromAddress), [initial.fromAddress]);
+  const defaultIdentity = useMemo(() => readIdentity(user.id), [user.id]);
+  const sentRef = useRef(false);
+  const identityInitializedRef = useRef(false);
 
   // 旧版本使用全站共享 key，无法判断内容属于哪个账户。为避免跨账户泄露，只清理、不迁移。
   useEffect(() => {
     try {
-      localStorage.removeItem(LEGACY_DRAFT_KEY);
+      localStorage.removeItem('hpc-compose-draft');
     } catch {
       // ignore
     }
   }, []);
 
   const [mailboxId, setMailboxId] = useState<number | null>(null);
-  const [localPart, setLocalPart] = useState(() => (isAdmin ? initialIdentity.localPart : ''));
-  const [adminDomain, setAdminDomain] = useState(() => (isAdmin ? initialIdentity.domain : ''));
+  const [localPart, setLocalPart] = useState(() => (isAdmin ? initialIdentity.localPart || savedDraft?.localPart || defaultIdentity?.localPart || '' : ''));
+  const [adminDomain, setAdminDomain] = useState(() => (isAdmin ? initialIdentity.domain || savedDraft?.adminDomain || defaultIdentity?.domain || '' : ''));
   const [to, setTo] = useState<string[]>(initial.to ?? savedDraft?.to ?? []);
   const [cc, setCc] = useState<string[]>(initial.cc ?? savedDraft?.cc ?? []);
-  const [bcc, setBcc] = useState<string[]>(savedDraft?.bcc ?? []);
+  const [bcc, setBcc] = useState<string[]>(initial.bcc ?? savedDraft?.bcc ?? []);
   const [showCc, setShowCc] = useState((initial.cc?.length ?? savedDraft?.cc?.length ?? 0) > 0);
-  const [showBcc, setShowBcc] = useState((savedDraft?.bcc?.length ?? 0) > 0);
+  const [showBcc, setShowBcc] = useState((initial.bcc?.length ?? savedDraft?.bcc?.length ?? 0) > 0);
   const [subject, setSubject] = useState(initial.subject ?? savedDraft?.subject ?? '');
   const [isHtml, setIsHtml] = useState(initial.isHtml ?? savedDraft?.isHtml ?? false);
   const [body, setBody] = useState(initial.body ?? savedDraft?.body ?? '');
-  const [attachments, setAttachments] = useState<AttachmentUpload[]>([]);
+  const [attachments, setAttachments] = useState<AttachmentUpload[]>(() => (savedDraft?.attachments ?? []).map((attachment) => {
+    const ready = attachment.status === 'ready' && attachment.token && !attachmentExpired(attachment);
+    return { ...attachment, status: ready ? 'ready' : 'error', loaded: ready ? attachment.size : 0, total: attachment.size,
+      error: ready ? undefined : '附件已过期或上传未完成，请移除后重新选择文件' };
+  }));
+  const attachmentRefs = useRef(attachments);
+  attachmentRefs.current = attachments;
+  useEffect(() => () => {
+    for (const attachment of attachmentRefs.current) attachment.abort?.abort();
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const replyToMessageId = initial.replyToMessageId;
 
-  const attachmentVersion = attachments
-    .map((attachment) => `${attachment.token ?? attachment.key}:${attachment.status}`)
-    .join('|');
+  // Reply identity wins over the saved draft/default; only choose owned mailboxes.
   useEffect(() => {
-    sendIdempotencyKeyRef.current = null;
-  }, [mailboxId, localPart, adminDomain, to, cc, bcc, subject, body, isHtml, attachmentVersion]);
+    if (!mailboxes || identityInitializedRef.current) return;
+    identityInitializedRef.current = true;
+    const matching = initial.fromAddress ? mailboxes.find((box) => box.address === initial.fromAddress) : undefined;
+    const preferredId = savedDraft?.mailboxId ?? defaultIdentity?.mailboxId;
+    const preferred = mailboxes.find((box) => box.id === preferredId);
+    const selected = matching ?? (!initial.fromAddress ? preferred ?? (mailboxes.length === 1 ? mailboxes[0] : undefined) : undefined);
+    if (selected) setMailboxId(selected.id);
+  }, [mailboxes, mailboxId, initial.fromAddress, savedDraft?.mailboxId, defaultIdentity?.mailboxId]);
 
-  // 预填了发件地址则选中匹配项；否则只有一个认领地址时自动选中（省一步手选）
-  useEffect(() => {
-    if (isAdmin || mailboxId !== null) return;
-    const boxes = mailboxes ?? [];
-    if (initial.fromAddress) {
-      const match = boxes.find((box) => box.address === initial.fromAddress);
-      if (match) setMailboxId(match.id);
-    } else if (boxes.length === 1) {
-      setMailboxId(boxes[0]!.id);
-    }
-  }, [mailboxes, isAdmin, mailboxId, initial.fromAddress]);
+  const validMailbox = (mailboxes ?? []).some((box) => box.id === mailboxId);
+  const validCustomIdentity = isAdmin && Boolean(localPart) && (visibleDomains ?? []).includes(adminDomain);
+  const identityValid = validMailbox || validCustomIdentity;
+  const saveDefaultIdentity = () => {
+    if (!identityValid) return;
+    try {
+      localStorage.setItem(identityKeyForUser(user.id), JSON.stringify({ mailboxId: validMailbox ? mailboxId : null, localPart, domain: adminDomain }));
+      toast({ title: '默认发件地址已保存', variant: 'success' });
+    } catch { toast({ title: '无法保存默认发件地址', variant: 'error' }); }
+  };
 
   // 草稿自动保存到 localStorage；有内容才存，清空则删；发送成功时清除
   useEffect(() => {
+    if (sentRef.current) return;
     const hasContent =
-      to.length > 0 || cc.length > 0 || bcc.length > 0 || subject.trim() !== '' || body.trim() !== '';
+      to.length > 0 || cc.length > 0 || bcc.length > 0 || attachments.length > 0 || Boolean(initial.forwardAttachmentsFrom) || subject.trim() !== '' || body.trim() !== '';
     if (!hasContent) {
       clearDraft(draftKey);
       return;
     }
     try {
-      localStorage.setItem(draftKey, JSON.stringify({ to, cc, bcc, subject, body, isHtml }));
+      const savedAttachments: SavedAttachment[] = attachments.map(({ key, filename, mimeType, size, token, status, createdAt }) => ({ key, filename, mimeType, size, token, status, createdAt }));
+      localStorage.setItem(draftKey, JSON.stringify({ ...initial, fromAddress: validMailbox ? mailboxes?.find((box) => box.id === mailboxId)?.address : isAdmin ? `${localPart}@${adminDomain}` : undefined,
+        to, cc, bcc, subject, body, isHtml, mailboxId, localPart, adminDomain, attachments: savedAttachments }));
     } catch {
       // 存储不可用时静默
     }
-  }, [draftKey, to, cc, bcc, subject, body, isHtml]);
+  }, [draftKey, to, cc, bcc, subject, body, isHtml, mailboxId, localPart, adminDomain, attachments, initial, validMailbox, mailboxes, isAdmin]);
 
   // 有未发送内容时离开页面/刷新给出浏览器原生拦截
   useEffect(() => {
-    const dirty = to.length > 0 || subject.trim() !== '' || body.trim() !== '';
+    const dirty = to.length + cc.length + bcc.length + attachments.length > 0 || Boolean(initial.forwardAttachmentsFrom) || subject.trim() !== '' || body.trim() !== '';
     if (!dirty) return;
     const handler = (event: BeforeUnloadEvent) => {
       event.preventDefault();
@@ -170,28 +172,49 @@ export function ComposePage() {
     };
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
-  }, [to.length, subject, body]);
+  }, [to.length, cc.length, bcc.length, attachments.length, initial.forwardAttachmentsFrom, subject, body]);
 
   const sendMutation = useMutation({
-    mutationFn: (payload: InternalSendMailRequest) => {
-      sendIdempotencyKeyRef.current ??= crypto.randomUUID();
+    mutationFn: async (payload: InternalSendMailRequest) => {
+      const payloadHash = await hashSendPayload(payload);
+      if (composeSessionTokenRef.current !== getAuthToken()) {
+        throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
+      }
+      const savedAttempt = readSendAttempt(user.id);
+      const currentKey = sendPayloadHashRef.current === payloadHash ? sendIdempotencyKeyRef.current : null;
+      sendIdempotencyKeyRef.current = currentKey ?? (savedAttempt?.payloadHash === payloadHash ? savedAttempt.key : crypto.randomUUID());
+      sendPayloadHashRef.current = payloadHash;
+      const persisted = persistSendAttempt(user.id, { key: sendIdempotencyKeyRef.current, payloadHash });
+      if (!persisted && !sendPersistenceWarningRef.current) {
+        sendPersistenceWarningRef.current = true;
+        toast({ title: '无法保存发送凭据', description: '本次可在当前页面重试；刷新前请先检查已发送，避免重复投递。' });
+      }
       return messageApi.send(payload, sendIdempotencyKeyRef.current);
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      sentRef.current = true;
+      clearSendAttempt(user.id, sendIdempotencyKeyRef.current);
+      setRecoveredSendPending(false);
       sendIdempotencyKeyRef.current = null;
-      toast({ title: '邮件已发送', variant: 'success' });
+      sendPayloadHashRef.current = null;
+      const failures = result.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
+      const issue = failures.length > 0 || Boolean(result.errorDetail) || result.status === 'failed';
+      toast({ title: issue ? failures.length ? `${failures.length} 个收件人发送失败，请查看并重试失败目标` : '邮件发送有异常，请查看详情' : result.status === 'delivered' ? '站内邮件已送达' : '邮件已提交发送', variant: issue ? 'error' : 'success' });
       clearDraft(draftKey);
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
-      navigate('/sent');
+      navigate(result.errorDetail || result.status === 'failed' || result.recipientOutcomes?.some((outcome) => outcome.status === 'failed') ? `/mail/${result.id}` : '/sent');
     },
     onError: (err) => {
       // 网络/超时可能发生在服务端已经发送之后，保留同一个 key 可安全查询/重放结果；
       // 明确的业务错误则允许用户修正后使用新 key。
-      if (
-        !(err instanceof ApiError) ||
-        (err.code !== 'network' && err.code !== 'timeout' && err.code !== 'conflict')
-      ) {
+      const unresolved = !(err instanceof ApiError) ||
+        ['network', 'timeout', 'conflict', 'malformed', 'session_changed'].includes(err.code) ||
+        err.httpStatus === 408 || (err.httpStatus !== null && err.httpStatus >= 500);
+      if (!unresolved) {
+        clearSendAttempt(user.id, sendIdempotencyKeyRef.current);
+        setRecoveredSendPending(false);
         sendIdempotencyKeyRef.current = null;
+        sendPayloadHashRef.current = null;
       }
       setError(err instanceof ApiError ? err.message : '发送失败，请重试');
     },
@@ -219,6 +242,7 @@ export function ComposePage() {
       {
         key,
         file,
+        createdAt: Date.now(),
         filename: file.name,
         mimeType,
         size: file.size,
@@ -245,6 +269,10 @@ export function ComposePage() {
           mimeType,
           size: file.size,
         });
+        if (abort.signal.aborted) {
+          void uploadsApi.remove(init.token).catch(() => {});
+          return;
+        }
         // 记录 token：上传中取消也能调 DELETE 回收（abort multipart + 删行）
         updateAttachment(key, { token: init.token });
         const parts: UploadedPart[] = [];
@@ -263,6 +291,7 @@ export function ComposePage() {
         const done = await uploadsApi.completeMultipart(init.token, parts);
         token = done.token;
       }
+      if (abort.signal.aborted) { void uploadsApi.remove(token).catch(() => {}); return; }
       updateAttachment(key, { status: 'ready', token, loaded: file.size, total: file.size });
     } catch (e) {
       // 用户主动取消：removeAttachment 已移除列表，此处不置错
@@ -304,6 +333,8 @@ export function ComposePage() {
   };
 
   const retryAttachment = (att: AttachmentUpload) => {
+    if (!att.file) return;
+    if (att.token) void uploadsApi.remove(att.token).catch(() => {});
     void uploadOne(att.file);
     setAttachments((prev) => prev.filter((a) => a.key !== att.key));
   };
@@ -319,19 +350,12 @@ export function ComposePage() {
     event.preventDefault();
     setError(null);
 
-    if (isAdmin) {
-      if (!localPart || !adminDomain) {
-        setError('请填写发件地址');
-        return;
-      }
-    } else if (!mailboxId) {
-      setError('请选择发件地址');
+    if (!identityValid) {
+      setError('请选择有效的发件地址');
       return;
     }
-
-    // 有附件仍在上传 → 阻止发送
-    if (attachments.some((a) => a.status === 'uploading')) {
-      toast({ title: '附件仍在上传，请稍候', variant: 'error' });
+    if (attachments.some((a) => a.status !== 'ready' || !a.token || attachmentExpired(a))) {
+      setError('附件尚未准备完成：请等待上传，重试失败附件，或移除过期附件后重新添加');
       return;
     }
     const ready = attachments.filter((a) => a.status === 'ready' && a.token);
@@ -347,7 +371,7 @@ export function ComposePage() {
     }
 
     const payload = {
-      from: isAdmin ? { localPart, domain: adminDomain } : { mailboxId: mailboxId ?? undefined },
+      from: validMailbox ? { mailboxId: mailboxId! } : { localPart, domain: adminDomain },
       to,
       cc,
       bcc,
@@ -379,7 +403,11 @@ export function ComposePage() {
   return (
     <div className="mx-auto max-w-2xl">
       <PageHeader title={title} />
+      {recoveredSendPending && <p role="status" className="mb-4 rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
+        上次发送结果待确认，可用原内容重试查询；修改内容前请核对已发送邮件。
+      </p>}
       <form onSubmit={handleSubmit} className="flex flex-col gap-4 rounded-lg border border-line bg-surface p-5">
+        <fieldset disabled={sendMutation.isPending} className="contents">
         <IdentityPicker
           isAdmin={isAdmin}
           mailboxes={mailboxes ?? []}
@@ -391,12 +419,15 @@ export function ComposePage() {
           domain={adminDomain}
           onDomain={setAdminDomain}
         />
+        <Button type="button" variant="ghost" size="sm" className="self-start" disabled={!identityValid} onClick={saveDefaultIdentity}>
+          设为默认发件地址
+        </Button>
 
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between">
-            <span className="text-sm font-medium text-ink">
+            <label htmlFor="compose-to" className="text-sm font-medium text-ink">
               收件人<span className="ml-0.5 text-critical">*</span>
-            </span>
+            </label>
             {(!showCc || !showBcc) && (
               <div className="flex gap-3 text-sm">
                 {!showCc && (
@@ -412,7 +443,7 @@ export function ComposePage() {
               </div>
             )}
           </div>
-          <RecipientInput value={to} onChange={setTo} placeholder="输入邮箱后回车" suggestions={contacts} />
+          <RecipientInput id="compose-to" value={to} onChange={setTo} placeholder="输入邮箱后回车" suggestions={contacts} />
         </div>
 
         {showCc && (
@@ -445,13 +476,14 @@ export function ComposePage() {
 
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
-            <span className="text-sm font-medium text-ink">正文</span>
+            <label htmlFor="compose-body" className="text-sm font-medium text-ink">正文</label>
             <label className="flex items-center gap-2 text-sm text-ink-secondary">
               HTML
               <Switch checked={isHtml} onCheckedChange={setIsHtml} aria-label="以 HTML 发送" />
             </label>
           </div>
           <Textarea
+            id="compose-body"
             rows={10}
             placeholder={isHtml ? '支持简单 HTML 标记' : '纯文本正文'}
             value={body}
@@ -478,6 +510,9 @@ export function ComposePage() {
               onChange={(event) => void handleFiles(event.target.files)}
             />
           </div>
+          {initial.forwardAttachmentsFrom && (
+            <p className="text-sm text-ink-secondary">将保留原邮件附件（来源邮件 #{initial.forwardAttachmentsFrom}）。</p>
+          )}
           {attachments.length > 0 && (
             <ul className="flex flex-col gap-1.5">
               {attachments.map((attachment) => {
@@ -511,7 +546,7 @@ export function ComposePage() {
                     {attachment.status === 'uploading' && (
                       <Progress value={attachment.loaded} max={attachment.total} />
                     )}
-                    {attachment.status === 'error' && (
+                    {attachment.status === 'error' && attachment.file && (
                       <button
                         type="button"
                         onClick={() => retryAttachment(attachment)}
@@ -520,6 +555,7 @@ export function ComposePage() {
                         {attachment.error ?? '上传失败，点击重试'}
                       </button>
                     )}
+                    {attachment.status === 'error' && !attachment.file && <p role="alert" className="text-xs text-critical">{attachment.error}</p>}
                   </li>
                 );
               })}
@@ -527,16 +563,17 @@ export function ComposePage() {
           )}
         </div>
 
-        {error && <p className="text-sm text-critical">{error}</p>}
+        {error && <p role="alert" className="text-sm text-critical">{error}</p>}
 
         <div className="flex items-center justify-end gap-2 border-t border-line pt-4">
           <Button type="button" variant="secondary" onClick={() => navigate(-1)}>
             取消
           </Button>
-          <Button type="submit" loading={sendMutation.isPending} disabled={to.length === 0}>
+          <Button type="submit" loading={sendMutation.isPending} disabled={to.length + cc.length + bcc.length === 0}>
             发送
           </Button>
         </div>
+        </fieldset>
       </form>
     </div>
   );

@@ -1,6 +1,7 @@
 import type { FeishuConfig } from '@hpc-mail/shared';
 import { hmacSha256Base64 } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
+import { NotificationDeliveryError, notificationRequest } from './notification-http.js';
 
 const FEISHU_WEBHOOK_HOSTS = new Set([
   'open.feishu.cn',
@@ -141,30 +142,25 @@ async function postOnce(
     body.timestamp = timestamp;
     body.sign = await generateFeishuSignature(timestamp, secret);
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-  let response: Response;
-  try {
-    response = await fetch(webhookUrl, {
+  const response = await notificationRequest(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      redirect: 'manual',
       body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-  const responseText = await response.text();
-  if (!response.ok) throw new Error(`HTTP ${response.status}: ${responseText.slice(0, 300)}`);
+    }, '飞书');
   let parsed: { code?: number; StatusCode?: number; msg?: string };
   try {
-    parsed = JSON.parse(responseText);
+    parsed = JSON.parse(response.text);
   } catch {
-    throw new Error('飞书返回非法 JSON');
+    throw new NotificationDeliveryError('飞书返回非法 JSON', response.status);
   }
-  if (parsed.code !== 0 && parsed.StatusCode !== 0) {
-    throw new Error(`飞书 API ${parsed.code ?? parsed.StatusCode}: ${String(parsed.msg ?? '')}`);
+  const code = parsed && typeof parsed === 'object'
+    ? typeof parsed.code === 'number' ? parsed.code : typeof parsed.StatusCode === 'number' ? parsed.StatusCode : null
+    : null;
+  if (code !== 0) {
+    throw new NotificationDeliveryError(
+      `飞书 API 错误 ${code ?? '未知'}`,
+      response.status,
+    );
   }
 }
 
@@ -173,9 +169,10 @@ async function postToFeishu(
   webhookUrl: string,
   secret: string,
   payload: Record<string, unknown>,
+  attempts = 3,
 ): Promise<void> {
   let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) {
       await new Promise((resolve) => setTimeout(resolve, attempt * 800));
     }
@@ -193,7 +190,7 @@ async function postToFeishu(
 export async function sendFeishuNotification(
   feishu: FeishuConfig,
   info: FeishuMailInfo,
-  options: { test?: boolean; force?: boolean; throwOnError?: boolean } = {},
+  options: { test?: boolean; force?: boolean; throwOnError?: boolean; attempts?: number } = {},
 ): Promise<boolean> {
   const { test = false, force = false, throwOnError = false } = options;
   try {
@@ -209,6 +206,7 @@ export async function sendFeishuNotification(
       safeUrl,
       feishu.secret,
       buildFeishuEmailCard(info, test, level) as Record<string, unknown>,
+      Math.max(1, Math.min(3, options.attempts ?? 3)),
     );
     return true;
   } catch (error) {

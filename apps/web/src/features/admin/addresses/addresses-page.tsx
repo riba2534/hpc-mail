@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, Search, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import type { Mailbox } from '@hpc-mail/shared';
-import { queryKeys } from '@/api/query-keys';
+import { invalidateMailboxOwnership } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
@@ -35,7 +35,7 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
           : '已强制释放',
         variant: 'success',
       });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.root });
+      invalidateMailboxOwnership(queryClient);
       onClose();
     },
     onError: () => toast({ title: '释放失败，请重试', variant: 'error' }),
@@ -50,7 +50,8 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
             <p>
               该地址当前由 <b className="text-ink">{mailbox?.ownerUsername || '未知用户'}</b> 认领，强制释放后回到未认领态、可被任何人重新认领。
             </p>
-            {mailbox && mailbox.messageCount > 0 && (
+            <p>若保留历史，下一个认领者可看到全部邮件。当前计数 {mailbox?.messageCount ?? 0}，可能有新来信。</p>
+            {mailbox && (
               <label className="flex items-center gap-2">
                 <input
                   type="checkbox"
@@ -58,7 +59,7 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
                   checked={deleteHistory}
                   onChange={(event) => setDeleteHistory(event.target.checked)}
                 />
-                <span className="text-ink">同时永久删除该地址 {mailbox.messageCount} 封历史邮件</span>
+                <span className="text-ink">同时永久删除该地址的全部历史邮件</span>
               </label>
             )}
           </div>

@@ -126,8 +126,8 @@ export function MailList({
   const batchRead = useMutation({
     mutationFn: ({ ids, isRead }: { ids: number[]; isRead: boolean }) =>
       messageApi.markRead(ids, isRead, mutationScope),
-    onSuccess: (_d, { isRead }) => {
-      toast({ title: isRead ? '已标记为已读' : '已标记为未读', variant: 'success' });
+    onSuccess: ({ changed }, { isRead }) => {
+      toast({ title: changed ? `已将 ${changed} 封标记为${isRead ? '已读' : '未读'}` : '没有邮件状态改变', variant: 'success' });
       clearSelection();
       invalidateMessages();
     },
@@ -136,8 +136,8 @@ export function MailList({
 
   const batchStar = useMutation({
     mutationFn: (ids: number[]) => messageApi.star(ids, true, starView),
-    onSuccess: () => {
-      toast({ title: '已加星标', variant: 'success' });
+    onSuccess: ({ changed }) => {
+      toast({ title: changed ? `已为 ${changed} 封加星标` : '没有邮件状态改变', variant: 'success' });
       clearSelection();
       invalidateMessages();
     },
@@ -160,8 +160,8 @@ export function MailList({
 
   const batchRestore = useMutation({
     mutationFn: (ids: number[]) => messageApi.restore(ids, mutationScope),
-    onSuccess: (_d, ids) => {
-      toast({ title: `已恢复 ${ids.length} 封`, variant: 'success' });
+    onSuccess: ({ changed }) => {
+      toast({ title: changed ? `已恢复 ${changed} 封` : '没有可恢复的邮件', variant: 'success' });
       clearSelection();
       invalidateMessages();
     },
@@ -170,8 +170,8 @@ export function MailList({
 
   const batchPurge = useMutation({
     mutationFn: (ids: number[]) => messageApi.purge(ids, mutationScope),
-    onSuccess: (_d, ids) => {
-      toast({ title: `已永久删除 ${ids.length} 封`, variant: 'success' });
+    onSuccess: ({ changed }) => {
+      toast({ title: changed ? `已永久删除 ${changed} 封` : '没有可永久删除的邮件', variant: 'success' });
       setPurgeIds([]);
       clearSelection();
       invalidateMessages();
@@ -259,8 +259,10 @@ export function MailList({
         <div className="flex items-center gap-2 rounded-md border border-caution-soft bg-caution-soft px-3 py-2 text-sm text-caution">
           <AlertCircle className="size-4 shrink-0" />
           网络异常，显示的是缓存内容。
+          <Button size="sm" variant="ghost" onClick={() => void refetch()}>重新加载</Button>
         </div>
       )}
+      <div className="flex justify-end"><Button size="sm" variant="ghost" onClick={() => void refetch()}>刷新邮件</Button></div>
       {selectionActive && (
         <div className="sticky top-14 z-20 flex flex-wrap items-center gap-2 rounded-lg border border-line-strong bg-surface px-3 py-2 shadow-sm">
           <button

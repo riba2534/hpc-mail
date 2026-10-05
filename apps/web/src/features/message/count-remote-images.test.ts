@@ -17,4 +17,7 @@ describe('countRemoteImages', () => {
     expect(countRemoteImages('')).toBe(0);
     expect(countRemoteImages('<p>hello</p>')).toBe(0);
   });
+  it('counts protocol-relative and srcset-only images once', () => {
+    expect(countRemoteImages('<img src="//track.example.com/a"><img srcset="https://track.example.com/b 1x, https://track.example.com/c 2x"><img src="https://track.example.com/d" srcset="https://track.example.com/e 2x">')).toBe(3);
+  });
 });

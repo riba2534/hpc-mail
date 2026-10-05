@@ -5,6 +5,7 @@ import { Link } from 'react-router-dom';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import type { ComboboxOption } from '@/components/ui/combobox';
 import { EmptyState } from '@/components/ui/empty-state';
@@ -20,8 +21,10 @@ import { useUnreadCount } from './use-unread-count';
 export function InboxPage() {
   const { filters, setDomain, setAddress, setUnread, setQuery, reset } = useInboxFilters();
   const { data: visibleDomains } = useDomains();
-  const { data: mailboxes } = useMailboxesQuery(false);
-  const { data: sharedMailboxes, isError: sharedError } = useSharedMailboxesQuery();
+  const ownedQuery = useMailboxesQuery(false);
+  const sharedQuery = useSharedMailboxesQuery();
+  const { data: mailboxes } = ownedQuery;
+  const { data: sharedMailboxes } = sharedQuery;
   const { data: unreadData } = useUnreadCount();
   const queryClient = useQueryClient();
 
@@ -53,13 +56,15 @@ export function InboxPage() {
 
   const domains = useMemo(() => {
     const set = new Set(visibleDomains ?? []);
+    for (const mailbox of mailboxes ?? []) set.add(mailbox.domain);
     for (const mailbox of sharedMailboxes ?? []) set.add(mailbox.domain);
     return [...set];
-  }, [visibleDomains, sharedMailboxes]);
+  }, [visibleDomains, mailboxes, sharedMailboxes]);
 
   const hasActiveFilters = Boolean(filters.domain || filters.address || filters.unread || filters.q);
-  const addressesReady = mailboxes !== undefined && (sharedMailboxes !== undefined || sharedError);
-  const noMailbox = addressesReady && mailboxes.length === 0 && (sharedMailboxes?.length ?? 0) === 0;
+  const addressesReady = mailboxes !== undefined && sharedMailboxes !== undefined;
+  const addressError = ownedQuery.isError || sharedQuery.isError;
+  const noMailbox = addressesReady && mailboxes.length === 0 && sharedMailboxes.length === 0;
 
   const query = {
     direction: 'inbound' as const,
@@ -83,7 +88,12 @@ export function InboxPage() {
           )
         }
       />
-      {!addressesReady ? (
+      {addressError ? (
+        <QueryErrorState error={ownedQuery.error ?? sharedQuery.error} onRetry={() => {
+          void ownedQuery.refetch();
+          void sharedQuery.refetch();
+        }} />
+      ) : !addressesReady ? (
         <Skeleton className="h-40 w-full rounded-lg" />
       ) : noMailbox ? (
         <div className="rounded-lg border border-line bg-surface">

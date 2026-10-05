@@ -3,7 +3,7 @@ import { Check, X } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import { claimMailboxRequestSchema, domainSchema, localPartSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
+import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
@@ -27,7 +27,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (open && !domain && domains[0]) setDomain(domains[0]);
+    if (!domains.includes(domain)) setDomain(domains[0] ?? '');
   }, [open, domain, domains]);
 
   useEffect(() => {
@@ -36,7 +36,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   }, [localPart]);
 
   const localValid = localPartSchema.safeParse(localPart).success;
-  const domainValid = domainSchema.safeParse(domain).success;
+  const domainValid = domains.includes(domain) && domainSchema.safeParse(domain).success;
 
   const availability = useQuery({
     queryKey: queryKeys.mailboxes.availability(debounced, domain),
@@ -48,7 +48,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
     mutationFn: () => mailboxApi.claim({ localPart, domain }),
     onSuccess: () => {
       toast({ title: '地址认领成功', variant: 'success' });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.root });
+      invalidateMailboxOwnership(queryClient);
       onOpenChange(false);
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : '认领失败，请重试'),
@@ -67,6 +67,10 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
     setError(null);
+    if (!domainValid) {
+      setError('可用域名已变更，请重新选择');
+      return;
+    }
     const parsed = claimMailboxRequestSchema.safeParse({ localPart, domain });
     if (!parsed.success) {
       setError(parsed.error.issues[0]?.message ?? '请检查输入');
@@ -131,7 +135,7 @@ export function ClaimDialog({ open, onOpenChange, domains }: ClaimDialogProps) {
               )}
             </FormField>
             {showAvailable && <p className="text-sm text-positive">{`${localPart}@${domain} 可以认领`}</p>}
-            {error && <p className="text-sm text-critical">{error}</p>}
+            {error && <p role="alert" className="text-sm text-critical">{error}</p>}
           </DialogBody>
           <DialogFooter>
             <Button type="button" variant="secondary" onClick={() => onOpenChange(false)}>

@@ -1,20 +1,23 @@
-import { useQuery } from '@tanstack/react-query';
-import { createContext, useContext, useSyncExternalStore } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { createContext, useCallback, useContext, useSyncExternalStore } from 'react';
 import type { SessionUser } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { authApi } from '@/api/resources';
-import { getAuthToken, subscribeAuthToken } from './auth-token';
+import { getAuthRevision, getAuthToken } from './auth-token';
+import { subscribeAuthCache } from './auth-cache';
 
 /** 订阅 localStorage token 变化（登录/登出/跨标签页同步） */
 export function useAuthToken(): string | null {
-  return useSyncExternalStore(subscribeAuthToken, getAuthToken, () => null);
+  const client = useQueryClient();
+  const subscribe = useCallback((listener: () => void) => subscribeAuthCache(client, listener), [client]);
+  return useSyncExternalStore(subscribe, getAuthToken, () => null);
 }
 
 /** ['session'] 查询：有 token 时拉取当前用户 */
 export function useSessionQuery() {
   const token = useAuthToken();
   return useQuery({
-    queryKey: queryKeys.session,
+    queryKey: queryKeys.sessionForRevision(getAuthRevision()),
     queryFn: () => authApi.me(),
     enabled: Boolean(token),
     staleTime: 60_000,

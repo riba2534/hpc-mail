@@ -5,6 +5,7 @@ import { AppError } from '../lib/errors.js';
 import { parseId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import { loadAttachmentById, loadAttachmentForViewer } from '../services/message.js';
+import { loadExternalAttachment } from '../services/external-attachment.js';
 import { getObject } from '../services/storage.js';
 import type { AppContext } from '../types.js';
 
@@ -20,7 +21,9 @@ app.get('/:id', async (c) => {
   if (sig && Number.isInteger(exp)) {
     const valid = await verifyAttachmentSig(c.env.jwt_secret, id, exp, sig);
     if (!valid) throw new AppError('unauthorized', '签名无效或已过期');
-    att = await loadAttachmentById(c.env, id);
+    const retained = await loadExternalAttachment(c.env, id);
+    if (retained && exp * 1000 <= retained.expiresAt.getTime()) att = { ...retained, id, messageId: 0, contentId: '', disposition: 'attachment' };
+    else att = await loadAttachmentById(c.env, id);
   } else {
     await requireAuth(c, async () => {});
     const user = c.get('user')!;

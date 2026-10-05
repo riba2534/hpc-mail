@@ -1,5 +1,7 @@
 import type { WebhookConfig } from '@hpc-mail/shared';
 import { hmacSha256Base64 } from '../lib/crypto.js';
+import { AppError } from '../lib/errors.js';
+import { notificationRequest } from './notification-http.js';
 
 const BLOCKED_SUFFIXES = [
   '.localhost',
@@ -73,7 +75,7 @@ function isBlockedIpv6(parts: number[]): boolean {
 export function isBlockedHost(rawHost: string): boolean {
   const host = rawHost.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
   if (host === 'localhost' || host === 'metadata.google.internal') return true;
-  if (BLOCKED_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true;
+  if (BLOCKED_SUFFIXES.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix))) return true;
   const ipv4 = parseIpv4(host);
   if (ipv4) return isBlockedIpv4(ipv4);
   const ipv6 = parseIpv6(host);
@@ -111,28 +113,28 @@ export interface WebhookMailPayload {
 export async function sendNotifyWebhook(
   cfg: WebhookConfig,
   payload: WebhookMailPayload,
+  options: { throwOnError?: boolean } = {},
 ): Promise<void> {
   if (!cfg.enabled || !cfg.url) return;
   const url = validateNotifyWebhookUrl(cfg.url);
-  if (!url) return;
+  if (!url) {
+    if (options.throwOnError) throw new AppError('validation_failed', '通用 Webhook 地址非法');
+    console.error('通用 Webhook 地址非法');
+    return;
+  }
   const body = JSON.stringify(payload);
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (cfg.secret) {
     headers['X-HPC-Signature'] = await hmacSha256Base64(new TextEncoder().encode(cfg.secret), body);
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
-    await fetch(url.toString(), {
+    await notificationRequest(url.toString(), {
       method: 'POST',
       headers,
       body,
-      redirect: 'manual',
-      signal: controller.signal,
-    });
+    }, '通用 Webhook');
   } catch (e) {
     console.error('通用 webhook 推送失败:', e instanceof Error ? e.message : e);
-  } finally {
-    clearTimeout(timeout);
+    if (options.throwOnError) throw e;
   }
 }

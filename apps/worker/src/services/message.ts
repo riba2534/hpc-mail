@@ -33,7 +33,8 @@ import { decodeCursor, encodeCursor } from '../lib/pagination.js';
 import { htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { resolveVerificationCode } from './code-extract.js';
-import { deleteMessageObjects, getJson } from './storage.js';
+import { getJson } from './storage.js';
+import { purgeMatchingMessages } from './message-lifecycle.js';
 
 export interface Viewer {
   userId: number;
@@ -58,6 +59,7 @@ type MessageSummaryRow = Pick<
   | 'verificationCode'
   | 'status'
   | 'errorDetail'
+  | 'recipientOutcomes'
   | 'isRead'
   | 'size'
   | 'createdAt'
@@ -76,6 +78,7 @@ const summarySelection = {
   verificationCode: messages.verificationCode,
   status: messages.status,
   errorDetail: messages.errorDetail,
+  recipientOutcomes: messages.recipientOutcomes,
   isRead: messages.isRead,
   size: messages.size,
   createdAt: messages.createdAt,
@@ -163,7 +166,7 @@ function scopeCondition(db: Db, scope: Scope, access: ScopeAccess = 'owned'): SQ
 
 
 
-function summarize(row: MessageSummaryRow, hasAttachments: boolean, isStarred: boolean): MessageSummary {
+export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isStarred: boolean): MessageSummary {
   const verificationCode = resolveVerificationCode(
     row.subject,
     row.preview,
@@ -181,6 +184,7 @@ function summarize(row: MessageSummaryRow, hasAttachments: boolean, isStarred: b
     verificationCode,
     status: row.status,
     errorDetail: row.errorDetail ?? '',
+    recipientOutcomes: row.recipientOutcomes,
     recipientsTo: row.direction === 'outbound' ? (row.recipients?.to ?? []) : undefined,
     isRead: row.isRead,
     isStarred,
@@ -242,19 +246,14 @@ export async function listMessages(
     );
   }
   if (query.q) {
-    // 转义 LIKE 通配符（% _ \），否则用户搜 "50%" 会变成任意匹配；配 ESCAPE 子句生效
-    const escaped = query.q.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-    const term = `%${escaped}%`;
-    conds.push(
-      or(
-        sql`${messages.subject} LIKE ${term} ESCAPE '\\'`,
-        sql`${messages.fromAddress} LIKE ${term} ESCAPE '\\'`,
-        sql`${messages.fromName} LIKE ${term} ESCAPE '\\'`,
-        sql`${messages.bodyText} LIKE ${term} ESCAPE '\\'`,
-        // recipients 存的是 JSON 文本，对其 LIKE 即可按收件人搜索（已发送找「发给谁」）
-        sql`${messages.recipients} LIKE ${term} ESCAPE '\\'`,
-      ),
-    );
+    const term = query.q.toLowerCase();
+    conds.push(or(
+      sql`instr(lower(${messages.subject}), ${term}) > 0`,
+      sql`instr(lower(${messages.fromAddress}), ${term}) > 0`,
+      sql`instr(lower(${messages.fromName}), ${term}) > 0`,
+      sql`instr(lower(${messages.bodyText}), ${term}) > 0`,
+      sql`instr(lower(${messages.recipients}), ${term}) > 0`,
+    ));
   }
   const cursorId = decodeCursor(query.cursor);
   if (cursorId) conds.push(lt(messages.id, cursorId));
@@ -430,7 +429,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
 
   const core = normalizeSubject(target.subject);
   if (!core) return summarizeRows([target]);
-  const escaped = core.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+
   const windowMs = 30 * 24 * 60 * 60 * 1000;
   const rows = await db
     .select()
@@ -442,7 +441,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
         eq(messages.address, target.address),
         gte(messages.createdAt, new Date(target.createdAt.getTime() - windowMs)),
         lte(messages.createdAt, new Date(target.createdAt.getTime() + windowMs)),
-        sql`${messages.subject} LIKE ${`%${escaped}%`} ESCAPE '\\'`,
+        sql`instr(lower(${messages.subject}), ${core.toLowerCase()}) > 0`,
       ),
     )
     .orderBy(asc(messages.id))
@@ -576,6 +575,7 @@ export async function getMessageDetail(
       row.verificationCode,
     ),
     recipients: row.recipients as MessageRecipients,
+    replyTo: row.replyTo,
     bodyText,
     bodyHtml,
     attachments: attachmentMetas,
@@ -677,22 +677,23 @@ export async function starMessages(
   }
   if (visibleIds.length === 0) return 0;
 
+  let changed = 0;
   if (starred) {
     // 每行 2 个绑定参数（userId + messageId），批次相应减半
     for (const batch of chunk(visibleIds, D1_PAIR_BATCH)) {
-      await db
-        .insert(stars)
+      const result = await db.insert(stars)
         .values(batch.map((id) => ({ userId: viewer.userId, messageId: id })))
-        .onConflictDoNothing();
+        .onConflictDoNothing().run();
+      changed += result.meta.changes ?? 0;
     }
   } else {
     for (const batch of chunk(visibleIds)) {
-      await db
-        .delete(stars)
-        .where(and(eq(stars.userId, viewer.userId), inArray(stars.messageId, batch)));
+      const result = await db.delete(stars)
+        .where(and(eq(stars.userId, viewer.userId), inArray(stars.messageId, batch))).run();
+      changed += result.meta.changes ?? 0;
     }
   }
-  return visibleIds.length;
+  return changed;
 }
 
 function scopedIdsCondition(db: Db, scope: Scope, ids: number[]): SQL {
@@ -719,7 +720,7 @@ export async function restoreMessages(env: Env, viewer: Viewer, ids: number[]): 
   const scope = resolveMutationScope(viewer);
   let changed = 0;
   for (const batch of chunk(ids)) {
-    const cond = and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt)) as SQL;
+    const cond = and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt), isNull(messages.purgeToken)) as SQL;
     const result = await db.update(messages).set({ deletedAt: null }).where(cond).run();
     changed += result.meta.changes ?? 0;
   }
@@ -730,23 +731,9 @@ export async function restoreMessages(env: Env, viewer: Viewer, ids: number[]): 
 export async function purgeMessages(env: Env, viewer: Viewer, ids: number[]): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  const targets: { id: number; bodyR2Key: string | null; rawR2Key: string | null }[] = [];
+  let changed = 0;
   for (const batch of chunk(ids)) {
-    const rows = await db
-      .select({ id: messages.id, bodyR2Key: messages.bodyR2Key, rawR2Key: messages.rawR2Key })
-      .from(messages)
-      .where(and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt)))
-      .all();
-    targets.push(...rows);
+    changed += await purgeMatchingMessages(env, and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt))!, batch.length);
   }
-  if (targets.length === 0) return 0;
-  const targetIds = targets.map((t) => t.id);
-  // 先删 R2 再删 D1；删除失败时保留 D1 引用，下次仍可重试。
-  await deleteMessageObjects(env, db, targets);
-  for (const batch of chunk(targetIds)) {
-    await db.delete(attachmentsTable).where(inArray(attachmentsTable.messageId, batch));
-    await db.delete(stars).where(inArray(stars.messageId, batch));
-    await db.delete(messages).where(inArray(messages.id, batch));
-  }
-  return targetIds.length;
+  return changed;
 }

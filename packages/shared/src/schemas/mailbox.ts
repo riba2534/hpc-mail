@@ -13,7 +13,8 @@ export const domainSchema = z
   .toLowerCase()
   .min(1)
   .max(253)
-  .regex(/^[a-z0-9.-]+\.[a-z]{2,}$/, '域名格式非法');
+  .regex(/^[a-z0-9.-]+\.[a-z]{2,}$/, '域名格式非法')
+  .refine((v) => v.split('.').every((label) => label.length >= 1 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)), '域名标签需为 1-63 位，不能以连字符开头或结尾');
 
 export const claimMailboxRequestSchema = z.object({
   localPart: localPartSchema,

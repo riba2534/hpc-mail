@@ -1,6 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { MessageRecipients, UserNotifyPrefs } from '@hpc-mail/shared';
+import type { MessageRecipients, RecipientOutcome, UserNotifyPrefs } from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -65,6 +65,11 @@ export const messages = sqliteTable(
       .notNull()
       .$type<MessageRecipients>()
       .default(sql`'{"to":[],"cc":[],"bcc":[]}'`),
+    replyTo: text('reply_to', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    recipientOutcomes: text('recipient_outcomes', { mode: 'json' }).notNull().$type<RecipientOutcome[]>().default(sql`'[]'`),
+    purgeToken: text('purge_token'),
+    notifyOwnerIds: text('notify_owner_ids', { mode: 'json' }).$type<number[]>(),
+    notificationsQueuedAt: integer('notifications_queued_at', { mode: 'timestamp_ms' }),
     subject: text('subject').notNull().default(''),
     /** 正文前 160 字符纯文本摘要，列表接口只读此列 */
     preview: text('preview').notNull().default(''),
@@ -103,6 +108,7 @@ export const messages = sqliteTable(
     index('idx_messages_message_id').on(t.messageId),
     index('idx_messages_in_reply_to').on(t.inReplyTo),
     uniqueIndex('idx_messages_ingest_key').on(t.ingestKey),
+    index('idx_messages_notification_outbox').on(t.createdAt, t.id).where(sql`${t.notifyOwnerIds} IS NOT NULL AND ${t.notificationsQueuedAt} IS NULL AND ${t.deletedAt} IS NULL`),
   ],
 );
 
@@ -131,6 +137,7 @@ export const idempotencyRecords = sqliteTable(
       .notNull()
       .default('pending'),
     responseJson: text('response_json'),
+    messageId: integer('message_id'),
     errorDetail: text('error_detail').notNull().default(''),
     updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
     createdAt: createdAtColumn(),
@@ -153,7 +160,7 @@ export const attachments = sqliteTable(
     contentId: text('content_id').notNull().default(''),
     disposition: text('disposition').notNull().default('attachment'),
   },
-  (t) => [index('idx_attachments_message').on(t.messageId)],
+  (t) => [index('idx_attachments_message').on(t.messageId), index('idx_attachments_r2_key').on(t.r2Key), uniqueIndex('idx_attachments_message_object').on(t.messageId, t.r2Key)],
 );
 
 /**
@@ -329,3 +336,46 @@ export const adminAuditLogs = sqliteTable(
   },
   (t) => [index('idx_admin_audit_created').on(t.createdAt)],
 );
+
+/** Long-lived delivery links keep an independent R2 reference after sent-mail deletion. */
+export const externalAttachmentLinks = sqliteTable('external_attachment_links', {
+  attachmentId: integer('attachment_id').primaryKey(),
+  r2Key: text('r2_key').notNull(),
+  filename: text('filename').notNull(),
+  mimeType: text('mime_type').notNull(),
+  size: integer('size').notNull(),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+}, (t) => [index('idx_external_links_expiry').on(t.expiresAt), index('idx_external_links_r2').on(t.r2Key)]);
+
+/** Durable garbage references survive failed R2 cleanup. */
+export const storageCleanupJobs = sqliteTable('storage_cleanup_jobs', {
+  r2Key: text('r2_key').primaryKey(),
+  createdAt: createdAtColumn(),
+  lastError: text('last_error').notNull().default(''),
+});
+
+export const notificationJobs = sqliteTable('notification_jobs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  messageId: integer('message_id'),
+  userId: integer('user_id').notNull(),
+  channel: text('channel', { enum: ['feishu', 'pushdeer', 'webhook', 'forward'] }).notNull(),
+  target: text('target').notNull().default(''),
+  payload: text('payload', { mode: 'json' }).notNull().$type<Record<string, unknown>>(),
+  status: text('status', { enum: ['pending', 'processing', 'succeeded', 'failed', 'skipped', 'unknown'] }).notNull().default('pending'),
+  attempts: integer('attempts').notNull().default(0),
+  maxAttempts: integer('max_attempts').notNull(),
+  nextAttemptAt: integer('next_attempt_at', { mode: 'timestamp_ms' }).notNull(),
+  createdAt: createdAtColumn(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+  lastAttemptAt: integer('last_attempt_at', { mode: 'timestamp_ms' }),
+  lastError: text('last_error').notNull().default(''),
+  lastHttpStatus: integer('last_http_status'),
+  dedupeKey: text('dedupe_key').notNull().unique(),
+}, (t) => [index('idx_notification_due').on(t.status, t.nextAttemptAt), index('idx_notification_user').on(t.userId, t.createdAt)]);
+
+/** Temporary references protect delivery objects while sending or copying metadata. */
+export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
+  r2Key: text('r2_key').notNull(),
+  token: text('token').notNull(),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+}, (t) => [primaryKey({ columns: [t.r2Key, t.token] }), index('idx_delivery_lease_expiry').on(t.expiresAt)]);

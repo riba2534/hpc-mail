@@ -26,7 +26,7 @@ export function FormField({ label, description, error, required, htmlFor, classN
       )}
       {children({ id, 'aria-describedby': describedById, 'aria-invalid': error ? true : undefined })}
       {error ? (
-        <p id={`${id}-error`} className="text-xs text-critical">
+        <p id={`${id}-error`} role="alert" className="text-xs text-critical">
           {error}
         </p>
       ) : description ? (

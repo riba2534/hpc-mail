@@ -1,0 +1,35 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { act, renderHook, waitFor } from '@testing-library/react';
+import type { ReactNode } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { MessageSummary } from '@hpc-mail/shared';
+const list = vi.hoisted(()=>vi.fn());
+vi.mock('@/api/resources',()=>({messageApi:{list}}));
+import { useMessagesQuery } from './use-messages';
+const first={items:[{id:3,isRead:false,isStarred:false,status:'received'} as MessageSummary],nextCursor:'older'};
+const older={items:[{id:2} as MessageSummary],nextCursor:null};
+afterEach(()=>vi.restoreAllMocks());
+describe('multi-page inbox polling',()=>{
+  it('probes only the first page until its data changes, then refreshes all cursors consistently',async()=>{
+    let tick: (()=>void | Promise<void>) | undefined;
+    const originalInterval=globalThis.setInterval;
+    vi.spyOn(globalThis,'setInterval').mockImplementation((callback,delay,...args)=>{if(delay===20_000){tick=callback as ()=>void | Promise<void>;return -137 as unknown as ReturnType<typeof setInterval>};return originalInterval(callback,delay,...args)});
+    let head=first;
+    list.mockImplementation(async(query:{cursor?:string})=>query.cursor==='older'?older:head);
+    const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
+    const wrapper=({children}:{children:ReactNode})=><QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    const {result}=renderHook(()=>useMessagesQuery({direction:'inbound'}),{wrapper});
+    await waitFor(()=>expect(result.current.isSuccess).toBe(true));
+    await act(async()=>{await result.current.fetchNextPage()});
+    await waitFor(()=>expect(result.current.data?.pages).toHaveLength(2));
+    const baseline=list.mock.calls.length;
+    await act(async()=>{await tick?.()});
+    await waitFor(()=>expect(list).toHaveBeenCalledTimes(baseline+1));
+    expect(result.current.data?.pages[1]).toEqual(older);
+    head={...first,items:[{...first.items[0]!,isRead:true}]};
+    await act(async()=>{await tick?.()});
+    await waitFor(()=>expect(result.current.data?.pages[0]?.items[0]?.isRead).toBe(true));
+    expect(list.mock.calls.slice(baseline+1).map(([query])=>query.cursor)).toEqual([undefined,undefined,'older']);
+    client.clear();
+  });
+});

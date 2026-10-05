@@ -28,7 +28,19 @@ export function IdentityPicker({
 }: IdentityPickerProps) {
   if (isAdmin) {
     return (
-      <FormField label="发件地址" description="管理员可用任意前缀 + 系统域名发件。" required>
+      <div className="flex flex-col gap-3">
+      <FormField label="发件身份" description="可选择已有邮箱（含保留的旧域邮箱），或填写系统域名下的地址。">
+        {(field) => (
+          <Select value={mailboxId ? String(mailboxId) : 'custom'} onValueChange={(value) => { if (value) onMailboxId(value === 'custom' ? null : Number(value)); }}>
+            <SelectTrigger {...field}><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="custom">自定义发件地址</SelectItem>
+              {mailboxes.map((mailbox) => <SelectItem key={mailbox.id} value={String(mailbox.id)}>{mailbox.address}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        )}
+      </FormField>
+      {mailboxId === null && <FormField label="发件地址" description="管理员可用任意前缀 + 系统域名发件。" required>
         {(field) => (
           <div className="flex items-center gap-2">
             <Input
@@ -41,7 +53,7 @@ export function IdentityPicker({
             <span className="text-sm text-ink-tertiary">@</span>
             <div className="w-48">
               <Select value={domain} onValueChange={onDomain}>
-                <SelectTrigger>
+                <SelectTrigger aria-label="发件域名">
                   <SelectValue placeholder="域名" />
                 </SelectTrigger>
                 <SelectContent>
@@ -55,7 +67,8 @@ export function IdentityPicker({
             </div>
           </div>
         )}
-      </FormField>
+      </FormField>}
+      </div>
     );
   }
 
@@ -64,7 +77,7 @@ export function IdentityPicker({
       {(field) => (
         <Select
           value={mailboxId ? String(mailboxId) : ''}
-          onValueChange={(value) => onMailboxId(value ? Number(value) : null)}
+          onValueChange={(value) => { if (value) onMailboxId(Number(value)); }}
         >
           <SelectTrigger id={field.id}>
             <SelectValue placeholder={mailboxes.length === 0 ? '请先认领一个地址' : '选择发件地址'} />

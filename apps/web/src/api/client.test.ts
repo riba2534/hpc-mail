@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api';
 import { ApiError } from '@/api/errors';
-import { TOKEN_STORAGE_KEY } from '@/lib/auth-token';
+import { setAuthToken, TOKEN_STORAGE_KEY } from '@/lib/auth-token';
 
 function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), {
@@ -55,6 +55,34 @@ describe('api client（新信封）', () => {
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).unauthorized).toBe(true);
     expect(localStorage.getItem(TOKEN_STORAGE_KEY)).toBeNull();
+  });
+
+  it('late 401 from an old account cannot remove a replacement token', async () => {
+    setAuthToken('old');
+    let finish!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; })));
+    const pending = api.get('/messages').catch((error: unknown) => error);
+    setAuthToken('new');
+    finish(jsonResponse({ error: { code: 'unauthorized', message: 'expired' } }, 401));
+    await pending;
+    expect(localStorage.getItem(TOKEN_STORAGE_KEY)).toBe('new');
+  });
+
+  it('anonymous login failure does not clear another tab’s authenticated account', async () => {
+    setAuthToken('new');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ error: { code: 'bad_credentials', message: 'wrong password' } }, 401)));
+    await api.post('/auth/login', {}, { token: null }).catch(() => {});
+    expect(localStorage.getItem(TOKEN_STORAGE_KEY)).toBe('new');
+  });
+
+  it('late success from an old account is discarded', async () => {
+    setAuthToken('old');
+    let finish!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { finish = resolve; })));
+    const pending = api.get('/messages');
+    setAuthToken('new');
+    finish(jsonResponse({ data: { private: 'old body' } }, 200));
+    await expect(pending).rejects.toMatchObject({ code: 'session_changed' });
   });
 
   it('非 JSON 错误响应也映射为带状态码的 ApiError', async () => {

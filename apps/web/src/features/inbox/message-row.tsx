@@ -7,7 +7,7 @@ import { cn } from '@/lib/cn';
 import { formatRelativeTime } from '@/lib/format';
 
 const OUTBOUND_STATUS: Record<OutboundStatus, { label: string; tone: BadgeTone }> = {
-  sent: { label: '已发送', tone: 'neutral' },
+  sent: { label: '已提交', tone: 'neutral' },
   delivered: { label: '已送达', tone: 'positive' },
   bounced: { label: '退信', tone: 'critical' },
   failed: { label: '失败', tone: 'critical' },
@@ -44,7 +44,7 @@ export function MessageRow({
   const unread = !outbound && !message.isRead;
   const primary = outbound ? outboundRecipientLabel(message) : message.fromName || message.fromAddress;
   const status = OUTBOUND_STATUS[message.status as OutboundStatus];
-  const failed = outbound && (message.status === 'failed' || message.status === 'bounced');
+  const failed = outbound && Boolean(message.errorDetail || message.status === 'failed' || message.status === 'bounced');
 
   return (
     <div
@@ -99,10 +99,11 @@ export function MessageRow({
               </Badge>
             )}
             {outbound && status && (
-              <Badge tone={status.tone} className="shrink-0">
-                {status.label}
+              <Badge tone={failed ? 'critical' : status.tone} className="shrink-0">
+                {failed && message.status !== 'failed' && message.status !== 'bounced' ? '部分失败' : status.label}
               </Badge>
             )}
+            {!outbound && (message.status === 'degraded' || message.errorDetail) && <Badge tone="caution">内容异常</Badge>}
             {!outbound && (
               <span className="ml-auto hidden max-w-[45%] shrink-0 items-center gap-1.5 truncate text-xs text-ink-tertiary sm:inline-flex">
                 {shared && (

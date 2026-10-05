@@ -1,13 +1,25 @@
 /** /v1 的 OpenAPI 3.1 描述（公开，供工具/人类开发者导入）；server 地址按请求来源生成 */
 export function buildOpenApiSpec(origin: string) {
-  return { ...OPENAPI_SPEC, servers: [{ url: `${origin}/v1` }] };
+  const paths = Object.fromEntries(Object.entries(OPENAPI_SPEC.paths).map(([path, item]) => [path,
+    Object.fromEntries(Object.entries(item).map(([method, value]) => {
+      if (method === 'parameters') return [method, value];
+      const operation = value as unknown as { summary: string; responses: Record<string, { description: string }> };
+      return [method, { ...operation, description: operation.summary, tags: ['Mail'],
+        operationId: `${method}_${path.replace(/[^a-zA-Z0-9]+/g, '_')}`,
+        responses: { ...Object.fromEntries(Object.entries(operation.responses).map(([code, response]) => [code, { ...response, content: path.includes('/attachments/') && code === '200' ? { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } : { 'application/json': { schema: { '$ref': '#/components/schemas/Envelope' } } } }])), 400: { description: 'Invalid request' }, 401: { description: 'Authentication required' }, 403: { description: 'Insufficient permission' }, 429: { description: 'Rate limit exceeded' }, 500: { description: 'Server error; keep the same Idempotency-Key when retrying a send' } },
+      }];
+    })),
+  ]));
+  return { ...OPENAPI_SPEC, paths, tags: [{ name: 'Mail', description: 'Mailbox and mail operations' }], servers: [{ url: `${origin}/v1` }] };
 }
 
 const OPENAPI_SPEC = {
   openapi: '3.1.0',
   info: {
     title: 'HPC Mail Open API',
-    version: '1.1.0',
+    version: '1.2.0',
+    license: { name: 'MIT', identifier: 'MIT' },
+    contact: { name: 'HPC Mail', url: 'https://github.com/riba2534/hpc-mail' },
     description: '多域名邮箱系统的开放 API。用 API Key（Bearer hpcm_...）鉴权。',
   },
   security: [{ apiKey: [] }],
@@ -18,7 +30,7 @@ const OPENAPI_SPEC = {
     schemas: {
       Envelope: {
         type: 'object',
-        properties: { data: {}, error: { type: 'object' }, requestId: { type: 'string' } },
+        properties: { data: { anyOf: [{ '$ref': '#/components/schemas/MessageSummary' }, { type: 'array', items: {} }, { type: 'object' }] }, error: { type: 'object' }, requestId: { type: 'string' } },
       },
       MessageSummary: {
         type: 'object',
@@ -34,6 +46,7 @@ const OPENAPI_SPEC = {
           verificationCode: { type: 'string' },
           status: { type: 'string' },
           errorDetail: { type: 'string' },
+          recipientOutcomes: { type: 'array', items: { type: 'object', properties: { address: { type: 'string' }, status: { type: 'string', enum: ['delivered', 'sent', 'failed'] }, error: { type: 'string' } } } },
           isRead: { type: 'boolean' },
           createdAt: { type: 'string', format: 'date-time' },
         },
@@ -113,8 +126,8 @@ const OPENAPI_SPEC = {
         responses: { 200: { description: '严格返回 afterId 后最早的一封新邮件，或 message:null' } },
       },
     },
-    '/messages/{id}': { get: { summary: '邮件详情（含 verificationCode）', responses: { 200: { description: 'ok' } } } },
-    '/messages/{id}/attachments/{attId}': { get: { summary: '下载附件', responses: { 200: { description: 'ok' } } } },
+    '/messages/{id}': { parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer', minimum: 1 } }], get: { summary: '邮件详情（含 verificationCode）', responses: { 200: { description: 'ok' } } } },
+    '/messages/{id}/attachments/{attId}': { parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer', minimum: 1 } }, { name: 'attId', in: 'path', required: true, schema: { type: 'integer', minimum: 1 } }], get: { summary: '下载附件', responses: { 200: { description: 'ok' } } } },
     '/messages/read': { post: { summary: '批量标记已读（mail.write）', responses: { 200: { description: 'ok' } } } },
     '/messages/delete': { post: { summary: '批量删除（mail.write）', responses: { 200: { description: 'ok' } } } },
   },

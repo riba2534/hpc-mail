@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { MessageDetail } from '@hpc-mail/shared';
-import { buildForward, buildReply } from './compose-init';
+import { buildForward, buildReply, buildReplyAll, buildResend } from './compose-init';
 
 function makeDetail(overrides: Partial<MessageDetail> = {}): MessageDetail {
   return {
@@ -52,5 +52,22 @@ describe('buildReply / buildForward', () => {
     expect(forward.to).toEqual([]);
     expect(forward.replyToMessageId).toBeUndefined();
     expect(forward.body).toContain('----- 原始邮件 -----');
+  });
+  it('reply and reply-all use Reply-To rather than a relay envelope sender', () => {
+    const message = makeDetail({replyTo:['original@example.com'],recipients:{to:['me@hpc.email','participant@example.com'],cc:['copy@example.com'],bcc:[]}});
+    expect(buildReply(message).to).toEqual(['original@example.com']);
+    expect(buildReplyAll(message)).toMatchObject({to:['original@example.com'],cc:['participant@example.com','copy@example.com']});
+  });
+  it('resending retains BCC, HTML and the original attachments', () => {
+    const message = makeDetail({direction:'outbound',recipients:{to:['to@example.com'],cc:['cc@example.com'],bcc:['bcc@example.com']},bodyHtml:'<p>formatted</p>',attachments:[{id:1,filename:'file.txt',mimeType:'text/plain',size:4,contentId:'',disposition:'attachment',url:'/signed'}]});
+    expect(buildResend(message)).toMatchObject({to:['to@example.com'],cc:['cc@example.com'],bcc:['bcc@example.com'],isHtml:true,body:'<p>formatted</p>',forwardAttachmentsFrom:42});
+  });
+  it('only failed recipients are retried, retaining Cc/Bcc grouping and excluding all successful targets', () => {
+    const message = makeDetail({direction:'outbound',recipients:{to:['ok@example.com'],cc:['failed-cc@example.com'],bcc:['failed-secret@example.com']},recipientOutcomes:[{address:'ok@example.com',status:'sent'},{address:'failed-cc@example.com',status:'failed'},{address:'failed-secret@example.com',status:'failed'}]});
+    const result = buildResend(message,true);
+    expect(result.to).toEqual([]);
+    expect(result.cc).toEqual(['failed-cc@example.com']);
+    expect(result.bcc).toEqual(['failed-secret@example.com']);
+    expect(message.recipients.bcc).toEqual(['failed-secret@example.com']);
   });
 });

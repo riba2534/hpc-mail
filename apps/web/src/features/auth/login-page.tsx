@@ -16,7 +16,7 @@ import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { toast } from '@/components/ui/toast';
-import { setAuthToken } from '@/lib/auth-token';
+import { getAuthRevision, setAuthToken } from '@/lib/auth-token';
 import { usePublicConfig } from '@/lib/use-config';
 import { useAuthToken } from '@/lib/use-session';
 
@@ -45,8 +45,9 @@ export function LoginPage() {
   const needsInvite = registrationMode === 'invite';
 
   const applySession = (data: LoginResponse) => {
+    queryClient.clear();
     setAuthToken(data.token);
-    queryClient.setQueryData(queryKeys.session, data.user);
+    queryClient.setQueryData(queryKeys.sessionForRevision(getAuthRevision()), data.user);
     void queryClient.invalidateQueries({ queryKey: queryKeys.session });
     navigate(redirectTo, { replace: true });
   };
@@ -118,7 +119,7 @@ export function LoginPage() {
   };
 
   return (
-    <div className="grid min-h-dvh place-items-center bg-canvas px-4 py-10">
+    <main className="grid min-h-dvh place-items-center bg-canvas px-4 py-10">
       <div className="w-full max-w-sm">
         <div className="mb-6 flex flex-col items-center gap-2 text-center">
           <img src="/logo.png" alt="" className="size-12 rounded-lg" />
@@ -190,7 +191,7 @@ export function LoginPage() {
               </FormField>
             )}
 
-            {error && <p className="text-sm text-critical">{error}</p>}
+        {error && <p role="alert" className="text-sm text-critical">{error}</p>}
 
             <Button type="submit" loading={pending} disabled={configLoading} className="mt-1 w-full">
               {mode === 'login' ? '登录' : '注册并登录'}
@@ -208,6 +209,6 @@ export function LoginPage() {
           开源于 GitHub
         </a>
       </div>
-    </div>
+    </main>
   );
 }

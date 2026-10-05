@@ -100,13 +100,19 @@ export async function apiRequest<TResponse, TBody = unknown>(
 
     if (!response.ok) {
       const error = await toErrorFromResponse(response);
-      if (error.unauthorized) clearAuthToken();
+      if (error.unauthorized && token && token === getAuthToken()) clearAuthToken();
       throw error;
     }
 
+    if (token && token !== getAuthToken()) {
+      throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
+    }
     if (response.status === 204) return undefined as TResponse;
     const payload = (await readJson(response)) as { data?: TResponse } | undefined;
-    if (payload === undefined) {
+    if (token && token !== getAuthToken()) {
+      throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
+    }
+    if (!payload || typeof payload !== 'object' || !('data' in payload)) {
       throw new ApiError('服务器返回了无法识别的响应', { code: 'malformed', httpStatus: response.status });
     }
     return payload.data as TResponse;

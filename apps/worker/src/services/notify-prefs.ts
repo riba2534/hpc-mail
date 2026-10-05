@@ -13,6 +13,9 @@ import { createDb } from '../db/client.js';
 import { settings as settingsTable, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
+import { validateFeishuWebhookUrl } from './feishu.js';
+import { validatePushDeerEndpoint } from './pushdeer.js';
+import { validateNotifyWebhookUrl } from './webhook-notify.js';
 
 function clone(prefs: UserNotifyPrefs): UserNotifyPrefs {
   return {
@@ -116,6 +119,20 @@ export async function updateUserNotifyPrefs(
       ...patch.pushdeer,
       pushkey: patch.pushdeer.pushkey === SECRET_MASK ? current.pushdeer.pushkey : patch.pushdeer.pushkey,
     };
+  }
+
+  // 保存启用配置时采用与实际投递相同的校验，避免保存成功但永远无法执行。
+  // 未启用的配置可作为未填完整的草稿；空 secret / PushKey 是明确清除，MASK 才是保留。
+  if (patch.feishu && next.feishu.enabled) validateFeishuWebhookUrl(next.feishu.webhookUrl);
+  if (patch.pushdeer && next.pushdeer.enabled) {
+    validatePushDeerEndpoint(next.pushdeer.endpoint);
+    if (!next.pushdeer.pushkey.trim()) throw new AppError('validation_failed', '开启 PushDeer 通知需要 PushKey');
+  }
+  if (patch.webhook && next.webhook.enabled && !validateNotifyWebhookUrl(next.webhook.url)) {
+    throw new AppError('validation_failed', '开启通用 Webhook 需要有效的 HTTPS 公网地址');
+  }
+  if (patch.forward && next.forward.enabled && next.forward.addresses.length === 0) {
+    throw new AppError('validation_failed', '开启邮箱转发需要至少一个目标地址');
   }
 
   const db = createDb(env);

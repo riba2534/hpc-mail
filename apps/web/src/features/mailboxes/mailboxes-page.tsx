@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, Pencil, Plus, Trash2 } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
 import type { Mailbox } from '@hpc-mail/shared';
-import { queryKeys } from '@/api/query-keys';
+import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
@@ -114,10 +114,10 @@ function ReleaseDialog({
         <DialogBody>
           <div className="flex flex-col gap-3 text-sm text-ink-secondary">
             <p>释放后该地址回到未认领状态，其他用户可重新认领。</p>
-            {mailbox && mailbox.messageCount > 0 && (
+            {mailbox && (
               <div className="rounded-md border border-caution/40 bg-caution-soft/40 p-3 text-ink">
                 <p className="font-medium text-caution">
-                  ⚠ 该地址有 {mailbox.messageCount} 封历史邮件
+                  当前已加载的历史邮件数：{mailbox.messageCount}（可能有新来信）
                 </p>
                 <p className="mt-1 text-xs text-ink-secondary">
                   若不删除，下一个认领此地址的人将看到这些邮件的<b>全部内容</b>（含验证码、账单等敏感信息）。
@@ -129,7 +129,7 @@ function ReleaseDialog({
                     checked={deleteHistory}
                     onChange={(event) => setDeleteHistory(event.target.checked)}
                   />
-                  <span className="text-sm text-ink">同时永久删除这些历史邮件</span>
+                  <span className="text-sm text-ink">同时永久删除该地址的全部历史邮件</span>
                 </label>
               </div>
             )}
@@ -154,14 +154,15 @@ function ReleaseDialog({
 
 export function MailboxesPage() {
   const queryClient = useQueryClient();
-  const { data: visibleDomains } = useDomains();
+  const domainsQuery = useDomains();
+  const { data: visibleDomains } = domainsQuery;
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(false);
   const [claimOpen, setClaimOpen] = useState(false);
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [editing, setEditing] = useState<Mailbox | null>(null);
 
   const invalidateMailboxes = () =>
-    void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.root });
+    invalidateMailboxOwnership(queryClient);
 
   const items = mailboxes ?? [];
 
@@ -171,12 +172,13 @@ export function MailboxesPage() {
         title="我的邮箱"
         description="认领任意前缀 + 系统域名的地址，全局唯一占用。"
         actions={
-          <Button onClick={() => setClaimOpen(true)}>
+          <Button disabled={!visibleDomains?.length} onClick={() => setClaimOpen(true)}>
             <Plus className="size-4" />
             认领地址
           </Button>
         }
       />
+      {domainsQuery.isError && <QueryErrorState error={domainsQuery.error} onRetry={() => void domainsQuery.refetch()} className="mb-4" />}
 
       {isLoading ? (
         <Skeleton className="h-40 w-full rounded-lg" />
@@ -187,7 +189,7 @@ export function MailboxesPage() {
           icon={AtSign}
           title="还没有认领任何地址"
           description="认领一个地址后即可收发邮件。"
-          action={<Button onClick={() => setClaimOpen(true)}>认领地址</Button>}
+          action={<Button disabled={!visibleDomains?.length} onClick={() => setClaimOpen(true)}>认领地址</Button>}
           className="rounded-lg border border-line bg-surface"
         />
       ) : (

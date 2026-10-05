@@ -89,14 +89,16 @@ export async function consumeDraftAttachments(
     .from(draftAttachments)
     .where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, uniq)))
     .all();
+  const cleaned: number[] = [];
   for (const r of rows) {
     try {
       await env.r2.delete(r.r2Key);
+      cleaned.push(r.id);
     } catch (e) {
       console.error('删除草稿附件 R2 失败:', e);
     }
   }
-  if (rows.length) {
-    await db.delete(draftAttachments).where(inArray(draftAttachments.id, rows.map((r) => r.id)));
+  if (cleaned.length) {
+    await db.delete(draftAttachments).where(inArray(draftAttachments.id, cleaned));
   }
 }
