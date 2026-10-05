@@ -76,6 +76,18 @@ fi
 step "OpenAPI 可读"
 curl -fsS "$BASE_URL/v1/openapi.json" | jq -e '.openapi == "3.1.0"' >/dev/null || fail "OpenAPI 结构异常"
 
+step "Agent 技能与会话 API 可发现"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '.openapi == "3.1.0" and (.paths["/auth/login"].post.requestBody != null) and (.paths["/admin/settings"].put != null)' >/dev/null || fail "会话 OpenAPI 缺少认证或管理员能力"
+agent_skill=$(curl -fsS "$BASE_URL/skill.md")
+grep -q '^name: hpc-mail$' <<< "$agent_skill" || fail "Agent 技能元数据缺失"
+agent_index=$(curl -fsS "$BASE_URL/llms.txt")
+grep -q '/skill.md' <<< "$agent_index" || fail "Agent 发现入口缺失"
+
+step "未知 API 返回结构化错误"
+unknown=$(curl -sS -w '\n%{http_code}' "$BASE_URL/v1/missing-smoke-endpoint")
+[ "$(echo "$unknown" | tail -1)" = "404" ] || fail "未知 API 未返回 404"
+echo "$unknown" | head -1 | jq -e '.error.code == "not_found" and (.requestId | type == "string")' >/dev/null || fail "未知 API 错误不可解析"
+
 step "注册模式=closed 时注册被拒"
 if [ "$mode" = "closed" ]; then
   rcode=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/api/auth/register" \

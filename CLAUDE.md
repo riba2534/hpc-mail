@@ -71,7 +71,10 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 ## AI Agent 操作指南 `/skill.md`
 
-`apps/web/public/skill.md` 是一份**给外部 AI Agent 的 API 使用说明书**，随前端构建部署到 https://hpc.email/skill.md（Worker assets 直接返回 raw Markdown）。它按 skill-creator 标准写（YAML frontmatter 的 `name` + pushy `description` + imperative 指令），教 AI 用用户名密码登录后完成收发、回复、读验证码等操作。**改动了会影响 AI 使用的 API（端点、字段、认证）时，同步更新这个文件**，保证指引与实现一致。
+`apps/web/public/skill.md` 是一份**给外部 AI Agent 的 API 使用说明书**，随前端构建部署到 https://hpc.email/skill.md（Worker assets 直接返回 raw Markdown）。YAML frontmatter 的 `name` 和 `description` 应准确说明目标系统及触发条件；入口说明认证选择和完整能力地图，详细参数和示例放入其链接的主题参考。API Key 用 `/v1`，JWT 用 `/api`；账户设置及管理员功能只使用 JWT，不扩张邮箱 Key 的权限。**改动了会影响 AI 使用的 API（端点、字段、认证）时，同步更新技能、参考文档和对应 OpenAPI**，保证指引与实现一致。
+
+- `/llms.txt`、首页 HTML 链接和 API 响应 `Link` 头提供文档发现入口；`/api/openapi.json` 与 `/v1/openapi.json` 分别描述会话和 API Key 接口，公开返回原始 OpenAPI JSON（不包 `{data}`）。两份描述均以请求站点 origin 为 server，适用于自部署。
+- 邮件 `scope` 必须显式校验，query/body 同时指定时必须一致；非法值不能静默退回个人邮箱。未知 API 返回统一 JSON 错误信封；缺失 Markdown 文档不能返回 SPA HTML 冒充技能正文。
 
 - 域名更新必须带 `expectedDomainsRevision`，旧快照返回 409；管理配置和认领校验直读 D1，避免 KV 陈旧配置允许已移除域名被认领。
 - 发件结果包含每个目标的 `recipientOutcomes`；补发保留 To/Cc/Bcc 分组，只重试失败目标。Idempotency-Key 在副作用开始前关联发件行；完成回填失败不能变成请求发送失败或重新投递。

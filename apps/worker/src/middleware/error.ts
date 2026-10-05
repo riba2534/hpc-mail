@@ -9,6 +9,10 @@ export const requestId: MiddlewareHandler<AppContext> = async (c, next) => {
   const id = c.req.header('X-Request-ID') || crypto.randomUUID();
   c.set('requestId', id);
   c.header('X-Request-ID', id);
+  const specification = c.req.path.startsWith('/v1/') || c.req.path === '/v1'
+    ? '/v1/openapi.json'
+    : '/api/openapi.json';
+  c.header('Link', `</skill.md>; rel="describedby"; type="text/markdown", <${specification}>; rel="service-desc"; type="application/vnd.oai.openapi+json"`);
   await next();
 };
 

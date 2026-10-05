@@ -1,9 +1,10 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { ok } from '../../lib/http.js';
-import { apiKeyAuth } from '../../middleware/api-key-auth.js';
+import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
 import { getVisibleDomains } from '../../services/domain.js';
 import type { AppContext } from '../../types.js';
+import { createUploadRoutes } from '../uploads.js';
 import v1Mailboxes from './mailboxes.js';
 import v1Messages from './messages.js';
 import { buildOpenApiSpec } from './openapi.js';
@@ -16,8 +17,8 @@ app.use(
   cors({
     origin: '*',
     allowHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key'],
-    allowMethods: ['GET', 'POST', 'OPTIONS'],
-    exposeHeaders: ['X-Request-ID', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    exposeHeaders: ['Link', 'X-Request-ID', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
   }),
 );
 
@@ -38,5 +39,9 @@ app.get('/openapi.json', (c) => c.json(buildOpenApiSpec(new URL(c.req.url).origi
 
 app.route('/mailboxes', v1Mailboxes);
 app.route('/messages', v1Messages);
+app.route('/uploads', createUploadRoutes(apiKeyAuth, async (c, next) => {
+  requireScope(c, 'mail.send');
+  await next();
+}));
 
 export default app;

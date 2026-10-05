@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { AppError } from './lib/errors.js';
 import { onError, requestId } from './middleware/error.js';
 import adminApiKeys from './routes/admin/api-keys.js';
 import adminAudit from './routes/admin/audit.js';
@@ -17,14 +18,17 @@ import mailboxes from './routes/mailboxes.js';
 import messages from './routes/messages.js';
 import notifyPrefs from './routes/notify-prefs.js';
 import v1 from './routes/v1/index.js';
+import { buildSessionOpenApiSpec } from './routes/api-openapi.js';
 import type { AppContext } from './types.js';
 
 export function createApp() {
   const app = new Hono<AppContext>();
   app.use('*', requestId);
   app.onError(onError);
+  app.notFound((c) => onError(new AppError('not_found', '接口不存在'), c));
 
   const api = new Hono<AppContext>();
+  api.get('/openapi.json', (c) => c.json(buildSessionOpenApiSpec(new URL(c.req.url).origin)));
   api.route('/auth', auth);
   api.route('/avatar', avatar);
   api.route('/config', config);

@@ -30,6 +30,13 @@ export function parseId(value: string | undefined): number {
   return id;
 }
 
+/** 显式布尔查询不能因拼写或客户端类型差异静默退回 false。 */
+export function parseBooleanFlag(value: string | undefined): boolean {
+  if (value === undefined || value === '' || value === '0' || value === 'false') return false;
+  if (value === '1' || value === 'true') return true;
+  throw new AppError('validation_failed', '开关参数需为 1/0 或 true/false');
+}
+
 /** safeParse JSON body，失败抛 validation_failed */
 export async function parseBody<T>(c: Context<AppContext>, schema: SafeParser<T>): Promise<T> {
   let raw: unknown;

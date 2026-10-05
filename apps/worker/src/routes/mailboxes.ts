@@ -1,7 +1,7 @@
 import { claimMailboxRequestSchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
+import { ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
-import { ok, parseBody, parseId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   checkAvailability,
@@ -19,7 +19,8 @@ app.use('*', requireAuth);
 /** admin ?all=1 看全站；否则看自己认领的 */
 app.get('/', async (c) => {
   const user = c.get('user')!;
-  const all = c.req.query('all') === '1' && user.role === 'admin';
+  const all = parseBooleanFlag(c.req.query('all'));
+  if (all && user.role !== 'admin') throw new AppError('forbidden', '需要管理员权限');
   const list = await listMailboxes(c.env, all ? { all: true } : { userId: user.id });
   return ok(c, list);
 });
@@ -31,10 +32,8 @@ app.get('/shared', async (c) => {
 });
 
 app.get('/availability', async (c) => {
-  const localPart = (c.req.query('localPart') || '').trim().toLowerCase();
-  const domain = (c.req.query('domain') || '').trim().toLowerCase();
-  if (!localPart || !domain) throw new AppError('validation_failed', '缺少 localPart 或 domain');
-  return ok(c, await checkAvailability(c.env, localPart, domain));
+  const req = parseQuery(c, claimMailboxRequestSchema);
+  return ok(c, await checkAvailability(c.env, req.localPart, req.domain, c.get('user')!.role === 'admin'));
 });
 
 app.post('/', async (c) => {
@@ -53,7 +52,7 @@ app.put('/:id', async (c) => {
 app.delete('/:id', async (c) => {
   const user = c.get('user')!;
   const id = parseId(c.req.param('id'));
-  const deleteHistory = c.req.query('deleteHistory') === '1';
+  const deleteHistory = parseBooleanFlag(c.req.query('deleteHistory'));
   const result = await releaseMailbox(c.env, user.id, id, user.role === 'admin', deleteHistory);
   return ok(c, { success: true, ...result });
 });

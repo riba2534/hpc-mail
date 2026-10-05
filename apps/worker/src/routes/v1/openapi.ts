@@ -1,134 +1,66 @@
-/** /v1 的 OpenAPI 3.1 描述（公开，供工具/人类开发者导入）；server 地址按请求来源生成 */
-export function buildOpenApiSpec(origin: string) {
-  const paths = Object.fromEntries(Object.entries(OPENAPI_SPEC.paths).map(([path, item]) => [path,
-    Object.fromEntries(Object.entries(item).map(([method, value]) => {
-      if (method === 'parameters') return [method, value];
-      const operation = value as unknown as { summary: string; responses: Record<string, { description: string }> };
-      return [method, { ...operation, description: operation.summary, tags: ['Mail'],
-        operationId: `${method}_${path.replace(/[^a-zA-Z0-9]+/g, '_')}`,
-        responses: { ...Object.fromEntries(Object.entries(operation.responses).map(([code, response]) => [code, { ...response, content: path.includes('/attachments/') && code === '200' ? { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } : { 'application/json': { schema: { '$ref': '#/components/schemas/Envelope' } } } }])), 400: { description: 'Invalid request' }, 401: { description: 'Authentication required' }, 403: { description: 'Insufficient permission' }, 429: { description: 'Rate limit exceeded' }, 500: { description: 'Server error; keep the same Idempotency-Key when retrying a send' } },
-      }];
-    })),
-  ]));
-  return { ...OPENAPI_SPEC, paths, tags: [{ name: 'Mail', description: 'Mailbox and mail operations' }], servers: [{ url: `${origin}/v1` }] };
-}
+import {
+  array, bool, changed, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, operation,
+  positiveId, query, ref, scopeQuery, specInfo, specificationOperation, str, uploadPaths, usedSchemas, type Paths,
+} from '../openapi-common.js';
 
-const OPENAPI_SPEC = {
-  openapi: '3.1.0',
-  info: {
-    title: 'HPC Mail Open API',
-    version: '1.2.0',
-    license: { name: 'MIT', identifier: 'MIT' },
-    contact: { name: 'HPC Mail', url: 'https://github.com/riba2534/hpc-mail' },
-    description: '多域名邮箱系统的开放 API。用 API Key（Bearer hpcm_...）鉴权。',
-  },
-  security: [{ apiKey: [] }],
-  components: {
-    securitySchemes: {
-      apiKey: { type: 'http', scheme: 'bearer', bearerFormat: 'hpcm_...' },
-    },
-    schemas: {
-      Envelope: {
-        type: 'object',
-        properties: { data: { anyOf: [{ '$ref': '#/components/schemas/MessageSummary' }, { type: 'array', items: {} }, { type: 'object' }] }, error: { type: 'object' }, requestId: { type: 'string' } },
-      },
-      MessageSummary: {
-        type: 'object',
-        required: ['id', 'direction', 'address', 'subject', 'preview', 'verificationCode', 'status', 'errorDetail', 'isRead', 'createdAt'],
-        properties: {
-          id: { type: 'integer' },
-          direction: { type: 'string', enum: ['inbound', 'outbound'] },
-          address: { type: 'string' },
-          fromAddress: { type: 'string' },
-          fromName: { type: 'string' },
-          subject: { type: 'string' },
-          preview: { type: 'string' },
-          verificationCode: { type: 'string' },
-          status: { type: 'string' },
-          errorDetail: { type: 'string' },
-          recipientOutcomes: { type: 'array', items: { type: 'object', properties: { address: { type: 'string' }, status: { type: 'string', enum: ['delivered', 'sent', 'failed'] }, error: { type: 'string' } } } },
-          isRead: { type: 'boolean' },
-          createdAt: { type: 'string', format: 'date-time' },
-        },
-      },
-      SendMailRequest: {
-        type: 'object',
-        required: ['from', 'to', 'subject'],
-        properties: {
-          from: {
-            type: 'object',
-            properties: {
-              mailboxId: { type: 'integer' },
-              localPart: { type: 'string' },
-              domain: { type: 'string' },
-              displayName: { type: 'string' },
-            },
-          },
-          to: { type: 'array', items: { type: 'string', format: 'email' } },
-          cc: { type: 'array', items: { type: 'string', format: 'email' }, default: [] },
-          bcc: { type: 'array', items: { type: 'string', format: 'email' }, default: [] },
-          subject: { type: 'string' },
-          text: { type: 'string' },
-          html: { type: 'string' },
-          replyToMessageId: { type: 'integer' },
-        },
-      },
-    },
-  },
-  paths: {
-    '/status': { get: { summary: '探活', responses: { 200: { description: 'ok' } } } },
-    '/domains': { get: { summary: '可用系统域名', responses: { 200: { description: 'ok' } } } },
+/** Public API-key contract. Session/admin operations are described separately. */
+export function buildOpenApiSpec(origin: string) {
+  const paths: Paths = {
+    '/openapi.json': { get: specificationOperation() },
+    '/status': { get: operation('Check API key access', object({ status: { type: 'string', const: 'operational' }, userId: positiveId,
+      role: { type: 'string', enum: ['admin', 'user'] }, scopes: array({ type: 'string', enum: ['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'] }) }),
+      { description: 'Requires an active API key and enabled API. No additional scope. This confirms access, not end-to-end mail delivery.' }) },
+    '/domains': { get: operation('List configured domains available to this role', object({ domains: array(str) }),
+      { description: 'No additional scope. Ordinary users see only public configured domains; administrators see all configured domains. Claim only a returned domain. Removed domains remain usable for existing owned mailbox identities but are absent from this new-claim list.' }) },
     '/mailboxes': {
-      get: { summary: '列出已认领邮箱', responses: { 200: { description: 'ok' } } },
-      post: { summary: '认领邮箱', responses: { 201: { description: 'created' } } },
+      get: operation('List owned mailboxes', array(ref('Mailbox')), { scope: 'mailbox.read', parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator-only, explicit all=1 lists every owner. Default lists caller-owned mailboxes.')] }),
+      post: operation('Claim a mailbox in an existing configured domain', ref('Mailbox'), { request: 'ClaimMailboxRequest', scope: 'mailbox.write', status: 201,
+        description: 'Use a domain returned by GET /domains. Does not register a domain or provision DNS. Ordinary users obey public-domain, reserved-prefix and per-user/per-domain quotas. Claiming inherits all historical mail at this address. A concurrent domain change returns 409.' }),
     },
-    '/mailboxes/shared': {
-      get: { summary: '列出共享给我的邮箱（只读，不能作为发件人）', responses: { 200: { description: 'ok' } } },
+    '/mailboxes/shared': { get: operation('List inboxes shared with the caller', array(ref('SharedMailbox')), { scope: 'mailbox.read',
+      description: 'Read-only inbound access. Shares do not grant send/delete/forward-notification rights. Read state is common to mailbox readers.' }) },
+    '/mailboxes/availability': { get: operation('Check address availability', ref('MailboxAvailability'), { scope: 'mailbox.read', parameters: [
+      query('localPart', { type: 'string', minLength: 1, maxLength: 64 }, undefined, true), query('domain', str, 'Use a visible configured domain.', true)],
+      description: 'Availability is advisory; a subsequent claim still enforces visibility, reserved prefixes, quotas and concurrent ownership.' }) },
+    '/mailboxes/{id}': {
+      put: operation('Update mailbox display name', ref('Mailbox'), { scope: 'mailbox.write', request: 'UpdateMailboxRequest' }),
+      delete: operation('Release a mailbox', object({ success: bool, deletedMessages: int }), { scope: 'mailbox.write', parameters: [query('deleteHistory', { type: 'string', enum: ['1', 'true', '0', 'false'] })],
+        description: 'Default retains all history and a future claimant inherits it. deleteHistory=1 atomically removes the address history and ownership. Already delivered external download links retain their promised 90-day lifetime. Owner or administrator only.' }),
     },
     '/messages': {
-      get: {
-        summary: '收发件列表',
-        parameters: [
-          { name: 'direction', in: 'query', schema: { type: 'string', enum: ['inbound', 'outbound'] } },
-          { name: 'address', in: 'query', schema: { type: 'string' } },
-          { name: 'q', in: 'query', schema: { type: 'string' } },
-          { name: 'afterId', in: 'query', schema: { type: 'integer' } },
-          { name: 'cursor', in: 'query', schema: { type: 'string' } },
-          { name: 'limit', in: 'query', schema: { type: 'integer', maximum: 100 } },
-        ],
-        responses: { 200: { description: 'ok' } },
-      },
-      post: {
-        summary: '发送/回复邮件（支持 Idempotency-Key 头）',
-        parameters: [
-          {
-            name: 'Idempotency-Key',
-            in: 'header',
-            required: false,
-            schema: { type: 'string', minLength: 1, maxLength: 128 },
-          },
-        ],
-        requestBody: {
-          required: true,
-          content: { 'application/json': { schema: { $ref: '#/components/schemas/SendMailRequest' } } },
-        },
-        responses: { 201: { description: 'created' } },
-      },
+      get: operation('List incoming or outgoing mail', ref('MessagePage'), { scope: 'mail.read', parameters: listQuery,
+        description: 'Descending cursor pagination. Use nextCursor exactly as returned; null ends the page stream. Shared inboxes only add non-trash inbound visibility. afterId supports incremental polling, but process all relevant results before advancing.' }),
+      post: operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope: 'mail.send', status: 201, parameters: [idempotencyHeader],
+        description: 'HTTP 201 can represent partial or total recipient failure: always inspect status, errorDetail and recipientOutcomes. Retry only failed recipients; preserve BCC, body and attachments explicitly. Provider-accepted sent is not proof of recipient inbox delivery. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion.' }),
     },
-    '/messages/wait': {
-      get: {
-        summary: '长轮询等新邮件（等验证码）',
-        parameters: [
-          { name: 'address', in: 'query', schema: { type: 'string' } },
-          { name: 'afterId', in: 'query', schema: { type: 'integer' } },
-          { name: 'timeout', in: 'query', schema: { type: 'integer', maximum: 50 } },
-        ],
-        responses: { 200: { description: '严格返回 afterId 后最早的一封新邮件，或 message:null' } },
-      },
-    },
-    '/messages/{id}': { parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer', minimum: 1 } }], get: { summary: '邮件详情（含 verificationCode）', responses: { 200: { description: 'ok' } } } },
-    '/messages/{id}/attachments/{attId}': { parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer', minimum: 1 } }, { name: 'attId', in: 'path', required: true, schema: { type: 'integer', minimum: 1 } }], get: { summary: '下载附件', responses: { 200: { description: 'ok' } } } },
-    '/messages/read': { post: { summary: '批量标记已读（mail.write）', responses: { 200: { description: 'ok' } } } },
-    '/messages/delete': { post: { summary: '批量删除（mail.write）', responses: { 200: { description: 'ok' } } } },
-  },
-} as const;
+    '/messages/wait': { get: operation('Wait for the earliest new incoming message', object({ message: { anyOf: [ref('MessageSummary'), { type: 'null' }] } }), { scope: 'mail.read',
+      parameters: [query('address', str), query('afterId', { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }), query('timeout', { type: 'integer', minimum: 1, maximum: 50, default: 25 }), ...scopeQuery],
+      description: 'Returns the earliest inbound id > afterId or message:null. Default scope is caller-owned/shared inbound; administrator may explicitly select unclaimed or user with userId. Poll every two seconds internally; maximum 120 polls per user per minute. Persist the returned id only after processing that message.' }) },
+    '/messages/read': { post: operation('Mark selected visible messages read or unread', changed, { request: 'MarkReadRequest', scope: 'mail.write', parameters: mutationQuery }) },
+    '/messages/read-all': { post: operation('Mark all visible incoming messages read', changed, { scope: 'mail.write', parameters: mutationQuery, request: 'MutationScopeRequest', requestRequired: false }) },
+    '/messages/delete': { post: operation('Move selected messages to trash', object({ deleted: int }), { request: 'MessageIdsRequest', scope: 'mail.write', parameters: mutationQuery,
+      description: 'Soft deletion only. Restorable until permanent deletion or automatic trash cleanup after seven days. Shared readers cannot delete mail.' }) },
+    '/messages/restore': { post: operation('Restore selected messages from trash', object({ restored: int, changed: int }), { request: 'MessageIdsRequest', scope: 'mail.write', parameters: mutationQuery }) },
+    '/messages/purge': { post: operation('Permanently delete selected trashed messages', object({ purged: int, changed: int }), { request: 'MessageIdsRequest', scope: 'mail.write', parameters: mutationQuery,
+      description: 'Irreversible metadata deletion. Cleanup persists through R2 outages. Count reflects messages actually removed; zero does not mean every requested id existed or was permitted.' }) },
+    '/messages/star': { post: operation('Set per-user stars on visible messages', changed, { request: 'StarMessagesRequest', scope: 'mail.write', parameters: mutationQuery }) },
+    '/messages/unread-count': { get: operation('Count unread inbox mail', object({ unread: int }), { scope: 'mail.read' }) },
+    '/messages/contacts': { get: operation('List recent contact addresses', object({ contacts: array(str) }), { scope: 'mail.read', parameters: scopeQuery }) },
+    '/messages/{id}': { get: operation('Read message detail, reply targets and attachments', ref('MessageDetail'), { scope: 'mail.read', parameters: scopeQuery,
+      description: 'replyTo is the preferred reply recipient list; otherwise reply to fromAddress. Attachment url values are short-lived signed download URLs. hasRaw indicates an original .eml is available. Degraded inbound mail exposes errorDetail and the original archive.' }) },
+    '/messages/{id}/thread': { get: operation('Read a visible message thread', object({ items: array(ref('MessageSummary')) }), { scope: 'mail.read', parameters: scopeQuery }) },
+    '/messages/{id}/raw': { get: operation('Download the original message archive', str, { scope: 'mail.read', parameters: scopeQuery, binary: 'message/rfc822', description: 'Returns binary .eml, without a data envelope. 404 when no raw archive exists.' }) },
+    '/messages/{id}/attachments/{attId}': { get: operation('Download a visible message attachment', str, { scope: 'mail.read', parameters: scopeQuery, binary: 'application/octet-stream',
+      description: 'Binary bytes with a safe Content-Type/Content-Disposition, without a data envelope. Attachment must belong to message id and the message must be visible.' }) },
+    ...uploadPaths('mail.send'),
+  };
+  return {
+    openapi: '3.1.0', info: specInfo('HPC Mail Open API', 'API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API.'),
+    servers: [{ url: `${origin}/v1` }], security: [{ apiKey: [] }],
+    externalDocs: { description: 'Agent usage guide and authentication workflows', url: `${origin}/skill.md` },
+    'x-relatedApis': [{ url: `${origin}/api/openapi.json`, description: 'JWT session and administration API' }],
+    tags: [{ name: 'Mail', description: 'Mail and mailbox operations. Required scopes are listed in x-required-scopes.' }],
+    components: { securitySchemes: { apiKey: { type: 'http', scheme: 'bearer', bearerFormat: 'hpcm_ followed by 64 hexadecimal characters' } }, schemas: usedSchemas(paths) },
+    paths: describePaths(paths),
+  };
+}

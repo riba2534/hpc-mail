@@ -54,6 +54,12 @@ export default {
     }
     // .md（如 /skill.md）assets 默认不带 charset，浏览器会按非 UTF-8 解析导致中文乱码，补上
     if (url.pathname.endsWith('.md')) {
+      if ((res.headers.get('content-type') || '').includes('text/html')) {
+        return withSecurityHeaders(new Response('Not Found', {
+          status: 404,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+        }));
+      }
       return withSecurityHeaders(res, { 'Content-Type': 'text/markdown; charset=utf-8' });
     }
     const hashedAsset = /^\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\.(js|css|woff2?|png|svg|webp)$/.test(url.pathname);

@@ -50,14 +50,14 @@ export const listMessagesQuerySchema = z.object({
   /** 搜索主题 / 发件人 / 正文 */
   q: z.string().trim().max(256).optional(),
   /**
-   * 可见范围。普通用户忽略（永远只看自己认领地址）。
+   * 可见范围。普通用户仅支持 mine（自己认领及共享收件），其他范围拒绝。
    * admin：缺省/'mine' = 自己认领；'unclaimed' = 未认领地址；'user' = 指定用户（需 userId）。
    */
   scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
   /** admin + scope=user 时指定目标用户 */
   userId: emptyAsUndefined(z.coerce.number().int().positive()),
   /** 增量拉取：只返回 id 大于该值的邮件（配合轮询/长轮询等码，避免漏检） */
-  afterId: z.coerce.number().int().positive().optional(),
+  afterId: emptyAsUndefined(z.coerce.number().int().nonnegative()),
   cursor: emptyAsUndefined(z.string().max(128)),
   limit: emptyAsUndefined(z.coerce.number().int().min(1).max(MAX_PAGE_SIZE)).default(
     DEFAULT_PAGE_SIZE,
@@ -71,6 +71,29 @@ export const listMessagesQuerySchema = z.object({
 export type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>;
 export type MessageListScope = NonNullable<ListMessagesQuery['scope']>;
 export type MessageMutationScope = 'mine' | 'unclaimed';
+
+/** 详情/线程/附件与批量操作复用同一范围参数，非法范围不能降级成默认范围。 */
+export const messageViewQuerySchema = z.object({
+  scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
+  userId: emptyAsUndefined(z.coerce.number().int().positive()),
+}).superRefine((query, ctx) => {
+  if (query.scope === 'user' && query.userId === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'scope=user 需要 userId', path: ['userId'] });
+  }
+});
+
+export const waitMessagesQuerySchema = z.object({
+  address: emptyAsUndefined(emailAddressSchema),
+  afterId: emptyAsUndefined(z.coerce.number().int().nonnegative()).default(0),
+  timeout: emptyAsUndefined(z.coerce.number().int().min(1).max(50)).default(25),
+  scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
+  userId: emptyAsUndefined(z.coerce.number().int().positive()),
+}).superRefine((query, ctx) => {
+  if (query.scope === 'user' && query.userId === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'scope=user 需要 userId', path: ['userId'] });
+  }
+});
+export type WaitMessagesQuery = z.infer<typeof waitMessagesQuerySchema>;
 
 /** 附件文件名：禁路径分隔符与 .. 遍历 */
 export const attachmentFilenameSchema = z
@@ -92,7 +115,8 @@ export const sendAttachmentSchema = z.object({
     .string()
     .min(1)
     .transform((v) => v.replace(/\s+/g, ''))
-    .refine((v) => /^[A-Za-z0-9+/]+={0,2}$/.test(v), '附件需为合法 base64'),
+    .refine((v) => /^[A-Za-z0-9+/]+={0,2}$/.test(v) && v.length % 4 !== 1 &&
+      (!v.endsWith('=') || v.length % 4 === 0), '附件需为合法 base64'),
 });
 
 /** 发件人身份：mailboxId 或 localPart+domain 二选一 */
@@ -147,7 +171,7 @@ function validateSendCommon(
 }
 
 /**
- * /v1 开放 API：附件以 base64 内联（AI/脚本一步发送，一般不带大附件）。
+ * 基础发送契约：附件以 base64 内联（AI/脚本一步发送，一般不带大附件）。
  * 保留原契约不破坏；附件合计按 base64 解码后字节数估 ≤ MAX_ATTACHMENT_TOTAL_BYTES。
  */
 export const sendMailRequestSchema = z
@@ -169,7 +193,7 @@ export const sendMailRequestSchema = z
 export type SendMailRequest = z.infer<typeof sendMailRequestSchema>;
 
 /**
- * 内部 /api：附件两种来源均可（向后兼容）——
+ * /api 与 /v1：附件两种来源均可（向后兼容）——
  *  · attachmentTokens：前端先分片上传到 R2 再引用（治本：请求体极小、不卡 UI、不超时）
  *  · attachments(base64)：AI / 脚本 / 旧调用方直接内联（与 /v1 一致，skill.md 教的就是这种）
  * 两者可混用，合并后送 sendMail。
@@ -260,9 +284,11 @@ export interface DraftAttachmentMeta {
 /**
  * 变更类操作的作用范围。admin 必须显式传 'unclaimed' 才动未认领地址下的邮件
  * （防漏传参数误改他人已认领邮件）。不能改其他用户已认领地址。
- * /api 从 query 读，/v1 放进 body。
+ * /api 与 /v1 均接受 query 或 body，同一次请求不能传冲突的范围。
  */
 const mutationScopeSchema = z.enum(['mine', 'unclaimed']).optional();
+
+export const markAllReadRequestSchema = z.object({ scope: mutationScopeSchema });
 
 export const markReadRequestSchema = z.object({
   ids: z.array(z.number().int().positive()).min(1).max(500),

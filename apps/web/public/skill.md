@@ -1,285 +1,74 @@
 ---
 name: hpc-mail
-description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）多域名邮箱系统——接收邮件并读取自动提取的验证码、发送与回复邮件、认领和管理邮箱地址、搜索邮件、下载附件。当你拿到 HPC Mail 的用户名和密码，或被要求「在 hpc.email 上收发邮件」「查收/获取邮箱验证码」「用某个 @hpc.email 之类的地址发信或回信」「自动化邮箱操作」时，务必使用本 skill——即使用户只说「帮我查一下验证码」「发封邮件」而没有点名 HPC Mail，只要目标邮箱属于本系统的域名，就按本文指引调用 API。
+description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和搜索邮件、获取邮箱验证码、发送回复转发及附件、管理邮箱和共享、多域名、通知、API Keys、账户与管理员设置。当用户明确要求操作 HPC Mail，或已确认目标邮箱属于此实例并提供了相应授权时使用；普通邮箱请求不能据此推断属于 HPC Mail。
 ---
 
-# HPC Mail — AI Agent 操作指南
+# HPC Mail
 
-你（AI Agent）拿到本站的**用户名**和**密码**后，照本文档即可完成邮箱的收发、回复、接收验证码等全部操作。所有接口都是标准 HTTP + JSON，用 `curl` 或任意 HTTP 客户端即可调用。
+默认实例：`https://hpc.email`。先确定用户要操作的账户、邮箱和动作，再选择已有凭证对应的 API。此指南描述能力，不额外授权发送邮件、推送测试、配置外部转发、删除数据或扩大共享范围；已有授权足够时直接完成任务。
 
-- **站点地址（Base URL）**：`https://hpc.email`（下文示例里的 `$BASE`）
-- **本文档地址**：`https://hpc.email/skill.md`
-- **你需要的凭据**：用户名 + 密码（由站点管理员提供给你）
+## 先选鉴权与参考
 
-> 本系统开源可自部署，本文档随每个部署实例分发。若你是从其他域名获取到本文件，`$BASE` 就是那个域名——把下文示例中的 `https://hpc.email` 全部替换为它即可，API 完全一致。
+| 任务 | API / 权限 | 按需读取 |
+|---|---|---|
+| 已有 `hpcm_…` Key：状态、可用域名 | `/v1/status`、`/v1/domains`；任一有效 Key | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
+| 收件箱、已发送、搜索、验证码、线程、原始邮件 | `/v1/messages…`：`mail.read`；或 `/api/messages…`：JWT | [邮件、验证码与发送](references/mail.md) |
+| 已读、星标、回收站恢复/永久删除 | `/v1/messages…`：`mail.write`；或 JWT | [邮件、验证码与发送](references/mail.md) |
+| 发信、回复、转发、部分失败补发 | `POST /v1/messages`：`mail.send`；或 `POST /api/messages/send`：JWT | [邮件、验证码与发送](references/mail.md) |
+| 下载附件、流式/分片上传、附件 Token | 下载 `mail.read`；上传 `mail.send`；或 JWT | [附件](references/attachments.md) |
+| 列出自己的/共享的邮箱、检查地址可用性 | `/v1/mailboxes…`：`mailbox.read`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 认领、改显示名、释放邮箱与清除历史 | `/v1/mailboxes…`：`mailbox.write`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 登录/注册/登出、密码、头像、两步验证 | `/api/auth…`；JWT，登录/注册除外 | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
+| 创建/更新/禁用/吊销 Key、自己的调用审计 | `/api/api-keys…`；JWT | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
+| 个人飞书/PushDeer/Webhook/邮箱转发、健康与重试 | `/api/me/notify-prefs…`；JWT | [通知与转发](references/notifications.md) |
+| 共享名单、域名增删/公开性/配额、接入检查 | `/api/admin…`；管理员 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 用户、邀请码、系统设置、全站 Key 与管理审计、审阅其他用户邮件 | `/api/admin…` 及邮件的管理员 `scope`；管理员 JWT | [管理员功能](references/administration.md) |
 
-理解这套 API 的关键在于：**邮箱地址与登录身份是分离的**。你用用户名密码登录得到一个访问令牌，令牌代表「你这个账户」；而收发邮件用的是一个个「邮箱地址」（如 `bot@hpc.email`）。认领后的地址归你专用。管理员还可以把自己已认领的地址共享给你：共享地址的来信会出现在你的收件里，但不能拿它当发件人。
+完整机器可读规格：[API Key API](https://hpc.email/v1/openapi.json)、[JWT API](https://hpc.email/api/openapi.json)。两份规格公开可读；业务接口仍逐项鉴权。安装本指南时保留 `references/` 的相对目录；只拿到了本文时，可从 `https://hpc.email/references/<文件名>` 读取对应参考。
 
-## 核心概念
+## 最小启动
 
-- **平台账户**：用用户名 + 密码登录的身份，和具体邮箱地址分开。
-- **邮箱地址**：形如 `任意前缀@某个系统域名`（例如 `bot@hpc.email`）。普通账户要先**认领**一个地址才能用它收发；地址全局唯一，认领后专属于认领人。管理员账户可直接用任意地址收发，无需认领。
-- **共享邮箱**：管理员把自己已认领的地址分享给普通账户后，该账户的收件列表会包含这个地址的来信和验证码。`GET /api/mailboxes` 仍只返回自己认领的地址；共享地址在 `GET /api/mailboxes/shared`。共享不授予发信、回复、转发或删除。
-- **验证码自动提取**：发到你能读取的地址（自己认领的，或共享给你的）的邮件，系统会自动把其中的验证码解析到 `verificationCode` 字段——这是接码类任务的核心，通常你不必再自己解析正文。
-- **发件限制**：普通账户只能用自己认领的地址作为发件人，共享地址不行；管理员不受限。
+仅有 Key 时无需用户名、密码或登录，直接调用 `/v1`。有用户名密码、需要账户/通知/管理能力时，经 `/api/auth/login` 获取 JWT；Key 不能用于 `/api`，JWT 不能当作 `/v1` Key。登录的 TOTP 与强制绑定处理见鉴权参考。
 
-## 第一步：登录拿到访问令牌
-
-所有后续请求都要带这个令牌，所以先做这一步。
-
-```bash
-curl -s -X POST $BASE/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"你的用户名","password":"你的密码"}'
-# → { "data": { "token": "eyJ...(JWT)", "user": { "id": 1, "username": "...", "role": "user" } } }
-```
-
-记下 `data.token`（下文记作 `$TOKEN`）。之后每个请求都加请求头 `Authorization: Bearer $TOKEN`。令牌有效期 7 天；长期无人值守请改用文末的 API Key + `/v1`。
-
-## 响应格式约定
-
-理解这个约定，你才能正确判断每次调用成没成功、结果在哪：
-
-- **成功**：HTTP 2xx，响应体 `{ "data": ... }`，你要的内容在 `data` 里。
-- **失败**：HTTP 4xx/5xx，响应体 `{ "error": { "code": "...", "message": "..." }, "requestId": "..." }`。读 `error.message` 了解原因，`code` 是机器可读错误码（见文末）。
-- **邮件列表**用游标分页：请求带 `?cursor=&limit=`（都可省略，省略即第一页、默认每页 30 条），返回 `{ "data": { "items": [...], "nextCursor": "字符串或 null" } }`。`nextCursor` 非 null 时，把它作为下一页的 `cursor` 继续拉。
-- **注意**：`/api/mailboxes`、`/api/mailboxes/shared`、`/api/domains`、`/api/api-keys`、`/v1/mailboxes`、`/v1/mailboxes/shared` 这几个**不分页**，`data` 直接就是数组，没有 `items` 字段——别去取 `data.items`。
-
-## 任务：接收邮件 / 读取验证码（最常见）
-
-这是绝大多数自动化任务的核心。拉取收件箱最新邮件。结果包含你认领的地址，以及管理员共享给你的地址上的来信：
+以下 shell 示例用 `curl` 和 `jq`，凭证从受保护的运行环境传入，勿打印凭证或开启 shell 调试输出：
 
 ```bash
-curl -s "$BASE/api/messages?direction=inbound&limit=10" -H "Authorization: Bearer $TOKEN"
+BASE='https://hpc.email'
+UA='HPC-Mail-Agent/1.0'
+set -o pipefail  # bash：任何管道阶段失败均视为失败
+
+# 已有 API Key 的邮件自动化
+API="$BASE/v1"
+AUTH="$HPC_API_KEY"
+
+# 通用请求；第一个参数是相对当前 API 的路径
+hpc() {
+  hpc_path="$1"
+  shift
+  curl --silent --show-error --fail-with-body --max-time 60 \
+    -A "$UA" -H "Authorization: Bearer $AUTH" "$API$hpc_path" "$@"
+}
+hpc '/status'
+hpc '/domains'
+hpc '/mailboxes'
 ```
 
-返回的每封邮件（`data.items[]`）含这些关键字段：
+用 JWT 时仅将 `API` 改为 `"$BASE/api"`、`AUTH` 改为登录返回的 Token；`/status` 只在 `/v1`，JWT 身份用 `/auth/me`。不要照搬 `/v1/messages` 的发送路径到 `/api`。
 
-| 字段 | 含义 |
-|------|------|
-| `id` | 邮件 id，取详情/回复时用 |
-| `fromAddress` / `fromName` | 发件人 |
-| `address` | 收到该邮件的本站地址 |
-| `subject` / `preview` | 主题 / 正文摘要 |
-| **`verificationCode`** | **系统自动提取的验证码**（无则为空字符串） |
-| `isRead` / `isStarred` / `hasAttachments` | 已读 / 星标 / 有附件 |
-| `createdAt` | 收件时间 |
+## 邮箱与权限模型
 
-**接码时优先读 `verificationCode`**，命中即可，通常不必解析正文。只看某个地址收到的信，加 `&address=bot@hpc.email`。看完整正文与附件用详情接口：
+- 登录用户名不是邮箱地址。`alice` 账户可以认领多个 `localPart@domain`；新账户通常没有邮箱，先查询域名再认领。
+- 邮件按完整地址归属，不按账户创建时间归属。认领可能获得该地址已有历史；默认释放保留历史，下一个认领者可能继承。需要清除时使用明确的 `deleteHistory=1`，先核对后果。
+- 普通用户可看自己认领的邮件，以及管理员共享给自己的未删除收件。共享不能作为发件身份，不能删除邮件或改/释放邮箱；可标记已读和设置自己的星标。已读状态是邮件的共享状态，星标按用户独立。
+- 管理员邮件列表默认也是自己的邮箱。未认领邮件用 `scope=unclaimed`；只读审阅指定用户用 `scope=user&userId=…`。所有邮件变更（含星标）仅支持 `mine/unclaimed`，审阅其他用户时不能变更状态。
+- 普通用户发件身份必须自己认领。管理员可使用有效系统域或保留旧邮箱域的地址发件，但不能推断任意外部域可用。域名列表缩小不删除已有邮箱或历史，也不撤销已有邮箱的站内投递与发件能力。
 
-```bash
-curl -s $BASE/api/messages/123 -H "Authorization: Bearer $TOKEN"
-# → data 含 bodyText、bodyHtml、verificationCode、recipients、attachments[]（每个附件带可下载的 url）
-```
+## 完成标准
 
-### 轮询等待验证码到达
+1. 读操作检查 HTTP 状态与 `{data}`；分页读完目标范围的 `nextCursor`，不要把首屏当全部。
+2. 等验证码先保存基线 ID，再触发用户授权的验证流程；对每封新邮件按来源/主题匹配并推进游标，设总截止时间。字段为空时读取目标邮件正文，勿把旧验证码当新码。
+3. 每次逻辑发信先持久化**原请求与 `Idempotency-Key`**，所有网络重试复用同一用户或 API Key、API 路径、发送 Key 和内容。刷新、超时、5xx、409 结果待确认时先查询原结果与已发送邮件；不得自动换 Key 重发。已完成记录约两天后可能被清理，幂等不是永久保障。
+4. 发信返回 201 仍需检查 `status`、`errorDetail`、`recipientOutcomes`；`sent` 表示外发已提交，`delivered` 表示站内投递已完成。部分失败只补发失败目标，保留 To/CC/BCC 分组与正文/附件；没有明确逐目标结果时先核查，不能猜测失败名单。
+5. 变更后读回目标状态，并据服务器计数报告实际结果。权限不足、冲突或超时应明确说明，保留 `requestId` 供排查；不要声称只看到了 2xx 就完成了所有投递。
 
-触发某操作后，验证码邮件通常几秒内到。按地址轮询，读到即停。为避免读到**旧**验证码，先记下当前最新邮件 id，只认比它更新的邮件。
-
-**关键：每次拉一整页（`limit=10`）并遍历所有 `id > LAST` 的新邮件**，而不是只看最新一封——否则验证码邮件之后若又进来一封别的邮件（如营销/通知），只看第一封就会漏掉验证码。
-
-```bash
-ADDR="bot@hpc.email"
-LAST=$(curl -s "$BASE/api/messages?direction=inbound&address=$ADDR&limit=1" \
-  -H "Authorization: Bearer $TOKEN" \
-  | python3 -c "import json,sys;i=json.load(sys.stdin)['data']['items'];print(i[0]['id'] if i else 0)")
-export LAST
-# ……在此触发会产生验证码邮件的操作……
-for i in $(seq 1 20); do
-  CODE=$(curl -s "$BASE/api/messages?direction=inbound&address=$ADDR&limit=10" \
-    -H "Authorization: Bearer $TOKEN" \
-    | python3 -c "import json,sys,os
-last=int(os.environ['LAST'])
-items=json.load(sys.stdin)['data']['items']
-# items 按 id 降序；取 id>last 且有验证码里最新的一封
-for m in items:
-    if m['id']>last and m['verificationCode']:
-        print(m['verificationCode']); break")
-  if [ -n "$CODE" ]; then echo "验证码：$CODE"; break; fi
-  sleep 3
-done
-```
-
-> `/v1`（API Key）用户可用长轮询端点 `GET /v1/messages/wait?address=<地址>&afterId=<LAST>&timeout=25` 一步到位，服务端 hold 到有新邮件即返回，免去自己写轮询循环（见文末进阶）。
-
-## 任务：发送邮件
-
-```bash
-SEND_KEY=$(python3 -c 'import uuid;print(uuid.uuid4())')
-# 若发送超时，保留 SEND_KEY，用完全相同请求重试。
-curl -s -X POST $BASE/api/messages/send \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -H "Idempotency-Key: $SEND_KEY" \
-  -d '{
-    "from": { "localPart": "bot", "domain": "hpc.email" },
-    "to": ["someone@example.com"],
-    "subject": "你好",
-    "text": "这是纯文本正文"
-  }'
-```
-
-- `from` 二选一：`{"localPart":"bot","domain":"hpc.email"}` 或 `{"mailboxId":5}`（用你认领的地址）。
-- 正文 `text`（纯文本）和 `html` 至少给一个；可选 `cc` / `bcc` 数组、`attachments`。
-- **附件结构**：`attachments` 是数组，每项 `{"filename":"a.pdf","contentType":"application/pdf","content":"<base64>"}`，`content` 为不含 `data:` 前缀的 base64（**允许换行**，`base64 file.pdf` / Python `base64.encodebytes()` 那种 76 字符折行的多行输出可直接用）；单次 ≤10 个、单文件 ≤50MB、合计 ≤50MB。
-- **外发大小限制**：发到本系统域名之外的邮箱（外部地址）走 Cloudflare 发信通道，单封邮件（含附件、base64 编码后）阈值 4MiB —— 因为 base64 会把体积撑大约 1/3，**原始附件超过约 3MB 就会走转链接**。未超阈值的附件直接内嵌发出；超出则附件自动转为 90 天有效的下载链接注入正文（收件人点链接下载），不会报错。系统独立保留外部下载链接的附件引用至有效期结束。站内 `@<系统域名>` 地址走站内存储，附件内嵌、不受此限。
-- 收件人若也是本站域名，即时站内投递；站外地址经 Cloudflare 发送到任意外部邮箱，个别收件人失败会在 `errorDetail` 里注明。
-- **自动化发送务必带唯一 `Idempotency-Key`**。网络超时后使用原 key 重试，已完成请求会重放原结果；相同 key 不能用于不同正文。
-- **判断投递结果**：成功响应的 `data` 是一封 outbound 邮件，检查 `status`、`errorDetail` 和 `recipientOutcomes`。`status:"failed"` 表示全部目标失败；`errorDetail` 非空时查看逐个目标的失败原因。`sent` 仅表示已提交外部发送，`delivered` 表示站内已落库。补发时只选择 `recipientOutcomes` 中 `status:"failed"` 的地址，并保留它们原来的 To/Cc/Bcc 分组，避免再次发送给成功目标；仅 Cc/Bcc 时 To 可为空。用新的 `Idempotency-Key`，附件可引用 `forwardAttachmentsFrom:原outbound邮件id`，不要重复使用已消费的上传 token。
-
-## 任务：回复邮件
-
-回复的要点是带上 `replyToMessageId`（原邮件 id），系统会自动注入邮件线程头（In-Reply-To / References），让回复正确挂到原对话上。详情有非空 `replyTo` 数组时优先使用它，否则使用原发件人；主题加 `Re:`：
-
-```bash
-SEND_KEY=$(python3 -c 'import uuid;print(uuid.uuid4())')
-# 若发送超时，保留 SEND_KEY，用完全相同请求重试。
-curl -s -X POST $BASE/api/messages/send \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{
-    "from": { "localPart": "bot", "domain": "hpc.email" },
-    "to": ["原发件人@example.com"],
-    "subject": "Re: 原主题",
-    "text": "我的回复内容。\n\n----- 原始邮件 -----\n> 原文引用...",
-    "replyToMessageId": 123
-  }'
-```
-
-## 任务：认领 / 管理邮箱地址
-
-普通账户收发前需先认领地址（管理员可跳过）。先查可用域名（此接口无需登录）：
-
-```bash
-curl -s $BASE/api/config
-# → data.domains 是可认领的系统域名列表
-```
-
-查地址是否可用并认领：
-
-```bash
-curl -s "$BASE/api/mailboxes/availability?localPart=bot&domain=hpc.email" -H "Authorization: Bearer $TOKEN"
-# → { "data": { "address": "bot@hpc.email", "available": true } }
-curl -s -X POST $BASE/api/mailboxes -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d '{"localPart":"bot","domain":"hpc.email"}'
-```
-
-查看已认领地址：`GET /api/mailboxes`（管理员加 `?all=1` 看全站）。释放地址：`DELETE /api/mailboxes/:id`。
-
-查看共享给你的地址（只读）：`GET /api/mailboxes/shared`。这里的地址会出现在收件列表里，不会出现在 `GET /api/mailboxes`，也不能作为 `from`。谁能看哪只邮箱由管理员在网页里分配，普通账户没有分享接口。
-
-## 任务：标记 / 搜索 / 下载附件
-
-```bash
-# 标记已读（isRead:false 则标未读）、星标（starred:false 取消）、删除
-curl -s -X POST $BASE/api/messages/read   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"ids":[123],"isRead":true}'
-curl -s -X POST $BASE/api/messages/star   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"ids":[123],"starred":true}'
-curl -s -X POST $BASE/api/messages/delete -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"ids":[123]}'
-```
-
-已读是这封邮件上的一份状态：共享邮箱里，你标已读，认领它的管理员也会看到已读。删除、恢复和彻底删除只作用于你自己认领的地址，对共享地址无效。
-
-read/star/restore/purge 的 `data.changed` 是实际变更数，delete 的 `data.deleted` 是实际软删数，不要用请求 ids 数量当作成功数。删除先进入 7 天回收站，`POST /api/messages/restore` 可恢复；`POST /api/messages/purge` 才会永久删除。
-
-**管理员注意**：这三个批量接口默认只作用于**你自己认领的地址**下的邮件（防止漏传参数误改他人邮件）。标已读还会带上共享给你的收件。
-清理未认领地址的信时显式加 `"scope":"unclaimed"`（或 query `?scope=unclaimed`），例如 `{"ids":[123],"isRead":true,"scope":"unclaimed"}`。
-不再支持 `scope=all`（会 400）。`/v1` 的同名接口用法一致。一次最多传 500 个 id。
-
-管理员列未认领收件：`GET /api/messages?scope=unclaimed&direction=inbound`。
-查看某用户已认领地址：`GET /api/messages?scope=user&userId=20`。
-
-搜索用 `GET /api/messages` 的 query 参数组合：`direction`（inbound/outbound）、`address`、`domain`、`unread=1`、`starred=1`、`q`（关键词，匹配主题/发件人/**正文**）、`cursor`/`limit`（limit 最大 100）。例：搜正文含 invoice 的未读收件 → `?direction=inbound&unread=1&q=invoice`。
-
-下载附件：邮件详情 `data.attachments[]` 每项有短期签名 `url`，`curl -s "$BASE<url>" -o file` 即可。
-
-## 完整接口速查
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/auth/login` | 登录拿 token |
-| GET | `/api/auth/me` | 当前账户信息 |
-| GET | `/api/config` | 公开配置（可用域名、注册模式）|
-| GET / POST | `/api/mailboxes` | 我认领的地址 / 认领 `{localPart,domain}` |
-| GET | `/api/mailboxes/shared` | 共享给我的地址（只读） |
-| GET | `/api/mailboxes/availability?localPart=&domain=` | 查地址可否认领 |
-| DELETE | `/api/mailboxes/:id` | 释放地址 |
-| GET | `/api/messages` | 收发件列表（过滤参数见「搜索」）|
-| GET | `/api/messages/:id` | 邮件详情（正文 + 验证码 + 附件）|
-| POST | `/api/messages/send` | 发送 / 回复（建议带 `Idempotency-Key`）|
-| POST | `/api/messages/read` `/star` `/delete` | 批量已读 / 星标 / 删除 `{ids,...}` |
-| GET | `/api/attachments/:id` | 下载附件 |
-
-## 错误码参考
-
-| code | HTTP | 含义与应对 |
-|------|------|------|
-| `bad_credentials` | 401 | 登录时用户名或密码错误 → 核对凭据（注意与 `unauthorized` 区分：这是登录失败，不是 token 问题）|
-| `unauthorized` | 401 | 未登录 / token 或 API Key 失效、过期、被禁用 → 重新登录或更换 key |
-| `forbidden` | 403 | 无权限（如用非自己认领的地址发件、来源 IP 不在白名单、缺少 API scope）|
-| `user_disabled` | 403 | 账户已被管理员禁用 |
-| `registration_closed` | 403 | 当前未开放注册 |
-| `validation_failed` | 400 | 参数不合法（如域名不在系统列表）|
-| `invite_invalid` | 400 | 邀请码无效 / 已用尽 / 已过期 |
-| `address_taken` | 409 | 认领的地址已被占用，换一个前缀 |
-| `conflict` | 409 | 资源冲突（如用户名已存在）|
-| `not_found` | 404 | 资源不存在 |
-| `totp_required` | 401 | 该账号开了两步验证，登录请求需带 `totp`（6 位动态码或恢复码）→ 用 `{"username":..,"password":..,"totp":"123456"}` 重试 |
-| `totp_setup_required` | 403 | 站点强制要求两步验证而该账号尚未绑定 → 需先在网页端完成绑定，脚本无法自行绕过（此时除绑定相关接口外都会返回它）|
-| `rate_limited` | 429 | 频率超限，稍后重试（响应带 `X-RateLimit-*`）|
-| `payload_too_large` | 413 | 请求体过大（如附件超限）|
-| `internal` | 500 | 服务端错误，可重试 |
-
-## 进阶：用 API Key + /v1 做长期自动化
-
-若需长期无人值守运行，建议创建 **API Key** 后改用 `/v1` 系列接口（专为脚本设计，带独立限流与调用审计），而不是反复用用户名密码登录。
-
-```bash
-# 用 $TOKEN 创建 key，data.key 是完整密钥（形如 hpcm_xxxx），只返回这一次，务必保存
-curl -s -X POST $BASE/api/api-keys -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"my-agent","scopes":["mail.read","mail.write","mail.send","mailbox.read","mailbox.write"]}'
-```
-
-**scope 说明**：`mail.read`（读邮件/验证码，含共享给你的收件）、`mail.write`（标记已读、删除自己认领地址下的邮件；共享地址只能标已读）、`mail.send`（发信/回复，仅自己认领的地址）、`mailbox.read`（列出认领的邮箱和共享邮箱）、`mailbox.write`（认领/释放）。按需最小授权。共享地址见 `GET /v1/mailboxes/shared`。
-
-之后用 `Authorization: Bearer hpcm_xxxx` 调用 `/v1`：
-
-| 方法 | 路径 | scope | 说明 |
-|------|------|-------|------|
-| GET | `/v1/status` | — | 探活，返回 key 的 userId/role/scopes |
-| GET | `/v1/domains` | — | 可用系统域名 |
-| GET / POST | `/v1/mailboxes` | mailbox.read / mailbox.write | 列出已认领邮箱 / 认领邮箱 |
-| GET | `/v1/mailboxes/shared` | mailbox.read | 列出共享给我的邮箱（只读，不能作为发件人） |
-| GET | `/v1/messages` | mail.read | 收发件列表（过滤参数同 `/api`）|
-| GET | `/v1/messages/wait?address=&afterId=&timeout=25` | mail.read | **长轮询**：hold 到有 `id>afterId` 的新邮件即返回，专为等验证码设计 |
-| GET | `/v1/messages/:id` | mail.read | 详情（含 verificationCode）|
-| GET | `/v1/messages/:id/attachments/:attId` | mail.read | 下载附件 |
-| POST | `/v1/messages` | mail.send | 发送 / 回复（body 同上；带 `Idempotency-Key: <唯一串>` 头可去重；相同 key 不得更换请求内容）|
-| POST | `/v1/messages/read` | mail.write | 批量标记已读 `{ids,isRead}` |
-| POST | `/v1/messages/delete` | mail.write | 批量删除 `{ids}` |
-
-`/v1` 响应带 `X-RateLimit-*` 头，超限返回 429。完整机器可读描述见 `GET https://hpc.email/v1/openapi.json`（OpenAPI 3.1，无需鉴权）。
-
-> 管理员另可在后台配置**通用 Webhook**：新邮件时系统会 POST JSON（`{event:"mail.received", message:{...}}`，带 `X-HPC-Signature` HMAC-SHA256 签名头）到你的 HTTPS 端点，比轮询更实时。
-
-### 用长轮询高效等验证码（推荐）
-
-有 `mail.write`/`mail.read` 的 key 不必自己写轮询循环，用 wait 端点一步到位——服务端最多 hold `timeout` 秒，一有新邮件立即返回：
-
-```bash
-ADDR="bot@hpc.email"
-# 先拿当前最新 id 作为基线
-LAST=$(curl -s "$BASE/v1/messages?direction=inbound&address=$ADDR&limit=1" \
-  -H "Authorization: Bearer $KEY" \
-  | python3 -c "import json,sys;i=json.load(sys.stdin)['data']['items'];print(i[0]['id'] if i else 0)")
-# ……触发验证码邮件……
-# 长轮询：返回第一封 id>LAST 的新邮件（含 verificationCode），或 timeout 后返回 {message:null}
-curl -s "$BASE/v1/messages/wait?address=$ADDR&afterId=$LAST&timeout=25" \
-  -H "Authorization: Bearer $KEY"
-# → { "data": { "message": { "id":.., "verificationCode":"482913", ... } } }  命中
-# → { "data": { "message": null } }  超时未等到，再调一次即可
-```
-
----
-
-**一句话流程**：登录拿 token → 认领地址，或使用管理员共享给你的地址 → `GET /api/messages` 收信读 `verificationCode` → 用自己认领的地址 `POST /api/messages/send` 发信/回复。
-
-脚本 HTTP 客户端应设置明确的 `User-Agent`（例如 `HPC-Mail-Agent/1.0`）。Cloudflare 的浏览器完整性检查可能在应用鉴权之前拒绝默认 Python urllib 的 User-Agent；收到 HTML 403 时，先检查响应来源和客户端 User-Agent。
+网页中的默认发件身份、写信草稿、待确认发送 Key、图片信任与布局偏好保存在浏览器本地，不是服务端同步资源。API Agent 应在自己的受保护状态中保存发送上下文；服务器有上传附件 Token，但没有草稿正文/默认发件身份 CRUD 接口。

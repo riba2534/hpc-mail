@@ -4,7 +4,7 @@ import { createDb } from '../db/client.js';
 import { mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
-import { domainPerUserLimit, getDomains, isDomainPublic } from './domain.js';
+import { domainPerUserLimit, getDomains, getVisibleDomains, isDomainPublic } from './domain.js';
 import { getSettingsFresh } from './setting.js';
 import { purgeStatements } from './message-lifecycle.js';
 import { processStorageCleanup } from './storage-cleanup.js';
@@ -212,9 +212,10 @@ export async function checkAvailability(
   env: Env,
   localPart: string,
   domain: string,
+  isAdmin = false,
 ): Promise<MailboxAvailability> {
   const address = `${localPart}@${domain}`;
-  const domains = await getDomains(env, await getSettingsFresh(env));
+  const domains = await getVisibleDomains(env, isAdmin, await getSettingsFresh(env));
   if (!domains.includes(domain)) return { address, available: false };
   const db = createDb(env);
   const existing = await db.select().from(mailboxes).where(eq(mailboxes.address, address)).get();

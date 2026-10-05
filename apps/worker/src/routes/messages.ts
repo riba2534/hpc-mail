@@ -3,6 +3,7 @@ import {
   internalSendMailSchema,
   listMessagesQuerySchema,
   markReadRequestSchema,
+  markAllReadRequestSchema,
   starMessagesRequestSchema,
   type MessageSummary,
 } from '@hpc-mail/shared';
@@ -24,6 +25,7 @@ import {
   starMessages,
   type Viewer,
 } from '../services/message.js';
+import { messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
 import { decodeInlineAttachments, sendMail } from '../services/outbound.js';
 import {
@@ -37,20 +39,14 @@ import type { AppContext } from '../types.js';
 const app = new Hono<AppContext>();
 app.use('*', requireAuth);
 
-function parseListScope(raw: string | undefined): Viewer['scope'] {
-  return raw === 'mine' || raw === 'unclaimed' || raw === 'user' ? raw : undefined;
+function viewerOf(c: Context<AppContext>, bodyScope?: 'mine' | 'unclaimed'): Viewer {
+  const user = c.get('user')!;
+  return messageViewer(c, { userId: user.id, role: user.role }, bodyScope);
 }
 
-function viewerOf(c: Context<AppContext>): Viewer {
+function mutationViewerOf(c: Context<AppContext>, bodyScope?: 'mine' | 'unclaimed'): Viewer {
   const user = c.get('user')!;
-  const scope = parseListScope(c.req.query('scope'));
-  const userIdRaw = Number(c.req.query('userId'));
-  return {
-    userId: user.id,
-    role: user.role,
-    scope,
-    targetUserId: Number.isInteger(userIdRaw) && userIdRaw > 0 ? userIdRaw : undefined,
-  };
+  return mutationViewer(c, { userId: user.id, role: user.role }, bodyScope);
 }
 
 function viewerFromListQuery(
@@ -112,39 +108,41 @@ app.post('/send', async (c) => {
 
 app.post('/read', async (c) => {
   const req = await parseBody(c, markReadRequestSchema);
-  const changed = await markMessages(c.env, viewerOf(c), req.ids, req.isRead);
+  const changed = await markMessages(c.env, mutationViewerOf(c, req.scope), req.ids, req.isRead);
   return ok(c, { changed });
 });
 
 /** 一键全读：可见范围内全部未读收件标为已读（admin 需显式 scope=unclaimed 才动未认领） */
 app.post('/read-all', async (c) => {
-  const changed = await markAllRead(c.env, viewerOf(c));
+  const req = c.req.header('Content-Length') === '0' || c.req.raw.body === null
+    ? {} : await parseBody(c, markAllReadRequestSchema);
+  const changed = await markAllRead(c.env, mutationViewerOf(c, req.scope));
   return ok(c, { changed });
 });
 
 app.post('/delete', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const deleted = await deleteMessages(c.env, viewerOf(c), req.ids);
+  const deleted = await deleteMessages(c.env, mutationViewerOf(c, req.scope), req.ids);
   return ok(c, { deleted });
 });
 
 /** 从回收站恢复 */
 app.post('/restore', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const restored = await restoreMessages(c.env, viewerOf(c), req.ids);
+  const restored = await restoreMessages(c.env, mutationViewerOf(c, req.scope), req.ids);
   return ok(c, { restored, changed: restored });
 });
 
 /** 永久删除（回收站里彻底删） */
 app.post('/purge', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, viewerOf(c), req.ids);
+  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids);
   return ok(c, { purged, changed: purged });
 });
 
 app.post('/star', async (c) => {
   const req = await parseBody(c, starMessagesRequestSchema);
-  const changed = await starMessages(c.env, viewerOf(c), req.ids, req.starred);
+  const changed = await starMessages(c.env, mutationViewerOf(c, req.scope), req.ids, req.starred);
   return ok(c, { changed });
 });
 
