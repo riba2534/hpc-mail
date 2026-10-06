@@ -97,6 +97,24 @@ export interface LoginResponse {
 
 // ---- 管理端用户管理 ----
 
+export const searchUsersQuerySchema = z.object({
+  q: z.string().trim().toLowerCase().min(1, '请输入用户名搜索').max(32),
+  excludeUserId: z.coerce.number().int().positive().optional(),
+  limit: z.coerce.number().int().min(1).max(20).default(20),
+});
+export type SearchUsersQuery = z.infer<typeof searchUsersQuerySchema>;
+
+export interface UserSearchResult {
+  id: number;
+  username: string;
+  role: Role;
+}
+
+export interface UserSearchResults {
+  items: UserSearchResult[];
+  hasMore: boolean;
+}
+
 export const createUserRequestSchema = z.object({
   username: usernameSchema,
   password: passwordSchema,

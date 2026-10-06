@@ -7,6 +7,7 @@
 | 方法与 `/api` 路径 | 契约 |
 |---|---|
 | `GET /admin/users` | 全部用户数组 |
+| `GET /admin/users/search?q=…&excludeUserId=…&limit=20` | 按用户名搜索启用中的用户，忽略大小写；可排除当前主人；limit 1–20，默认 20；返回 `{items:[{id,username,role}],hasMore}` |
 | `POST /admin/users` | `{username,password,role?}`，role 默认 user，可 admin；201 新用户，不自动认领邮箱 |
 | `PUT /admin/users/:id` | 至少一个 `status:active\|disabled`、`role:user\|admin`、`password`（重置密码）；返回更新后的用户 |
 | `DELETE /admin/users/:id` | `{success:true}`，不可恢复；账户与其邮箱/共享/Key/星标关联撤销，邮件历史仍按地址保留 |
@@ -17,7 +18,7 @@
 
 管理员 JWT 可 `POST /api/admin/mailboxes/:id/transfer`，将任意现有已认领邮箱直接转给指定的启用中用户（普通用户或管理员）。自己或别人认领的均可；此操作不经过未认领状态，不受普通认领配额、保留前缀、域名公开性或当前新认领域名列表限制。它不创建尚未存在的邮箱。
 
-先读 `GET /api/mailboxes?all=1` 核对邮箱 `id,address,userId`，再读 `GET /api/admin/users` 核对目标 `id,username,status`。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
+先读 `GET /api/mailboxes?all=1` 核对邮箱 `id,address,userId`，再用 `GET /api/admin/users/search?q=用户名&excludeUserId=当前主人ID` 查找目标用户。q 为 1–32 字符的用户名片段，完全匹配优先，其次前缀和其他包含匹配；hasMore=true 时继续补充用户名缩小范围。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
 
 ```bash
 # API="$BASE/api"，AUTH 为管理员 JWT；三个 ID 均来自上面的实际查询

@@ -33,6 +33,7 @@ export const queryKeys = {
 
   admin: {
     users: ['admin', 'users'] as const,
+    userSearch: (q: string, excludeUserId?: number) => ['admin', 'users', 'search', q, excludeUserId] as const,
     settings: ['admin', 'settings'] as const,
     invites: ['admin', 'invites'] as const,
     domainStatus: (domain: string) => ['admin', 'domain-status', domain] as const,

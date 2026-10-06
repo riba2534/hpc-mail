@@ -91,6 +91,12 @@ export function buildSessionOpenApiSpec(origin: string) {
       get: operation('List users', array(ref('AdminUser')), admin),
       post: operation('Create a user', ref('AdminUser'), { ...admin, request: 'CreateUserRequest', status: 201 }),
     },
+    '/admin/users/search': { get: operation('Search active users for mailbox transfer', ref('UserSearchResults'), {
+      ...admin, parameters: [query('q', { type: 'string', minLength: 1, maxLength: 32 }, 'Required username substring, trimmed and case-insensitive; % and _ are literal characters.', true),
+        query('excludeUserId', { type: 'integer', minimum: 1 }, 'Exclude the mailbox current owner.'),
+        query('limit', { type: 'integer', minimum: 1, maximum: 20, default: 20 })],
+      description: 'Returns only active users with id, username and role. Exact matches are ranked first, then prefixes, then other substring matches. hasMore means refine q to narrow the results. This endpoint avoids returning all account details and mailbox lists.'
+    }) },
     '/admin/users/{id}': {
       put: operation('Change user role/status or reset password', ref('AdminUser'), { ...admin, request: 'UpdateUserRequest',
         description: 'At least one field. Cannot disable self or remove the last active administrator. Password reset/disable revokes prior JWT epochs. Downgrading an administrator revokes their mailbox shares.' }),

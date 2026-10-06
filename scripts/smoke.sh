@@ -94,12 +94,18 @@ unknown=$(curl -sS -w '\n%{http_code}' "$BASE_URL/v1/missing-smoke-endpoint")
 [ "$(echo "$unknown" | tail -1)" = "404" ] || fail "未知 API 未返回 404"
 echo "$unknown" | head -1 | jq -e '.error.code == "not_found" and (.requestId | type == "string")' >/dev/null || fail "未知 API 错误不可解析"
 
-step "管理员邮箱过户契约和输入边界"
+step "管理员用户搜索和邮箱过户契约"
 curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
   .paths["/admin/mailboxes/{id}/transfer"].post["x-required-role"] == "admin" and
+  .paths["/admin/users/search"].get["x-required-role"] == "admin" and
   (.components.schemas.TransferMailboxRequest.required | sort) == ["expectedOwnerId", "userId"]
 ' >/dev/null || fail "邮箱过户机器契约缺失"
 admin_id=$(echo "$me" | jq -r '.data.id')
+curl -fsS --get "$BASE_URL/api/admin/users/search" --data-urlencode "q=$ADMIN_USERNAME" \
+  -H "Authorization: Bearer $TOKEN" | jq --argjson userId "$admin_id" -e '
+    .data.items[0].id == $userId and (.data.items | length) <= 20 and
+    (.data.hasMore | type) == "boolean" and (.data.items[0] | keys | sort) == ["id", "role", "username"]
+  ' >/dev/null || fail "管理员用户搜索结构或精确匹配异常"
 transfer_input=$(jq -n --argjson ownerId "$admin_id" '{userId:0,expectedOwnerId:$ownerId}')
 invalid_transfer=$(curl -sS -w '\n%{http_code}' -X POST "$BASE_URL/api/admin/mailboxes/0/transfer" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data-binary "$transfer_input")

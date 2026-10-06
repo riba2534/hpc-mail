@@ -1,7 +1,7 @@
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import type { CreatedApiKey, MailboxTransferResult } from '@hpc-mail/shared';
+import type { CreatedApiKey, MailboxTransferResult, UserSearchResults } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, attachments, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
@@ -82,6 +82,42 @@ function beforeWrite(hook: () => Promise<void>, mode: 'batch' | 'run' = 'batch')
 }
 
 describe('管理员邮箱强制过户', () => {
+  it('搜索只返回匹配的启用用户与必要字段，可排除主人并严格限制数量', async () => {
+    const f = await fixture();
+    const prefix = `search-${f.admin.id}`;
+    const seed: Array<{ username: string; passwordHash: string; role?: 'admin' | 'user'; status?: 'active' | 'disabled' }> = [
+      ...Array.from({ length: 25 }, (_, index) => ({ username: `${prefix}-user-${String(index).padStart(2, '0')}`, passwordHash: 'test' })),
+      { username: prefix, passwordHash: 'test', role: 'admin' as const },
+      { username: `${prefix}-disabled`, passwordHash: 'test', status: 'disabled' as const },
+      { username: `${prefix}_literal`, passwordHash: 'test' },
+    ];
+    await env.db.batch(seed.map(user => env.db.prepare('INSERT INTO users (username, password_hash, role, status) VALUES (?, ?, ?, ?)')
+      .bind(user.username, user.passwordHash, user.role ?? 'user', user.status ?? 'active')));
+    const found = await value<UserSearchResults>(await request(`/api/admin/users/search?q=${prefix.toUpperCase()}`, f.admin.jwt));
+    expect(found.items).toHaveLength(20);
+    expect(found.hasMore).toBe(true);
+    expect(found.items[0]).toMatchObject({ username: prefix, role: 'admin' });
+    expect(found.items.every(user => Object.keys(user).sort().join(',') === 'id,role,username')).toBe(true);
+    const narrower = await value<UserSearchResults>(await request(`/api/admin/users/search?q=${prefix}-user-24`, f.admin.jwt));
+    expect(narrower.items.map(user => user.username)).toEqual([`${prefix}-user-24`]);
+    expect(narrower.hasMore).toBe(false);
+    const excluded = await value<UserSearchResults>(await request(`/api/admin/users/search?q=${prefix}&excludeUserId=${found.items[0]!.id}&limit=2`, f.admin.jwt));
+    expect(excluded.items).toHaveLength(2);
+    expect(excluded.items.map(user => user.id)).not.toContain(found.items[0]!.id);
+    expect((await value<UserSearchResults>(await request(`/api/admin/users/search?q=${prefix}-disabled`, f.admin.jwt))).items).toEqual([]);
+    expect((await value<UserSearchResults>(await request('/api/admin/users/search?q=%25', f.admin.jwt))).items).toEqual([]);
+    expect((await value<UserSearchResults>(await request('/api/admin/users/search?q=_', f.admin.jwt))).items.map(user => user.username)).toEqual([`${prefix}_literal`]);
+  });
+
+  it('用户搜索必须管理员登录，空查询、过长查询和非法限额均拒绝', async () => {
+    const f = await fixture();
+    expect((await request('/api/admin/users/search?q=user', '')).status).toBe(401);
+    expect((await request('/api/admin/users/search?q=user', f.old.jwt)).status).toBe(403);
+    for (const query of ['', 'q=%20', `q=${'x'.repeat(33)}`, 'q=user&limit=21', 'q=user&limit=0', 'q=user&excludeUserId=bad']) {
+      expect((await request('/api/admin/users/search?' + query, f.admin.jwt)).status).toBe(400);
+    }
+  });
+
   it('直接过户管理员自有邮箱，保留所有历史和附件，撤销共享且未来通知归新主人', async () => {
     const f = await fixture();
     const box = await f.box(f.admin.id);

@@ -5,10 +5,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/errors';
 import { AddressesPage } from './addresses-page';
 
-const mocks = vi.hoisted(() => ({ transfer: vi.fn(), users: vi.fn(), toast: vi.fn() }));
+const mocks = vi.hoisted(() => ({ transfer: vi.fn(), search: vi.fn(), toast: vi.fn() }));
 const box = { id: 42, address: 'existing@example.com', domain: 'example.com', userId: 10, ownerUsername: 'old-owner',
   displayName: '', messageCount: 12, createdAt: '2026-10-06T00:00:00Z' };
-vi.mock('@/api/resources', () => ({ adminApi: { listUsers: mocks.users, transferMailbox: mocks.transfer }, mailboxApi: { release: vi.fn() } }));
+vi.mock('@/api/resources', () => ({ adminApi: { searchUsers: mocks.search, transferMailbox: mocks.transfer }, mailboxApi: { release: vi.fn() } }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.mock('@/features/mailboxes/use-mailboxes', () => ({ useMailboxesQuery: () => ({ data: [box], isLoading: false, isError: false }) }));
 
@@ -21,12 +21,10 @@ function mount() {
 }
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.users.mockResolvedValue([
-    { id: 10, username: 'old-owner', role: 'user', status: 'active' },
-    { id: 20, username: 'new-owner', role: 'user', status: 'active' },
-    { id: 30, username: 'disabled-user', role: 'user', status: 'disabled' },
-    { id: 40, username: 'another-admin', role: 'admin', status: 'active' },
-  ]);
+  mocks.search.mockImplementation(async (q: string) => ({ items: [
+    { id: 20, username: 'new-owner', role: 'user' },
+    { id: 40, username: 'another-admin', role: 'admin' },
+  ].filter(user => user.username.includes(q)), hasMore: false }));
   mocks.transfer.mockResolvedValue({ mailbox: { ...box, userId: 20, ownerUsername: 'new-owner' }, transferred: true, revokedShares: 2 });
 });
 
@@ -35,12 +33,12 @@ describe('全站地址邮箱过户', () => {
     const { client, reset, invalidate, view } = mount();
     fireEvent.click(screen.getByRole('button', { name: `过户 ${box.address}` }));
     expect(screen.getByRole('button', { name: '确认过户' })).toBeDisabled();
-    await screen.findByRole('option', { name: 'new-owner' });
-    expect(screen.queryByRole('option', { name: 'old-owner' })).toBeNull();
-    expect(screen.queryByRole('option', { name: 'disabled-user' })).toBeNull();
-    expect(screen.getByRole('option', { name: 'another-admin（管理员）' })).toBeInTheDocument();
+    expect(mocks.search).not.toHaveBeenCalled();
+    expect(screen.queryByRole('option')).toBeNull();
     expect(screen.getByText(/旧共享授权将全部撤销/)).toBeInTheDocument();
-    fireEvent.change(screen.getByRole('combobox', { name: /目标用户/ }), { target: { value: '20' } });
+    fireEvent.change(screen.getByRole('combobox', { name: /目标用户/ }), { target: { value: 'NEW' } });
+    fireEvent.click(await screen.findByRole('option', { name: /new-owner/ }));
+    expect(mocks.search).toHaveBeenCalledWith('new', 10, expect.any(AbortSignal));
     fireEvent.click(screen.getByRole('button', { name: '确认过户' }));
     await waitFor(() => expect(mocks.transfer).toHaveBeenCalledWith(42, { userId: 20, expectedOwnerId: 10 }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
@@ -55,8 +53,8 @@ describe('全站地址邮箱过户', () => {
     mocks.transfer.mockRejectedValue(new ApiError('邮箱归属已改变，请刷新后重新确认', { code: 'conflict', httpStatus: 409 }));
     const { client, invalidate, view } = mount();
     fireEvent.click(screen.getByRole('button', { name: `过户 ${box.address}` }));
-    await screen.findByRole('option', { name: 'new-owner' });
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: '20' } });
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'new' } });
+    fireEvent.click(await screen.findByRole('option', { name: /new-owner/ }));
     fireEvent.click(screen.getByRole('button', { name: '确认过户' }));
     await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({ title: '邮箱归属已改变，请刷新后重新确认', variant: 'error' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
@@ -65,15 +63,70 @@ describe('全站地址邮箱过户', () => {
   });
 
   it('用户列表加载失败时不能提交，并能重试', async () => {
-    mocks.users.mockRejectedValue(new Error('用户列表暂不可用'));
+    mocks.search.mockRejectedValue(new Error('用户搜索暂不可用'));
     const { client, view } = mount();
     fireEvent.click(screen.getByRole('button', { name: `过户 ${box.address}` }));
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'new' } });
     await screen.findByRole('button', { name: '重新加载' });
     expect(screen.getByRole('button', { name: '确认过户' })).toBeDisabled();
     expect(mocks.transfer).not.toHaveBeenCalled();
-    mocks.users.mockResolvedValue([{ id: 20, username: 'new-owner', role: 'user', status: 'active' }]);
+    mocks.search.mockResolvedValue({ items: [{ id: 20, username: 'new-owner', role: 'user' }], hasMore: false });
     fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
-    await screen.findByRole('option', { name: 'new-owner' });
+    await screen.findByRole('option', { name: /new-owner/ });
+    view.unmount(); client.clear();
+  });
+
+  it('支持无匹配提示和键盘选择管理员，修改搜索会清除已选目标', async () => {
+    const { client, view } = mount();
+    fireEvent.click(screen.getByRole('button', { name: `过户 ${box.address}` }));
+    const input = screen.getByRole('combobox');
+    fireEvent.change(input, { target: { value: 'missing' } });
+    await screen.findByText('没有匹配的可过户用户。');
+    fireEvent.change(input, { target: { value: 'admin' } });
+    await screen.findByRole('option', { name: /another-admin.*管理员/ });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(screen.getByText('已选择：another-admin（管理员）')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '确认过户' })).toBeEnabled();
+    fireEvent.change(input, { target: { value: 'new' } });
+    expect(screen.getByRole('button', { name: '确认过户' })).toBeDisabled();
+    expect(screen.queryByText(/已选择/)).toBeNull();
+    await screen.findByRole('option', { name: /new-owner/ });
+    view.unmount(); client.clear();
+  });
+
+  it('新搜索结果就绪后，旧请求晚返回不能替换结果或错误选中用户', async () => {
+    let finishOld!: (value: unknown) => void;
+    mocks.search.mockImplementation((q: string) => q === 'old' ? new Promise(resolve => { finishOld = resolve; })
+      : Promise.resolve({ items: [{ id: 20, username: 'new-owner', role: 'user' }], hasMore: true }));
+    const { client, view } = mount();
+    fireEvent.click(screen.getByRole('button', { name: `过户 ${box.address}` }));
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'old' } });
+    await waitFor(() => expect(mocks.search).toHaveBeenCalledWith('old', 10, expect.any(AbortSignal)));
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'new' } });
+    await screen.findByRole('option', { name: /new-owner/ });
+    expect(screen.getByText(/请继续输入更完整的用户名/)).toBeInTheDocument();
+    finishOld({ items: [{ id: 99, username: 'old-match', role: 'user' }], hasMore: false });
+    fireEvent.click(screen.getByRole('option', { name: /new-owner/ }));
+    expect(screen.queryByRole('option', { name: /old-match/ })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '确认过户' }));
+    await waitFor(() => expect(mocks.transfer).toHaveBeenCalledWith(42, { userId: 20, expectedOwnerId: 10 }));
+    view.unmount(); client.clear();
+  });
+
+  it('之前的精确搜索失败后，仍能选择片段搜索找到的同一用户', async () => {
+    mocks.search.mockImplementation(async (q: string) => {
+      if (q === 'new-owner') throw new Error('临时搜索失败');
+      return { items: [{ id: 20, username: 'new-owner', role: 'user' }], hasMore: false };
+    });
+    const { client, view } = mount();
+    fireEvent.click(screen.getByRole('button', { name: `过户 ${box.address}` }));
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'new-owner' } });
+    await screen.findByRole('button', { name: '重新加载' });
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'new' } });
+    fireEvent.click(await screen.findByRole('option', { name: /new-owner/ }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '确认过户' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: '确认过户' }));
+    await waitFor(() => expect(mocks.transfer).toHaveBeenCalledWith(42, { userId: 20, expectedOwnerId: 10 }));
     view.unmount(); client.clear();
   });
 });

@@ -1,15 +1,16 @@
-import { createUserRequestSchema, updateUserRequestSchema } from '@hpc-mail/shared';
+import { createUserRequestSchema, searchUsersQuerySchema, updateUserRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { clientIp, ok, parseBody, parseId } from '../../lib/http.js';
+import { clientIp, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { logAdminAction } from '../../services/audit.js';
-import { createUser, deleteUser, listUsers, updateUser } from '../../services/user.js';
+import { createUser, deleteUser, listUsers, searchUsers, updateUser } from '../../services/user.js';
 import type { AppContext } from '../../types.js';
 
 const app = new Hono<AppContext>();
 app.use('*', requireAuth, requireAdmin);
 
 app.get('/', async (c) => ok(c, await listUsers(c.env)));
+app.get('/search', async (c) => ok(c, await searchUsers(c.env, parseQuery(c, searchUsersQuerySchema))));
 
 app.post('/', async (c) => {
   const acting = c.get('user')!;

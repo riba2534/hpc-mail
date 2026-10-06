@@ -1,6 +1,7 @@
 import type {
   MailboxTransferResult,
   TransferMailboxRequest,
+  UserSearchResults,
   AdminAuditLogEntry,
   AdminUser,
   ApiKeySummary,
@@ -208,6 +209,8 @@ export const apiKeyApi = {
 
 // ---- 管理端 ----
 export const adminApi = {
+  searchUsers: (q: string, excludeUserId?: number, signal?: AbortSignal) =>
+    api.get<UserSearchResults>('/admin/users/search', { query: { q, excludeUserId }, signal }),
   transferMailbox: (id: number, body: TransferMailboxRequest) =>
     api.post<MailboxTransferResult, TransferMailboxRequest>(`/admin/mailboxes/${id}/transfer`, body),
   listUsers: () => api.get<AdminUser[]>('/admin/users'),
