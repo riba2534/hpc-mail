@@ -21,7 +21,7 @@ description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和�
 | 登录/注册/登出、密码、头像、两步验证 | `/api/auth…`；JWT，登录/注册除外 | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 创建/更新/禁用/吊销 Key、自己的调用审计 | `/api/api-keys…`；JWT | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 个人飞书/PushDeer/Webhook/邮箱转发、健康与重试 | `/api/me/notify-prefs…`；JWT | [通知与转发](references/notifications.md) |
-| 共享名单、域名增删/公开性/配额、接入检查 | `/api/admin…`；管理员 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 强制过户邮箱、共享名单、域名增删/公开性/配额、接入检查 | `/api/admin…`；管理员 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 用户、邀请码、系统设置、全站 Key 与管理审计、审阅其他用户邮件 | `/api/admin…` 及邮件的管理员 `scope`；管理员 JWT | [管理员功能](references/administration.md) |
 
 完整机器可读规格：[API Key API](https://hpc.email/v1/openapi.json)、[JWT API](https://hpc.email/api/openapi.json)。两份规格公开可读；业务接口仍逐项鉴权。安装本指南时保留 `references/` 的相对目录；只拿到了本文时，可从 `https://hpc.email/references/<文件名>` 读取对应参考。

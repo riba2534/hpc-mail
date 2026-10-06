@@ -1,6 +1,6 @@
 import {
   API_SCOPES, ERROR_CODES, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
-  SETTING_SCHEMAS, claimMailboxRequestSchema, updateMailboxRequestSchema,
+  SETTING_SCHEMAS, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
   internalSendMailSchema, markReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
@@ -82,6 +82,7 @@ export const schemas: Record<string, Schema> = {
   MessageDetail: object({ ...summaryProperties, replyTo: array(str), recipients: object({ to: array(str), cc: array(str), bcc: array(str) }),
     bodyText: str, bodyHtml: str, attachments: array(ref('Attachment')), hasRaw: bool }, ['recipientOutcomes', 'recipientsTo', 'replyTo']),
   MessagePage: page(ref('MessageSummary')), Attachment: attachment, Mailbox: mailbox,
+  MailboxTransferResult: object({ mailbox: ref('Mailbox'), previousUserId: positiveId, transferred: bool, revokedShares: int }),
   SharedMailbox: object({ mailboxId: positiveId, address: str, domain: str, displayName: str, ownerUsername: str }),
   MailboxShareGrant: object({ mailboxId: positiveId, address: str, domain: str, displayName: str,
     grantees: array(object({ userId: positiveId, username: str, grantedAt: date })) }),
@@ -105,6 +106,7 @@ export const schemas: Record<string, Schema> = {
   PublicConfig: object({ siteTitle: str, registrationMode: { type: 'string', enum: ['closed', 'invite', 'open'] }, domains: array(str), require2fa: bool }),
   SendMailRequest: send,
   ClaimMailboxRequest: fromZod(claimMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
+  TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
   MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
   MutationScopeRequest: object({ scope: { type: 'string', enum: ['mine', 'unclaimed'] } }, ['scope']),
   InitMultipartUploadRequest: fromZod(initMultipartUploadSchema), CompleteMultipartUploadRequest: fromZod(completeMultipartUploadSchema),

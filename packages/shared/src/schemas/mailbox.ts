@@ -27,6 +27,13 @@ export const updateMailboxRequestSchema = z.object({
 });
 export type UpdateMailboxRequest = z.infer<typeof updateMailboxRequestSchema>;
 
+/** 管理员强制过户；expectedOwnerId 来自最新的全站邮箱列表。 */
+export const transferMailboxRequestSchema = z.object({
+  userId: z.number().int().positive(),
+  expectedOwnerId: z.number().int().positive(),
+});
+export type TransferMailboxRequest = z.infer<typeof transferMailboxRequestSchema>;
+
 export interface Mailbox {
   id: number;
   address: string;
@@ -42,6 +49,13 @@ export interface Mailbox {
 export interface MailboxAvailability {
   address: string;
   available: boolean;
+}
+
+export interface MailboxTransferResult {
+  mailbox: Mailbox;
+  previousUserId: number;
+  transferred: boolean;
+  revokedShares: number;
 }
 
 /** 管理员替换某只自己认领的邮箱的共享名单。空数组表示全部撤销。 */

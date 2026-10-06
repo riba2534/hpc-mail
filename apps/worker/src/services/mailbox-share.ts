@@ -1,5 +1,5 @@
 import type { MailboxShareGrant, SharedMailboxView } from '@hpc-mail/shared';
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { mailboxShares, mailboxes, users } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
@@ -105,13 +105,16 @@ export async function replaceMailboxShares(
   }
 
   await env.db.batch([
-    env.db.prepare('DELETE FROM mailbox_shares WHERE mailbox_id = ?').bind(mailboxId),
+    env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id = ?
+      AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`).bind(mailboxId, mailboxId, adminId),
     ...uniqueIds.map((userId) =>
       env.db
-        .prepare('INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by) VALUES (?, ?, ?)')
-        .bind(mailboxId, userId, adminId),
+        .prepare(`INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by)
+          SELECT id, ?, ? FROM mailboxes WHERE id = ? AND user_id = ?`)
+        .bind(userId, adminId, mailboxId, adminId),
     ),
   ]);
+  assertOwnMailbox(await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId)).get(), adminId);
 
   return {
     mailboxId: box.id,
@@ -133,7 +136,8 @@ export async function revokeMailboxShare(
   assertOwnMailbox(box, adminId);
   const result = await db
     .delete(mailboxShares)
-    .where(and(eq(mailboxShares.mailboxId, mailboxId), eq(mailboxShares.userId, userId)))
+    .where(and(eq(mailboxShares.mailboxId, mailboxId), eq(mailboxShares.userId, userId),
+      sql`EXISTS (SELECT 1 FROM mailboxes WHERE id = ${mailboxId} AND user_id = ${adminId})`))
     .run();
   if ((result.meta.changes ?? 0) === 0) throw new AppError('not_found', '该用户不在共享名单中');
 }

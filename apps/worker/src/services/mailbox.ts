@@ -1,9 +1,9 @@
-import type { ClaimMailboxRequest, Mailbox, MailboxAvailability, Role } from '@hpc-mail/shared';
+import type { ClaimMailboxRequest, Mailbox, MailboxAvailability, MailboxTransferResult, Role, TransferMailboxRequest } from '@hpc-mail/shared';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import type { Env } from '../types.js';
+import type { AuthUser, Env } from '../types.js';
 import { domainPerUserLimit, getDomains, getVisibleDomains, isDomainPublic } from './domain.js';
 import { getSettingsFresh } from './setting.js';
 import { purgeStatements } from './message-lifecycle.js';
@@ -168,13 +168,60 @@ export async function updateMailbox(
   const db = createDb(env);
   const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
   if (!row || (!isAdmin && row.userId !== userId)) throw new AppError('not_found', '邮箱不存在');
-  await db.update(mailboxes).set({ displayName }).where(eq(mailboxes.id, id));
+  const result = await db.update(mailboxes).set({ displayName })
+    .where(and(eq(mailboxes.id, id), eq(mailboxes.userId, row.userId))).run();
+  if (!result.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
   const [updated] = await db
     .select({ mailbox: mailboxes, messageCount: messageCountSql })
     .from(mailboxes)
     .where(eq(mailboxes.id, id))
     .all();
   return serialize(updated!.mailbox, Number(updated!.messageCount));
+}
+
+/** 不经过释放/重新认领：所有权、审计及旧共享撤销在同一个 D1 事务内完成。 */
+export async function transferMailbox(
+  env: Env,
+  actor: Pick<AuthUser, 'id' | 'username' | 'role'>,
+  id: number,
+  req: TransferMailboxRequest,
+  ip = '',
+): Promise<MailboxTransferResult> {
+  if (actor.role !== 'admin') throw new AppError('forbidden', '需要管理员权限');
+  const db = createDb(env);
+  const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  if (!row) throw new AppError('not_found', '邮箱不存在');
+  const target = await db.select().from(users).where(eq(users.id, req.userId)).get();
+  if (!target) throw new AppError('not_found', '目标用户不存在');
+  if (target.status !== 'active') throw new AppError('validation_failed', '只能过户给启用中的用户');
+  const resultFor = async (box: MailboxRow, transferred: boolean, revokedShares = 0): Promise<MailboxTransferResult> => {
+    const count = await db.select({ value: sql<number>`COUNT(*)` }).from(messages).where(eq(messages.address, box.address)).get();
+    return { mailbox: serialize(box, Number(count?.value ?? 0), target.username),
+      previousUserId: transferred ? row.userId : box.userId, transferred, revokedShares };
+  };
+  // 重试已完成的过户不清理新主人后来建立的共享，也不重复记审计。
+  if (row.userId === target.id) return resultFor(row, false);
+  if (row.userId !== req.expectedOwnerId) throw new AppError('conflict', '邮箱归属已改变，请刷新后重新确认');
+  const previous = await db.select({ username: users.username }).from(users).where(eq(users.id, row.userId)).get();
+  const detail = `${previous?.username ?? `user#${row.userId}`} (#${row.userId}) → ${target.username} (#${target.id})；保留全部历史并撤销旧共享`;
+  const results = await env.db.batch([
+    env.db.prepare(`UPDATE mailboxes SET user_id = ? WHERE id = ? AND user_id = ? AND user_id <> ?
+      AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active')`)
+      .bind(target.id, id, req.expectedOwnerId, target.id, target.id),
+    // changes() 关联事务内紧邻的上一条写入；CAS 失败时后续审计和共享删除均不执行。
+    env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+      SELECT ?, ?, 'mailbox.transfer', ?, ?, ? WHERE changes() = 1`)
+      .bind(actor.id, actor.username, row.address, detail, ip),
+    env.db.prepare('DELETE FROM mailbox_shares WHERE mailbox_id = ? AND changes() = 1').bind(id),
+  ]);
+  const updated = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  if (!updated) throw new AppError('not_found', '邮箱已被释放，请刷新后重试');
+  if (!results[0]?.meta.changes) {
+    if (updated.userId === target.id) return resultFor(updated, false);
+    throw new AppError('conflict', '邮箱归属或目标用户状态已改变，请刷新后重新确认');
+  }
+  // 返回本次提交的结果；若另一管理员随后再次过户，客户端读回列表即可发现。
+  return resultFor({ ...row, userId: target.id }, true, results[2]?.meta.changes ?? 0);
 }
 
 /**
@@ -199,10 +246,12 @@ export async function releaseMailbox(
       .bind(token, row.address, row.id, row.userId));
     statements.push(...purgeStatements(env, token));
   }
-  statements.push(env.db.prepare('DELETE FROM mailbox_shares WHERE mailbox_id = ?').bind(row.id));
+  statements.push(env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id = ?
+    AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`).bind(row.id, row.id, row.userId));
   statements.push(env.db.prepare('DELETE FROM mailboxes WHERE id = ? AND user_id = ?').bind(row.id, row.userId));
   // One D1 transaction includes every message present at release, including concurrent inbound.
   const result = await env.db.batch(statements);
+  if (!result[result.length - 1]?.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
   const deletedMessages = deleteHistory ? (result[4]?.meta.changes ?? 0) : 0;
   if (deleteHistory) await processStorageCleanup(env, 100);
   return { deletedMessages };

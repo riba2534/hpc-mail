@@ -1,4 +1,6 @@
 import type {
+  MailboxTransferResult,
+  TransferMailboxRequest,
   AdminAuditLogEntry,
   AdminUser,
   ApiKeySummary,
@@ -206,6 +208,8 @@ export const apiKeyApi = {
 
 // ---- 管理端 ----
 export const adminApi = {
+  transferMailbox: (id: number, body: TransferMailboxRequest) =>
+    api.post<MailboxTransferResult, TransferMailboxRequest>(`/admin/mailboxes/${id}/transfer`, body),
   listUsers: () => api.get<AdminUser[]>('/admin/users'),
   createUser: (body: CreateUserRequest) => api.post<AdminUser, CreateUserRequest>('/admin/users', body),
   updateUser: (id: number, body: UpdateUserRequest) =>

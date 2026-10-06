@@ -96,6 +96,9 @@ export function buildSessionOpenApiSpec(origin: string) {
         description: 'At least one field. Cannot disable self or remove the last active administrator. Password reset/disable revokes prior JWT epochs. Downgrading an administrator revokes their mailbox shares.' }),
       delete: operation('Delete a user', success, { ...admin, description: 'Cannot delete self or last active administrator. Releases owned mailboxes and revokes keys/shares; message history remains address-owned and may be inherited by later claimants.' }),
     },
+    '/admin/mailboxes/{id}/transfer': { post: operation('Transfer any existing mailbox to an active user', ref('MailboxTransferResult'), {
+      ...admin, request: 'TransferMailboxRequest', description: 'Administrator JWT only. userId is the target owner; expectedOwnerId comes from GET /mailboxes?all=1. Transfers an existing mailbox directly, including another user’s mailbox. Bypasses ordinary claim quotas, reserved prefixes and domain visibility. Preserves mailbox id, address, display name and all message/attachment history. Atomically changes ownership, revokes all old shares and records mailbox.transfer audit. A stale owner returns 409, unless the mailbox already belongs to the target: that retry returns transferred=false and does not revoke new shares. Disabled/missing users cannot receive a mailbox. Future mail uses the new owner’s notification preferences; existing receipt-time snapshots/jobs remain unchanged.'
+    }) },
     '/admin/settings': {
       get: operation('Read current settings and domain revision', ref('Settings'), admin),
       put: operation('Update validated settings with domain conflict protection', ref('Settings'), { ...admin, request: 'UpdateSettingsRequest',

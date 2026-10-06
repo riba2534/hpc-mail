@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { AtSign, Search, Trash2 } from 'lucide-react';
+import { ArrowRightLeft, AtSign, Search, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import type { Mailbox } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership } from '@/api/query-keys';
@@ -16,6 +16,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+import { TransferMailboxDialog } from './transfer-mailbox-dialog';
 
 function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onClose: () => void }) {
   const queryClient = useQueryClient();
@@ -85,6 +86,7 @@ export function AddressesPage() {
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
   const [q, setQ] = useState('');
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
+  const [transferring, setTransferring] = useState<Mailbox | null>(null);
 
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -97,7 +99,7 @@ export function AddressesPage() {
 
   return (
     <div className="mx-auto max-w-4xl">
-      <PageHeader title="全站地址" description="所有已认领地址及其归属，可强制释放（用于治理抢注/清理）。" />
+      <PageHeader title="全站地址" description="查看所有已认领地址，可过户给指定用户或强制释放。" />
       <div className="relative mb-4">
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-tertiary" />
         <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索地址或用户名" className="pl-9" />
@@ -132,7 +134,10 @@ export function AddressesPage() {
                 <TableCell className="text-ink-secondary">{mailbox.messageCount}</TableCell>
                 <TableCell className="text-ink-tertiary">{formatDateTime(mailbox.createdAt)}</TableCell>
                 <TableCell>
-                  <div className="flex justify-end">
+                  <div className="flex justify-end gap-1">
+                    <IconButton size="sm" aria-label={`过户 ${mailbox.address}`} onClick={() => setTransferring(mailbox)}>
+                      <ArrowRightLeft className="size-4" />
+                    </IconButton>
                     <IconButton size="sm" aria-label="强制释放" onClick={() => setReleasing(mailbox)}>
                       <Trash2 className="size-4 text-critical" />
                     </IconButton>
@@ -145,6 +150,7 @@ export function AddressesPage() {
       )}
 
       <ForceReleaseDialog mailbox={releasing} onClose={() => setReleasing(null)} />
+      <TransferMailboxDialog mailbox={transferring} onClose={() => setTransferring(null)} />
     </div>
   );
 }

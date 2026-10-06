@@ -13,6 +13,24 @@
 
 用户含 `id,username,role,status,mailboxCount,mailboxes,apiKeyCount,createdAt,lastLoginAt,avatarUrl`。建户/重置密码约束见鉴权参考。不能禁用或删除自己；不能移除最后一个启用中的管理员。禁用/重置密码撤销旧会话，禁用期间 Key 也被拒绝；重置密码本身不吊销 Key。降级管理员撤销其名下共享，存量邮箱仍存在，新认领/发件按当前角色校验。
 
+## 强制过户邮箱
+
+管理员 JWT 可 `POST /api/admin/mailboxes/:id/transfer`，将任意现有已认领邮箱直接转给指定的启用中用户（普通用户或管理员）。自己或别人认领的均可；此操作不经过未认领状态，不受普通认领配额、保留前缀、域名公开性或当前新认领域名列表限制。它不创建尚未存在的邮箱。
+
+先读 `GET /api/mailboxes?all=1` 核对邮箱 `id,address,userId`，再读 `GET /api/admin/users` 核对目标 `id,username,status`。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
+
+```bash
+# API="$BASE/api"，AUTH 为管理员 JWT；三个 ID 均来自上面的实际查询
+jq -n --argjson userId "$HPC_TARGET_USER_ID" --argjson ownerId "$HPC_CURRENT_OWNER_ID" \
+  '{userId:$userId,expectedOwnerId:$ownerId}' |
+  hpc "/admin/mailboxes/$HPC_MAILBOX_ID/transfer" -X POST \
+    -H 'Content-Type: application/json' --data-binary @-
+```
+
+返回 `data:{mailbox,previousUserId,transferred,revokedShares}`。保留邮箱 ID、地址、显示名、原创建时间及全部历史收发邮件、回收站和附件；新主人取得完整邮箱权限，原主人失去普通所属权限。**旧共享全部撤销**，过户后不自动恢复；新收到的邮件使用新主人的个人通知/转发配置。以前收件的通知快照和任务保持原归属，不重新推送历史邮件。
+
+所有权变更、共享撤销和 `mailbox.transfer` 管理审计在同一事务内提交。主人已改变时返回 409 `conflict`，需重新读取并确认新状态，不能自动改 expectedOwnerId 强行覆盖。超时后的相同请求若目标已经是主人，返回 `transferred:false,revokedShares:0`，不重复记审计，也不清除新主人后来建立的共享。不存在邮箱/用户返回 404；禁用用户返回 400，不能把过户成功解读为替目标启用账号或修改密码。
+
 删除用户 **不删邮件**，邮箱变为未认领、历史可能由下一位 owner 继承。用户要求账户及邮件一起删除时，先核对并按授权清理该用户各邮箱历史（释放时 `deleteHistory=1`），再删账户；不能把单个 deleteUser 的成功报告成历史已全部消除。外发大附件独立保留链接的边界见附件参考。
 
 邮件审阅不是另一个 admin/messages 路径：

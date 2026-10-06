@@ -78,5 +78,6 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 - `wrangler.toml` 的 `assets.run_worker_first` 必须包含 `/skill.md`、`/references/*` 和 `/llms.txt`，使编码及缺失文档处理在生产生效；新增文档目录时同步维护，不能只测试 Worker handler。
 
 - 域名更新必须带 `expectedDomainsRevision`，旧快照返回 409；管理配置和认领校验直读 D1，避免 KV 陈旧配置允许已移除域名被认领。
+- 管理员邮箱过户用 `/api/admin/mailboxes/:id/transfer`（JWT），带 `userId/expectedOwnerId`；所有权、旧共享撤销、管理审计同一 D1 事务，保留全部地址历史。过户不经过释放，不受普通认领限制；相同目标重试不重复清共享。收信时通知快照不随过户重写。
 - 发件结果包含每个目标的 `recipientOutcomes`；补发保留 To/Cc/Bcc 分组，只重试失败目标。Idempotency-Key 在副作用开始前关联发件行；完成回填失败不能变成请求发送失败或重新投递。
 - `/api/config` 返回 `X-HPC-Build`；CI 等待该值等于本次提交 SHA 后才执行线上冒烟。

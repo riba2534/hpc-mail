@@ -94,6 +94,18 @@ unknown=$(curl -sS -w '\n%{http_code}' "$BASE_URL/v1/missing-smoke-endpoint")
 [ "$(echo "$unknown" | tail -1)" = "404" ] || fail "未知 API 未返回 404"
 echo "$unknown" | head -1 | jq -e '.error.code == "not_found" and (.requestId | type == "string")' >/dev/null || fail "未知 API 错误不可解析"
 
+step "管理员邮箱过户契约和输入边界"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
+  .paths["/admin/mailboxes/{id}/transfer"].post["x-required-role"] == "admin" and
+  (.components.schemas.TransferMailboxRequest.required | sort) == ["expectedOwnerId", "userId"]
+' >/dev/null || fail "邮箱过户机器契约缺失"
+admin_id=$(echo "$me" | jq -r '.data.id')
+transfer_input=$(jq -n --argjson ownerId "$admin_id" '{userId:0,expectedOwnerId:$ownerId}')
+invalid_transfer=$(curl -sS -w '\n%{http_code}' -X POST "$BASE_URL/api/admin/mailboxes/0/transfer" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data-binary "$transfer_input")
+[ "$(echo "$invalid_transfer" | tail -1)" = "400" ] || fail "非法目标用户 ID 未被过户接口拒绝"
+echo "$invalid_transfer" | head -1 | jq -e '.error.code == "validation_failed"' >/dev/null || fail "非法过户请求错误不可解析"
+
 step "注册模式=closed 时注册被拒"
 if [ "$mode" = "closed" ]; then
   rcode=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/api/auth/register" \
