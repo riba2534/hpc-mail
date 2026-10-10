@@ -46,6 +46,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: one('r'), label: '回复' },
       { keys: one('a'), label: '全部回复' },
       { keys: one('f'), label: '转发' },
+      { keys: one('t'), label: '翻译 / 显示原文（需启用 AI 翻译）' },
       { keys: one('s'), label: '星标' },
       { keys: one('e', '#'), label: '删除' },
       { keys: one('Shift+U'), label: '标为未读（共享邮件不可用）' },

@@ -12,7 +12,7 @@ description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和�
 | 任务 | API / 权限 | 按需读取 |
 |---|---|---|
 | 已有 `hpcm_…` Key：状态、可用域名 | `/v1/status`、`/v1/domains`；任一有效 Key | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
-| 收件箱、已发送、搜索、验证码/验证链接、按发件人等新邮件、线程、原始邮件 | `/v1/messages…`：`mail.read`；或 `/api/messages…`：JWT（长轮询仅 `/v1`） | [邮件、验证码与发送](references/mail.md) |
+| 收件箱、已发送、搜索、验证码/验证链接、按发件人等新邮件、线程、原始邮件、译成简体中文 | `/v1/messages…`：`mail.read`；或 `/api/messages…`：JWT（长轮询仅 `/v1`，翻译仅 JWT，需管理员启用并配置 AI 模型） | [邮件、验证码与发送](references/mail.md) |
 | 已读（含按地址/域名/搜索词全部已读）、星标、回收站恢复/永久删除 | `/v1/messages…`：`mail.write`；或 JWT | [邮件、验证码与发送](references/mail.md) |
 | 发信、回复、转发、部分失败补发 | `POST /v1/messages`：`mail.send`；或 `POST /api/messages/send`：JWT | [邮件、验证码与发送](references/mail.md) |
 | 下载附件、流式/分片上传、附件 Token | 下载 `mail.read`；上传 `mail.send`；或 JWT | [附件](references/attachments.md) |

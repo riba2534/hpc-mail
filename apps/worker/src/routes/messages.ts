@@ -5,10 +5,11 @@ import {
   markReadRequestSchema,
   markAllReadRequestSchema,
   starMessagesRequestSchema,
+  translateMessageRequestSchema,
   type MessageSummary,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
-import { ok, parseBody, parseId, parseQuery } from '../lib/http.js';
+import { execCtx, ok, parseBody, parseId, parseQuery } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   countUnread,
@@ -33,6 +34,7 @@ import {
   completeIdempotentSend,
   failIdempotentSend,
 } from '../services/idempotency.js';
+import { translateMessage } from '../services/translate.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
 import type { AppContext } from '../types.js';
 
@@ -165,6 +167,14 @@ app.get('/contacts', async (c) => {
 app.get('/:id/thread', async (c) => {
   const id = parseId(c.req.param('id'));
   return ok(c, { items: await getThread(c.env, viewerOf(c), id) });
+});
+
+/** AI 翻译为简体中文（仅 JWT，不开放到 /v1）：scope/userId 与详情同一校验，只译出自该邮件的片段 */
+app.post('/:id/translate', async (c) => {
+  const id = parseId(c.req.param('id'));
+  const viewer = viewerOf(c);
+  const req = await parseBody(c, translateMessageRequestSchema);
+  return ok(c, await translateMessage(c.env, execCtx(c), viewer, id, req.segments));
 });
 
 /** 下载原始 .eml（须在 /:id 之前注册） */

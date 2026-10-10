@@ -7,7 +7,6 @@ compatibility_date = "2025-06-04"
 
 [vars]
 # 域名由 settings.domains.list 维护，测试在 setup 里 updateSettings 设置
-ai_model = "@cf/meta/llama-3.1-8b-instruct-fp8"
 
 [[d1_databases]]
 binding = "db"
@@ -23,9 +22,6 @@ id = "00000000000000000000000000000000"
 [[r2_buckets]]
 binding = "r2"
 bucket_name = "hpc-cloud-mail-r2"
-
-[ai]
-binding = "ai"
 
 [assets]
 binding = "assets"

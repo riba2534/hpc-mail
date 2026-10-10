@@ -1,5 +1,6 @@
 import {
   DEFAULT_SETTINGS,
+  SECRET_MASK,
   SETTING_SCHEMAS,
   type SettingKey,
   type Settings,
@@ -7,6 +8,7 @@ import {
 } from '@hpc-mail/shared';
 import { AppError } from '../lib/errors.js';
 import { createDb } from '../db/client.js';
+import { isAiModelConfigured } from './ai-provider.js';
 import { settings as settingsTable } from '../db/schema.js';
 import type { Env, ExecCtx } from '../types.js';
 
@@ -90,27 +92,55 @@ export async function invalidateSettingsCache(env: Env): Promise<void> {
   }
 }
 
+/** AI 翻译已启用且 ai_model 配置完整（/api/config 的 translationEnabled 与翻译接口共用此口径） */
+export function isTranslationReady(settings: Pick<Settings, 'translation' | 'ai_model'>): boolean {
+  return settings.translation.enabled && isAiModelConfigured(settings.ai_model);
+}
+
 /** 写设置：逐 key 校验后落库并失效缓存 */
 export async function updateSettings(env: Env, patch: UpdateSettingsRequest): Promise<void> {
   const db = createDb(env);
   const writes: { key: string; value: string }[] = [];
+  let fresh: Settings | undefined;
+  const loadCurrent = async () => (fresh ??= await getSettingsFresh(env));
 
+  const next: Partial<Pick<Settings, 'ai_model' | 'translation'>> = {};
+  let domains: { value: string; expected: number } | undefined;
   for (const key of Object.keys(SETTING_SCHEMAS) as SettingKey[]) {
     const incoming = patch[key];
     if (incoming === undefined) continue;
     const parsed = SETTING_SCHEMAS[key].safeParse(incoming);
     if (!parsed.success) throw new AppError('validation_failed', '配置格式非法');
-    if (key === 'domains') {
-      const current = await getSettingsFresh(env);
+    if (key === 'ai_model') {
+      const value = parsed.data as Settings['ai_model'];
+      // 提交 SECRET_MASK 表示保留已存 apiKey
+      next.ai_model = { ...value, apiKey: value.apiKey === SECRET_MASK ? (await loadCurrent()).ai_model.apiKey : value.apiKey };
+      writes.push({ key, value: JSON.stringify(next.ai_model) });
+    } else if (key === 'translation') {
+      next.translation = parsed.data as Settings['translation'];
+      writes.push({ key, value: JSON.stringify(next.translation) });
+    } else if (key === 'domains') {
+      const current = await loadCurrent();
       const expected = patch.expectedDomainsRevision ?? current.domains.revision ?? 0;
-      const value = JSON.stringify({ ...parsed.data as object, revision: expected + 1 });
-      const result = await env.db.prepare(`INSERT INTO settings (key, value)
-        SELECT 'domains', ? WHERE ? = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ? RETURNING key`)
-        .bind(value, expected, expected).first();
-      if (!result) throw new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
+      domains = { value: JSON.stringify({ ...parsed.data as object, revision: expected + 1 }), expected };
     } else writes.push({ key, value: JSON.stringify(parsed.data) });
+  }
+  // 翻译启用依赖模型配置：任一项在本次提交里时，按合并后的结果校验（验证码 AI 兜底未配置模型时只走正则，不拦）。
+  // 校验先于任何写入，避免域名已写而其余设置被拒的半截更新
+  if (next.ai_model || next.translation) {
+    const current = next.ai_model && next.translation ? undefined : await loadCurrent();
+    const merged = { ai_model: next.ai_model ?? current!.ai_model, translation: next.translation ?? current!.translation };
+    if (merged.translation.enabled && !isTranslationReady(merged)) {
+      throw new AppError('validation_failed', '启用 AI 翻译需先配置 AI 模型的接口地址、API Key 和模型');
+    }
+  }
+  if (domains) {
+    const result = await env.db.prepare(`INSERT INTO settings (key, value)
+      SELECT 'domains', ? WHERE ? = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ? RETURNING key`)
+      .bind(domains.value, domains.expected, domains.expected).first();
+    if (!result) throw new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
   }
   for (const w of writes) {
     await db.insert(settingsTable).values(w)
@@ -119,7 +149,8 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest): Pr
   await invalidateSettingsCache(env);
 }
 
-/** 管理端回显：系统设置已无密文字段（飞书/webhook 密钥已下放个人偏好），原样返回 */
+/** 管理端回显：AI 模型 apiKey 已配置时显示 SECRET_MASK（飞书/webhook 密钥已下放个人偏好） */
 export function maskSettings(settings: Settings): Settings {
-  return { ...settings };
+  const { ai_model: aiModel } = settings;
+  return { ...settings, ai_model: { ...aiModel, apiKey: aiModel.apiKey ? SECRET_MASK : '' } };
 }

@@ -100,3 +100,8 @@ export const DEFAULT_RESERVED_LOCAL_PARTS = [
   'info',
   'help',
 ] as const;
+
+/** AI 翻译：单次请求的片段数、单片段字符数与总字符数上限（前端据此分批） */
+export const MAX_TRANSLATE_SEGMENTS = 60;
+export const MAX_TRANSLATE_SEGMENT_CHARS = 2000;
+export const MAX_TRANSLATE_BATCH_CHARS = 6000;

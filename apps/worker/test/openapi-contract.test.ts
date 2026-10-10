@@ -1,3 +1,4 @@
+import { MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
@@ -134,6 +135,29 @@ describe('OpenAPI routes and public contracts', () => {
       expect(((availability.properties as Record<string, Schema>).reason!).enum).toEqual(['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable']);
       expect(availability.required).toEqual(['address', 'available']);
       expect(spec.components.schemas).not.toHaveProperty('MutationScopeRequest');
+    }
+  });
+
+  it('documents JWT-only translation, its limits and the write-only provider key', () => {
+    const translate = specs.api.paths['/messages/{id}/translate']!.post!;
+    expect((translate.parameters as Array<{ name: string }>).map(param => param.name)).toEqual(['scope', 'userId']);
+    expect(translate.requestBody).toMatchObject({ required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/TranslateMessageRequest' } } } });
+    expect(specs.v1.paths).not.toHaveProperty('/messages/{id}/translate');
+    expect(specs.v1.components.schemas).not.toHaveProperty('MessageTranslation');
+    const test = specs.api.paths['/admin/settings/ai-model-test']!.post!;
+    expect(test['x-required-role']).toBe('admin');
+    expect((test.requestBody as { required: boolean }).required).toBe(false);
+    const schemas = specs.api.components.schemas;
+    expect(schemas.TranslateMessageRequest!['x-max-total-chars']).toBe(MAX_TRANSLATE_BATCH_CHARS);
+    expect((schemas.TranslateMessageRequest!.properties as Record<string, Schema>).segments).toMatchObject({ maxItems: MAX_TRANSLATE_SEGMENTS, items: { maxLength: MAX_TRANSLATE_SEGMENT_CHARS } });
+    expect(schemas.MessageTranslation!.required).toEqual(['translations', 'cached', 'skipped']);
+    expect(schemas.AiModelTestResult!.required).toEqual(['ok', 'latencyMs', 'sample']);
+    expect(schemas.PublicConfig!.required).toContain('translationEnabled');
+    for (const name of ['Settings', 'UpdateSettingsRequest']) {
+      const properties = schemas[name]!.properties as Record<string, Schema>;
+      expect(properties.ai_model!.description).toContain('verification-code fallback');
+      expect(((properties.ai_model!.properties as Record<string, Schema>).apiKey!).description).toContain('******');
+      expect(Object.keys(properties.translation!.properties as Schema).sort()).toEqual(['dailyCharsPerUser', 'enabled']);
     }
   });
 

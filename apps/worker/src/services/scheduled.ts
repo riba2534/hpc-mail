@@ -16,6 +16,7 @@ import { getSettings } from './setting.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
+import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -199,7 +200,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   });
   // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ 回收 R2 + 删行
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
-  // 计数器：外发/转发配额按天、登录失败与注册限流按分钟窗口，各自回收过期行
+  // 计数器：外发/转发/翻译配额按天、登录失败与注册限流按分钟窗口，各自回收过期行
   await step(report, 'counters', async () => {
     await purgeCounters(env, 'out', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, 'fwd-domain', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
@@ -210,6 +211,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, 'auth-user', minuteWindow(1) - 120);
     await purgeCounters(env, 'auth-global', minuteWindow(1) - 120);
     await purgeCounters(env, 'ai-extract', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, TRANSLATE_CHARS_SCOPE, dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, TRANSLATE_REQUESTS_SCOPE, minuteWindow(1) - 120);
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });

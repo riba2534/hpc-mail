@@ -5,12 +5,9 @@ export interface Env {
   db: D1Database;
   kv: KVNamespace;
   r2: R2Bucket;
-  ai: Ai;
   assets: Fetcher;
   /** send_email binding：Cloudflare 原生发信（仅已验证 destination） */
   email: SendEmail;
-  /** [vars] ai_model：验证码兜底模型 */
-  ai_model: string;
   /** Canonical web origin for links in relayed mail. */
   site_origin?: string;
   build_sha?: string;

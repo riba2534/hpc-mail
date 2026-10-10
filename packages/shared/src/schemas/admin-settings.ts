@@ -26,6 +26,7 @@ export const feishuSettingSchema = z.object({
 
 export const codeExtractSettingSchema = z.object({
   enabled: z.boolean(),
+  /** 正则提不到码时用 ai_model 兜底；ai_model 未配置时只走正则 */
   aiEnabled: z.boolean(),
 });
 
@@ -106,6 +107,46 @@ export const mailboxPolicySettingSchema = z.object({
   reservedLocalParts: z.array(z.string().trim().toLowerCase().max(64)).max(200),
 });
 
+/**
+ * 全站统一的 AI 模型：OpenAI 兼容的 Chat Completions 接口（如 DeepSeek：baseUrl=https://api.deepseek.com，
+ * model=deepseek-flash）。AI 翻译与入站验证码的 AI 兜底识别都用它；三项任一为空视为未配置。
+ * apiKey 回显一律为 SECRET_MASK；提交 SECRET_MASK 表示保持原值。
+ */
+export const aiModelSettingSchema = z.object({
+  /** 接口根地址，不含 /chat/completions；只接受 https */
+  baseUrl: z.union([z.literal(''), z.url().startsWith('https://')]).default(''),
+  apiKey: z.string().trim().max(512).default(''),
+  model: z.string().trim().max(128).default(''),
+});
+
+/**
+ * AI 翻译开关与额度（模型见 ai_model）。启用后，用户在邮件详情点「翻译」时，
+ * 邮件主题与正文的文字片段会发送到 ai_model 配置的服务；启用要求 ai_model 配置完整。
+ */
+export const translationSettingSchema = z.object({
+  enabled: z.boolean(),
+  /** 每个用户每天可翻译的字符数上限（0=不限） */
+  dailyCharsPerUser: z.number().int().min(0).max(10_000_000).default(200_000),
+});
+
+/**
+ * 管理员测试 AI 模型（POST /api/admin/settings/ai-model-test，body 可省略）：
+ * 缺省或空字段用已保存的 ai_model，apiKey 为 SECRET_MASK 时同样用已保存值；不要求任何功能已启用。
+ */
+export const aiModelTestRequestSchema = z.object({
+  baseUrl: z.union([z.literal(''), z.url().startsWith('https://')]).optional(),
+  apiKey: z.string().trim().max(512).optional(),
+  model: z.string().trim().max(128).optional(),
+});
+export type AiModelTestRequest = z.infer<typeof aiModelTestRequestSchema>;
+
+/** 测试成功：sample 为固定示例句的译文；失败走错误信封（message 含 HTTP 状态码或超时等原因） */
+export interface AiModelTestResult {
+  ok: true;
+  latencyMs: number;
+  sample: string;
+}
+
 // gmail_forward / feishu / notify_webhook 已从系统设置下放为「每用户的个人转发与通知偏好」
 // （见 schemas/notify-prefs.ts）；下面三个 schema 定义保留、被个人偏好复用。
 export const SETTING_SCHEMAS = {
@@ -118,6 +159,8 @@ export const SETTING_SCHEMAS = {
   quota: quotaSettingSchema,
   mailbox_policy: mailboxPolicySettingSchema,
   security: securitySettingSchema,
+  ai_model: aiModelSettingSchema,
+  translation: translationSettingSchema,
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
 
@@ -140,6 +183,8 @@ export const DEFAULT_SETTINGS: Settings = {
     reservedLocalParts: [...DEFAULT_RESERVED_LOCAL_PARTS],
   },
   security: { require2fa: false },
+  ai_model: { baseUrl: '', apiKey: '', model: '' },
+  translation: { enabled: false, dailyCharsPerUser: 200_000 },
 };
 
 export const updateSettingsRequestSchema = z
@@ -154,6 +199,8 @@ export const updateSettingsRequestSchema = z
     quota: quotaSettingSchema.optional(),
     mailbox_policy: mailboxPolicySettingSchema.optional(),
     security: securitySettingSchema.optional(),
+    ai_model: aiModelSettingSchema.optional(),
+    translation: translationSettingSchema.optional(),
   })
   .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',
@@ -167,6 +214,8 @@ export interface PublicConfig {
   domains: string[];
   /** 是否强制两步验证（前端据此引导未启用用户设置） */
   require2fa: boolean;
+  /** AI 翻译已启用且 ai_model 配置完整（baseUrl、apiKey、model 均非空）；前端据此显示「翻译」按钮 */
+  translationEnabled: boolean;
 }
 
 /** 域名接入自检状态：DNS-over-HTTPS 探测 MX/SPF 是否已指向 Cloudflare Email Routing（无需 CF 凭据） */

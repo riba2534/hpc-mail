@@ -12,7 +12,7 @@ pnpm workspace monorepo，Node ≥22.12、pnpm 10。
 
 ```bash
 pnpm install
-pnpm dev          # 并行起 worker(:8787, wrangler dev --local) + web(:3002, vite)，vite 只把 /api、/v1 路径代理到 worker；--local 下 Workers AI 不可用，只走正则提码
+pnpm dev          # 并行起 worker(:8787, wrangler dev --local) + web(:3002, vite)，vite 只把 /api、/v1 路径代理到 worker
 pnpm build        # web 构建 → 产物拷进 apps/worker/dist（Worker 以 assets 形式托管前端）
 pnpm test         # 全部包 vitest（pnpm -r test）
 pnpm typecheck    # 全部包 tsc（pnpm -r typecheck）
@@ -59,6 +59,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 - **D1 没有 STAT4，规划器常选错索引**（ANALYZE 无效）。可见性条件不要写成 `owned OR shared`，用地址集合 `UNION`；需要时用 `INDEXED BY`（通知补录）或一元 `+domain` 压掉错误索引；改索引前对所有 messages 查询跑 EXPLAIN 回归（见 `test/perf-optimizations.test.ts`）。
 - **共享邮件的已读状态属于所有者**：成员的已读/未读操作、全部已读都不生效，未读数与 `unread=1` 筛选也不含共享邮件；前端按已读样式显示共享邮件。
 - **验证链接**：入站时由 `services/link-extract.ts` 提取到 `messages.verification_link`（宁缺毋滥，与提码同一开关，不回填历史）；前端比对链接域名与发件域，不一致时提示。
+- **AI 只走管理后台配置的 OpenAI 兼容模型**（`settings.ai_model`，如 DeepSeek），不再使用 Workers AI binding。验证码兜底（仅在命中验证码关键词且正则未识别时调用）与邮件翻译共用 `services/ai-provider.ts`；DeepSeek 必须带 `thinking: {type: 'disabled'}`（否则慢且贵）；workerd 的 fetch 不支持 `redirect: 'error'`，用 `manual` 并把 3xx 当失败。apiKey 回显为 `SECRET_MASK`，审计不记录。译文缓存在 `message_translations`，必须随 `purgeStatements` 一起删除（永久删除、保留期清理、释放并清空历史共用这条路径）。
 - **`cloudflare:email` 和 `mimetext` 必须在 `outbound.ts` 里动态 `import()`**（静态 import 会让 vitest 的 workerd 加载即崩）；mimetext 用 `mimetext/browser` 入口（避免 nodejs_compat 依赖）。
 
 ## 前端约定

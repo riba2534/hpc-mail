@@ -11,6 +11,10 @@ import {
   registerRequestSchema,
   sendMailRequestSchema,
   SETTING_SCHEMAS,
+  aiModelSettingSchema,
+  aiModelTestRequestSchema,
+  translateMessageRequestSchema,
+  translationSettingSchema,
   updateNotifyPrefsRequestSchema,
   updateSettingsRequestSchema,
   userNotifyPrefsSchema,
@@ -199,5 +203,27 @@ describe('createApiKeyRequestSchema / createInviteRequestSchema', () => {
     const r = createInviteRequestSchema.parse({});
     expect(r.count).toBe(1);
     expect(r.maxUses).toBe(1);
+  });
+});
+
+describe('AI 模型与翻译契约', () => {
+  it('模型只接受 https 根地址，默认未配置；翻译默认关闭且不含模型字段', () => {
+    expect(DEFAULT_SETTINGS.ai_model).toEqual({ baseUrl: '', apiKey: '', model: '' });
+    expect(DEFAULT_SETTINGS.translation).toEqual({ enabled: false, dailyCharsPerUser: 200_000 });
+    expect(aiModelSettingSchema.safeParse({ baseUrl: 'http://api.deepseek.com', apiKey: 'k', model: 'm' }).success).toBe(false);
+    expect(aiModelSettingSchema.parse({})).toEqual({ baseUrl: '', apiKey: '', model: '' });
+    expect(translationSettingSchema.parse({ enabled: true, baseUrl: 'https://x.example' })).toEqual({ enabled: true, dailyCharsPerUser: 200_000 });
+  });
+  it('翻译片段数量、单段与总字符数受限', () => {
+    expect(translateMessageRequestSchema.safeParse({ segments: [] }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: Array(61).fill('a') }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: ['a'.repeat(2001)] }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: Array(4).fill('a'.repeat(1600)) }).success).toBe(false);
+    expect(translateMessageRequestSchema.safeParse({ segments: Array(3).fill('a'.repeat(2000)) }).success).toBe(true);
+  });
+  it('测试请求的字段都可省略，不填默认值', () => {
+    expect(aiModelTestRequestSchema.parse({})).toEqual({});
+    expect(aiModelTestRequestSchema.parse({ apiKey: ' ****** ' })).toEqual({ apiKey: '******' });
+    expect(aiModelTestRequestSchema.safeParse({ baseUrl: 'http://x.example' }).success).toBe(false);
   });
 });

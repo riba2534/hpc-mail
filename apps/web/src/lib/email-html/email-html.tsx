@@ -7,6 +7,8 @@ export interface EmailHtmlProps {
   trustedImageOrigins?: string[]
   allowRemoteImages?: boolean
   className?: string
+  /** 正文写入 iframe 后回调正文根节点（每次重新渲染都会换新节点），卸载或重渲染前回调 null */
+  onContentChange?: (content: HTMLElement | null) => void
 }
 
 const FRAME_SANDBOX = 'allow-same-origin allow-popups allow-popups-to-escape-sandbox'
@@ -54,9 +56,12 @@ export function EmailHtml({
   trustedImageOrigins = [],
   allowRemoteImages = true,
   className,
+  onContentChange,
 }: EmailHtmlProps) {
   const frameRef = useRef<HTMLIFrameElement>(null)
   const trustedOriginsKey = trustedImageOrigins.join('\n')
+  const onContentChangeRef = useRef(onContentChange)
+  onContentChangeRef.current = onContentChange
 
   // 绘制前同步换上可信骨架（含本封邮件的 CSP）并清空旧正文：切换邮件时旧内容不会残留一帧。
   useLayoutEffect(() => {
@@ -95,6 +100,7 @@ export function EmailHtml({
       allowRemoteImages,
     })
     frameDocument.body.replaceChildren(content)
+    onContentChangeRef.current?.(content)
 
     let animationFrame = 0
     let previousHeight = 0
@@ -128,6 +134,7 @@ export function EmailHtml({
       frameDocument.removeEventListener('load', resize, true)
       cancelAnimationFrame(animationFrame)
       iframe.style.removeProperty('height')
+      onContentChangeRef.current?.(null)
     }
     // The key intentionally tracks array contents rather than its reference.
     // eslint-disable-next-line react-hooks/exhaustive-deps

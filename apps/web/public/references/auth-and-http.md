@@ -14,7 +14,7 @@
 
 ## 登录与 bootstrap
 
-公开 `GET /api/config` 返回 `siteTitle`、`registrationMode`（`closed|invite|open`）、`domains`（仅公开域）、`require2fa`。登录不要求 Key：
+公开 `GET /api/config` 返回 `siteTitle`、`registrationMode`（`closed|invite|open`）、`domains`（仅公开域）、`require2fa`、`translationEnabled`（AI 翻译已启用且 AI 模型已配置）。登录不要求 Key：
 
 ```bash
 # 需用户提供 HPC_USERNAME、HPC_PASSWORD；启用 2FA 时还需 HPC_TOTP

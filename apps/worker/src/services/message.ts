@@ -34,6 +34,7 @@ import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor } from '../lib/pagination.js';
 import { htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
+import { isAiModelConfigured } from './ai-provider.js';
 import { CODE_SCAN_BODY_CHARS, resolveVerificationCode } from './code-extract.js';
 import { getSettings } from './setting.js';
 import { getJson } from './storage.js';
@@ -383,7 +384,7 @@ export async function findNextMessage(
     if (input.hasCode && !summary.verificationCode) {
       if (aiPending === undefined) {
         const settings = await getSettings(env);
-        aiPending = settings.code_extract.enabled && settings.code_extract.aiEnabled;
+        aiPending = settings.code_extract.enabled && settings.code_extract.aiEnabled && isAiModelConfigured(settings.ai_model);
       }
       if (aiPending && Date.now() - row.createdAt.getTime() < AI_CODE_GRACE_MS) break;
       scannedThroughId = row.id;
@@ -650,6 +651,23 @@ function rewriteCidUrls(
   return result;
 }
 
+/** 完整正文：超过 D1 上限的正文在 R2，D1 里只有截断预览 */
+async function fullBody(env: Env, row: Pick<MessageRow, 'bodyText' | 'bodyHtml' | 'bodyR2Key'>) {
+  if (!row.bodyR2Key) return { bodyText: row.bodyText, bodyHtml: row.bodyHtml };
+  const full = await getJson<{ text?: string; html?: string }>(env, row.bodyR2Key);
+  return { bodyText: full?.text ?? row.bodyText, bodyHtml: full?.html ?? row.bodyHtml };
+}
+
+/** 主题与完整正文（可见性同详情），供翻译等只需要文字内容的读取 */
+export async function getMessageContent(
+  env: Env,
+  viewer: Viewer,
+  id: number,
+): Promise<{ subject: string; bodyText: string; bodyHtml: string }> {
+  const row = await loadVisible(env, viewer, id);
+  return { subject: row.subject, ...(await fullBody(env, row)) };
+}
+
 export async function getMessageDetail(
   env: Env,
   viewer: Viewer,
@@ -658,15 +676,9 @@ export async function getMessageDetail(
   const db = createDb(env);
   const row = await loadVisible(env, viewer, id);
 
-  let bodyText = row.bodyText;
-  let bodyHtml = row.bodyHtml;
-  if (row.bodyR2Key) {
-    const full = await getJson<{ text?: string; html?: string }>(env, row.bodyR2Key);
-    if (full) {
-      bodyText = full.text ?? bodyText;
-      bodyHtml = full.html ?? bodyHtml;
-    }
-  }
+  const body = await fullBody(env, row);
+  const bodyText = body.bodyText;
+  let bodyHtml = body.bodyHtml;
 
   const [attRows, starSet] = await Promise.all([
     db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).all(),

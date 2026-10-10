@@ -339,8 +339,11 @@ describe('wait 过滤与 scannedThroughId', () => {
     }
   });
 
-  it('hasCode 在 AI 兜底窗口内不跳过刚到的无码邮件，窗口过后才判为不匹配', async () => {
-    await baseSettings({ code_extract: { enabled: true, aiEnabled: true } });
+  it('hasCode 在 AI 兜底窗口内不跳过刚到的无码邮件，窗口过后才判为不匹配；未配置模型时不等待', async () => {
+    await baseSettings({
+      code_extract: { enabled: true, aiEnabled: true },
+      ai_model: { baseUrl: 'https://api.deepseek.com', apiKey: 'sk-synthetic-wait', model: 'deepseek-flash' },
+    });
     const user = await account('w2-wait-ai');
     const address = `w2-wait-ai-${rand()}@hpc.email`;
     await own(user.id, address);
@@ -351,6 +354,11 @@ describe('wait 过滤与 scannedThroughId', () => {
     expect(await findNextMessage(env, viewer, { afterId: base, address, hasCode: true })).toEqual({ message: null, scannedThroughId: base });
     await createDb(env).update(messages).set({ createdAt: new Date(Date.now() - 60_000) }).where(eq(messages.id, fresh));
     expect(await findNextMessage(env, viewer, { afterId: base, address, hasCode: true })).toMatchObject({ message: { id: later }, scannedThroughId: later });
+
+    await baseSettings({ code_extract: { enabled: true, aiEnabled: true }, ai_model: { baseUrl: '', apiKey: '', model: '' } });
+    await mail(address, { subject: 'Sign in again', preview: 'Use the code below' });
+    const coded = await mail(address, { subject: 'Your code', preview: 'Your verification code is 246813', verificationCode: '246813' });
+    expect(await findNextMessage(env, viewer, { afterId: later, address, hasCode: true })).toMatchObject({ message: { id: coded }, scannedThroughId: coded });
     await baseSettings();
   });
 });

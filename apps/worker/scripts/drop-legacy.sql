@@ -30,6 +30,7 @@ DROP TABLE IF EXISTS admin_audit_logs;
 DROP TABLE IF EXISTS rate_counters;
 DROP TABLE IF EXISTS idempotency_records;
 DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS message_translations;
 DROP TABLE IF EXISTS stars;
 DROP TABLE IF EXISTS attachments;
 DROP TABLE IF EXISTS messages;

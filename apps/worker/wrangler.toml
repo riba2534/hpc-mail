@@ -28,7 +28,6 @@ crons = ["*/5 * * * *", "0 16 * * *"]
 
 [vars]
 # 系统域名不再写死在 vars，改由 settings.domains.list（管理端维护）；见 services/domain.ts
-ai_model = "@cf/meta/llama-3.1-8b-instruct-fp8"
 site_origin = "https://hpc.email"
 build_sha = "local"
 
@@ -49,9 +48,6 @@ bucket_name = "hpc-cloud-mail-r2"
 # Cloudflare 原生发信（send_email binding）
 [[send_email]]
 name = "email"
-
-[ai]
-binding = "ai"
 
 [assets]
 binding = "assets"

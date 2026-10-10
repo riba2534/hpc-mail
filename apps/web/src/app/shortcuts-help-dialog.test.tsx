@@ -33,6 +33,7 @@ describe('ShortcutsHelpDialog', () => {
       'r=回复',
       'a=全部回复',
       'f=转发',
+      't=翻译 / 显示原文（需启用 AI 翻译）',
       's=星标',
       'e|#=删除',
       'Shift+U=标为未读（共享邮件不可用）',

@@ -9,7 +9,7 @@ import { AppError } from '../lib/errors.js';
 import type { AuthUser, Env } from '../types.js';
 import { domainPerUserLimit, isDomainPublic } from './domain.js';
 import { getSettingsFresh } from './setting.js';
-import { purgeStatements } from './message-lifecycle.js';
+import { PURGE_MESSAGES_INDEX, purgeStatements } from './message-lifecycle.js';
 import { processStorageCleanup } from './storage-cleanup.js';
 
 type MailboxRow = typeof mailboxes.$inferSelect;
@@ -273,7 +273,7 @@ export async function releaseMailbox(
   // One D1 transaction includes every message present at release, including concurrent inbound.
   const result = await env.db.batch(statements);
   if (!result[result.length - 1]?.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
-  const deletedMessages = deleteHistory ? (result[4]?.meta.changes ?? 0) : 0;
+  const deletedMessages = deleteHistory ? (result[1 + PURGE_MESSAGES_INDEX]?.meta.changes ?? 0) : 0;
   if (deleteHistory) await processStorageCleanup(env, 100);
   return { deletedMessages };
 }

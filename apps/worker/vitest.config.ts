@@ -7,7 +7,7 @@ export default defineConfig(async () => {
   return {
     plugins: [
       cloudflareTest({
-        // AI 无本地模拟；单测不真正调用 AI，关闭远程绑定避免要求 CF 凭据
+        // 全部绑定本地模拟（AI 模型调用一律 mock fetch），关闭远程绑定避免要求 CF 凭据
         remoteBindings: false,
         wrangler: { configPath: './wrangler.test.toml' },
         miniflare: {

@@ -63,7 +63,7 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | 配置字段 | 结构与边界 |
 |---|---|
 | `register_mode` | `closed\|invite\|open`；决定注册开放性，不影响已有账户 |
-| `code_extract` | `{enabled,aiEnabled}`；两布尔，控制验证码提取；不能因此证明提取码绝对正确 |
+| `code_extract` | `{enabled,aiEnabled}`；两布尔，控制验证码提取；aiEnabled 用 `ai_model` 兜底，未配置模型时只走正则；不能因此证明提取码绝对正确 |
 | `site` | `{title}`，1–64 字符 |
 | `api` | `{enabled}`；控制 `/v1` 开放 API，不关闭 JWT 网页管理 |
 | `security` | `{require2fa}`；强制尚未绑定的 JWT 用户完成 2FA 后使用业务接口 |
@@ -71,10 +71,16 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | `mailbox_policy` | `{perUserLimit,reservedLocalParts}`；总认领上限 0–10000，0 不限；保留前缀最多 200 项，每项 ≤64 字符；普通用户生效，admin 豁免 |
 | `quota` | `{dailyOutbound,dailyRecipients}`；普通用户每日外发邮件数 0–100000、唯一收件地址数 0–1000000，跨 Key/JWT 共用；0 不限，admin 豁免 |
 | `retention` | `{unclaimedDays,allMessagesDays}`；0–3650 天，0 关闭该项定时清理 |
+| `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除 |
+| `translation` | `{enabled,dailyCharsPerUser}`；AI 翻译开关与额度。enabled=true 要求 `ai_model` 已配置，同一请求同时提交两者时按合并后的结果校验（翻译开着时不能单独清空模型）；dailyCharsPerUser 0–10000000，每用户每 UTC 日发送给模型的字符数，0 不限，admin 不豁免 |
 
 外发 dailyRecipients 以每次请求去重后的收件地址计数，不是跨全天同一收件人只计一次；站内/外收件均计入。系统当前策略必须先读取，不把 schema 默认值当线上设置。
 
 retention.unclaimedDays 对当时未认领地址的旧 inbound 生效；allMessagesDays 对所有旧邮件生效，包括已认领及已发送。设置清理期限可能在下一次定时任务永久删除已有历史，按用户授权范围修改；0 不清理会继续增长，不能自动替用户开启破坏性策略。回收站 7 天清理和草稿附件 24 小时清理是独立机制，不受这两个 0 禁用。DNS 接入检测 `GET /admin/settings/domain-status` 及多域并发控制见域名参考。
+
+AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Workers AI。配置 `ai_model`（例如 DeepSeek：`baseUrl=https://api.deepseek.com`、`model=deepseek-flash`）后，邮件内容会在两种情况下发送到该第三方服务：① 翻译启用后，用户在网页邮件详情点「翻译」时，主题与正文中的文字片段；只有能在该邮件中找到的片段才会发送，验证码、纯数字、URL、邮箱等无字母片段不发送，译文缓存在本站并随邮件永久删除一并删除；② `code_extract.aiEnabled` 开启时，正则没提到码、且主题或正文（不含 URL）出现验证码相关词（验证码、code、OTP、passcode、PIN、verification、one-time 等）的入站邮件，其主题和正文前 6000 字符，每域每日最多 500 封，10 秒超时；只让点链接的邮件不发送，模型返回的码必须在原文中出现才采用。是否把邮件内容交给第三方处理属于隐私决定，按用户授权和所在组织的数据政策决定是否配置，不要替用户开启。`GET /api/config` 的 `translationEnabled` 只公开是否可用，不公开服务地址或 Key。翻译另有每用户每分钟 30 次模型调用上限；超额返回 429，翻译服务失败返回 500 并退还字符额度。翻译接口 `POST /api/messages/:id/translate` 仅 JWT，见邮件参考。
+
+`POST /admin/settings/ai-model-test` 用固定英文示例按翻译格式真实调用一次 AI 模型，返回 `{ok:true,latencyMs,sample}`；body 可省略，`{baseUrl,apiKey,model}` 中未提交或为空的字段、以及 apiKey 为 `******` 时用已保存的 `ai_model`，不要求任何功能已启用，便于保存前验证。三项解析后仍缺失返回 400；服务失败返回 500，message 说明 HTTP 状态码、超时或返回格式无效，不回显 Key。测试会产生一次真实外部调用，不计用户额度。
 
 通知/转发已为个人偏好，不在上述系统设置中；通过 `/api/me/notify-prefs` 修改当前管理员的个人通道，不能 PUT 旧全局 `feishu/notify_webhook/gmail_forward` 字段。
 
@@ -88,4 +94,4 @@ retention.unclaimedDays 对当时未认领地址的旧 inbound 生效；allMessa
 | `DELETE /admin/api-keys/:id` | 吊销目标 Key，`{success:true}` |
 | `GET /admin/audit-logs?cursor=…&limit=30` | 管理操作审计分页 |
 
-管理员全站 Key 接口没有 PUT；自己 Key 的创建/更新仍用 `/api/api-keys`，不能把 admin metadata 查询当明文找回。审计默认页大小 30、最大 100，倒序读到 nextCursor=null；管理日志含 `id,actorName,action,target,detail,ip,createdAt`；`settings.update` 的 target 只列实际变化的设置键（不含 `expectedDomainsRevision`），detail 为变更摘要，如域名新增/移除、公开性与每人上限变化、`mailbox_policy.perUserLimit: 50→20`，Key 日志字段见鉴权参考，保留约 90 天。只根据已看到的审计区间报告结果，不声称此接口是全部应用运行日志或队列监控。生产部署、Cloudflare DNS/Routing、数据库/R2 运维不是这些管理接口提供的能力。
+管理员全站 Key 接口没有 PUT；自己 Key 的创建/更新仍用 `/api/api-keys`，不能把 admin metadata 查询当明文找回。审计默认页大小 30、最大 100，倒序读到 nextCursor=null；管理日志含 `id,actorName,action,target,detail,ip,createdAt`；`settings.update` 的 target 只列实际变化的设置键（不含 `expectedDomainsRevision`），detail 为变更摘要，如域名新增/移除、公开性与每人上限变化、`mailbox_policy.perUserLimit: 50→20`；`ai_model.apiKey` 只记「已更新/已清除」，不记录值，Key 日志字段见鉴权参考，保留约 90 天。只根据已看到的审计区间报告结果，不声称此接口是全部应用运行日志或队列监控。生产部署、Cloudflare DNS/Routing、数据库/R2 运维不是这些管理接口提供的能力。

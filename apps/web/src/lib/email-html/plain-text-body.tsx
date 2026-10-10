@@ -46,12 +46,27 @@ function QuoteBlock({ lines }: { lines: string[] }) {
   )
 }
 
-/** 纯文本正文：自动识别 http/https/mailto 链接，连续「>」引用默认折叠。只生成 React 元素。 */
-export function PlainTextBody({ text, className }: { text: string; className?: string }) {
+/**
+ * 纯文本正文：自动识别 http/https/mailto 链接，连续「>」引用默认折叠。只生成 React 元素。
+ * transformText 用于替换非引用文字块（如译文），结果同样按纯文本渲染并识别链接。
+ */
+export function PlainTextBody({
+  text,
+  className,
+  transformText,
+}: {
+  text: string
+  className?: string
+  transformText?: (text: string) => string
+}) {
   const blocks = useMemo(() => splitQuoteBlocks(text), [text])
+  const rendered = useMemo(
+    () => (transformText ? blocks.map((block) => (block.type === 'text' ? { ...block, text: transformText(block.text) } : block)) : blocks),
+    [blocks, transformText],
+  )
   return (
     <div className={cn('whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-ink', className)}>
-      {blocks.map((block, index) =>
+      {rendered.map((block, index) =>
         block.type === 'quote' ? (
           <QuoteBlock key={index} lines={block.lines} />
         ) : (

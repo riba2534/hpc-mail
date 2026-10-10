@@ -232,6 +232,24 @@ export const stars = sqliteTable(
   ],
 );
 
+/**
+ * AI 翻译缓存：按邮件 + 待译片段的哈希存译文，同一邮件的所有可见者共用。
+ * 内容来自邮件本身，随邮件永久删除（purgeStatements）一并删除。
+ */
+export const messageTranslations = sqliteTable(
+  'message_translations',
+  {
+    messageId: integer('message_id').notNull(),
+    /** sha256(提示版本 + 模型 + 待译片段 JSON) */
+    cacheKey: text('cache_key').notNull(),
+    /** 与待译片段一一对应的译文 JSON 数组 */
+    translations: text('translations', { mode: 'json' }).notNull().$type<string[]>(),
+    model: text('model').notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [primaryKey({ columns: [t.messageId, t.cacheKey] })],
+);
+
 export const settings = sqliteTable('settings', {
   key: text('key').primaryKey(),
   value: text('value').notNull(),

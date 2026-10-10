@@ -12,6 +12,7 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`AP
 | `GET /messages/:id` | `mail.read` | 邮件详情；读取本身不自动标记已读 |
 | `GET /messages/:id/thread` | `mail.read` | `{items:[摘要...]}`；有界线程视图，优先按线程头关联；无法关联时仅对带 `Re:/Fwd:/Fw:/回复:/转发:` 前缀、且双方都没有验证码的同地址同主题邮件（30 天内）回退归并，不是独立分页或完整历史承诺 |
 | `GET /messages/:id/raw` | `mail.read` | 原始 `.eml` 二进制；仅有原始存档的邮件可下载，404 不代表正文不存在 |
+| `POST /messages/:id/translate` | 仅 JWT（`/api`） | `{translations,cached,skipped}`；把该邮件的文字片段译成简体中文，见下文 |
 | `GET /messages/contacts` | `mail.read` | `{contacts:[邮箱...]}`，自己的近期联系人，不是完整通讯录 |
 | `GET /messages/unread-count` | `mail.read` | `{unread:number}`；未读数只统计你认领的地址，共享邮件的已读状态属于所有者、不计入；不是全站统计 |
 | `GET /v1/messages/wait` | `mail.read` | `{message:摘要\|null,scannedThroughId}`，见下文 |
@@ -28,6 +29,8 @@ hpc '/messages' --get --data-urlencode 'q=验证码' --data-urlencode 'unread=1'
 
 摘要包含 `id,direction,address,domain,fromAddress,fromName,subject,preview,verificationCode,verificationLink,status,errorDetail,isRead,isStarred,hasAttachments,size,createdAt`，发件还可含 `recipientsTo,recipientOutcomes`；`trash=1` 列表的每项另有 `deletedAt`（进入回收站时间，7 天后永久删除）。`verificationLink` 是收件时识别出的 http/https 验证、登录、激活或重置密码链接，识别不到、发件、关闭自动提取或功能上线前收到的邮件为空串，见[等待本次验证码](#等待本次验证码)的安全要求。详情增加 `recipients:{to,cc,bcc}`、`replyTo` 数组、`bodyText,bodyHtml,attachments,hasRaw`。BCC 不在收件副本中披露。`status=degraded` 表示收件解析/附件降级，应说明 `errorDetail`、核对 `hasRaw`，不能承诺内容完整。
 
+翻译 `POST /api/messages/:id/translate` 只接受 JWT，`/v1` 没有对应接口；管理员未启用翻译或未配置 AI 模型（`/api/config` 的 `translationEnabled=false`）时返回 403。body `{segments:[...]}`：1–60 段，单段 ≤2000 字符，合计 ≤6000 字符，长邮件分多次请求；scope/userId 与详情相同。返回 `translations` 与 segments 一一对应。只有能在该邮件主题或完整正文中找到的片段（比对只看字母和数字，忽略 HTML 标签、实体、标点、空白和大小写）才会发送给管理员配置的第三方模型，找不到的原样返回并计入 `skipped`；去掉 URL、邮箱后没有字母的片段（验证码、数字、标点）原样返回且不计费；相同片段只发一次。同一邮件同一组片段命中缓存时 `cached=true`，不消耗额度。每用户每日字符额度由管理员设置（admin 也计入），另有每分钟 30 次模型调用上限，超额 429；服务失败 500 并退还额度。译文是机器翻译，验证码、链接等以原文为准。
+
 管理员读列表/详情/线程/原始档时可带 `scope=mine|unclaimed|user`，`scope=user` 需正整数 `userId`；普通用户不能使用管理员 scope。共享只加入个人可见的非删除 inbound；`direction=outbound`、`trash=1`、审阅他人 scope 都不会扩大到共享内容。
 
 ## 等待本次验证码
@@ -40,7 +43,7 @@ hpc '/messages' --get --data-urlencode 'q=验证码' --data-urlencode 'unread=1'
 |---|---|
 | `from` | 完整地址精确匹配，或 `@域名` 匹配该域名后缀（`@example.com` 不含 `mail.example.com`） |
 | `subjectContains` | 主题包含该文本，1–200 字符 |
-| `hasCode=1` | 只要返回的 `verificationCode` 非空的邮件；刚到且暂无码的邮件会被保留最多约 30 秒等待异步 AI 补码，期间不越过它 |
+| `hasCode=1` | 只要返回的 `verificationCode` 非空的邮件；管理员开启 AI 兜底并配置了 AI 模型时，刚到且暂无码的邮件会被保留最多约 30 秒等待异步 AI 补码，期间不越过它 |
 
 返回基线之后**最早一封满足过滤**的未删除 inbound，跳过不满足的邮件；超时返回 `message:null`。`scannedThroughId` 是本次已检查到的最大 ID：命中时等于 `message.id`，未命中时是最后一封被跳过的邮件 ID，没有新邮件时等于 `afterId`。处理完命中邮件后以其 ID 为新基线；超时则以 `scannedThroughId` 为新基线，被跳过的邮件不会再出现。不传过滤时行为与旧版一致（未必有验证码），需自行检查发件人/主题。用总截止时间限制全部请求。普通账户仅个人/共享可见范围，Key 仅需 `mail.read`。
 

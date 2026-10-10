@@ -17,7 +17,7 @@ const ALLOWED_ATTR = [
   'label', 'max', 'maxlength', 'min', 'minlength', 'multiple', 'name', 'placeholder',
   'readonly', 'rel', 'required', 'role', 'rows', 'rowspan', 'scope', 'selected',
   'size', 'span', 'src', 'srcset', 'start', 'step', 'style', 'summary', 'target',
-  'title', 'type', 'valign', 'value', 'width', 'wrap',
+  'title', 'translate', 'type', 'valign', 'value', 'width', 'wrap',
 ]
 
 const FORBIDDEN_TAGS = [

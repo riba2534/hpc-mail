@@ -7,6 +7,9 @@ import {
   MAX_BODY_BYTES,
   MAX_PAGE_SIZE,
   MAX_RECIPIENTS,
+  MAX_TRANSLATE_BATCH_CHARS,
+  MAX_TRANSLATE_SEGMENT_CHARS,
+  MAX_TRANSLATE_SEGMENTS,
   MESSAGE_DIRECTIONS,
   type MessageDirection,
 } from '../constants.js';
@@ -396,4 +399,27 @@ export interface MessageDetail extends MessageSummary {
   attachments: AttachmentMeta[];
   /** 是否存有原始 .eml，可经 /api/messages/:id/raw 下载 */
   hasRaw: boolean;
+}
+
+/**
+ * 邮件翻译（POST /api/messages/:id/translate，scope 等查询参数同详情）：
+ * segments 是前端从该邮件主题与正文中按文字节点/段落切出的片段，按顺序翻译成简体中文。
+ * 服务端只翻译能在该邮件内容中找到的片段，找不到的原样返回并计入 skipped。
+ */
+export const translateMessageRequestSchema = z.object({
+  segments: z
+    .array(z.string().max(MAX_TRANSLATE_SEGMENT_CHARS))
+    .min(1)
+    .max(MAX_TRANSLATE_SEGMENTS)
+    .refine((items) => items.reduce((sum, item) => sum + item.length, 0) <= MAX_TRANSLATE_BATCH_CHARS, `单次翻译总字符数不能超过 ${MAX_TRANSLATE_BATCH_CHARS}`),
+});
+export type TranslateMessageRequest = z.infer<typeof translateMessageRequestSchema>;
+
+export interface MessageTranslation {
+  /** 与请求 segments 一一对应的简体中文译文 */
+  translations: string[];
+  /** 是否命中服务端缓存（命中不消耗额度） */
+  cached: boolean;
+  /** 未在邮件内容中找到、因此原样返回的片段数 */
+  skipped: number;
 }

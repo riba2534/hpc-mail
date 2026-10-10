@@ -52,4 +52,18 @@ describe('PlainTextBody', () => {
     fireEvent.click(screen.getByRole('button', { name: '收起引用内容' }))
     expect(screen.queryByText(/原文第一行/)).toBeNull()
   })
+
+  it('transformText 只替换非引用文字块，结果按纯文本渲染并照常识别链接', () => {
+    const { container } = render(
+      <PlainTextBody
+        text={'Click https://a.example/x\n> quoted'}
+        transformText={(text) => `<b>点击</b> ${text.replace('Click ', '')}`}
+      />,
+    )
+    expect(container.querySelector('b')).toBeNull()
+    expect(container).toHaveTextContent('<b>点击</b> https://a.example/x')
+    expect(screen.getByRole('link', { name: 'https://a.example/x' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '显示引用内容（1 行）' }))
+    expect(screen.getByText('quoted')).toBeInTheDocument()
+  })
 })

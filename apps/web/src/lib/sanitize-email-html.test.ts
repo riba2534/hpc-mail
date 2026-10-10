@@ -40,6 +40,12 @@ describe('sanitizeEmailHtml：<style> 提前闭合绕过', () => {
 })
 
 describe('sanitizeEmailHtml：正常内容不被误伤', () => {
+  it('保留 translate="no" 与 notranslate，翻译时据此跳过', () => {
+    const host = reparse('<span translate="no">Brand</span><p class="notranslate">Code</p>')
+    expect(host.querySelector('span')).toHaveAttribute('translate', 'no')
+    expect(host.querySelector('p')).toHaveClass('notranslate')
+  })
+
   it('保留白名单 CSS 与安全链接', () => {
     const host = reparse(
       `<style>p{color:red;font-size:14px}</style><p style="color:blue">正文</p><a href="https://example.com">链接</a>`,

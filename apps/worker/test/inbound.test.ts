@@ -89,7 +89,7 @@ describe('收件链路 handleInbound', () => {
   });
 
   it('已认领地址按认领用户的个人转发，不外溢到管理员', async () => {
-    // 本地 workerd 无 AI 绑定，正文无码会触发 AI 兜底 → 显式关闭
+    // 正文无码会进入 AI 兜底判定 → 显式关闭，与模型配置无关
     await updateSettings(env, { code_extract: { enabled: true, aiEnabled: false } });
     const adminId = await seedUser('inb-admin2', 'admin');
     await updateUserNotifyPrefs(env, adminId, {

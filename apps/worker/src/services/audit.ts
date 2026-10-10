@@ -61,7 +61,11 @@ function describeDomains(before: Settings['domains'], after: Settings['domains']
   return parts;
 }
 
+/** 密文字段只记录是否变化，绝不写入值 */
+const SECRET_SETTING_FIELDS = new Set(['ai_model.apiKey']);
+
 function describeValue(key: string, before: unknown, after: unknown): string[] {
+  if (SECRET_SETTING_FIELDS.has(key)) return before === after ? [] : [`${key} ${after ? '已更新' : '已清除'}`];
   if (Array.isArray(before) && Array.isArray(after)) {
     const diff = arrayDiff(before, after);
     return diff ? [`${key} ${diff}`] : [];

@@ -8,6 +8,7 @@ import {
   FileDown,
   Forward,
   ImageOff,
+  Languages,
   Mail,
   MoreHorizontal,
   Paperclip,
@@ -53,6 +54,8 @@ import { getAuthToken } from '@/lib/auth-token';
 import { extractOtp } from '@/lib/otp';
 import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
+import { TranslationBar } from './translation/translation-bar';
+import { useMessageTranslation } from './translation/use-message-translation';
 import { inspectVerificationLink } from './verification-link';
 import { useDocumentTitle } from '@/lib/use-document-title';
 import { useCurrentUser } from '@/lib/use-session';
@@ -126,6 +129,7 @@ export function MessagePage() {
   const personalView = !scope || scope === 'mine';
   const mutationScope = scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
   const [imagesAllowedFor, setImagesAllowedFor] = useState<number | null>(null);
+  const [htmlRoot, setHtmlRoot] = useState<HTMLElement | null>(null);
   const markedRef = useRef<number | null>(null);
 
   const { data: ownedMailboxes } = useMailboxesQuery(false);
@@ -135,6 +139,8 @@ export function MessagePage() {
   });
 
   const star = useStarMutation(view);
+  // 只读操作：共享邮件、管理员的未认领/用户视图同样可译
+  const translation = useMessageTranslation(message, view, htmlRoot);
   // 标签页标题用邮件主题；加载中传 null 沿用路由默认标题
   useDocumentTitle(message ? message.subject || '（无主题）' : null);
 
@@ -263,6 +269,7 @@ export function MessagePage() {
       a: () => void replyAll(),
       f: () => void forward(),
       s: () => void toggleStar(),
+      t: () => (translation.available ? translation.toggle() : false),
       e: remove,
       '#': remove,
       u: goBack,
@@ -314,7 +321,7 @@ export function MessagePage() {
   const sendIssue = outbound && (message.errorDetail || message.status === 'failed' || message.status === 'bounced');
   const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
   const canMarkUnread = readStateWritable && !outbound;
-  const hasMobileMenu = canActAsOwner || canMarkUnread || message.hasRaw;
+  const hasMobileMenu = canActAsOwner || canMarkUnread || message.hasRaw || translation.available;
 
   return (
     <div className="mx-auto max-w-3xl">
@@ -356,6 +363,19 @@ export function MessagePage() {
               </Button>
             </>
           )}
+          {translation.available && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className={cn('hidden sm:inline-flex', translation.translated && 'bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent')}
+              title={`${translation.translated ? '显示原文' : '翻译成简体中文'}（t）`}
+              aria-pressed={translation.translated}
+              onClick={translation.toggle}
+            >
+              <Languages className="size-4" />
+              翻译
+            </Button>
+          )}
           {hasMobileMenu && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -374,6 +394,12 @@ export function MessagePage() {
                   <DropdownMenuItem onSelect={forward}>
                     <Forward className="size-4" />
                     转发
+                  </DropdownMenuItem>
+                )}
+                {translation.available && (
+                  <DropdownMenuItem onSelect={translation.toggle}>
+                    <Languages className="size-4" />
+                    {translation.translated ? '显示原文' : '翻译'}
                   </DropdownMenuItem>
                 )}
                 {canMarkUnread && (
@@ -419,7 +445,8 @@ export function MessagePage() {
 
       <article className="-mx-4 overflow-hidden border-y border-line bg-surface sm:mx-0 sm:rounded-lg sm:border-x">
         <header className="border-b border-line px-4 py-4 sm:px-5">
-          <h1 className="text-lg font-semibold text-ink">{message.subject || '（无主题）'}</h1>
+          <h1 className="text-lg font-semibold text-ink">{translation.subject ?? (message.subject || '（无主题）')}</h1>
+          {translation.subject && <p className="mt-0.5 text-sm text-ink-tertiary">原文：{message.subject}</p>}
           <div className="mt-2 flex flex-col gap-1 text-sm text-ink-secondary">
             <div className="flex flex-wrap items-center gap-x-2">
               <span className="font-medium text-ink">{message.fromName || message.fromAddress}</span>
@@ -437,6 +464,7 @@ export function MessagePage() {
         </header>
 
         <div className="flex flex-col gap-4 px-4 py-5 sm:px-5">
+          {translation.translated && <TranslationBar translation={translation} />}
           {sendIssue && (
             <div className="rounded-md border border-critical/40 bg-critical-soft px-3 py-2.5 text-sm">
               <p className="font-medium text-critical">
@@ -499,9 +527,10 @@ export function MessagePage() {
               html={message.bodyHtml}
               allowRemoteImages={showRemoteImages}
               trustedImageOrigins={[globalThis.location.origin]}
+              onContentChange={setHtmlRoot}
             />
           ) : (
-            <PlainTextBody text={message.bodyText || '（无正文）'} />
+            <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
           )}
 
           {message.attachments.length > 0 && (

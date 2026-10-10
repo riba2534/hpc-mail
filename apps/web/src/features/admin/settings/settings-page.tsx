@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { type ReactNode, useEffect, useState } from 'react';
-import { type Settings } from '@hpc-mail/shared';
+import type { AiModelTestRequest, AiModelTestResult, Settings } from '@hpc-mail/shared';
+import { api } from '@/api/client';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
@@ -9,6 +10,7 @@ import { QueryErrorState } from '@/components/query-error-state';
 import { UnsavedChangesGuard } from '@/components/unsaved-changes-guard';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { PasswordInput } from '@/components/ui/password-input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
@@ -58,6 +60,18 @@ function ToggleRow({
   );
 }
 
+/** 与 @hpc-mail/shared 的 SECRET_MASK 一致（测试校验）；本地定义，设置页 chunk 不必引入 shared 运行时 */
+export const SECRET_MASK = '******';
+
+type AiModelSetting = Settings['ai_model'];
+
+/** 测试连接只有本页用到，不放进入口 chunk 里的 api/resources.ts */
+const testAiModel = (body: AiModelTestRequest) =>
+  api.post<AiModelTestResult, AiModelTestRequest>('/admin/settings/ai-model-test', body, { timeoutMs: 60_000 });
+
+/** 三项都填了（API Key 为掩码也算已配置）才视为可用，与服务端判定一致 */
+const aiModelReady = (model: AiModelSetting | undefined) => Boolean(model?.baseUrl && model.apiKey && model.model);
+
 function NumberRow({
   label,
   description,
@@ -96,6 +110,102 @@ function NumberRow({
         {suffix && <span className="text-xs text-ink-tertiary">{suffix}</span>}
       </span>
     </label>
+  );
+}
+
+/** 全站 AI 模型（OpenAI 兼容接口）。API Key 回显为掩码：提交掩码表示保持原值，提交空串表示删除 */
+function AiModelSection({
+  value,
+  saved,
+  onChange,
+}: {
+  value: AiModelSetting;
+  saved: AiModelSetting | undefined;
+  onChange: (updater: (model: AiModelSetting) => void) => void;
+}) {
+  const savedKey = saved?.apiKey === SECRET_MASK;
+  const test = useMutation({ mutationFn: testAiModel });
+  // 表单改动后，旧的测试结果不再代表当前配置
+  const tested = test.variables?.baseUrl === value.baseUrl && test.variables.apiKey === value.apiKey && test.variables.model === value.model;
+  const insecureUrl = value.baseUrl !== '' && !value.baseUrl.startsWith('https://');
+
+  return (
+    <Section
+      title="AI 模型"
+      description="翻译与验证码 AI 兜底识别共用此模型（OpenAI 兼容接口，如 DeepSeek：https://api.deepseek.com / deepseek-flash）。"
+    >
+      <p className="rounded-md border border-line bg-canvas p-3 text-sm text-ink-secondary">
+        配置后，含验证码关键词但正则未识别出验证码的来信，其主题和正文前 6000 字会发送到该服务；用户点击翻译时，会发送所翻译邮件的片段。
+      </p>
+      <label className="flex flex-col gap-1.5">
+        <span className="text-sm font-medium text-ink">接口地址</span>
+        <span className="text-xs text-ink-tertiary">接口根地址，不含 /chat/completions，仅支持 https。</span>
+        <Input
+          value={value.baseUrl}
+          placeholder="https://api.deepseek.com"
+          inputMode="url"
+          invalid={insecureUrl}
+          onChange={(event) => onChange((m) => void (m.baseUrl = event.target.value.trim()))}
+        />
+        {insecureUrl && <span className="text-xs text-critical">接口地址必须以 https:// 开头</span>}
+      </label>
+      <label className="flex flex-col gap-1.5">
+        <span className="text-sm font-medium text-ink">模型</span>
+        <Input
+          value={value.model}
+          placeholder="deepseek-flash"
+          onChange={(event) => onChange((m) => void (m.model = event.target.value.trim()))}
+        />
+      </label>
+      <div className="flex flex-col gap-1.5">
+        <label className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-ink">API Key</span>
+          <PasswordInput
+            autoComplete="off"
+            placeholder={value.apiKey === SECRET_MASK ? '已配置（输入可替换，清除请用按钮）' : savedKey ? '保存后将删除已配置的 Key' : '未配置'}
+            value={value.apiKey === SECRET_MASK ? '' : value.apiKey}
+            // 输入后再删空，回到「保持原值」；删除已保存的 Key 用下方按钮
+            onChange={(event) => {
+              const next = event.target.value.trim();
+              onChange((m) => void (m.apiKey = next === '' && savedKey ? SECRET_MASK : next));
+            }}
+          />
+        </label>
+        {value.apiKey && (
+          <div>
+            <Button type="button" variant="ghost" size="sm" onClick={() => onChange((m) => void (m.apiKey = ''))}>
+              清除 API Key
+            </Button>
+          </div>
+        )}
+      </div>
+      <div className="flex flex-col gap-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            loading={test.isPending}
+            disabled={!aiModelReady(value) || insecureUrl}
+            onClick={() => test.mutate({ baseUrl: value.baseUrl, apiKey: value.apiKey, model: value.model })}
+          >
+            测试连接
+          </Button>
+          <span className="text-xs text-ink-tertiary">使用当前表单中的配置，无需先保存。</span>
+        </div>
+        {tested && test.isSuccess && (
+          <div role="status" className="rounded-md border border-positive/40 bg-positive-soft p-3 text-sm">
+            <p className="font-medium text-positive">连接成功 · 耗时 {test.data.latencyMs} ms</p>
+            {test.data.sample && <p className="mt-1 break-words text-ink-secondary">示例译文：{test.data.sample}</p>}
+          </div>
+        )}
+        {tested && test.isError && (
+          <p role="alert" className="rounded-md border border-critical/40 bg-critical-soft p-3 text-sm text-critical">
+            {test.error instanceof ApiError ? test.error.message : '测试失败，请检查配置'}
+          </p>
+        )}
+      </div>
+    </Section>
   );
 }
 
@@ -203,6 +313,15 @@ export function SettingsPage() {
           />
         </Section>
 
+        {/* 旧版本服务端没有 ai_model / translation 设置时不显示对应分区 */}
+        {draft.ai_model && (
+          <AiModelSection
+            value={draft.ai_model}
+            saved={data.ai_model}
+            onChange={(updater) => patch((s) => updater(s.ai_model))}
+          />
+        )}
+
         <Section title="验证码提取" description="从收件正文中自动识别一次性验证码。">
           <ToggleRow
             label="启用验证码提取"
@@ -211,11 +330,30 @@ export function SettingsPage() {
           />
           <ToggleRow
             label="AI 兜底提取"
-            description="正则未命中时用 Workers AI 异步补充。"
+            description="使用上方 AI 模型；未配置模型时只用正则识别。"
             checked={draft.code_extract.aiEnabled}
             onChange={(value) => patch((s) => void (s.code_extract.aiEnabled = value))}
           />
         </Section>
+
+        {draft.translation && (
+          <Section title="AI 翻译" description="在邮件详情把主题与正文翻译成简体中文。">
+            <ToggleRow
+              label="启用 AI 翻译"
+              description={aiModelReady(draft.ai_model) ? undefined : '需先配置 AI 模型'}
+              checked={draft.translation.enabled}
+              onChange={(value) => patch((s) => void (s.translation.enabled = value))}
+            />
+            <NumberRow
+              label="每用户每日翻译上限"
+              description="按原文字符数计，命中缓存不计入。0 表示不限。"
+              value={draft.translation.dailyCharsPerUser}
+              onChange={(v) => patch((s) => void (s.translation.dailyCharsPerUser = v))}
+              max={10_000_000}
+              suffix="字符/天"
+            />
+          </Section>
+        )}
 
         <Section
           title="邮件保留策略"

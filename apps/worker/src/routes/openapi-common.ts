@@ -6,7 +6,8 @@ import {
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
   createInviteRequestSchema, replaceMailboxSharesRequestSchema, updateSettingsRequestSchema,
-  updateNotifyPrefsRequestSchema, userNotifyPrefsSchema,
+  updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
+  MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
 } from '@hpc-mail/shared';
 
 export type Schema = Record<string, unknown>;
@@ -55,6 +56,13 @@ const settingsUpdate = fromZod(updateSettingsRequestSchema);
 settingsUpdate.description = 'Partial settings update. A domains replacement requires expectedDomainsRevision from the latest GET; stale revisions return 409. Adding a domain does not configure DNS or Cloudflare Email Routing. Removing a domain only removes new-claim availability, and preserves existing mailbox routing. At least one setting key is required.';
 settingsUpdate.dependentRequired = { domains: ['expectedDomainsRevision'] };
 const settingsResponse = object(Object.fromEntries(Object.entries(SETTING_SCHEMAS).map(([key, schema]) => [key, fromZod(schema, 'output')])));
+for (const schema of [settingsResponse, settingsUpdate]) {
+  const properties = schema.properties as Record<string, Schema>;
+  properties.ai_model!.description = 'The single OpenAI-compatible Chat Completions model used by every AI feature: message translation and the inbound verification-code fallback. Configured means baseUrl, apiKey and model are all nonempty; baseUrl must be https and excludes /chat/completions. When translation is enabled, segments a user chooses to translate are sent to it; when code_extract.aiEnabled is on, the subject and first 6000 body characters of inbound mail that the regex could not resolve and that mentions a code-related keyword are sent to it. Unconfigured: translation is unavailable and code extraction uses regex only.';
+  const aiFields = properties.ai_model!.properties as Record<string, Schema>;
+  aiFields.apiKey = { ...aiFields.apiKey, description: 'Write-only provider key. Responses return ****** when a key is stored (empty string when none). Submitting ****** keeps the stored key; an empty string clears it.' };
+  properties.translation!.description = 'AI translation switch and quota. Enabling requires a configured ai_model (checked against the merged result when both are submitted). dailyCharsPerUser limits characters sent per user per UTC day, administrators included; 0 is unlimited.';
+}
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
 notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webhook.secret and pushdeer.pushkey are returned as ******; plaintext secrets are never returned. In updates ****** preserves the secret and an explicit empty string clears it. Enabled configurations must have valid complete endpoints/keys/forward addresses. These are mail-owner notifications; shared mailbox readers do not receive owner notifications.';
 const messageSummary = object({
@@ -109,7 +117,25 @@ export const schemas: Record<string, Schema> = {
     forward: object({ domainLimit: int, targetLimit: int, windowEndsAt: date,
       targets: array(object({ address: str, attempts: int, remaining: int })), domains: array(object({ domain: str, attempts: int, remaining: int })) }) }),
   DomainStatus: object({ domain: str, inList: bool, mxReady: bool, spfReady: bool, mxRecords: array(str), resolved: bool }),
-  PublicConfig: object({ siteTitle: str, registrationMode: { type: 'string', enum: ['closed', 'invite', 'open'] }, domains: array(str), require2fa: bool }),
+  PublicConfig: object({ siteTitle: str, registrationMode: { type: 'string', enum: ['closed', 'invite', 'open'] }, domains: array(str), require2fa: bool,
+    translationEnabled: { ...bool, description: 'translation.enabled is on and ai_model has baseUrl, apiKey and model configured; provider details are never public.' } }),
+  TranslateMessageRequest: (() => {
+    const schema = fromZod(translateMessageRequestSchema);
+    schema.description = `Segments cut from this message subject/body in display order, translated in order. 1–${MAX_TRANSLATE_SEGMENTS} segments, each at most ${MAX_TRANSLATE_SEGMENT_CHARS} characters, combined at most ${MAX_TRANSLATE_BATCH_CHARS} characters; split longer messages into several requests.`;
+    schema['x-max-total-chars'] = MAX_TRANSLATE_BATCH_CHARS;
+    return schema;
+  })(),
+  MessageTranslation: object({
+    translations: { ...array(str), description: 'One Simplified Chinese translation per request segment, same order and count. Skipped or letterless segments are returned unchanged; surrounding whitespace is preserved.' },
+    cached: { ...bool, description: 'Served from the per-message cache; no quota used.' },
+    skipped: { ...int, description: 'Segments not found in this message content and therefore returned unchanged.' },
+  }),
+  AiModelTestRequest: (() => {
+    const schema = fromZod(aiModelTestRequestSchema);
+    schema.description = 'All fields optional; the body may be omitted. Omitted or empty fields and apiKey ****** use the saved ai_model.';
+    return schema;
+  })(),
+  AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),
   SendMailRequest: send,
   ClaimMailboxRequest: fromZod(claimMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),

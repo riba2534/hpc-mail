@@ -10,7 +10,8 @@ import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-a
 import { sha256Hex } from '../lib/crypto.js';
 import { htmlToText, makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
-import { extractCodeByAi, extractCodeByRegex } from './code-extract.js';
+import { isAiModelConfigured } from './ai-provider.js';
+import { extractCodeByAi, extractCodeByRegex, wantsAiCode } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
 import { resolveNotifyOwnerIds } from './mailbox.js';
 import { loadNotifyOwners, type NotifyOwner } from './notify-prefs.js';
@@ -296,11 +297,13 @@ export async function handleInbound(
   ctx.waitUntil(
     (async () => {
       let finalCode = code;
-      if (!finalCode && settings.code_extract.enabled && settings.code_extract.aiEnabled) {
+      // 模型未配置、或邮件里没有验证码相关词时不外发、也不占每域额度
+      if (!finalCode && settings.code_extract.enabled && settings.code_extract.aiEnabled
+        && isAiModelConfigured(settings.ai_model) && wantsAiCode({ subject, text, html })) {
         try {
           const usage = await bumpCounter(env, 'ai-extract', domain, dayWindow(), 1);
           if (usage.count <= DAILY_AI_EXTRACT_LIMIT) {
-            const aiCode = await extractCodeByAi(env, { subject, text, html });
+            const aiCode = await extractCodeByAi(settings.ai_model, { subject, text, html });
             if (aiCode) {
               finalCode = aiCode;
               await db

@@ -35,7 +35,7 @@
 
 ## HPC Mail 是什么
 
-HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Routing（收件）+ Workers（处理）+ D1 / KV / R2（存储）+ Workers AI（验证码兜底）** 组合出完整的多域名、多用户邮件服务——没有 SMTP 服务器要维护，没有 VPS 要续费。收件、阅读和站内互投的日常用量基本落在 Cloudflare 免费额度内；外发到任意外部地址需要 Workers Paid 计划。
+HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Routing（收件）+ Workers（处理）+ D1 / KV / R2（存储）** 组合出，可选接入一个 OpenAI 兼容大模型（如 DeepSeek）做验证码兜底识别与邮件翻译，完整的多域名、多用户邮件服务——没有 SMTP 服务器要维护，没有 VPS 要续费。收件、阅读和站内互投的日常用量基本落在 Cloudflare 免费额度内；外发到任意外部地址需要 Workers Paid 计划。
 
 把任意多个域名的 catch-all 指向它，**任何前缀的地址都即收即用**：`abc@your-domain.com`、`x123@another.com` 不需要预先创建，来信全部落库。用户「认领」一个地址后即可用它收发；系统自动从来信里提取验证码；全套能力同时通过网页和开放 REST API 提供——后者配有一份专门写给 AI Agent 的操作指南，让 Claude / GPT 之类的 Agent 拿到用户名密码就能自己收发邮件、读验证码。
 
@@ -43,7 +43,7 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 
 - **零服务器** — 收发、存储、前端托管全部在 Cloudflare 上，部署完成后没有任何需要运维的进程
 - **任意前缀 catch-all** — 不用预建邮箱，注册网站时现编一个地址就能收到信；接码场景开箱即用
-- **验证码自动提取** — 正则同步提取 + Workers AI 兜底，列表角标、详情高亮、一键复制，API 里直接给 `verificationCode` 字段
+- **验证码自动提取** — 正则同步提取 + 可选的大模型兜底，列表角标、详情高亮、一键复制，API 里直接给 `verificationCode` 字段
 - **多域名 + 多用户** — 域名由管理后台动态维护（加域名不用重新部署）；地址认领制，全局唯一，认领即可见该地址全部历史邮件
 - **完整收发** — 回复线程化（In-Reply-To/References）、转发、CC/BCC、附件；外发走 Cloudflare `send_email`，在 Workers Paid 计划下可发送任意外部地址
 - **转发与通知到你常用的地方** — 每个用户独立配置：转发到任意外部邮箱（原生转发失败自动降级中转重发，带防环路守卫）、推送飞书卡片、回调通用 Webhook（Bark / ntfy / 自建）
@@ -56,7 +56,8 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 | --- | --- |
 | **收件** | 多域名 catch-all、大正文自动落 R2、附件存 R2、失败隔离（只有落库失败才触发 SMTP 重试） |
 | **收件箱** | 全域名混排，按域名 / 地址 / 已读未读 / 星标 / 关键词（含正文）过滤，状态同步到 URL |
-| **验证码** | 正则同步提取 + Workers AI 兜底（可开关），角标展示与一键复制 |
+| **验证码** | 正则同步提取 + 大模型兜底（可开关），角标展示与一键复制 |
+| **AI 翻译** | 邮件详情一键翻译成简体中文，HTML 邮件保留排版，译文缓存、按用户限额 |
 | **发件** | 回复 / 转发 / CC / BCC / 附件，站内互投即时落库，外发配额可配 |
 | **转发通知** | 按「收件地址归属人」分流的个人偏好：邮箱转发（含中转降级）、飞书 Webhook 卡片（HMAC 签名 + 防 SSRF）、通用 Webhook |
 | **多用户** | admin / user 两角色；注册模式默认关闭（可开邀请码/开放）；地址认领制；域名可设「仅管理员」或开放认领，可按域名限制每人认领数 |
@@ -94,11 +95,9 @@ flowchart LR
         D1[(D1 业务数据)]
         KV[(KV 配置缓存/回滚兼容)]
         R2[(R2 附件/大正文)]
-        AI[Workers AI<br/>验证码兜底]
         W --- D1
         W --- KV
         W --- R2
-        W --- AI
     end
 
     B[浏览器 SPA] -->|同源 /api| W
@@ -106,6 +105,7 @@ flowchart LR
     W -->|send_email| OUT[任意外部收件人]
     W -->|Webhook 卡片| FS[飞书 / 通用 Webhook]
     W -->|forward / 中转降级| FW[外部邮箱转发]
+    W -->|OpenAI 兼容接口| LLM[大模型 如 DeepSeek<br/>验证码兜底 / 翻译]
 ```
 
 单个 Worker 同时承载三个入口：`fetch`（`/api` 内部接口 + `/v1` 开放接口 + 前端静态资源）、`email`（Email Routing catch-all 收件）、`scheduled`（每日清理）。前端构建产物打进 Worker Assets **同源部署**，`/api` 请求零跨域。
@@ -193,7 +193,7 @@ Cloudflare 账号，走 GitHub Actions 持续部署。逐步执行，每步验�
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/riba2534/hpc-mail)
 
-点击按钮后 Cloudflare 会：把仓库克隆到你的 GitHub → 自动创建 D1 / KV / R2 / Workers AI 资源并写入配置 → 引导你填入 `jwt_secret` → 构建并部署到 `*.workers.dev`，之后 push 到你的克隆仓库即由 Workers Builds 持续部署。
+点击按钮后 Cloudflare 会：把仓库克隆到你的 GitHub → 自动创建 D1 / KV / R2 资源并写入配置 → 引导你填入 `jwt_secret` → 构建并部署到 `*.workers.dev`，之后 push 到你的克隆仓库即由 Workers Builds 持续部署。
 
 部署完成后还差三步：
 
@@ -308,7 +308,7 @@ git fetch upstream && git merge upstream/main && git push          # push 即触
 <details>
 <summary><b>要花多少钱？</b></summary>
 
-收件、阅读和站内互投的个人用量通常落在 Cloudflare 免费额度内：Workers 免费版每天 10 万请求，D1 / KV / R2 免费层对邮箱场景都很充裕。外发到任意外部地址需要 Workers Paid 计划（每月含 3,000 封，超出按 $0.35 / 千封计费）；外部收件人逐个单独发送，每个收件人计 1 封。另外两点注意：**Workers AI 验证码兜底默认开启**，超出免费日额度后按量计费（可在管理后台关闭，正则提取不受影响）；R2 首次开通需要绑定支付方式。域名本身的费用除外。相关限额：收件正文超过 256KB 时完整正文落 R2，附件总大小上限 50MB / 单封最多 10 个。
+收件、阅读和站内互投的个人用量通常落在 Cloudflare 免费额度内：Workers 免费版每天 10 万请求，D1 / KV / R2 免费层对邮箱场景都很充裕。外发到任意外部地址需要 Workers Paid 计划（每月含 3,000 封，超出按 $0.35 / 千封计费）；外部收件人逐个单独发送，每个收件人计 1 封。另外两点注意：验证码兜底识别与邮件翻译需要在管理后台「AI 模型」中配置 OpenAI 兼容接口（如 DeepSeek），费用按该服务计；不配置时只用正则识别验证码。启用后，含验证码关键词但正则未识别出的来信、以及用户点击翻译的邮件片段会发送到该服务；R2 首次开通需要绑定支付方式。域名本身的费用除外。相关限额：收件正文超过 256KB 时完整正文落 R2，附件总大小上限 50MB / 单封最多 10 个。
 
 </details>
 
