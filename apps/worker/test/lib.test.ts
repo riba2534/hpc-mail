@@ -18,6 +18,7 @@ import {
   sanitizeMimeType,
 } from '../src/lib/mime.js';
 import { chunk, D1_ID_BATCH, D1_MAX_BOUND_PARAMS, D1_PAIR_BATCH } from '../src/lib/d1.js';
+import { asciiFallbackFilename, buildSecureHeaders } from '../src/lib/attachment-security.js';
 import { generateCode, generateTotpSecret, verifyTotp } from '../src/lib/totp.js';
 import { AppError } from '../src/lib/errors.js';
 import {
@@ -280,6 +281,30 @@ describe('chunk（D1 100 绑定参数上限）', () => {
     // 批内 id 数 + 若干附加绑定值（SET 字段、scope 子查询的 ownerId 等）
     expect(D1_ID_BATCH + 10).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
     expect(D1_PAIR_BATCH * 2 + 10).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
+  });
+});
+
+describe('附件下载文件名头', () => {
+  it('filename= 兜底只含 ASCII 并保留扩展名，filename* 保留完整 UTF-8', () => {
+    const disposition = buildSecureHeaders('application/pdf', '季度报告 2026.pdf').get('Content-Disposition')!;
+    expect(disposition).toBe(`attachment; filename="_ 2026.pdf"; filename*=UTF-8''${encodeURIComponent('季度报告 2026.pdf')}`);
+    expect(/^[\x20-\x7e]*$/.test(disposition)).toBe(true);
+  });
+
+  it('主干全是非 ASCII 时用 download 代替，扩展名照留；无扩展名也能兜底', () => {
+    expect(asciiFallbackFilename('报告.pdf')).toBe('download.pdf');
+    expect(asciiFallbackFilename('照片.JPG')).toBe('download.JPG');
+    expect(asciiFallbackFilename('合同')).toBe('download');
+    expect(asciiFallbackFilename('résumé-final.docx')).toBe('r_sum_-final.docx');
+    expect(asciiFallbackFilename('invoice.发票')).toBe('invoice');
+    expect(asciiFallbackFilename('.env')).toBe('.env');
+    expect(asciiFallbackFilename('plain-ascii_v2.tar.gz')).toBe('plain-ascii_v2.tar.gz');
+  });
+
+  it("filename* 按 RFC 5987 转义 '()*，图片仍 inline", () => {
+    const headers = buildSecureHeaders('image/png', "截图(1)*.png");
+    expect(headers.get('Content-Disposition')).toBe(`inline; filename="_(1)*.png"; filename*=UTF-8''%E6%88%AA%E5%9B%BE%281%29%2A.png`);
+    expect(headers.get('Content-Type')).toBe('image/png');
   });
 });
 

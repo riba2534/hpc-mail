@@ -1,0 +1,1 @@
+ALTER TABLE `messages` ADD `verification_link` text DEFAULT '' NOT NULL;

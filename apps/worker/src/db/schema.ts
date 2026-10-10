@@ -84,6 +84,8 @@ export const messages = sqliteTable(
     /** 软删除时间；null=正常，有值=在回收站（scheduled 到期后硬删） */
     deletedAt: integer('deleted_at', { mode: 'timestamp_ms' }),
     verificationCode: text('verification_code').notNull().default(''),
+    /** 收件时识别出的验证/登录链接（仅 http/https，≤2048）；识别不到或历史邮件为空串 */
+    verificationLink: text('verification_link').notNull().default(''),
     messageId: text('message_id'),
     inReplyTo: text('in_reply_to'),
     references: text('references').notNull().default(''),

@@ -11,6 +11,7 @@ import { sha256Hex } from '../lib/crypto.js';
 import { htmlToText, makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByAi, extractCodeByRegex } from './code-extract.js';
+import { extractVerificationLink } from './link-extract.js';
 import { resolveNotifyOwnerIds } from './mailbox.js';
 import { loadNotifyOwners, type NotifyOwner } from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
@@ -126,10 +127,12 @@ export async function handleInbound(
   const rawR2Key = `raw/${ingestKey}.eml`;
   await env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } });
 
-  // 同步正则提码
+  // 同步正则提码 + 验证链接识别（同受「自动提取」开关控制）
   let code = '';
+  let verificationLink = '';
   if (settings.code_extract.enabled) {
     code = extractCodeByRegex(subject, text || htmlToText(html));
+    verificationLink = extractVerificationLink({ subject, text, html, fromAddress });
   }
 
   // 附件落 R2 前先算内容
@@ -197,6 +200,7 @@ export async function handleInbound(
       rawR2Key,
       ingestKey,
       verificationCode: code,
+      verificationLink,
       messageId: sourceMessageId || null,
       inReplyTo: (email.inReplyTo || '').slice(0, 998) || null,
       references: sourceReferences,
@@ -315,7 +319,7 @@ export async function handleInbound(
         ownerIds,
         owners,
         message: { id: messageId, address: toAddress, fromAddress, fromName, subject,
-          verificationCode: finalCode, preview, createdAt: new Date().toISOString() },
+          verificationCode: finalCode, verificationLink, preview, createdAt: new Date().toISOString() },
         text, html,
       });
     })(),

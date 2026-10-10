@@ -104,6 +104,8 @@ export interface WebhookMailPayload {
     fromName: string;
     subject: string;
     verificationCode: string;
+    /** 识别出的验证/登录链接；没有为空串。升级前入队的任务载荷可能缺失，投递时补空串 */
+    verificationLink?: string;
     preview: string;
     createdAt: string;
   };

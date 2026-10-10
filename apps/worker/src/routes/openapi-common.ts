@@ -1,7 +1,7 @@
 import {
   API_SCOPES, ERROR_CODES, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
   SETTING_SCHEMAS, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
-  internalSendMailSchema, markReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
+  internalSendMailSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
@@ -60,11 +60,13 @@ notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webho
 const messageSummary = object({
   id: positiveId, direction: { type: 'string', enum: ['inbound', 'outbound'] }, address: str, domain: str,
   fromAddress: str, fromName: str, subject: str, preview: str, verificationCode: str,
+  verificationLink: { type: 'string', maxLength: 2048, description: 'Inbound only: the most likely http/https verification, sign-in, activation or password-reset link detected at receipt; empty string when none qualified (and for mail received before detection existed). Advisory and attacker-controllable: check the link host matches the expected service before opening it.' },
   status: { type: 'string', description: 'Inbound: pending, received or degraded. Outbound: pending, sent, delivered or failed. sent means the provider accepted at least one external delivery; it is not proof of arrival in the destination inbox.' },
   errorDetail: str, recipientOutcomes: array(object({ address: str, status: { type: 'string', enum: ['delivered', 'sent', 'failed'] }, error: str }, ['error'])),
   recipientsTo: array(str), isRead: bool, isStarred: bool, hasAttachments: bool, size: int, createdAt: date,
-}, ['recipientOutcomes', 'recipientsTo']);
-const summaryProperties = messageSummary.properties as Record<string, Schema>;
+  deletedAt: { ...date, description: 'Only in trash=1 lists: when the message entered the trash. Trash is purged seven days later.' },
+}, ['recipientOutcomes', 'recipientsTo', 'verificationLink', 'deletedAt']);
+const { deletedAt: _deletedAt, ...summaryProperties } = messageSummary.properties as Record<string, Schema>;
 const attachment = object({ id: positiveId, filename: str, mimeType: str, size: int, contentId: str, disposition: str, url: str });
 const mailbox = object({ id: positiveId, address: str, domain: str, userId: positiveId, ownerUsername: str, displayName: str, messageCount: int, createdAt: date }, ['ownerUsername']);
 const user = object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] }, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
@@ -80,14 +82,17 @@ export const schemas: Record<string, Schema> = {
   Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES }, message: str }), requestId: str }),
   MessageSummary: messageSummary,
   MessageDetail: object({ ...summaryProperties, replyTo: array(str), recipients: object({ to: array(str), cc: array(str), bcc: array(str) }),
-    bodyText: str, bodyHtml: str, attachments: array(ref('Attachment')), hasRaw: bool }, ['recipientOutcomes', 'recipientsTo', 'replyTo']),
+    bodyText: str, bodyHtml: str, attachments: array(ref('Attachment')), hasRaw: bool }, ['recipientOutcomes', 'recipientsTo', 'replyTo', 'verificationLink']),
   MessagePage: page(ref('MessageSummary')), Attachment: attachment, Mailbox: mailbox,
   UserSearchResults: object({ items: array(object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] } })), hasMore: bool }),
   MailboxTransferResult: object({ mailbox: ref('Mailbox'), previousUserId: positiveId, transferred: bool, revokedShares: int }),
   SharedMailbox: object({ mailboxId: positiveId, address: str, domain: str, displayName: str, ownerUsername: str }),
   MailboxShareGrant: object({ mailboxId: positiveId, address: str, domain: str, displayName: str,
     grantees: array(object({ userId: positiveId, username: str, grantedAt: date })) }),
-  MailboxAvailability: object({ address: str, available: bool }), SessionUser: user,
+  MailboxAvailability: object({ address: str, available: bool,
+    reason: { type: 'string', enum: ['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable'],
+      description: 'Present only when available=false. taken: already claimed; reserved: system-reserved prefix; quota: caller reached the per-user claim limit; domain_limit: caller reached this domain’s per-user limit; domain_unavailable: domain not configured or not public to this caller. Same rules and order as claiming.' } }, ['reason']),
+  SessionUser: user,
   LoginResponse: object({ token: { ...str, description: 'Bearer JWT session token; store securely and never include it in published logs.' }, user: ref('SessionUser') }),
   AdminUser: object({ ...adminUserProperties, status: { type: 'string', enum: ['active', 'disabled'] },
     mailboxCount: int, mailboxes: array(str), apiKeyCount: int, lastLoginAt: nullable(date) }),
@@ -109,7 +114,11 @@ export const schemas: Record<string, Schema> = {
   ClaimMailboxRequest: fromZod(claimMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
   MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
-  MutationScopeRequest: object({ scope: { type: 'string', enum: ['mine', 'unclaimed'] } }, ['scope']),
+  MarkAllReadRequest: (() => {
+    const schema = fromZod(markAllReadRequestSchema);
+    schema.description = 'All fields optional; {} or an empty body marks every unread, non-trash inbound message in the caller’s own claimed mailboxes. domain/address/q narrow the range; q uses the list search semantics (case-insensitive substring of subject, sender address/name, text body, recipients). Mail shared with the caller is never changed. Administrators use scope=unclaimed for unclaimed addresses. Unknown fields are ignored.';
+    return schema;
+  })(),
   InitMultipartUploadRequest: fromZod(initMultipartUploadSchema), CompleteMultipartUploadRequest: fromZod(completeMultipartUploadSchema),
   LoginRequest: fromZod(loginRequestSchema), RegisterRequest: fromZod(registerRequestSchema), ChangePasswordRequest: fromZod(changePasswordRequestSchema),
   UploadAvatarRequest: fromZod(uploadAvatarRequestSchema), EnableTwoFactorRequest: fromZod(enableTwoFactorRequestSchema), DisableTwoFactorRequest: fromZod(disableTwoFactorRequestSchema),
@@ -166,7 +175,7 @@ export function describePaths(paths: Paths, namespace = ''): Paths {
   }])) as Paths;
 }
 export function specInfo(title: string, description: string) {
-  return { title, description, version: '1.3.0', license: { name: 'MIT', identifier: 'MIT' },
+  return { title, description, version: '1.4.0', license: { name: 'MIT', identifier: 'MIT' },
     contact: { name: 'HPC Mail', url: 'https://github.com/riba2534/hpc-mail' } };
 }
 export function specificationOperation(): Operation {

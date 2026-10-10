@@ -115,13 +115,13 @@ export async function enqueueMailNotifications(
 export async function repairUnqueuedNotifications(env: Env, options: { limit?: number } = {}): Promise<number> {
   const limit = Math.max(1, Math.min(100, options.limit ?? 30));
   const { results } = await env.db.prepare(`SELECT id, address, from_address, from_name, subject, verification_code,
-      preview, created_at, notify_owner_ids
+      verification_link, preview, created_at, notify_owner_ids
     FROM messages INDEXED BY idx_messages_notification_outbox
     WHERE notify_owner_ids IS NOT NULL AND notifications_queued_at IS NULL AND deleted_at IS NULL
       AND direction = 'inbound' AND status IN ('received', 'degraded')
     ORDER BY created_at, id LIMIT ?`).bind(limit).all<{
       id: number; address: string; from_address: string; from_name: string; subject: string;
-      verification_code: string; preview: string; created_at: number; notify_owner_ids: string;
+      verification_code: string; verification_link: string; preview: string; created_at: number; notify_owner_ids: string;
     }>();
   let queued = 0;
   for (const row of results) {
@@ -141,7 +141,7 @@ export async function repairUnqueuedNotifications(env: Env, options: { limit?: n
       }
       queued += (await enqueueMailNotifications(env, null, { ownerIds: ownerIds as number[],
         message: { id: row.id, address: row.address, fromAddress: row.from_address, fromName: row.from_name,
-          subject: row.subject, verificationCode: row.verification_code, preview: row.preview,
+          subject: row.subject, verificationCode: row.verification_code, verificationLink: row.verification_link ?? '', preview: row.preview,
           createdAt: new Date(Number(row.created_at)).toISOString() },
         text, html,
       })).length;
@@ -173,7 +173,8 @@ async function deliver(env: Env, job: Job, owners?: Map<number, NotifyOwner>): P
   } else if (job.channel === 'pushdeer') {
     await sendPushDeerNotification(prefs.pushdeer, info, { throwOnError: true });
   } else {
-    await sendNotifyWebhook(prefs.webhook, { event: 'mail.received', message }, { throwOnError: true });
+    // 升级前入队的任务载荷没有 verificationLink，补空串保持字段齐全
+    await sendNotifyWebhook(prefs.webhook, { event: 'mail.received', message: { ...message, verificationLink: message.verificationLink ?? '' } }, { throwOnError: true });
   }
   return true;
 }

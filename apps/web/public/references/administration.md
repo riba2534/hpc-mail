@@ -88,4 +88,4 @@ retention.unclaimedDays 对当时未认领地址的旧 inbound 生效；allMessa
 | `DELETE /admin/api-keys/:id` | 吊销目标 Key，`{success:true}` |
 | `GET /admin/audit-logs?cursor=…&limit=30` | 管理操作审计分页 |
 
-管理员全站 Key 接口没有 PUT；自己 Key 的创建/更新仍用 `/api/api-keys`，不能把 admin metadata 查询当明文找回。审计默认页大小 30、最大 100，倒序读到 nextCursor=null；管理日志含 `id,actorName,action,target,detail,ip,createdAt`，Key 日志字段见鉴权参考，保留约 90 天。只根据已看到的审计区间报告结果，不声称此接口是全部应用运行日志或队列监控。生产部署、Cloudflare DNS/Routing、数据库/R2 运维不是这些管理接口提供的能力。
+管理员全站 Key 接口没有 PUT；自己 Key 的创建/更新仍用 `/api/api-keys`，不能把 admin metadata 查询当明文找回。审计默认页大小 30、最大 100，倒序读到 nextCursor=null；管理日志含 `id,actorName,action,target,detail,ip,createdAt`；`settings.update` 的 target 只列实际变化的设置键（不含 `expectedDomainsRevision`），detail 为变更摘要，如域名新增/移除、公开性与每人上限变化、`mailbox_policy.perUserLimit: 50→20`，Key 日志字段见鉴权参考，保留约 90 天。只根据已看到的审计区间报告结果，不声称此接口是全部应用运行日志或队列监控。生产部署、Cloudflare DNS/Routing、数据库/R2 运维不是这些管理接口提供的能力。

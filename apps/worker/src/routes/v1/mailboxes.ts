@@ -29,7 +29,7 @@ app.get('/availability', async (c) => {
   requireScope(c, 'mailbox.read');
   const key = c.get('apiKey')!;
   const req = parseQuery(c, claimMailboxRequestSchema);
-  return ok(c, await checkAvailability(c.env, req.localPart, req.domain, key.role === 'admin'));
+  return ok(c, await checkAvailability(c.env, { userId: key.userId, role: key.role }, req.localPart, req.domain));
 });
 
 app.put('/:id', async (c) => {

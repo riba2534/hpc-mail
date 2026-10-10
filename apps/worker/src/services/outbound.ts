@@ -19,6 +19,7 @@ import { encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, saniti
 import { makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
+import { extractVerificationLink } from './link-extract.js';
 import { getRoutableDomains } from './domain.js';
 import { resolveNotifyOwnerIds } from './mailbox.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
@@ -393,6 +394,7 @@ function summarize(
     subject: row.subject,
     preview: row.preview,
     verificationCode: row.verificationCode,
+    verificationLink: row.verificationLink,
     status: row.status,
     errorDetail: row.errorDetail ?? '',
     recipientsTo: row.direction === 'outbound' ? (row.recipients?.to ?? []) : undefined,
@@ -518,6 +520,9 @@ export async function sendMail(
   const preview = makePreview(text, html);
   const size = bodyBytes(text, html) + totalAttachmentBytes;
   const code = settings.code_extract.enabled ? extractCodeByRegex(req.subject, text) : '';
+  // 只写站内收件副本；发件记录本身不是「收到的验证邮件」
+  const verificationLink = settings.code_extract.enabled && internalTargets.length
+    ? extractVerificationLink({ subject: req.subject, text, html, fromAddress: from.address }) : '';
   await assertOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
 
   let outbound: typeof messages.$inferSelect | undefined;
@@ -603,7 +608,7 @@ export async function sendMail(
           fromAddress: from.address, fromName: from.displayName,
           recipients: { to: recipients.to, cc: recipients.cc, bcc: [] }, replyTo: [],
           notifyOwnerIds: ownerIds,
-          subject: req.subject, preview, ...body, verificationCode: code,
+          subject: req.subject, preview, ...body, verificationCode: code, verificationLink,
           messageId: outgoingMessageId, inReplyTo, references, status: 'received',
           sendChannel: 'internal', isRead: false, size, createdAt: new Date(),
         }).returning({ id: messages.id });
@@ -685,7 +690,7 @@ export async function sendMail(
         await enqueueMailNotifications(env, null, {
           ownerIds, message: { id: delivery.messageId, address: delivery.target,
             fromAddress: from.address, fromName: from.displayName, subject: req.subject,
-            verificationCode: code, preview, createdAt: new Date().toISOString() }, text, html,
+            verificationCode: code, verificationLink, preview, createdAt: new Date().toISOString() }, text, html,
         });
       } catch (error) { console.error('站内转发/通知入队失败:', error); }
     }

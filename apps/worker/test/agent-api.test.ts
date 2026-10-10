@@ -217,7 +217,7 @@ describe('外部 Agent API 真实 HTTP 工作流', () => {
     }
   });
 
-  it('共享邮箱只授权收件阅读、已读和个人星标，不授权发件及破坏性操作', async () => {
+  it('共享邮箱只授权收件阅读和个人星标，不能改所有者已读状态，不授权发件及破坏性操作', async () => {
     const owner = await actor('agent-shared-owner', 'admin');
     const viewer = await actor('agent-shared-reader');
     const box = await claim(owner.key, 'agent-shared-owned');
@@ -233,7 +233,9 @@ describe('外部 Agent API 真实 HTTP 工作流', () => {
     expect(raw.status).toBe(200);
     expect(await raw.text()).toBe(received.raw);
     expect((await data<{ changed: number }>(await request('/v1/messages/star', json(viewer.key, { ids: [received.id] })))).changed).toBe(1);
-    expect((await data<{ changed: number }>(await request('/v1/messages/read', json(viewer.key, { ids: [received.id] })))).changed).toBe(1);
+    expect((await data<{ changed: number }>(await request('/v1/messages/read', json(viewer.key, { ids: [received.id], isRead: true })))).changed).toBe(0);
+    expect((await data<{ changed: number }>(await request('/v1/messages/read-all', json(viewer.key, {})))).changed).toBe(0);
+    expect((await data<MessageDetail>(await request(`/v1/messages/${received.id}`, { headers: auth(owner.key) }))).isRead).toBe(false);
     expect((await data<{ deleted: number }>(await request('/v1/messages/delete', json(viewer.key, { ids: [received.id] })))).deleted).toBe(0);
     expect((await data<{ restored: number }>(await request('/v1/messages/restore', json(viewer.key, { ids: [received.id] })))).restored).toBe(0);
     expect((await data<{ purged: number }>(await request('/v1/messages/purge', json(viewer.key, { ids: [received.id] })))).purged).toBe(0);
@@ -253,11 +255,11 @@ describe('外部 Agent API 真实 HTTP 工作流', () => {
     const started = Date.now();
     const pending = request(new Request('https://example.test/v1/messages/wait?timeout=50&afterId=0', { headers: auth(owner.key), signal: controller.signal }));
     setTimeout(() => controller.abort(), 50);
-    expect(await data(await pending)).toEqual({ message: null });
+    expect(await data(await pending)).toEqual({ message: null, scannedThroughId: 0 });
     expect(Date.now() - started).toBeLessThan(1000);
     expect((await readCounter(env, 'api-wait', String(owner.id), minute)).count).toBe(1);
     const timeoutStarted = Date.now();
-    expect(await data(await request('/v1/messages/wait?timeout=1&afterId=0', { headers: auth(owner.key) }))).toEqual({ message: null });
+    expect(await data(await request('/v1/messages/wait?timeout=1&afterId=0', { headers: auth(owner.key) }))).toEqual({ message: null, scannedThroughId: 0 });
     expect(Date.now() - timeoutStarted).toBeLessThan(1600);
   });
 

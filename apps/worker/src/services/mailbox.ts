@@ -1,10 +1,13 @@
-import type { ClaimMailboxRequest, Mailbox, MailboxAvailability, MailboxTransferResult, Role, TransferMailboxRequest } from '@hpc-mail/shared';
+import type {
+  ClaimMailboxRequest, Mailbox, MailboxAvailability, MailboxTransferResult, MailboxUnavailableReason, Role, Settings,
+  TransferMailboxRequest,
+} from '@hpc-mail/shared';
 import { and, desc, eq, sql } from 'drizzle-orm';
-import { createDb } from '../db/client.js';
+import { createDb, type Db } from '../db/client.js';
 import { mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { AuthUser, Env } from '../types.js';
-import { domainPerUserLimit, getDomains, getVisibleDomains, isDomainPublic } from './domain.js';
+import { domainPerUserLimit, isDomainPublic } from './domain.js';
 import { getSettingsFresh } from './setting.js';
 import { purgeStatements } from './message-lifecycle.js';
 import { processStorageCleanup } from './storage-cleanup.js';
@@ -49,6 +52,66 @@ export async function listMailboxes(
   return rows.map((r) => serialize(r.mailbox, Number(r.messageCount)));
 }
 
+interface ClaimPolicy {
+  /** 普通用户的全局/按域认领上限（0=不限；管理员恒为 0），供 INSERT 时原子复核 */
+  perUserLimit: number;
+  perDomainLimit: number;
+  /** 第一条不满足的规则；null 表示规则层面可认领（地址占用另判） */
+  blocked: { reason: MailboxUnavailableReason; error: AppError } | null;
+}
+
+/**
+ * 认领规则唯一来源：认领与可用性检查共用，避免两处判定漂移。
+ * 顺序：域名可用 → 保留前缀 → 全局上限 → 按域名上限（管理员只受域名存在性约束）。
+ */
+async function evaluateClaimPolicy(
+  db: Db,
+  settings: Settings,
+  actor: { userId: number; role: Role },
+  localPart: string,
+  domain: string,
+): Promise<ClaimPolicy> {
+  const allow = (perUserLimit = 0, perDomainLimit = 0): ClaimPolicy => ({ perUserLimit, perDomainLimit, blocked: null });
+  const block = (reason: MailboxUnavailableReason, error: AppError): ClaimPolicy => ({ perUserLimit: 0, perDomainLimit: 0, blocked: { reason, error } });
+  if (!settings.domains.list.some((entry) => entry.domain === domain)) {
+    return block('domain_unavailable', new AppError('validation_failed', '域名不在系统域名列表内'));
+  }
+  if (actor.role === 'admin') return allow();
+  // 可见性：只能认领对普通用户公开的域名（未公开的域名对普通用户等同不存在）
+  if (!isDomainPublic(settings, domain)) {
+    return block('domain_unavailable', new AppError('forbidden', '该域名未对普通用户开放'));
+  }
+  const policy = settings.mailbox_policy;
+  // 保留前缀禁止认领（防冒充官方身份）
+  if (policy.reservedLocalParts.includes(localPart)) {
+    return block('reserved', new AppError('forbidden', `前缀 ${localPart} 为系统保留，无法认领`));
+  }
+  // 全局每用户认领上限（跨域名合计，防囤积）
+  if (policy.perUserLimit > 0) {
+    const owned = await db
+      .select({ value: sql<number>`COUNT(*)` })
+      .from(mailboxes)
+      .where(eq(mailboxes.userId, actor.userId))
+      .get();
+    if ((owned?.value ?? 0) >= policy.perUserLimit) {
+      return block('quota', new AppError('forbidden', `认领地址数已达上限（${policy.perUserLimit}）`));
+    }
+  }
+  // 按域名上限：统计该用户在此域名下已认领数
+  const domainLimit = domainPerUserLimit(settings, domain);
+  if (domainLimit > 0) {
+    const ownedInDomain = await db
+      .select({ value: sql<number>`COUNT(*)` })
+      .from(mailboxes)
+      .where(and(eq(mailboxes.userId, actor.userId), eq(mailboxes.domain, domain)))
+      .get();
+    if ((ownedInDomain?.value ?? 0) >= domainLimit) {
+      return block('domain_limit', new AppError('forbidden', `在该域名下最多认领 ${domainLimit} 个地址`));
+    }
+  }
+  return allow(policy.perUserLimit, domainLimit);
+}
+
 /** 认领地址：domain 必须 ∈ 系统域名，address 全局唯一，普通用户受保留前缀/配额限制 */
 export async function claimMailbox(
   env: Env,
@@ -57,51 +120,10 @@ export async function claimMailbox(
   req: ClaimMailboxRequest,
 ): Promise<Mailbox> {
   const settings = await getSettingsFresh(env);
-  const domains = await getDomains(env, settings);
-  if (!domains.includes(req.domain)) {
-    throw new AppError('validation_failed', '域名不在系统域名列表内');
-  }
   const db = createDb(env);
-  let perUserLimit = 0;
-  let perDomainLimit = 0;
-
-  // 普通用户：域名可见性 + 保留前缀 + 全局上限 + 按域名上限（管理员全部豁免）
-  if (role !== 'admin') {
-    // 可见性：只能认领对普通用户公开的域名（未公开的域名对普通用户等同不存在）
-    if (!isDomainPublic(settings, req.domain)) {
-      throw new AppError('forbidden', '该域名未对普通用户开放');
-    }
-    const policy = settings.mailbox_policy;
-    perUserLimit = policy.perUserLimit;
-    // 保留前缀禁止认领（防冒充官方身份）
-    if (policy.reservedLocalParts.includes(req.localPart)) {
-      throw new AppError('forbidden', `前缀 ${req.localPart} 为系统保留，无法认领`);
-    }
-    // 全局每用户认领上限（跨域名合计，防囤积）
-    if (policy.perUserLimit > 0) {
-      const owned = await db
-        .select({ value: sql<number>`COUNT(*)` })
-        .from(mailboxes)
-        .where(eq(mailboxes.userId, userId))
-        .get();
-      if ((owned?.value ?? 0) >= policy.perUserLimit) {
-        throw new AppError('forbidden', `认领地址数已达上限（${policy.perUserLimit}）`);
-      }
-    }
-    // 按域名上限：统计该用户在此域名下已认领数
-    const domainLimit = domainPerUserLimit(settings, req.domain);
-    perDomainLimit = domainLimit;
-    if (domainLimit > 0) {
-      const ownedInDomain = await db
-        .select({ value: sql<number>`COUNT(*)` })
-        .from(mailboxes)
-        .where(and(eq(mailboxes.userId, userId), eq(mailboxes.domain, req.domain)))
-        .get();
-      if ((ownedInDomain?.value ?? 0) >= domainLimit) {
-        throw new AppError('forbidden', `在该域名下最多认领 ${domainLimit} 个地址`);
-      }
-    }
-  }
+  const policy = await evaluateClaimPolicy(db, settings, { userId, role }, req.localPart, req.domain);
+  if (policy.blocked) throw policy.blocked.error;
+  const { perUserLimit, perDomainLimit } = policy;
 
   const address = `${req.localPart}@${req.domain}`;
   const existing = await db.select().from(mailboxes).where(eq(mailboxes.address, address)).get();
@@ -256,18 +278,19 @@ export async function releaseMailbox(
   return { deletedMessages };
 }
 
+/** 可用性提示：与认领同一套规则（evaluateClaimPolicy），不可用时给出 reason；不预订地址 */
 export async function checkAvailability(
   env: Env,
+  actor: { userId: number; role: Role },
   localPart: string,
   domain: string,
-  isAdmin = false,
 ): Promise<MailboxAvailability> {
   const address = `${localPart}@${domain}`;
-  const domains = await getVisibleDomains(env, isAdmin, await getSettingsFresh(env));
-  if (!domains.includes(domain)) return { address, available: false };
   const db = createDb(env);
-  const existing = await db.select().from(mailboxes).where(eq(mailboxes.address, address)).get();
-  return { address, available: !existing };
+  const policy = await evaluateClaimPolicy(db, await getSettingsFresh(env), actor, localPart, domain);
+  if (policy.blocked) return { address, available: false, reason: policy.blocked.reason };
+  const existing = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, address)).get();
+  return existing ? { address, available: false, reason: 'taken' } : { address, available: true };
 }
 
 /** 取用户认领的全部地址（用于 messages 可见性过滤） */

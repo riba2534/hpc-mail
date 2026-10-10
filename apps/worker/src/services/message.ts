@@ -1,5 +1,6 @@
 import type {
   ListMessagesQuery,
+  MarkAllReadRequest,
   MessageDetail,
   MessageRecipients,
   MessageSummary,
@@ -34,6 +35,7 @@ import { decodeCursor, encodeCursor } from '../lib/pagination.js';
 import { htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { CODE_SCAN_BODY_CHARS, resolveVerificationCode } from './code-extract.js';
+import { getSettings } from './setting.js';
 import { getJson } from './storage.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 
@@ -58,6 +60,7 @@ type MessageSummaryRow = Pick<
   | 'subject'
   | 'preview'
   | 'verificationCode'
+  | 'verificationLink'
   | 'status'
   | 'errorDetail'
   | 'recipientOutcomes'
@@ -77,6 +80,7 @@ const summarySelection = {
   subject: messages.subject,
   preview: messages.preview,
   verificationCode: messages.verificationCode,
+  verificationLink: messages.verificationLink,
   status: messages.status,
   errorDetail: messages.errorDetail,
   recipientOutcomes: messages.recipientOutcomes,
@@ -140,10 +144,20 @@ function shareAccess(viewer: Viewer, scope: Scope): ScopeAccess {
   return 'owned';
 }
 
-function listAccess(viewer: Viewer, scope: Scope, query: { trash?: boolean; direction?: string }): ScopeAccess {
+/** 共享邮件的已读状态属于所有者：「未读」筛选与未读数一样只看自己认领的地址 */
+function listAccess(viewer: Viewer, scope: Scope, query: { trash?: boolean; direction?: string; unread?: boolean }): ScopeAccess {
   if (shareAccess(viewer, scope) === 'owned') return 'owned';
-  if (query.trash || query.direction === 'outbound') return 'owned';
+  if (query.trash || query.direction === 'outbound' || query.unread) return 'owned';
   return 'readable';
+}
+
+/**
+ * domain 收窄：认领/共享范围是小地址集合，应沿地址索引逐个找；裸 domain = ? 会让规划器改走
+ * idx_messages_domain 扫完整个 catch-all 域。一元 + 不改值，只让该条件不参与选索引。
+ * 未认领范围没有地址集合可走，交给规划器。
+ */
+function domainCondition(scope: Scope, domain: string): SQL {
+  return scope === 'unclaimed' ? eq(messages.domain, domain) : sql`+${messages.domain} = ${domain}`;
 }
 
 /** 分享给 userId、且认领人仍是启用中管理员的地址 */
@@ -207,6 +221,7 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     subject: row.subject,
     preview: row.preview,
     verificationCode,
+    verificationLink: row.verificationLink ?? '',
     status: row.status,
     errorDetail: row.errorDetail ?? '',
     recipientOutcomes: row.recipientOutcomes,
@@ -247,6 +262,19 @@ async function starFlags(db: Db, userId: number, ids: number[]): Promise<Set<num
   return out;
 }
 
+/** 列表搜索语义（主题/发件地址/发件名/文本正文/收件人子串）；全部已读按同一语义收窄 */
+function searchCondition(q: string | undefined): SQL | undefined {
+  if (!q) return undefined;
+  const term = q.toLowerCase();
+  return or(
+    sql`instr(lower(${messages.subject}), ${term}) > 0`,
+    sql`instr(lower(${messages.fromAddress}), ${term}) > 0`,
+    sql`instr(lower(${messages.fromName}), ${term}) > 0`,
+    sql`instr(lower(${messages.bodyText}), ${term}) > 0`,
+    sql`instr(lower(${messages.recipients}), ${term}) > 0`,
+  );
+}
+
 export async function listMessages(
   env: Env,
   viewer: Viewer,
@@ -259,7 +287,7 @@ export async function listMessages(
   // 回收站视图看软删除的，普通视图排除软删除的
   conds.push(query.trash ? isNotNull(messages.deletedAt) : isNull(messages.deletedAt));
   if (query.direction) conds.push(eq(messages.direction, query.direction));
-  if (query.domain) conds.push(eq(messages.domain, query.domain));
+  if (query.domain) conds.push(domainCondition(scope, query.domain));
   if (query.address) conds.push(eq(messages.address, query.address));
   if (query.unread) conds.push(eq(messages.isRead, false));
   if (query.starred) {
@@ -270,23 +298,14 @@ export async function listMessages(
       ),
     );
   }
-  if (query.q) {
-    const term = query.q.toLowerCase();
-    conds.push(or(
-      sql`instr(lower(${messages.subject}), ${term}) > 0`,
-      sql`instr(lower(${messages.fromAddress}), ${term}) > 0`,
-      sql`instr(lower(${messages.fromName}), ${term}) > 0`,
-      sql`instr(lower(${messages.bodyText}), ${term}) > 0`,
-      sql`instr(lower(${messages.recipients}), ${term}) > 0`,
-    ));
-  }
+  conds.push(searchCondition(query.q));
   const cursorId = decodeCursor(query.cursor);
   if (cursorId) conds.push(lt(messages.id, cursorId));
   if (query.afterId) conds.push(gt(messages.id, query.afterId));
 
   const where = and(...conds.filter((x): x is SQL => x !== undefined));
   const rows = await db
-    .select(summarySelection)
+    .select({ ...summarySelection, deletedAt: messages.deletedAt })
     .from(messages)
     .where(where)
     .orderBy(desc(messages.id))
@@ -302,44 +321,92 @@ export async function listMessages(
   ]);
 
   return {
-    items: page.map((r) => summarize(r, attSet.has(r.id), starSet.has(r.id))),
+    items: page.map((r) => {
+      const summary = summarize(r, attSet.has(r.id), starSet.has(r.id));
+      // 回收站视图带上进入回收站的时间，前端据此计算剩余保留天数
+      return query.trash && r.deletedAt ? { ...summary, deletedAt: r.deletedAt.toISOString() } : summary;
+    }),
     nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.id) : null,
   };
 }
 
-/** 增量读取严格返回 afterId 之后最早的一封，保证游标推进时不会跳过突发邮件。 */
+/** 长轮询过滤：发件人（完整地址或 `@域名`）、主题包含、已识别验证码 */
+export interface WaitFilters {
+  from?: string;
+  subjectContains?: string;
+  hasCode?: boolean;
+}
+
+/** 单次轮询最多检查的新邮件数；积压更多时由调用方用 scannedThroughId 继续推进 */
+const WAIT_SCAN_BATCH = 50;
+/** AI 兜底提码在收件后异步写回；这段时间内无码的新邮件先不判为「不匹配」，避免被跳过 */
+const AI_CODE_GRACE_MS = 30_000;
+
+/**
+ * 增量读取严格返回 afterId 之后最早一封满足过滤条件的收件，保证游标推进时不会跳过突发邮件。
+ * scannedThroughId 是本次已确定检查过的最大 id（没有新邮件时等于 afterId）：其间不匹配的邮件被跳过，
+ * 调用方超时后可从它继续。hasCode 与返回的 verificationCode 同一口径；AI 可能稍后补码的新邮件
+ * 不计入已检查，下一次轮询再判定。
+ */
 export async function findNextMessage(
   env: Env,
   viewer: Viewer,
-  input: { afterId: number; address?: string },
-): Promise<MessageSummary | null> {
+  input: { afterId: number; address?: string } & WaitFilters,
+): Promise<{ message: MessageSummary | null; scannedThroughId: number }> {
   const db = createDb(env);
   const scope = resolveScope(viewer);
   const conditions: SQL[] = [
-    scopeCondition(db, scope, shareAccess(viewer, scope)),
+    inboxScopeCondition(db, scope, shareAccess(viewer, scope)),
     eq(messages.direction, 'inbound'),
     isNull(messages.deletedAt),
     gt(messages.id, input.afterId),
   ];
   if (input.address) conditions.push(eq(messages.address, input.address));
-  const row = await db
+  const filtered = Boolean(input.from || input.subjectContains || input.hasCode);
+  const rows = await db
     .select(summarySelection)
     .from(messages)
     .where(and(...conditions))
     .orderBy(asc(messages.id))
-    .limit(1)
-    .get();
-  if (!row) return null;
-  const [attSet, starSet] = await Promise.all([
-    attachmentFlags(db, [row.id]),
-    starFlags(db, viewer.userId, [row.id]),
-  ]);
-  return summarize(row, attSet.has(row.id), starSet.has(row.id));
+    .limit(filtered ? WAIT_SCAN_BATCH : 1)
+    .all();
+
+  let aiPending: boolean | undefined;
+  let scannedThroughId = input.afterId;
+  for (const row of rows) {
+    const subjectMatches = !input.subjectContains || row.subject.toLowerCase().includes(input.subjectContains.toLowerCase());
+    if (!matchesSender(row.fromAddress, input.from) || !subjectMatches) {
+      scannedThroughId = row.id;
+      continue;
+    }
+    const summary = summarize(row, false, false);
+    if (input.hasCode && !summary.verificationCode) {
+      if (aiPending === undefined) {
+        const settings = await getSettings(env);
+        aiPending = settings.code_extract.enabled && settings.code_extract.aiEnabled;
+      }
+      if (aiPending && Date.now() - row.createdAt.getTime() < AI_CODE_GRACE_MS) break;
+      scannedThroughId = row.id;
+      continue;
+    }
+    const [attSet, starSet] = await Promise.all([
+      attachmentFlags(db, [row.id]),
+      starFlags(db, viewer.userId, [row.id]),
+    ]);
+    return { message: { ...summary, hasAttachments: attSet.has(row.id), isStarred: starSet.has(row.id) }, scannedThroughId: row.id };
+  }
+  return { message: null, scannedThroughId };
+}
+
+function matchesSender(fromAddress: string, filter: string | undefined): boolean {
+  if (!filter) return true;
+  const sender = fromAddress.toLowerCase();
+  return filter.startsWith('@') ? sender.endsWith(filter) : sender === filter;
 }
 
 /**
- * 收件箱未读数：口径同 /inbox（scope=mine + inbound + 未读），一条 COUNT 查询。
- * 复用 listMessages 的可见性逻辑（resolveScope + 地址集合形式的 scopeCondition），避免条件漂移；
+ * 收件箱未读数：口径同 /inbox 的未读筛选（scope=mine + inbound + 未读），一条 COUNT 查询。
+ * 只数自己认领的地址：共享邮件的已读状态属于所有者，成员改不了，也不计入成员的未读。
  * admin 也按 scope=mine 只数自己认领地址（个人角标，非全站）。
  */
 export async function countUnread(env: Env, userId: number, role: Role): Promise<number> {
@@ -351,7 +418,7 @@ export async function countUnread(env: Env, userId: number, role: Role): Promise
     .from(messages)
     .where(
       and(
-        inboxScopeCondition(db, scope, shareAccess(viewer, scope)),
+        scopeCondition(db, scope),
         eq(messages.direction, 'inbound'),
         eq(messages.isRead, false),
         isNull(messages.deletedAt),
@@ -389,6 +456,9 @@ export async function getRecentContacts(env: Env, viewer: Viewer, limit = 100): 
   }
   return [...seen].slice(0, limit);
 }
+
+/** 回复/转发前缀：Re:/Fwd:/Fw:/回复:/转发:（全角冒号同样识别） */
+const REPLY_PREFIX = /^\s*(?:re|fwd?|回复|转发)\s*[:：]/i;
 
 /** 归一化主题：剥离 Re:/Fwd:/回复:/转发: 前缀，用于会话归组 */
 function normalizeSubject(subject: string): string {
@@ -463,8 +533,9 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
     return summarizeRows([...related.values()].sort((a, b) => a.id - b.id));
   }
 
+  // 主题回退只服务于缺线程头的回复/转发：验证码邮件常年同名（「Your code」），一律不按主题归并。
   const core = normalizeSubject(target.subject);
-  if (!core) return summarizeRows([target]);
+  if (!core || hasCode(target)) return summarizeRows([target]);
 
   const windowMs = 30 * 24 * 60 * 60 * 1000;
   const rows = await db
@@ -483,8 +554,21 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
     .orderBy(asc(messages.id))
     .limit(100)
     .all();
-  const thread = rows.filter((r) => normalizeSubject(r.subject) === core);
+  // 两封里至少一封带 Re:/Fwd: 等前缀才算回复关系；两封都没前缀的同名邮件是彼此独立的邮件。
+  const targetIsReply = hasReplyPrefix(target.subject);
+  const thread = rows.filter((r) => r.id === target.id || (
+    normalizeSubject(r.subject) === core && !hasCode(r) && (targetIsReply || hasReplyPrefix(r.subject))
+  ));
   return summarizeRows(thread.length ? thread : [target]);
+}
+
+function hasReplyPrefix(subject: string): boolean {
+  return REPLY_PREFIX.test(subject);
+}
+
+/** 与列表展示同一口径（读取时会重新校验已存验证码） */
+function hasCode(row: Pick<MessageRow, 'subject' | 'preview' | 'verificationCode'>): boolean {
+  return resolveVerificationCode(row.subject, row.preview, row.verificationCode) !== '';
 }
 
 async function isAddressClaimed(db: Db, address: string): Promise<boolean> {
@@ -673,7 +757,10 @@ export async function loadAttachmentById(
   return att;
 }
 
-/** 批量已读/未读（按可见范围过滤） */
+/**
+ * 批量已读/未读：is_read 是邮件本身的状态，只能由认领人（或管理员对未认领）修改。
+ * 分享来的邮件不在 owned 范围内，静默计 0，共享成员改不动所有者的已读状态。
+ */
 export async function markMessages(
   env: Env,
   viewer: Viewer,
@@ -682,32 +769,41 @@ export async function markMessages(
 ): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  const access = shareAccess(viewer, scope);
   // ids 分批：D1 单条查询最多 100 个绑定参数，schema 允许一次传 500 个 id
   let changed = 0;
   for (const batch of chunk(ids)) {
-    const cond = and(inArray(messages.id, batch), scopeCondition(db, scope, access));
+    const cond = and(inArray(messages.id, batch), scopeCondition(db, scope));
     const result = await db.update(messages).set({ isRead }).where(cond).run();
     changed += result.meta.changes ?? 0;
   }
   return changed;
 }
 
-/** 收件箱一键全读：可见范围内全部未读 inbound 标为已读（不含回收站） */
-export async function markAllRead(env: Env, viewer: Viewer): Promise<number> {
+/**
+ * 一键全读：范围内全部未读 inbound 标为已读（不含回收站），可按 domain/address/q 收窄，
+ * q 与列表同一搜索语义。只处理自己认领的地址（admin scope=unclaimed 为未认领），共享邮件一律不动。
+ * 范围仍是地址集合子查询，收窄条件只叠加在外层，保持走 idx_messages_visible。
+ */
+export async function markAllRead(
+  env: Env,
+  viewer: Viewer,
+  filters: Omit<MarkAllReadRequest, 'scope'> = {},
+): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
+  const conds: (SQL | undefined)[] = [
+    scopeCondition(db, scope),
+    eq(messages.direction, 'inbound'),
+    eq(messages.isRead, false),
+    isNull(messages.deletedAt),
+  ];
+  if (filters.domain) conds.push(domainCondition(scope, filters.domain));
+  if (filters.address) conds.push(eq(messages.address, filters.address));
+  conds.push(searchCondition(filters.q));
   const result = await db
     .update(messages)
     .set({ isRead: true })
-    .where(
-      and(
-        inboxScopeCondition(db, scope, shareAccess(viewer, scope)),
-        eq(messages.direction, 'inbound'),
-        eq(messages.isRead, false),
-        isNull(messages.deletedAt),
-      ),
-    )
+    .where(and(...conds.filter((x): x is SQL => x !== undefined)))
     .run();
   return result.meta.changes ?? 0;
 }

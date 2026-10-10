@@ -269,7 +269,7 @@ describe('入口路由与可观测性', () => {
 });
 
 describe('未读计数与线程查询改写保持语义', () => {
-  it('未读 = 认领地址 + 启用管理员分享的未删除收件，口径与原 OR 条件一致', async () => {
+  it('未读只数自己认领地址的未删除收件，共享收件不计入也不被全部已读改动', async () => {
     const db = createDb(env);
     const admin = await seedUser('perf-unread-admin', { role: 'admin' });
     const disabledAdmin = await seedUser('perf-unread-off', { role: 'admin', status: 'disabled' });
@@ -285,11 +285,12 @@ describe('未读计数与线程查询改写保持语义', () => {
       mail('perf-shared@hpc.email'), mail('perf-shared@hpc.email', { deletedAt: new Date() }),
       mail('perf-stale@hpc.email'), mail('perf-unrelated@hpc.email'),
     ]) await db.insert(messages).values(row);
-    expect(await countUnread(env, viewer, 'user')).toBe(3);
+    // 只数自己认领地址的 2 封；共享收件的已读状态属于所有者，不计入成员未读，全部已读也不碰
+    expect(await countUnread(env, viewer, 'user')).toBe(2);
     expect(await countUnread(env, admin, 'admin')).toBe(1);
-    expect(await markAllRead(env, { userId: viewer, role: 'user', scope: 'mine' })).toBe(3);
+    expect(await markAllRead(env, { userId: viewer, role: 'user', scope: 'mine' })).toBe(2);
     expect(await countUnread(env, viewer, 'user')).toBe(0);
-    expect(await countUnread(env, admin, 'admin')).toBe(0);
+    expect(await countUnread(env, admin, 'admin')).toBe(1);
   });
 
   it('线程按邮件头多轮扩展、排除已删除与不可见邮件，只返回摘要', async () => {

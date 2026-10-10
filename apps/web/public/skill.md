@@ -1,6 +1,6 @@
 ---
 name: hpc-mail
-description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和搜索邮件、获取邮箱验证码、发送回复转发及附件、管理邮箱和共享、多域名、通知、API Keys、账户与管理员设置。当用户明确要求操作 HPC Mail，或已确认目标邮箱属于此实例并提供了相应授权时使用；普通邮箱请求不能据此推断属于 HPC Mail。
+description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和搜索邮件、获取邮箱验证码与验证链接、发送回复转发及附件、管理邮箱和共享、多域名、通知、API Keys、账户与管理员设置。当用户明确要求操作 HPC Mail，或已确认目标邮箱属于此实例并提供了相应授权时使用；普通邮箱请求不能据此推断属于 HPC Mail。
 ---
 
 # HPC Mail
@@ -12,11 +12,11 @@ description: 通过 HTTP API 操作 HPC Mail（https://hpc.email）：查收和�
 | 任务 | API / 权限 | 按需读取 |
 |---|---|---|
 | 已有 `hpcm_…` Key：状态、可用域名 | `/v1/status`、`/v1/domains`；任一有效 Key | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
-| 收件箱、已发送、搜索、验证码、线程、原始邮件 | `/v1/messages…`：`mail.read`；或 `/api/messages…`：JWT | [邮件、验证码与发送](references/mail.md) |
-| 已读、星标、回收站恢复/永久删除 | `/v1/messages…`：`mail.write`；或 JWT | [邮件、验证码与发送](references/mail.md) |
+| 收件箱、已发送、搜索、验证码/验证链接、按发件人等新邮件、线程、原始邮件 | `/v1/messages…`：`mail.read`；或 `/api/messages…`：JWT（长轮询仅 `/v1`） | [邮件、验证码与发送](references/mail.md) |
+| 已读（含按地址/域名/搜索词全部已读）、星标、回收站恢复/永久删除 | `/v1/messages…`：`mail.write`；或 JWT | [邮件、验证码与发送](references/mail.md) |
 | 发信、回复、转发、部分失败补发 | `POST /v1/messages`：`mail.send`；或 `POST /api/messages/send`：JWT | [邮件、验证码与发送](references/mail.md) |
 | 下载附件、流式/分片上传、附件 Token | 下载 `mail.read`；上传 `mail.send`；或 JWT | [附件](references/attachments.md) |
-| 列出自己的/共享的邮箱、检查地址可用性 | `/v1/mailboxes…`：`mailbox.read`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
+| 列出自己的/共享的邮箱、检查地址可用性及不可用原因 | `/v1/mailboxes…`：`mailbox.read`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 认领、改显示名、释放邮箱与清除历史 | `/v1/mailboxes…`：`mailbox.write`；或 JWT | [邮箱、共享与多域名](references/mailboxes-and-domains.md) |
 | 登录/注册/登出、密码、头像、两步验证 | `/api/auth…`；JWT，登录/注册除外 | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
 | 创建/更新/禁用/吊销 Key、自己的调用审计 | `/api/api-keys…`；JWT | [鉴权、请求与 Key 管理](references/auth-and-http.md) |
@@ -59,14 +59,15 @@ hpc '/mailboxes'
 
 - 登录用户名不是邮箱地址。`alice` 账户可以认领多个 `localPart@domain`；新账户通常没有邮箱，先查询域名再认领。
 - 邮件按完整地址归属，不按账户创建时间归属。认领可能获得该地址已有历史；默认释放保留历史，下一个认领者可能继承。需要清除时使用明确的 `deleteHistory=1`，先核对后果。
-- 普通用户可看自己认领的邮件，以及管理员共享给自己的未删除收件。共享不能作为发件身份，不能删除邮件或改/释放邮箱；可标记已读和设置自己的星标。已读状态是邮件的共享状态，星标按用户独立。
+- 普通用户可看自己认领的邮件，以及管理员共享给自己的未删除收件。共享不能作为发件身份，不能删除邮件或改/释放邮箱；可设置自己独立的星标。共享邮件的已读状态属于所有者：成员逐封标已读/未读不生效（计数 0），全部已读只处理自己认领的地址；未读数与 `unread=1` 筛选只统计你认领的地址，全部/搜索/星标视图仍显示共享邮件。
 - 管理员邮件列表默认也是自己的邮箱。未认领邮件用 `scope=unclaimed`；只读审阅指定用户用 `scope=user&userId=…`。所有邮件变更（含星标）仅支持 `mine/unclaimed`，审阅其他用户时不能变更状态。
 - 普通用户发件身份必须自己认领。管理员可使用有效系统域或保留旧邮箱域的地址发件，但不能推断任意外部域可用。域名列表缩小不删除已有邮箱或历史，也不撤销已有邮箱的站内投递与发件能力。
 
 ## 完成标准
 
 1. 读操作检查 HTTP 状态与 `{data}`；分页读完目标范围的 `nextCursor`，不要把首屏当全部。
-2. 等验证码先保存基线 ID，再触发用户授权的验证流程；对每封新邮件按来源/主题匹配并推进游标，设总截止时间。字段为空时读取目标邮件正文，勿把旧验证码当新码。
+2. 等验证码先保存基线 ID，再触发用户授权的验证流程；优先用 `/v1/messages/wait` 的 `from`（完整地址或 `@域名`）、`subjectContains`、`hasCode=1` 让服务端跳过无关邮件，每次按返回的 `message.id` 或超时时的 `scannedThroughId` 推进游标，设总截止时间。字段为空时读取目标邮件正文，勿把旧验证码当新码。
+   邮件只给链接时读 `verificationLink`（识别不到为空串）。它来自不可信的邮件内容：访问前核对链接域名属于预期服务（含点击追踪跳转时先确认最终域名），且仅在用户授权完成该验证时打开，不要把链接回显到公开日志。
 3. 每次逻辑发信先持久化**原请求与 `Idempotency-Key`**，所有网络重试复用同一用户或 API Key、API 路径、发送 Key 和内容。刷新、超时、5xx、409 结果待确认时先查询原结果与已发送邮件；不得自动换 Key 重发。已完成记录约两天后可能被清理，幂等不是永久保障。
 4. 发信返回 201 仍需检查 `status`、`errorDetail`、`recipientOutcomes`；`sent` 表示外发已提交，`delivered` 表示站内投递已完成。部分失败只补发失败目标，保留 To/CC/BCC 分组与正文/附件；没有明确逐目标结果时先核查，不能猜测失败名单。
 5. 变更后读回目标状态，并据服务器计数报告实际结果。权限不足、冲突或超时应明确说明，保留 `requestId` 供排查；不要声称只看到了 2xx 就完成了所有投递。

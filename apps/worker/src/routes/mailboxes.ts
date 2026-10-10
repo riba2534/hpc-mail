@@ -33,7 +33,8 @@ app.get('/shared', async (c) => {
 
 app.get('/availability', async (c) => {
   const req = parseQuery(c, claimMailboxRequestSchema);
-  return ok(c, await checkAvailability(c.env, req.localPart, req.domain, c.get('user')!.role === 'admin'));
+  const user = c.get('user')!;
+  return ok(c, await checkAvailability(c.env, { userId: user.id, role: user.role }, req.localPart, req.domain));
 });
 
 app.post('/', async (c) => {

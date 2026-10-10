@@ -82,10 +82,24 @@ export const messageViewQuerySchema = z.object({
   }
 });
 
+/** 发件人过滤：完整地址，或 `@域名` 匹配该域全部发件人 */
+const senderFilterSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(254)
+  .refine((v) => /^@[a-z0-9.-]+\.[a-z]{2,}$/.test(v) || /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v), '发件人需为完整地址或 @域名');
+
 export const waitMessagesQuerySchema = z.object({
   address: emptyAsUndefined(emailAddressSchema),
   afterId: emptyAsUndefined(z.coerce.number().int().nonnegative()).default(0),
   timeout: emptyAsUndefined(z.coerce.number().int().min(1).max(50)).default(25),
+  /** 只等指定发件人（完整地址或 @域名）；不匹配的新邮件被跳过 */
+  from: emptyAsUndefined(senderFilterSchema),
+  /** 只等主题包含该文本（不区分大小写）的邮件 */
+  subjectContains: emptyAsUndefined(z.string().trim().min(1).max(200)),
+  /** 只等已提取出验证码的邮件 */
+  hasCode: boolFlag(),
   scope: z.enum(['mine', 'unclaimed', 'user']).optional(),
   userId: emptyAsUndefined(z.coerce.number().int().positive()),
 }).superRefine((query, ctx) => {
@@ -288,7 +302,17 @@ export interface DraftAttachmentMeta {
  */
 const mutationScopeSchema = z.enum(['mine', 'unclaimed']).optional();
 
-export const markAllReadRequestSchema = z.object({ scope: mutationScopeSchema });
+/**
+ * 全部已读：按与列表相同的筛选收窄范围（domain/address/q），只处理自己认领的地址
+ * （admin scope=unclaimed 处理未认领地址）。共享邮件的已读状态属于所有者，任何情况下都不改。
+ */
+export const markAllReadRequestSchema = z.object({
+  scope: mutationScopeSchema,
+  domain: domainSchema.optional(),
+  address: emailAddressSchema.optional(),
+  q: z.string().trim().max(256).optional(),
+});
+export type MarkAllReadRequest = z.infer<typeof markAllReadRequestSchema>;
 
 export const markReadRequestSchema = z.object({
   ids: z.array(z.number().int().positive()).min(1).max(500),
@@ -331,6 +355,8 @@ export interface MessageSummary {
   subject: string;
   preview: string;
   verificationCode: string;
+  /** 入站邮件中识别出的验证/登录链接（http/https）；没有则为空串 */
+  verificationLink?: string;
   status: string;
   /** 发送失败/部分失败原因（inbound 与成功发送为空串）；让调用方能识别「假成功」 */
   errorDetail: string;
@@ -341,6 +367,8 @@ export interface MessageSummary {
   hasAttachments: boolean;
   size: number;
   createdAt: string;
+  /** 仅回收站列表返回：进入回收站的时间，用于计算剩余保留天数 */
+  deletedAt?: string;
 }
 
 export interface AttachmentMeta {

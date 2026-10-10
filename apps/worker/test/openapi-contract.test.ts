@@ -112,6 +112,31 @@ describe('OpenAPI routes and public contracts', () => {
     }
   });
 
+  it('documents wait filters, verification links, trash timestamps, read-all filters and availability reasons', () => {
+    const wait = specs.v1.paths['/messages/wait']!.get!;
+    const waitParams = (wait.parameters as Array<{ name: string }>).map(param => param.name);
+    expect(waitParams).toEqual(expect.arrayContaining(['from', 'subjectContains', 'hasCode', 'afterId']));
+    const waitData = ((wait.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>)['200']!
+      .content['application/json']!.schema.properties.data);
+    expect(waitData.required).toEqual(['message', 'scannedThroughId']);
+    for (const spec of Object.values(specs)) {
+      const summary = spec.components.schemas.MessageSummary!;
+      expect(summary.properties).toHaveProperty('verificationLink');
+      expect(summary.properties).toHaveProperty('deletedAt');
+      expect(summary.required).not.toContain('verificationLink');
+      expect(summary.required).not.toContain('deletedAt');
+      expect(spec.components.schemas.MessageDetail!.properties).toHaveProperty('verificationLink');
+      expect(spec.components.schemas.MessageDetail!.properties).not.toHaveProperty('deletedAt');
+      const readAll = spec.paths['/messages/read-all']!.post!.requestBody as { content: Record<string, { schema: Schema }> };
+      expect(readAll.content['application/json']!.schema).toEqual({ $ref: '#/components/schemas/MarkAllReadRequest' });
+      expect(Object.keys(spec.components.schemas.MarkAllReadRequest!.properties as Schema).sort()).toEqual(['address', 'domain', 'q', 'scope']);
+      const availability = spec.components.schemas.MailboxAvailability!;
+      expect(((availability.properties as Record<string, Schema>).reason!).enum).toEqual(['taken', 'reserved', 'quota', 'domain_limit', 'domain_unavailable']);
+      expect(availability.required).toEqual(['address', 'available']);
+      expect(spec.components.schemas).not.toHaveProperty('MutationScopeRequest');
+    }
+  });
+
   it('describes structured errors with request ids and avoids publishing plaintext credentials', async () => {
     const ctx = createExecutionContext();
     const response = await app.request('/api/unknown-openapi-test-route', {}, env, ctx);

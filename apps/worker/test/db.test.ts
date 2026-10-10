@@ -680,9 +680,12 @@ describe('共享邮箱', () => {
     );
     expect(adminInbox.items.map((item) => item.id)).toContain(inboundId);
 
-    expect(await countUnread(env, shareeId, 'user')).toBeGreaterThanOrEqual(1);
-    expect(await markAllRead(env, sharee)).toBeGreaterThanOrEqual(1);
-    expect(await countUnread(env, adminId, 'admin')).toBe(0);
+    // 共享邮件的已读状态属于所有者：成员的未读数不计入、逐封标记计 0、全部已读不碰
+    expect(await countUnread(env, shareeId, 'user')).toBe(0);
+    expect(await markMessages(env, sharee, [inboundId], true)).toBe(0);
+    expect(await markAllRead(env, sharee)).toBe(0);
+    expect((await getMessageDetail(env, { userId: adminId, role: 'admin' }, inboundId)).isRead).toBe(false);
+    expect(await countUnread(env, adminId, 'admin')).toBeGreaterThanOrEqual(1);
 
     expect(await deleteMessages(env, sharee, [inboundId])).toBe(0);
     const stillThere = await getMessageDetail(env, sharee, inboundId);

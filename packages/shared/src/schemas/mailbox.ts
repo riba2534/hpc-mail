@@ -46,9 +46,17 @@ export interface Mailbox {
   createdAt: string;
 }
 
+/**
+ * 不可认领原因：taken 已被占用；reserved 系统保留前缀；quota 达到个人认领上限；
+ * domain_limit 达到该域名的每人上限；domain_unavailable 域名不存在或未对当前用户开放。
+ */
+export type MailboxUnavailableReason = 'taken' | 'reserved' | 'quota' | 'domain_limit' | 'domain_unavailable';
+
 export interface MailboxAvailability {
   address: string;
   available: boolean;
+  /** available=false 时说明原因 */
+  reason?: MailboxUnavailableReason;
 }
 
 export interface MailboxTransferResult {

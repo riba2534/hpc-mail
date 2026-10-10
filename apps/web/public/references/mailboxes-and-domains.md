@@ -10,7 +10,7 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD 在 JWT
 | `GET /mailboxes` | 自己认领的数组 | 同左，`mailbox.read` |
 | `GET /mailboxes?all=1` | 管理员全站数组；普通用户不能请求全站范围 | 同左，`mailbox.read` 加管理员角色 |
 | `GET /mailboxes/shared` | 分享给自己的只读管理员邮箱数组 | 同左，`mailbox.read` |
-| `GET /mailboxes/availability?localPart=…&domain=…` | `{address,available}` | 同左，`mailbox.read` |
+| `GET /mailboxes/availability?localPart=…&domain=…` | `{address,available,reason?}` | 同左，`mailbox.read` |
 | `POST /mailboxes` | `{localPart,domain}` → 201 邮箱 | 同左，`mailbox.write` |
 | `PUT /mailboxes/:id` | `{displayName}` → 邮箱 | 同左，`mailbox.write` |
 | `DELETE /mailboxes/:id` | `{success:true,deletedMessages}` | 同左，`mailbox.write` |
@@ -27,7 +27,17 @@ jq -n --arg local "$HPC_LOCAL_PART" --arg domain "$HPC_DOMAIN" \
   hpc '/mailboxes' -X POST -H 'Content-Type: application/json' --data-binary @-
 ```
 
-availability 是瞬时占用提示，不预订、不保证通过保留前缀/全局/每域限额；认领最终可能 403、409 `address_taken` 或域配置冲突。普通用户受系统保留前缀、用户总认领上限和每域认领上限；管理员豁免，0 表示该限额不限。并发冲突刷新域名/邮箱状态后按任务要求重试，不能忽略错误声称认领成功。
+availability 与认领使用同一套规则、同一判定顺序，是瞬时提示而非预订。`available:false` 时带 `reason`：
+
+| reason | 含义 | 对应认领错误 |
+|---|---|---|
+| `domain_unavailable` | 域名不在配置中，或未对当前普通用户公开 | 400 / 403 |
+| `reserved` | 系统保留前缀（仅普通用户） | 403 |
+| `quota` | 当前用户已达总认领上限 | 403 |
+| `domain_limit` | 当前用户已达该域名的每人上限 | 403 |
+| `taken` | 地址已被认领 | 409 `address_taken` |
+
+按 `reason` 决定换前缀、换域名或告知用户额度已满，不要对 quota/domain_limit 反复换前缀重试。检查与认领之间状态仍可能变化，认领可能 403、409 `address_taken` 或域配置冲突。普通用户受系统保留前缀、用户总认领上限和每域认领上限；管理员豁免，0 表示该限额不限。并发冲突刷新域名/邮箱状态后按任务要求重试，不能忽略错误声称认领成功。
 
 显示名最多 64 字符，允许空串清除；不是改地址。普通用户仅可改/释放自己的邮箱，管理员可处理全站邮箱；不能凭“共享给我”修改它。普通用户发件可用自己的 `mailboxId` 或已认领 `localPart+domain`；管理员任意发件仍限服务器认可的系统/保留域。
 
@@ -39,7 +49,7 @@ availability 是瞬时占用提示，不预订、不保证通过保留前缀/全
 
 选择动作时复用已有用户意图：只要释放可用默认行为；要求删邮箱及历史时带 deleteHistory。缺失且会影响隐私/保留正确性的关键选择才需要澄清，不能把接口的二选一说明变成每次重复批准流程。结果 `deletedMessages` 是被清除的记录数量；释放不停止域名 catch-all，后来到该地址的新邮件仍可能入库。
 
-共享只公开管理员自己认领邮箱的**全部现有及未来未删除收件**，不是自共享时刻起的新信，不包括发件或回收站。grantee 必须是启用中的普通用户，最多 100 人。共享不能当发件身份/回复引用/附件转发来源，不能删除、恢复、purge、重命名或释放邮箱；允许查看详情/线程/附件/raw、修改邮件已读状态、设置自己独立的星标。仅被分享人的通知偏好不会因共享自动收到推送，通知按收信时实际 owner 结算。
+共享只公开管理员自己认领邮箱的**全部现有及未来未删除收件**，不是自共享时刻起的新信，不包括发件或回收站。grantee 必须是启用中的普通用户，最多 100 人。共享不能当发件身份/回复引用/附件转发来源，不能删除、恢复、purge、重命名或释放邮箱；允许查看详情/线程/附件/raw、设置自己独立的星标。共享邮件的已读状态属于所有者：成员逐封标记计 0、全部已读不包含共享邮件；成员的未读数和 `unread=1` 筛选只统计自己认领的地址。仅被分享人的通知偏好不会因共享自动收到推送，通知按收信时实际 owner 结算。
 
 管理员 JWT 接口：
 

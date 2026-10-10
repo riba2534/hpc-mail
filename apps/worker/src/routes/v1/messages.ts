@@ -112,7 +112,8 @@ app.post('/read-all', async (c) => {
   requireScope(c, 'mail.write');
   const req = c.req.header('Content-Length') === '0' || c.req.raw.body === null
     ? {} : await parseBody(c, markAllReadRequestSchema);
-  return ok(c, { changed: await markAllRead(c.env, mutationViewer(c, c.get('apiKey')!, req.scope)) });
+  const { scope, ...filters } = req;
+  return ok(c, { changed: await markAllRead(c.env, mutationViewer(c, c.get('apiKey')!, scope), filters) });
 });
 
 app.post('/star', async (c) => {
@@ -150,6 +151,7 @@ app.get('/unread-count', async (c) => {
  * afterId=0 是空邮箱基线；校验参数、范围，客户端取消后不再进行额外 D1 轮询。
  * 轮询配额在请求开始时按本次最多轮询次数一次性预占（1 次写），结束时退还未用部分，
  * 不再每 2 秒写一次计数；预占超限即拒绝，并发长轮询仍受同一上限约束。
+ * from/subjectContains/hasCode 跳过不匹配的新邮件；scannedThroughId 让调用方超时后也能推进游标。
  */
 app.get('/wait', async (c) => {
   requireScope(c, 'mail.read');
@@ -158,7 +160,9 @@ app.get('/wait', async (c) => {
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
   const signal = c.req.raw.signal;
-  if (signal.aborted) return ok(c, { message: null });
+  let cursor = query.afterId;
+  const empty = () => ok(c, { message: null, scannedThroughId: cursor });
+  if (signal.aborted) return empty();
   const subject = String(key.userId);
   const window = minuteWindow(1);
   const planned = Math.ceil((query.timeout * 1000) / WAIT_POLL_INTERVAL_MS) + 1;
@@ -171,12 +175,16 @@ app.get('/wait', async (c) => {
   let polls = 0;
   try {
     for (;;) {
-      if (signal.aborted) return ok(c, { message: null });
+      if (signal.aborted) return empty();
       polls++;
-      const found = await findNextMessage(c.env, viewer, { afterId: query.afterId, address: query.address });
-      if (found) return ok(c, { message: found });
+      const found = await findNextMessage(c.env, viewer, {
+        afterId: cursor, address: query.address,
+        from: query.from, subjectContains: query.subjectContains, hasCode: query.hasCode,
+      });
+      cursor = found.scannedThroughId;
+      if (found.message) return ok(c, found);
       const remaining = deadline - Date.now();
-      if (remaining <= 0 || polls >= planned) return ok(c, { message: null });
+      if (remaining <= 0 || polls >= planned) return empty();
       await waitForPoll(signal, Math.min(WAIT_POLL_INTERVAL_MS, remaining));
     }
   } finally {

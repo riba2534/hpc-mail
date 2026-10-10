@@ -112,11 +112,15 @@ app.post('/read', async (c) => {
   return ok(c, { changed });
 });
 
-/** 一键全读：可见范围内全部未读收件标为已读（admin 需显式 scope=unclaimed 才动未认领） */
+/**
+ * 一键全读：范围内全部未读收件标为已读，可按 domain/address/q 收窄；只动自己认领的地址，
+ * 共享邮件的已读状态属于所有者（admin 需显式 scope=unclaimed 才动未认领）
+ */
 app.post('/read-all', async (c) => {
   const req = c.req.header('Content-Length') === '0' || c.req.raw.body === null
     ? {} : await parseBody(c, markAllReadRequestSchema);
-  const changed = await markAllRead(c.env, mutationViewerOf(c, req.scope));
+  const { scope, ...filters } = req;
+  const changed = await markAllRead(c.env, mutationViewerOf(c, scope), filters);
   return ok(c, { changed });
 });
 
