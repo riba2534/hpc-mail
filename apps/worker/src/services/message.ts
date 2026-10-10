@@ -24,6 +24,7 @@ import {
   sql,
   type SQL,
 } from 'drizzle-orm';
+import { union } from 'drizzle-orm/sqlite-core';
 import { createDb, type Db } from '../db/client.js';
 import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, stars, users } from '../db/schema.js';
 import { signAttachment } from '../lib/crypto.js';
@@ -32,7 +33,7 @@ import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor } from '../lib/pagination.js';
 import { htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
-import { resolveVerificationCode } from './code-extract.js';
+import { CODE_SCAN_BODY_CHARS, resolveVerificationCode } from './code-extract.js';
 import { getJson } from './storage.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 
@@ -83,6 +84,19 @@ const summarySelection = {
   size: messages.size,
   createdAt: messages.createdAt,
 };
+
+/** 线程只需摘要与邮件头，不读正文列 */
+const threadSelection = {
+  ...summarySelection,
+  messageId: messages.messageId,
+  inReplyTo: messages.inReplyTo,
+  references: messages.references,
+  deletedAt: messages.deletedAt,
+};
+type ThreadRow = MessageSummaryRow & Pick<MessageRow, 'messageId' | 'inReplyTo' | 'references' | 'deletedAt'>;
+
+/** 单封可见性判定所需的最少列 */
+type VisibilityRow = Pick<MessageRow, 'address' | 'direction' | 'deletedAt'>;
 
 /** 可见范围：未认领地址，或限定为某用户认领的地址集合（以 mailboxes 子查询表达，不展开成数组） */
 type Scope = 'unclaimed' | { ownerId: number };
@@ -162,6 +176,17 @@ function scopeCondition(db: Db, scope: Scope, access: ScopeAccess = 'owned'): SQ
     inArray(messages.address, sharedAddressQuery(db, scope.ownerId)),
   );
   return or(owned, sharedInbound) ?? owned;
+}
+
+/**
+ * 只用于已限定「inbound + 未删除」的查询：可见地址集合 = 认领 ∪ 分享，用 UNION 代替 OR。
+ * 分享分支本身要求 inbound + 未删除，外层条件已覆盖，语义与 scopeCondition 一致；
+ * 去掉 OR 后规划器才能按地址逐个走 idx_messages_visible，而不是扫全站未删除邮件。
+ */
+function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess): SQL {
+  if (scope === 'unclaimed' || access === 'owned') return scopeCondition(db, scope, access);
+  const owned = db.select({ address: mailboxes.address }).from(mailboxes).where(eq(mailboxes.userId, scope.ownerId));
+  return inArray(messages.address, union(owned, sharedAddressQuery(db, scope.ownerId)));
 }
 
 
@@ -314,7 +339,7 @@ export async function findNextMessage(
 
 /**
  * 收件箱未读数：口径同 /inbox（scope=mine + inbound + 未读），一条 COUNT 查询。
- * 复用 listMessages 的可见性逻辑（resolveScope/scopeCondition），避免条件漂移；
+ * 复用 listMessages 的可见性逻辑（resolveScope + 地址集合形式的 scopeCondition），避免条件漂移；
  * admin 也按 scope=mine 只数自己认领地址（个人角标，非全站）。
  */
 export async function countUnread(env: Env, userId: number, role: Role): Promise<number> {
@@ -326,7 +351,7 @@ export async function countUnread(env: Env, userId: number, role: Role): Promise
     .from(messages)
     .where(
       and(
-        scopeCondition(db, scope, shareAccess(viewer, scope)),
+        inboxScopeCondition(db, scope, shareAccess(viewer, scope)),
         eq(messages.direction, 'inbound'),
         eq(messages.isRead, false),
         isNull(messages.deletedAt),
@@ -373,11 +398,17 @@ function normalizeSubject(subject: string): string {
     .toLowerCase();
 }
 
-/** 会话线程：同一归一化主题、可见范围内的邮件，按时间正序 */
+/**
+ * 会话线程：同一归一化主题、可见范围内的邮件，按时间正序。
+ * 每轮先用 message_id / in_reply_to 两条各自走索引的子查询 UNION 出候选 id，
+ * 再套未删除与可见性条件；原先 OR 叠加可见性 OR 会让规划器放弃索引、每轮扫全表并读出正文。
+ */
 export async function getThread(env: Env, viewer: Viewer, id: number): Promise<MessageSummary[]> {
   const db = createDb(env);
-  const target = await loadVisible(env, viewer, id);
-  const summarizeRows = async (rows: MessageRow[]) => {
+  const target = await db.select(threadSelection).from(messages).where(eq(messages.id, id)).get();
+  if (!target) throw new AppError('not_found', '邮件不存在');
+  await assertVisible(db, viewer, target);
+  const summarizeRows = async (rows: ThreadRow[]) => {
     const ids = rows.map((r) => r.id);
     const [attSet, starSet] = await Promise.all([
       attachmentFlags(db, ids),
@@ -387,9 +418,9 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
   };
   const scope = await threadScope(db, viewer, target);
   const access = shareAccess(viewer, scope);
-  const related = new Map<number, MessageRow>([[target.id, target]]);
+  const related = new Map<number, ThreadRow>([[target.id, target]]);
   const messageKeys = new Set<string>();
-  const addKeys = (row: MessageRow) => {
+  const addKeys = (row: ThreadRow) => {
     if (row.messageId) messageKeys.add(row.messageId);
     if (row.inReplyTo) messageKeys.add(row.inReplyTo);
     for (const ref of row.references.match(/<[^>]+>/g) ?? []) messageKeys.add(ref);
@@ -397,17 +428,22 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
   addKeys(target);
 
   // 优先按标准邮件头构建连通分量，最多扩展 10 轮/100 封，避免同主题邮件误合并。
+  // 每批 40 个键在两条子查询里各绑定一次（80 个），加上可见性参数仍在 D1 的 100 个上限内。
   for (let round = 0; round < 10 && messageKeys.size > 0 && related.size < 100; round++) {
     let changed = false;
     for (const keys of chunk([...messageKeys], 40)) {
+      const candidates = union(
+        db.select({ id: messages.id }).from(messages).where(inArray(messages.messageId, keys)),
+        db.select({ id: messages.id }).from(messages).where(inArray(messages.inReplyTo, keys)),
+      );
       const rows = await db
-        .select()
+        .select(threadSelection)
         .from(messages)
         .where(
           and(
-            scopeCondition(db, scope, access),
+            inArray(messages.id, candidates),
             isNull(messages.deletedAt),
-            or(inArray(messages.messageId, keys), inArray(messages.inReplyTo, keys)),
+            scopeCondition(db, scope, access),
           ),
         )
         .orderBy(asc(messages.id))
@@ -432,7 +468,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
 
   const windowMs = 30 * 24 * 60 * 60 * 1000;
   const rows = await db
-    .select()
+    .select(threadSelection)
     .from(messages)
     .where(
       and(
@@ -463,21 +499,18 @@ async function isAddressClaimed(db: Db, address: string): Promise<boolean> {
  * - 其余（含 admin 裸开无 query）→ 自己认领的地址，外加分享给自己的未删除收件
  * - admin 无 scope 时额外允许未认领
  */
-async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
-  const db = createDb(env);
-  const row = await db.select().from(messages).where(eq(messages.id, id)).get();
-  if (!row) throw new AppError('not_found', '邮件不存在');
+async function assertVisible(db: Db, viewer: Viewer, row: VisibilityRow): Promise<void> {
   const scope = resolveScope(viewer);
   if (scope === 'unclaimed') {
     if (await isAddressClaimed(db, row.address)) throw new AppError('not_found', '邮件不存在');
-    return row;
+    return;
   }
   const owned = await db
     .select({ id: mailboxes.id })
     .from(mailboxes)
     .where(and(eq(mailboxes.userId, scope.ownerId), eq(mailboxes.address, row.address)))
     .get();
-  if (owned) return row;
+  if (owned) return;
   if (shareAccess(viewer, scope) === 'readable' && row.direction === 'inbound' && row.deletedAt === null) {
     const shared = await db
       .select({ id: mailboxShares.mailboxId })
@@ -493,16 +526,25 @@ async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<Messag
         ),
       )
       .get();
-    if (shared) return row;
+    if (shared) return;
   }
   if (viewer.role === 'admin' && viewer.scope === undefined && !(await isAddressClaimed(db, row.address))) {
-    return row;
+    return;
   }
   throw new AppError('not_found', '邮件不存在');
 }
 
+/** 详情需要完整行（含正文）；只做可见性判定的调用方用 assertVisible 并自选列 */
+async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
+  const db = createDb(env);
+  const row = await db.select().from(messages).where(eq(messages.id, id)).get();
+  if (!row) throw new AppError('not_found', '邮件不存在');
+  await assertVisible(db, viewer, row);
+  return row;
+}
+
 /** 详情线程跟目标邮件同一可见桶，避免 admin 裸开未认领信时线程掉回「自己认领」 */
-async function threadScope(db: Db, viewer: Viewer, target: MessageRow): Promise<Scope> {
+async function threadScope(db: Db, viewer: Viewer, target: { address: string }): Promise<Scope> {
   const scope = resolveScope(viewer);
   if (scope === 'unclaimed') return 'unclaimed';
   if (viewer.role === 'admin' && viewer.scope === undefined && !(await isAddressClaimed(db, target.address))) {
@@ -569,9 +611,10 @@ export async function getMessageDetail(
 
   return {
     ...summarize(row, attRows.length > 0, starSet.has(id)),
+    // 只看正文前 16KB：验证码总在开头附近，超长营销邮件不必每次打开都全文扫描
     verificationCode: resolveVerificationCode(
       row.subject,
-      bodyText || htmlToText(bodyHtml),
+      (bodyText || htmlToText(bodyHtml)).slice(0, CODE_SCAN_BODY_CHARS),
       row.verificationCode,
     ),
     recipients: row.recipients as MessageRecipients,
@@ -589,7 +632,14 @@ export async function getRawMessageObject(
   viewer: Viewer,
   id: number,
 ): Promise<R2ObjectBody | null> {
-  const row = await loadVisible(env, viewer, id);
+  const db = createDb(env);
+  const row = await db
+    .select({ address: messages.address, direction: messages.direction, deletedAt: messages.deletedAt, rawR2Key: messages.rawR2Key })
+    .from(messages)
+    .where(eq(messages.id, id))
+    .get();
+  if (!row) throw new AppError('not_found', '邮件不存在');
+  await assertVisible(db, viewer, row);
   if (!row.rawR2Key) return null;
   return env.r2.get(row.rawR2Key);
 }
@@ -603,7 +653,13 @@ export async function loadAttachmentForViewer(
   const db = createDb(env);
   const att = await db.select().from(attachmentsTable).where(eq(attachmentsTable.id, attId)).get();
   if (!att) throw new AppError('not_found', '附件不存在');
-  await loadVisible(env, viewer, att.messageId);
+  const owner = await db
+    .select({ address: messages.address, direction: messages.direction, deletedAt: messages.deletedAt })
+    .from(messages)
+    .where(eq(messages.id, att.messageId))
+    .get();
+  if (!owner) throw new AppError('not_found', '邮件不存在');
+  await assertVisible(db, viewer, owner);
   return att;
 }
 
@@ -646,7 +702,7 @@ export async function markAllRead(env: Env, viewer: Viewer): Promise<number> {
     .set({ isRead: true })
     .where(
       and(
-        scopeCondition(db, scope, shareAccess(viewer, scope)),
+        inboxScopeCondition(db, scope, shareAccess(viewer, scope)),
         eq(messages.direction, 'inbound'),
         eq(messages.isRead, false),
         isNull(messages.deletedAt),

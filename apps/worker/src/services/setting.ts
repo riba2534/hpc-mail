@@ -8,7 +8,7 @@ import {
 import { AppError } from '../lib/errors.js';
 import { createDb } from '../db/client.js';
 import { settings as settingsTable } from '../db/schema.js';
-import type { Env } from '../types.js';
+import type { Env, ExecCtx } from '../types.js';
 
 const CACHE_KEY = 'setting-cache';
 const CACHE_TTL_SECONDS = 60;
@@ -32,30 +32,57 @@ export async function getSettingsFresh(env: Env): Promise<Settings> {
   return merged;
 }
 
-/** 读设置（KV 缓存 60s，失败降级直读 DB，再失败用默认值——收件不因配置故障丢信） */
-export async function getSettings(env: Env): Promise<Settings> {
+/**
+ * isolate 内存缓存：同一 isolate 内 15s 复用，避免每个请求都跨区读 KV。
+ * 只缓存「非强一致」读路径；认领/域名修订等仍走 getSettingsFresh 直读 D1。
+ */
+const MEMORY_TTL_MS = 15_000;
+let memory: { value: Settings; expiresAt: number } | null = null;
+
+/** 不阻塞响应的后台写：有 ctx 时交给 waitUntil，否则 fire-and-forget 并吞掉错误 */
+function inBackground(ctx: ExecCtx | null | undefined, task: Promise<unknown>): void {
+  const guarded = task.catch(() => {
+    // 缓存写失败无所谓
+  });
+  if (ctx) ctx.waitUntil(guarded);
+}
+
+/**
+ * 读设置：内存缓存 15s → KV 缓存 60s → 直读 D1，再失败用默认值（收件不因配置故障丢信）。
+ * KV 回填放到 waitUntil，不阻塞响应。
+ */
+export async function getSettings(env: Env, ctx?: ExecCtx | null): Promise<Settings> {
+  const now = Date.now();
+  if (memory && memory.expiresAt > now) return memory.value;
   try {
     const cached = await env.kv.get(CACHE_KEY, { type: 'json' });
     // 与默认值浅合并：部署切换期缓存可能是旧代码写的、缺少新增的顶层键，
     // 直接返回会让下游 settings.X.Y 解引用 undefined 报 500。合并保证每个顶层键都在。
-    if (cached) return { ...DEFAULT_SETTINGS, ...(cached as Partial<Settings>) };
+    if (cached) {
+      const value = { ...DEFAULT_SETTINGS, ...(cached as Partial<Settings>) };
+      memory = { value, expiresAt: now + MEMORY_TTL_MS };
+      return value;
+    }
   } catch {
     // 缓存读失败，继续直读 DB
   }
   try {
     const fresh = await getSettingsFresh(env);
-    try {
-      await env.kv.put(CACHE_KEY, JSON.stringify(fresh), { expirationTtl: CACHE_TTL_SECONDS });
-    } catch {
-      // 缓存写失败无所谓
-    }
+    memory = { value: fresh, expiresAt: now + MEMORY_TTL_MS };
+    inBackground(ctx, env.kv.put(CACHE_KEY, JSON.stringify(fresh), { expirationTtl: CACHE_TTL_SECONDS }));
     return fresh;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
 }
 
+/** 清空本 isolate 的内存缓存（其他 isolate 最长 15s 后自然过期） */
+export function invalidateSettingsMemory(): void {
+  memory = null;
+}
+
 export async function invalidateSettingsCache(env: Env): Promise<void> {
+  invalidateSettingsMemory();
   try {
     await env.kv.delete(CACHE_KEY);
   } catch {

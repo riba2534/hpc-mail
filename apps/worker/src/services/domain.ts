@@ -1,4 +1,6 @@
 import type { Settings } from '@hpc-mail/shared';
+import { inArray } from 'drizzle-orm';
+import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
 import { mailboxes } from '../db/schema.js';
 import type { Env } from '../types.js';
@@ -48,12 +50,23 @@ export function domainPerUserLimit(settings: Settings, domain: string): number {
 /**
  * 站内投递 / 已领地址发件白名单：settings 列表 ∪ 已有 mailbox 的 domain。
  * 管理员从列表拿掉某个域后，已认领用户仍应按站内互投，而不是被当成外发。
+ * 传入 candidates 时只核对这些域是否有认领地址（走 idx_mailboxes_domain），结果对这些域的
+ * 判定与全量一致；不传则读出全部认领域名。
  */
-export async function getRoutableDomains(env: Env, settings?: Settings): Promise<string[]> {
+export async function getRoutableDomains(env: Env, settings?: Settings, candidates?: string[]): Promise<string[]> {
   const listed = await getDomains(env, settings);
-  const db = createDb(env);
-  const rows = await db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes).all();
   const set = new Set(listed);
+  const db = createDb(env);
+  if (candidates) {
+    const unknown = [...new Set(candidates.filter((domain) => domain && !set.has(domain)))];
+    for (const batch of chunk(unknown)) {
+      const rows = await db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes)
+        .where(inArray(mailboxes.domain, batch)).all();
+      for (const row of rows) set.add(row.domain);
+    }
+    return [...set];
+  }
+  const rows = await db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes).all();
   for (const row of rows) set.add(row.domain);
   return [...set];
 }

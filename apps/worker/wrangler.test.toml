@@ -7,7 +7,7 @@ compatibility_date = "2025-06-04"
 
 [vars]
 # 域名由 settings.domains.list 维护，测试在 setup 里 updateSettings 设置
-ai_model = "@cf/meta/llama-3.1-8b-instruct"
+ai_model = "@cf/meta/llama-3.1-8b-instruct-fp8"
 
 [[d1_databases]]
 binding = "db"

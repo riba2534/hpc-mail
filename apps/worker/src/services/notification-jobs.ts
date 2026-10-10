@@ -1,5 +1,7 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, lt, lte, sql } from 'drizzle-orm';
 import { normalizeEmail, getEmailDomain } from '../lib/email-address.js';
+import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
+import { chunk, d1Statement } from '../lib/d1.js';
 import type { NotificationHealth } from '@hpc-mail/shared';
 export type { NotificationHealth, NotificationDeliveryView } from '@hpc-mail/shared';
 import { createDb } from '../db/client.js';
@@ -10,10 +12,10 @@ import type { Env, ExecCtx } from '../types.js';
 import { getDomains } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
 import { resolveNotifyOwnerIds } from './mailbox.js';
-import { getUserNotifyPrefs } from './notify-prefs.js';
+import { getUserNotifyPrefs, loadNotifyOwners, type NotifyOwner } from './notify-prefs.js';
 import { NotificationDeliveryError } from './notification-http.js';
 import { sendPushDeerNotification } from './pushdeer.js';
-import { dayWindow, readCounter } from './rate-counter.js';
+import { dayWindow } from './rate-counter.js';
 import { sendNotifyWebhook, type WebhookMailPayload } from './webhook-notify.js';
 import { getJson } from './storage.js';
 
@@ -22,6 +24,8 @@ type DeliveryStatus = typeof notificationJobs.$inferSelect.status;
 type Job = typeof notificationJobs.$inferSelect;
 export interface MailNotificationInput {
   ownerIds?: number[];
+  /** 调用方已读出的归属人状态与偏好；提供时入队与即时投递不再逐个重读 */
+  owners?: Map<number, NotifyOwner>;
   message: WebhookMailPayload['message'];
   text?: string;
   html?: string;
@@ -46,7 +50,10 @@ export async function enqueueMailNotifications(
   try {
     const ownerIds = [...new Set(input.ownerIds ?? await resolveNotifyOwnerIds(env, input.message.address))];
     // 单个用户偏好读取失败不应压制其他管理员的正常通知。
-    const prefs = await Promise.allSettled(ownerIds.map(id => getUserNotifyPrefs(env, id)));
+    const owners = input.owners;
+    const prefs: PromiseSettledResult<NotifyOwner['prefs']>[] = owners
+      ? ownerIds.map((id) => ({ status: 'fulfilled', value: owners.get(id)?.prefs ?? DEFAULT_USER_NOTIFY_PREFS }))
+      : await Promise.allSettled(ownerIds.map(id => getUserNotifyPrefs(env, id)));
     const now = new Date();
     const fullBody = input.text || htmlToText(input.html || '');
     const payload = {
@@ -72,52 +79,70 @@ export async function enqueueMailNotifications(
         });
       }
     }
-    // 每条有多个 bind，必须小批次以遵守 D1 的参数上限。
+    // 每条有多个 bind，必须小批次以遵守 D1 的参数上限；全部写入与「已入队」标记合成一个事务往返。
     const db = createDb(env);
+    const statements: D1PreparedStatement[] = [];
     for (let start = 0; start < rows.length; start += 5) {
-      const inserted = await db.insert(notificationJobs).values(rows.slice(start, start + 5))
-        .onConflictDoNothing({ target: notificationJobs.dedupeKey }).returning({ id: notificationJobs.id });
-      ids.push(...inserted.map(row => row.id));
+      statements.push(d1Statement(env, db.insert(notificationJobs).values(rows.slice(start, start + 5))
+        .onConflictDoNothing({ target: notificationJobs.dedupeKey }).returning({ id: notificationJobs.id })));
     }
+    const insertCount = statements.length;
     // 只有全部偏好读取和任务写入成功才标记；部分任务可由 cron 按快照补齐，已有 dedupe 不重复发。
     if (prefs.every(result => result.status === 'fulfilled')) {
-      await db.update(messages).set({ notificationsQueuedAt: now })
-        .where(and(eq(messages.id, input.message.id), isNotNull(messages.notifyOwnerIds)));
+      statements.push(d1Statement(env, db.update(messages).set({ notificationsQueuedAt: now })
+        .where(and(eq(messages.id, input.message.id), isNotNull(messages.notifyOwnerIds)))));
+    }
+    if (statements.length) {
+      const results = await env.db.batch<{ id: number }>(statements);
+      for (const result of results.slice(0, insertCount)) ids.push(...result.results.map(row => Number(row.id)));
     }
   } catch {
     console.error('邮件通知任务保存失败（邮件已入库）');
   }
   if (ctx && ids.length) {
-    ctx.waitUntil(processNotificationJobs(env, { jobIds: ids }).catch(() => console.error('通知队列处理失败')));
+    ctx.waitUntil(processNotificationJobs(env, { jobIds: ids, owners: input.owners })
+      .catch(() => console.error('通知队列处理失败')));
   }
   return ids;
 }
 
-/** 只恢复新收件快照；历史无快照邮件不重新归属，也不会在用户认领后补推给新主人。 */
+/**
+ * 只恢复新收件快照；历史无快照邮件不重新归属，也不会在用户认领后补推给新主人。
+ * 规划器在无统计信息时会选 direction/deleted_at 类索引扫遍全部收件，必须 INDEXED BY
+ * 部分索引 idx_messages_notification_outbox（只含待补录行）。先取元数据，正文逐条再读，
+ * 避免一次把多封大正文拉进内存。
+ */
 export async function repairUnqueuedNotifications(env: Env, options: { limit?: number } = {}): Promise<number> {
-  const rows = await createDb(env).select({
-    id: messages.id, address: messages.address, fromAddress: messages.fromAddress, fromName: messages.fromName,
-    subject: messages.subject, verificationCode: messages.verificationCode, preview: messages.preview,
-    createdAt: messages.createdAt, bodyText: messages.bodyText, bodyHtml: messages.bodyHtml, bodyR2Key: messages.bodyR2Key,
-    notifyOwnerIds: messages.notifyOwnerIds,
-  }).from(messages).where(and(
-    eq(messages.direction, 'inbound'), inArray(messages.status, ['received', 'degraded']),
-    isNotNull(messages.notifyOwnerIds), isNull(messages.notificationsQueuedAt), isNull(messages.deletedAt),
-  )).orderBy(asc(messages.createdAt), asc(messages.id)).limit(Math.max(1, Math.min(100, options.limit ?? 30)));
+  const limit = Math.max(1, Math.min(100, options.limit ?? 30));
+  const { results } = await env.db.prepare(`SELECT id, address, from_address, from_name, subject, verification_code,
+      preview, created_at, notify_owner_ids
+    FROM messages INDEXED BY idx_messages_notification_outbox
+    WHERE notify_owner_ids IS NOT NULL AND notifications_queued_at IS NULL AND deleted_at IS NULL
+      AND direction = 'inbound' AND status IN ('received', 'degraded')
+    ORDER BY created_at, id LIMIT ?`).bind(limit).all<{
+      id: number; address: string; from_address: string; from_name: string; subject: string;
+      verification_code: string; preview: string; created_at: number; notify_owner_ids: string;
+    }>();
   let queued = 0;
-  for (const row of rows) {
-    if (!Array.isArray(row.notifyOwnerIds) || row.notifyOwnerIds.some(id => !Number.isInteger(id) || id <= 0)) continue;
+  for (const row of results) {
+    let ownerIds: unknown;
+    try { ownerIds = JSON.parse(row.notify_owner_ids); } catch { continue; }
+    if (!Array.isArray(ownerIds) || ownerIds.some(id => !Number.isInteger(id) || id <= 0)) continue;
     try {
-      let text = row.bodyText;
-      let html = row.bodyHtml;
-      if (row.bodyR2Key) {
-        const body = await getJson<{ text?: string; html?: string }>(env, row.bodyR2Key);
-        if (typeof body?.text === 'string') text = body.text;
-        if (typeof body?.html === 'string') html = body.html;
+      const body = await env.db.prepare('SELECT body_text, body_html, body_r2_key FROM messages WHERE id = ?')
+        .bind(row.id).first<{ body_text: string; body_html: string; body_r2_key: string | null }>();
+      if (!body) continue;
+      let text = body.body_text;
+      let html = body.body_html;
+      if (body.body_r2_key) {
+        const full = await getJson<{ text?: string; html?: string }>(env, body.body_r2_key);
+        if (typeof full?.text === 'string') text = full.text;
+        if (typeof full?.html === 'string') html = full.html;
       }
-      queued += (await enqueueMailNotifications(env, null, { ownerIds: row.notifyOwnerIds,
-        message: { id: row.id, address: row.address, fromAddress: row.fromAddress, fromName: row.fromName,
-          subject: row.subject, verificationCode: row.verificationCode, preview: row.preview, createdAt: row.createdAt.toISOString() },
+      queued += (await enqueueMailNotifications(env, null, { ownerIds: ownerIds as number[],
+        message: { id: row.id, address: row.address, fromAddress: row.from_address, fromName: row.from_name,
+          subject: row.subject, verificationCode: row.verification_code, preview: row.preview,
+          createdAt: new Date(Number(row.created_at)).toISOString() },
         text, html,
       })).length;
     } catch {
@@ -127,10 +152,10 @@ export async function repairUnqueuedNotifications(env: Env, options: { limit?: n
   return queued;
 }
 
-async function deliver(env: Env, job: Job): Promise<boolean> {
-  const user = await createDb(env).select({ status: users.status }).from(users).where(eq(users.id, job.userId)).get();
-  if (!user || user.status !== 'active') return false;
-  const prefs = await getUserNotifyPrefs(env, job.userId);
+async function deliver(env: Env, job: Job, owners?: Map<number, NotifyOwner>): Promise<boolean> {
+  const owner = owners?.get(job.userId) ?? (await loadNotifyOwners(env, [job.userId])).get(job.userId);
+  if (!owner || !owner.active) return false;
+  const prefs = owner.prefs;
   if (job.channel === 'forward' || !prefs[job.channel].enabled) return false;
   const payload = job.payload as unknown as Payload;
   if (!payload.message || typeof payload.body !== 'string') {
@@ -141,6 +166,7 @@ async function deliver(env: Env, job: Job): Promise<boolean> {
     subject: message.subject, fromAddress: message.fromAddress, fromName: message.fromName,
     toAddress: message.address, code: message.verificationCode,
     body: payload.body + (payload.bodyTruncated ? '\n…（正文过长，已截断）' : ''),
+    link: env.site_origin ? `${env.site_origin.replace(/\/+$/, '')}/mail/${message.id}` : undefined,
   };
   if (job.channel === 'feishu') {
     await sendFeishuNotification(prefs.feishu, info, { throwOnError: true, attempts: 1 });
@@ -163,22 +189,26 @@ export interface NotificationProcessResult {
 /** 原子认领避免并发重复投递；不确定的旧 processing 不自动重发，避免误报/重复通知。 */
 export async function processNotificationJobs(
   env: Env,
-  options: { limit?: number; concurrency?: number; jobIds?: number[] } = {},
+  options: { limit?: number; concurrency?: number; jobIds?: number[]; owners?: Map<number, NotifyOwner> } = {},
 ): Promise<NotificationProcessResult> {
   const db = createDb(env);
   const now = new Date();
-  await db.update(notificationJobs).set({
+  const expireStale = db.update(notificationJobs).set({
     status: 'unknown', lastError: '任务处理超时，投递结果未确认，请检查后手动重试', updatedAt: now,
   }).where(and(eq(notificationJobs.status, 'processing'), lt(notificationJobs.updatedAt, new Date(now.getTime() - PROCESSING_LEASE_MS))));
   const result: NotificationProcessResult = { processed: 0, succeeded: 0, failed: 0, deferred: 0, skipped: 0 };
-  if (options.jobIds && !options.jobIds.length) return result;
+  if (options.jobIds && !options.jobIds.length) {
+    await expireStale;
+    return result;
+  }
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 8)));
   const concurrency = Math.max(1, Math.min(4, Math.floor(options.concurrency ?? 4)));
-  const candidates = await db.select({ id: notificationJobs.id }).from(notificationJobs).where(and(
+  // 过期租约标记与候选查询同一往返
+  const [, candidates] = await db.batch([expireStale, db.select({ id: notificationJobs.id }).from(notificationJobs).where(and(
     eq(notificationJobs.status, 'pending'), lte(notificationJobs.nextAttemptAt, now),
     inArray(notificationJobs.channel, [...MAIL_CHANNELS]),
     options.jobIds ? inArray(notificationJobs.id, options.jobIds.slice(0, 90)) : undefined,
-  )).orderBy(asc(notificationJobs.nextAttemptAt), asc(notificationJobs.id)).limit(limit);
+  )).orderBy(asc(notificationJobs.nextAttemptAt), asc(notificationJobs.id)).limit(limit)]);
   let index = 0;
   const workers = await Promise.allSettled(Array.from({ length: Math.min(concurrency, candidates.length) }, async () => {
     while (index < candidates.length) {
@@ -195,7 +225,7 @@ export async function processNotificationJobs(
       let lastHttpStatus: number | null = null;
       let nextAttemptAt = new Date();
       try {
-        if (!await deliver(env, claimed)) {
+        if (!await deliver(env, claimed, options.owners)) {
           status = 'skipped';
           lastError = '用户或该通知通道已停用';
           result.skipped += 1;
@@ -265,7 +295,7 @@ export async function retryNotificationJob(env: Env, userId: number, id: number)
   if (!reset.length) throw new AppError('conflict', '通知任务状态已改变');
 }
 
-export async function cleanupNotificationJobs(env: Env, retentionDays = 30): Promise<void> {
+export async function cleanupNotificationJobs(env: Env, retentionDays = 30): Promise<number> {
   const db = createDb(env);
   const before = new Date(Date.now() - Math.max(1, retentionDays) * 86_400_000);
   const stale = await db.select({ id: notificationJobs.id }).from(notificationJobs)
@@ -274,24 +304,39 @@ export async function cleanupNotificationJobs(env: Env, retentionDays = 30): Pro
   for (let start = 0; start < stale.length; start += 90) {
     await db.delete(notificationJobs).where(inArray(notificationJobs.id, stale.slice(start, start + 90).map(row => row.id)));
   }
+  return stale.length;
 }
 
+/**
+ * 通知健康：偏好读取与一个 batch（计数、各通道最新一条、角色、认领地址）并行，
+ * 再一次性读出全部转发计数；往返从每通道/每目标一次降到 3 次以内。
+ */
 export async function getNotificationHealth(env: Env, userId: number): Promise<NotificationHealth> {
   const db = createDb(env);
-  const prefs = await getUserNotifyPrefs(env, userId);
-  const counts = await db.select({ channel: notificationJobs.channel,
-    pendingCount: sql<number>`sum(case when ${notificationJobs.status} in ('pending','processing') then 1 else 0 end)`,
-    failedCount: sql<number>`sum(case when ${notificationJobs.status} in ('failed','unknown') then 1 else 0 end)`,
-  }).from(notificationJobs).where(eq(notificationJobs.userId, userId)).groupBy(notificationJobs.channel);
-  const channels = await Promise.all([...MAIL_CHANNELS, 'forward' as const].map(async channel => {
-    const latest = await db.select({
-      id: notificationJobs.id, messageId: notificationJobs.messageId, target: notificationJobs.target,
-      status: notificationJobs.status, attempts: notificationJobs.attempts, maxAttempts: notificationJobs.maxAttempts,
-      lastError: notificationJobs.lastError, lastHttpStatus: notificationJobs.lastHttpStatus,
-      createdAt: notificationJobs.createdAt, updatedAt: notificationJobs.updatedAt,
-      nextAttemptAt: notificationJobs.nextAttemptAt, lastAttemptAt: notificationJobs.lastAttemptAt,
-    }).from(notificationJobs).where(and(eq(notificationJobs.userId, userId), eq(notificationJobs.channel, channel)))
-      .orderBy(desc(notificationJobs.id)).get();
+  const channelsAll = [...MAIL_CHANNELS, 'forward' as const];
+  const latestQuery = (channel: Channel) => db.select({
+    id: notificationJobs.id, messageId: notificationJobs.messageId, target: notificationJobs.target,
+    status: notificationJobs.status, attempts: notificationJobs.attempts, maxAttempts: notificationJobs.maxAttempts,
+    lastError: notificationJobs.lastError, lastHttpStatus: notificationJobs.lastHttpStatus,
+    createdAt: notificationJobs.createdAt, updatedAt: notificationJobs.updatedAt,
+    nextAttemptAt: notificationJobs.nextAttemptAt, lastAttemptAt: notificationJobs.lastAttemptAt,
+  }).from(notificationJobs).where(and(eq(notificationJobs.userId, userId), eq(notificationJobs.channel, channel)))
+    .orderBy(desc(notificationJobs.id)).limit(1);
+  const [prefs, [counts, latestFeishu, latestPushdeer, latestWebhook, latestForward, user, owned]] = await Promise.all([
+    getUserNotifyPrefs(env, userId),
+    db.batch([
+      db.select({ channel: notificationJobs.channel,
+        pendingCount: sql<number>`sum(case when ${notificationJobs.status} in ('pending','processing') then 1 else 0 end)`,
+        failedCount: sql<number>`sum(case when ${notificationJobs.status} in ('failed','unknown') then 1 else 0 end)`,
+      }).from(notificationJobs).where(eq(notificationJobs.userId, userId)).groupBy(notificationJobs.channel),
+      latestQuery('feishu'), latestQuery('pushdeer'), latestQuery('webhook'), latestQuery('forward'),
+      db.select({ role: users.role }).from(users).where(eq(users.id, userId)).limit(1),
+      db.select({ address: mailboxes.address }).from(mailboxes).where(eq(mailboxes.userId, userId)),
+    ]),
+  ]);
+  const latestByChannel = { feishu: latestFeishu[0], pushdeer: latestPushdeer[0], webhook: latestWebhook[0], forward: latestForward[0] };
+  const channels = channelsAll.map(channel => {
+    const latest = latestByChannel[channel];
     const count = counts.find(row => row.channel === channel);
     return {
       channel, enabled: prefs[channel].enabled,
@@ -299,25 +344,43 @@ export async function getNotificationHealth(env: Env, userId: number): Promise<N
         nextAttemptAt: latest.nextAttemptAt.toISOString(), lastAttemptAt: latest.lastAttemptAt?.toISOString() ?? null } : null,
       pendingCount: Number(count?.pendingCount || 0), failedCount: Number(count?.failedCount || 0),
     };
-  }));
+  });
   const now = new Date();
   const window = dayWindow(now);
-  const user = await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).get();
-  const owned = await db.select({ address: mailboxes.address }).from(mailboxes).where(eq(mailboxes.userId, userId));
   const domains = [...new Set([
     ...owned.map(row => getEmailDomain(row.address)),
-    ...(user?.role === 'admin' ? await getDomains(env) : []),
+    ...(user[0]?.role === 'admin' ? await getDomains(env) : []),
   ])];
+  const targets = [...new Set(prefs.forward.addresses.map(normalizeEmail))];
+  const counters = await readForwardCounters(env, window, targets, domains);
   return { channels, forward: {
     domainLimit: FORWARD_DOMAIN_DAILY_LIMIT, targetLimit: FORWARD_TARGET_DAILY_LIMIT,
     windowEndsAt: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString(),
-    targets: await Promise.all([...new Set(prefs.forward.addresses.map(normalizeEmail))].map(async address => {
-      const { count } = await readCounter(env, 'fwd-target', address, window);
+    targets: targets.map(address => {
+      const count = counters.get(`fwd-target\n${address}`) ?? 0;
       return { address, attempts: count, remaining: Math.max(0, FORWARD_TARGET_DAILY_LIMIT - count) };
-    })),
-    domains: await Promise.all(domains.map(async domain => {
-      const { count } = await readCounter(env, 'fwd-domain', domain, window);
+    }),
+    domains: domains.map(domain => {
+      const count = counters.get(`fwd-domain\n${domain}`) ?? 0;
       return { domain, attempts: count, remaining: Math.max(0, FORWARD_DOMAIN_DAILY_LIMIT - count) };
-    })),
+    }),
   } };
+}
+
+/** 当日转发计数：按 (scope, subject) 一次批量读出，主键查找，键为 `scope\nsubject` */
+async function readForwardCounters(env: Env, window: number, targets: string[], domains: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const keys = [
+    ...targets.map(subject => ['fwd-target', subject] as const),
+    ...domains.map(subject => ['fwd-domain', subject] as const),
+  ];
+  if (!keys.length) return out;
+  // 每个键 2 个绑定 + window 1 个，单批 45 个键不超过 D1 的 100 参数上限
+  const statements = chunk(keys, 45).map(batch => env.db.prepare(`SELECT scope, subject, count FROM rate_counters
+    WHERE "window" = ? AND (${batch.map(() => '(scope = ? AND subject = ?)').join(' OR ')})`)
+    .bind(window, ...batch.flat()));
+  for (const result of await env.db.batch<{ scope: string; subject: string; count: number }>(statements)) {
+    for (const row of result.results) out.set(`${row.scope}\n${row.subject}`, Number(row.count));
+  }
+  return out;
 }

@@ -12,12 +12,23 @@ workers_dev = true
 [observability]
 enabled = true
 
+[observability.traces]
+enabled = true
+
+# Placement（可选，默认不启用）：API 请求每次要多次往返 D1，Worker 若在离 D1 主库很远的 colo
+# 执行，每次往返都要跨洋。可把 Worker 固定到 D1 主库附近的云区域，例如主库在 APAC（新加坡）时：
+#   [placement]
+#   region = "aws:ap-southeast-1"
+# 各部署的 D1 位置不同，模板不写死；GitHub Actions 部署时设置 Variable PLACEMENT_REGION 即由 CI 追加。
+# 页面与现存哈希资源仍在边缘直出（scripts/inject-asset-routes.mjs 注入排除规则）；
+# email/scheduled handler 不受 placement 影响。
+
 [triggers]
 crons = ["*/5 * * * *", "0 16 * * *"]
 
 [vars]
 # 系统域名不再写死在 vars，改由 settings.domains.list（管理端维护）；见 services/domain.ts
-ai_model = "@cf/meta/llama-3.1-8b-instruct"
+ai_model = "@cf/meta/llama-3.1-8b-instruct-fp8"
 site_origin = "https://hpc.email"
 build_sha = "local"
 
@@ -47,6 +58,7 @@ binding = "assets"
 directory = "./dist"
 not_found_handling = "single-page-application"
 # Agent 文档必须经过 Worker：补 UTF-8，并阻止缺失文档回退为成功的 SPA HTML。
+# "/assets/*" 让缺失的哈希资源进 Worker 返回 404；现存文件的 "!/assets/<文件>" 排除规则由部署时注入。
 run_worker_first = ["/api", "/api/*", "/v1", "/v1/*", "/skill.md", "/references/*", "/llms.txt", "/assets/*"]
 
 # Secrets（wrangler secret put）：

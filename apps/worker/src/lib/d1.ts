@@ -19,3 +19,12 @@ export function chunk<T>(arr: readonly T[], size: number = D1_ID_BATCH): T[][] {
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
+
+/**
+ * drizzle 查询构建器 → 原生 D1 语句，供 `env.db.batch` 合并往返。
+ * 不用 drizzle 的 db.batch：语句准备阶段抛错时它会留下一个未处理的 rejection。
+ */
+export function d1Statement(env: { db: D1Database }, query: { toSQL(): { sql: string; params: unknown[] } }): D1PreparedStatement {
+  const { sql, params } = query.toSQL();
+  return env.db.prepare(sql).bind(...params);
+}

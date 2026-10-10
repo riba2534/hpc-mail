@@ -1,4 +1,4 @@
-import { createApp } from './app.js';
+import { createApp, isApiPath } from './app.js';
 import { handleInbound } from './services/inbound.js';
 import { runScheduled } from './services/scheduled.js';
 import type { Env } from './types.js';
@@ -33,12 +33,61 @@ function withSecurityHeaders(res: Response, extra?: Record<string, string>): Res
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
+const SLOW_REQUEST_MS = 1500;
+
+/**
+ * 只计数、不代理语句：prepare/exec 各算一次往返，batch 整体算一次（抵消其中语句的 prepare）。
+ * drizzle 对无参数语句在 batch 里会重复 prepare，故结果是近似值。
+ */
+function countingDb(db: D1Database, stats: { d1: number }): D1Database {
+  return {
+    prepare: (query: string) => {
+      stats.d1++;
+      return db.prepare(query);
+    },
+    batch: (statements: D1PreparedStatement[]) => {
+      stats.d1 += 1 - statements.length;
+      return db.batch(statements);
+    },
+    exec: (query: string) => {
+      stats.d1++;
+      return db.exec(query);
+    },
+    dump: () => db.dump(),
+    withSession: (constraint?: Parameters<D1Database['withSession']>[0]) => db.withSession(constraint),
+  } as unknown as D1Database;
+}
+
+/** 日志里的路由：去掉查询串，数字 id 归一为 :id，避免高基数 */
+function routeLabel(pathname: string): string {
+  return pathname.replace(/\/\d+(?=\/|$)/g, '/:id');
+}
+
+async function handleApi(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+  const started = Date.now();
+  const stats = { d1: 0 };
+  let res = await app.fetch(request, { ...env, db: countingDb(env.db, stats) }, ctx);
+  const ms = Date.now() - started;
+  const d1Calls = Math.max(0, stats.d1);
+  const timing = `app;dur=${ms}, d1;desc="n=${d1Calls}"`;
+  try {
+    res.headers.append('Server-Timing', timing);
+  } catch {
+    // 不可变响应头（如透传的上游响应）复制一份再加
+    res = new Response(res.body, res);
+    res.headers.append('Server-Timing', timing);
+  }
+  if (ms > SLOW_REQUEST_MS) {
+    const colo = (request as Request & { cf?: { colo?: string } }).cf?.colo ?? '';
+    console.log(JSON.stringify({ event: 'slow_request', route: `${request.method} ${routeLabel(url.pathname)}`, status: res.status, ms, colo, d1Calls }));
+  }
+  return res;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith('/api') || url.pathname.startsWith('/v1')) {
-      return app.fetch(request, env, ctx);
-    }
+    if (isApiPath(url.pathname)) return handleApi(request, env, ctx, url);
     // 其余路径交给静态资源（SPA fallback 由 assets 处理）
     const res = await env.assets.fetch(request);
     // 缺失的哈希资源不能回退成 index.html：nosniff 下会拒绝把 HTML 当 JS 加载，

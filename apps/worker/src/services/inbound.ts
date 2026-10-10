@@ -12,18 +12,32 @@ import { htmlToText, makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByAi, extractCodeByRegex } from './code-extract.js';
 import { resolveNotifyOwnerIds } from './mailbox.js';
-import { getUserNotifyPrefs } from './notify-prefs.js';
+import { loadNotifyOwners, type NotifyOwner } from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { bodyBytes, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
+import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
 
 /** 未认领 catch-all 转发必须按稳定主体限额，不能让随机 local-part 刷新额度。 */
 const DAILY_AI_EXTRACT_LIMIT = 500;
 
 const encoder = new TextEncoder();
+
+/** 附件并行写 R2 的并发上限 */
+const ATTACHMENT_UPLOAD_CONCURRENCY = 4;
+/** 附件元数据每行 7 个绑定参数，单条 INSERT 不超过 D1 的 100 参数上限 */
+const ATTACHMENT_INSERT_BATCH = 12;
+
+/** 有限并发执行；任一失败整体 reject（与串行时「任一失败即抛出」语义一致） */
+async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) await task(items[next++]!);
+  }));
+}
 
 interface ParsedAttachment {
   seq: number;
@@ -44,7 +58,7 @@ export async function handleInbound(
   env: Env,
   ctx: ExecCtx,
 ): Promise<void> {
-  const settings = await getSettings(env);
+  const settings = await getSettings(env, ctx);
 
   // 先缓冲原始 .eml（stream 只能读一次），解析与幂等摘要共用这一份字节。
   const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
@@ -89,8 +103,17 @@ export async function handleInbound(
   const sourceReferences = (email.references || '').slice(0, 4096);
   const ingestKey = await sha256Hex(`${toAddress}\n${sourceMessageId}\n${rawDigest}`);
   const db = createDb(env);
+  const duplicateColumns = {
+    id: messages.id,
+    status: messages.status,
+    errorDetail: messages.errorDetail,
+    rawR2Key: messages.rawR2Key,
+    bodyR2Key: messages.bodyR2Key,
+    deletedAt: messages.deletedAt,
+    notifyOwnerIds: messages.notifyOwnerIds,
+  };
   let duplicate = await db
-    .select()
+    .select(duplicateColumns)
     .from(messages)
     .where(eq(messages.ingestKey, ingestKey))
     .get();
@@ -142,6 +165,14 @@ export async function handleInbound(
   const size = bodyBytes(text, html) + attachmentsSize;
   const ownerIds = duplicate?.notifyOwnerIds ?? await resolveNotifyOwnerIds(env, toAddress);
 
+  const finalState = {
+    status: attachmentsDropped ? 'degraded' : 'received',
+    errorDetail: attachmentsDropped ? '部分附件超过数量或总大小上限，请下载原始邮件查看' : '',
+  };
+  // 无附件的新邮件在插入时就已完整（原文/正文已落 R2），直接写最终状态，省掉 pending → 完整的回写；
+  // 有附件时仍先写 pending，附件保存成功后再原子转为完整状态。
+  const completeOnInsert = !duplicate && parsedAttachments.length === 0;
+
   // 消息落库：失败向上抛出触发 SMTP 重试
   let inserted: { id: number } | undefined;
   if (duplicate) {
@@ -169,7 +200,7 @@ export async function handleInbound(
       messageId: sourceMessageId || null,
       inReplyTo: (email.inReplyTo || '').slice(0, 998) || null,
       references: sourceReferences,
-      status: 'pending',
+      status: completeOnInsert ? finalState.status : 'pending',
       errorDetail: attachmentsDropped ? '部分附件超过数量或总大小上限，请下载原始邮件查看' : '',
       isRead: false,
       size,
@@ -178,7 +209,7 @@ export async function handleInbound(
   } catch (error) {
     // 并发重复投递：另一请求已成功落库，确定性 R2 key 属于那条记录，不能删除。
     const raced = await db
-      .select()
+      .select(duplicateColumns)
       .from(messages)
       .where(eq(messages.ingestKey, ingestKey))
       .get();
@@ -191,16 +222,22 @@ export async function handleInbound(
   const messageId = inserted!.id;
 
   // 附件上传 + 落库：失败保留 pending，下次原始邮件重投修复同一条记录。
-  if (parsedAttachments.length) {
+  // R2 并行写（并发 4）；附件元数据与「pending → 完整」状态切换同一个 D1 事务往返。
+  const pendingRecovery = !duplicate || duplicate.status === 'pending';
+  const markComplete = db.update(messages).set(finalState).where(pendingRecovery
+    ? and(eq(messages.id, messageId), eq(messages.status, 'pending'))
+    : eq(messages.id, messageId)).returning({ id: messages.id });
+  let completed: boolean;
+  if (completeOnInsert && !duplicate) {
+    completed = true;
+  } else if (parsedAttachments.length) {
     try {
-      const rows = [];
+      const rows: typeof attachmentsTable.$inferInsert[] = [];
       for (const att of parsedAttachments) {
         const hash16 = await sha256Hex16(att.content);
-        const key = attachmentKey(messageId, att.seq, hash16, getExt(att.filename));
-        await putObject(env, key, att.content, att.mimeType);
         rows.push({
           messageId,
-          r2Key: key,
+          r2Key: attachmentKey(messageId, att.seq, hash16, getExt(att.filename)),
           filename: att.filename,
           mimeType: att.mimeType,
           size: att.size,
@@ -208,12 +245,16 @@ export async function handleInbound(
           disposition: att.disposition,
         });
       }
-      // 补偿重投不重复增加附件行；每个已保存对象有稳定 key。
-      const existing = await db.select({ key: attachmentsTable.r2Key }).from(attachmentsTable)
-        .where(eq(attachmentsTable.messageId, messageId)).all();
-      const savedKeys = new Set(existing.map(row => row.key));
-      const missing = rows.filter(row => !savedKeys.has(row.r2Key));
-      if (missing.length) await db.insert(attachmentsTable).values(missing).onConflictDoNothing();
+      await runLimited(rows.map((row, index) => ({ row, att: parsedAttachments[index]! })), ATTACHMENT_UPLOAD_CONCURRENCY,
+        ({ row, att }) => putObject(env, row.r2Key, att.content, att.mimeType));
+      // 补偿重投不重复增加附件行：(message_id, r2_key) 唯一索引去重，每个已保存对象有稳定 key。
+      const inserts = [];
+      for (let start = 0; start < rows.length; start += ATTACHMENT_INSERT_BATCH) {
+        inserts.push(db.insert(attachmentsTable).values(rows.slice(start, start + ATTACHMENT_INSERT_BATCH)).onConflictDoNothing());
+      }
+      // batch 是事务：任一附件行写入失败，状态切换一并回滚，邮件保持 pending
+      const [marked] = await db.batch([markComplete, ...inserts]);
+      completed = marked.length > 0;
     } catch (e) {
       console.error('附件入库失败:', e);
       try {
@@ -222,25 +263,21 @@ export async function handleInbound(
       } catch (updateError) { console.error('附件降级状态保存失败:', updateError); }
       throw e;
     }
+  } else {
+    completed = !!(await markComplete.get());
   }
-
-  const finalState = {
-    status: attachmentsDropped ? 'degraded' : 'received',
-    errorDetail: attachmentsDropped ? '部分附件超过数量或总大小上限，请下载原始邮件查看' : '',
-  };
-  const pendingRecovery = !duplicate || duplicate.status === 'pending';
-  const completed = await db.update(messages).set(finalState).where(pendingRecovery
-    ? and(eq(messages.id, messageId), eq(messages.status, 'pending'))
-    : eq(messages.id, messageId)).returning({ id: messages.id }).get();
   // 并发修复只有将 pending 原子转为完整状态的一方执行转发与通知。
   if (!completed) return;
   // 旧完整消息补存原文时不重复转发；pending 消息从未进入后处理，恢复后正常通知。
   if (duplicate && duplicate.status !== 'pending') return;
 
   // 转发偏好来自收件时保存的 owner 快照；偏好读取失败不影响已经可靠落库的邮件。
-  let ownerPrefs: Awaited<ReturnType<typeof getUserNotifyPrefs>>[] = [];
+  // 状态与偏好只读一次，转发、入队与即时投递共用。
+  let owners: Map<number, NotifyOwner> | undefined;
+  let ownerPrefs: NotifyOwner['prefs'][] = [];
   try {
-    ownerPrefs = await Promise.all(ownerIds.map((id) => getUserNotifyPrefs(env, id)));
+    owners = await loadNotifyOwners(env, ownerIds);
+    ownerPrefs = ownerIds.map((id) => owners!.get(id)?.prefs ?? DEFAULT_USER_NOTIFY_PREFS);
   } catch (e) {
     console.error('通知偏好解析失败，跳过转发（邮件与归属快照已入库）:', e);
   }
@@ -276,6 +313,7 @@ export async function handleInbound(
       }
       await enqueueMailNotifications(env, ctx, {
         ownerIds,
+        owners,
         message: { id: messageId, address: toAddress, fromAddress, fromName, subject,
           verificationCode: finalCode, preview, createdAt: new Date().toISOString() },
         text, html,

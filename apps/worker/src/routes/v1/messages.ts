@@ -12,7 +12,7 @@ import { Hono } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
 import { messageViewer, mutationViewer } from '../../lib/message-viewer.js';
 import { AppError } from '../../lib/errors.js';
-import { ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
+import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
 import {
   countUnread,
@@ -43,6 +43,7 @@ import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
 
 const app = new Hono<AppContext>();
+const WAIT_POLL_INTERVAL_MS = 2000;
 app.use('*', apiKeyAuth);
 
 app.get('/', async (c) => {
@@ -145,7 +146,11 @@ app.get('/unread-count', async (c) => {
   return ok(c, { unread: await countUnread(c.env, key.userId, key.role) });
 });
 
-/** afterId=0 是空邮箱基线；校验参数、范围，客户端取消后不再进行额外 D1 轮询。 */
+/**
+ * afterId=0 是空邮箱基线；校验参数、范围，客户端取消后不再进行额外 D1 轮询。
+ * 轮询配额在请求开始时按本次最多轮询次数一次性预占（1 次写），结束时退还未用部分，
+ * 不再每 2 秒写一次计数；预占超限即拒绝，并发长轮询仍受同一上限约束。
+ */
 app.get('/wait', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
@@ -153,17 +158,36 @@ app.get('/wait', async (c) => {
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
   const signal = c.req.raw.signal;
-  for (;;) {
-    if (signal.aborted) return ok(c, { message: null });
-    const rate = await bumpCounter(c.env, 'api-wait', String(key.userId), minuteWindow(1));
-    if (rate.count > MAX_WAIT_POLLS_PER_USER_PER_MINUTE) {
-      throw new AppError('rate_limited', '长轮询查询频率超限，请稍后重试');
+  if (signal.aborted) return ok(c, { message: null });
+  const subject = String(key.userId);
+  const window = minuteWindow(1);
+  const planned = Math.ceil((query.timeout * 1000) / WAIT_POLL_INTERVAL_MS) + 1;
+  const rate = await bumpCounter(c.env, 'api-wait', subject, window, planned);
+  if (rate.count > MAX_WAIT_POLLS_PER_USER_PER_MINUTE) {
+    // 被拒的这次与原先一样计 1 次，其余预占立即退还
+    await bumpCounter(c.env, 'api-wait', subject, window, 1 - planned);
+    throw new AppError('rate_limited', '长轮询查询频率超限，请稍后重试');
+  }
+  let polls = 0;
+  try {
+    for (;;) {
+      if (signal.aborted) return ok(c, { message: null });
+      polls++;
+      const found = await findNextMessage(c.env, viewer, { afterId: query.afterId, address: query.address });
+      if (found) return ok(c, { message: found });
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || polls >= planned) return ok(c, { message: null });
+      await waitForPoll(signal, Math.min(WAIT_POLL_INTERVAL_MS, remaining));
     }
-    const found = await findNextMessage(c.env, viewer, { afterId: query.afterId, address: query.address });
-    if (found) return ok(c, { message: found });
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) return ok(c, { message: null });
-    await waitForPoll(signal, Math.min(2000, remaining));
+  } finally {
+    const unused = planned - polls;
+    if (unused > 0) {
+      const refund = bumpCounter(c.env, 'api-wait', subject, window, -unused)
+        .catch(error => console.error('长轮询配额退还失败:', error));
+      const ctx = execCtx(c);
+      if (ctx) ctx.waitUntil(refund);
+      else await refund;
+    }
   }
 });
 

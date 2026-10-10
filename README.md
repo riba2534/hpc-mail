@@ -35,7 +35,7 @@
 
 ## HPC Mail 是什么
 
-HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Routing（收件）+ Workers（处理）+ D1 / KV / R2（存储）+ Workers AI（验证码兜底）** 组合出完整的多域名、多用户邮件服务——没有 SMTP 服务器要维护，没有 VPS 要续费，日常用量基本落在 Cloudflare 免费额度内。
+HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Routing（收件）+ Workers（处理）+ D1 / KV / R2（存储）+ Workers AI（验证码兜底）** 组合出完整的多域名、多用户邮件服务——没有 SMTP 服务器要维护，没有 VPS 要续费。收件、阅读和站内互投的日常用量基本落在 Cloudflare 免费额度内；外发到任意外部地址需要 Workers Paid 计划。
 
 把任意多个域名的 catch-all 指向它，**任何前缀的地址都即收即用**：`abc@your-domain.com`、`x123@another.com` 不需要预先创建，来信全部落库。用户「认领」一个地址后即可用它收发；系统自动从来信里提取验证码；全套能力同时通过网页和开放 REST API 提供——后者配有一份专门写给 AI Agent 的操作指南，让 Claude / GPT 之类的 Agent 拿到用户名密码就能自己收发邮件、读验证码。
 
@@ -45,7 +45,7 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 - **任意前缀 catch-all** — 不用预建邮箱，注册网站时现编一个地址就能收到信；接码场景开箱即用
 - **验证码自动提取** — 正则同步提取 + Workers AI 兜底，列表角标、详情高亮、一键复制，API 里直接给 `verificationCode` 字段
 - **多域名 + 多用户** — 域名由管理后台动态维护（加域名不用重新部署）；地址认领制，全局唯一，认领即可见该地址全部历史邮件
-- **完整收发** — 回复线程化（In-Reply-To/References）、转发、CC/BCC、附件；外发走 Cloudflare `send_email`，可发送任意外部地址
+- **完整收发** — 回复线程化（In-Reply-To/References）、转发、CC/BCC、附件；外发走 Cloudflare `send_email`，在 Workers Paid 计划下可发送任意外部地址
 - **转发与通知到你常用的地方** — 每个用户独立配置：转发到任意外部邮箱（原生转发失败自动降级中转重发，带防环路守卫）、推送飞书卡片、回调通用 Webhook（Bark / ntfy / 自建）
 - **AI Agent 原生** — `/skill.md` 是一份部署在站点上的 Agent 操作说明书，`/v1/openapi.json` 提供 OpenAPI 3.1 描述
 - **push 即部署** — 一条 GitHub Actions 流水线：测试门控 → 构建 → 数据库迁移 → 部署 → 迁移完整性校验 → 线上冒烟
@@ -235,6 +235,7 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 | Variable | `KV_NAMESPACE_ID` | 第 1 步输出的 KV ID |
 | Variable | `CUSTOM_DOMAIN` | 站点域名（Worker custom domain，不含 `https://`） |
 | Variable | `ADMIN_USERNAME` | 管理员用户名（3–32 位小写字母/数字/`-`/`_`） |
+| Variable（可选） | `PLACEMENT_REGION` | Worker 放置区域，填 D1 主库附近的云区域（如主库在新加坡填 `aws:ap-southeast-1`）。设置后 API 请求在数据库附近执行，跨洋访问可显著降低延迟；不设则在离用户最近的节点执行 |
 
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
 
@@ -300,14 +301,14 @@ git fetch upstream && git merge upstream/main && git push          # push 即触
 <details>
 <summary><b>需要自己的邮件服务器或第三方发信服务吗？</b></summary>
 
-不需要。收件走 Cloudflare Email Routing，外发走 Workers 的 `send_email` binding，可以发送到任意外部地址。整套系统没有传统 MTA。
+不需要。收件走 Cloudflare Email Routing，外发走 Workers 的 `send_email` binding。发往任意外部地址需要 Workers Paid 计划；Workers Free 只能发往账户内已验证的目标地址。整套系统没有传统 MTA。
 
 </details>
 
 <details>
 <summary><b>要花多少钱？</b></summary>
 
-个人用量通常落在 Cloudflare 免费额度内：Workers 免费版每天 10 万请求，D1 / KV / R2 免费层对邮箱场景都很充裕。两点注意：**Workers AI 验证码兜底默认开启**，超出免费日额度后按量计费（可在管理后台关闭，正则提取不受影响）；R2 首次开通需要绑定支付方式。域名本身的费用除外。相关限额：收件正文超过 256KB 时完整正文落 R2，附件总大小上限 50MB / 单封最多 10 个。
+收件、阅读和站内互投的个人用量通常落在 Cloudflare 免费额度内：Workers 免费版每天 10 万请求，D1 / KV / R2 免费层对邮箱场景都很充裕。外发到任意外部地址需要 Workers Paid 计划（每月含 3,000 封，超出按 $0.35 / 千封计费）；外部收件人逐个单独发送，每个收件人计 1 封。另外两点注意：**Workers AI 验证码兜底默认开启**，超出免费日额度后按量计费（可在管理后台关闭，正则提取不受影响）；R2 首次开通需要绑定支付方式。域名本身的费用除外。相关限额：收件正文超过 256KB 时完整正文落 R2，附件总大小上限 50MB / 单封最多 10 个。
 
 </details>
 

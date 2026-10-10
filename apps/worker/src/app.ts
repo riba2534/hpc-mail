@@ -22,6 +22,11 @@ import v1 from './routes/v1/index.js';
 import { buildSessionOpenApiSpec } from './routes/api-openapi.js';
 import type { AppContext } from './types.js';
 
+/** 只认 `/api`、`/v1` 本身或其子路径；`/api-keys` 之类前端路由仍交给 SPA */
+export function isApiPath(pathname: string): boolean {
+  return pathname === '/api' || pathname.startsWith('/api/') || pathname === '/v1' || pathname.startsWith('/v1/');
+}
+
 export function createApp() {
   const app = new Hono<AppContext>();
   app.use('*', requestId);

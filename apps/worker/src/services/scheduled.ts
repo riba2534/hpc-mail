@@ -30,11 +30,12 @@ async function purgeMessagesWhere(env: Env, cond: SQL): Promise<number> {
   return purgeMatchingMessages(env, cond, RETENTION_BATCH);
 }
 
-/** 邮件保留清理：未认领地址 + 全局上限；各自独立 try/catch 互不影响 */
-async function runRetention(env: Env): Promise<void> {
+/** 邮件保留清理：未认领地址 + 全局上限；各自独立 try/catch 互不影响；返回删除封数 */
+async function runRetention(env: Env): Promise<number> {
   const settings = await getSettings(env);
   const { unclaimedDays, allMessagesDays } = settings.retention;
   const db = createDb(env);
+  let deleted = 0;
 
   if (unclaimedDays > 0) {
     try {
@@ -54,6 +55,7 @@ async function runRetention(env: Env): Promise<void> {
         total += n;
         if (n < RETENTION_BATCH) break;
       }
+      deleted += total;
       if (total > 0) console.log(`保留清理：删除未认领地址邮件 ${total} 封`);
     } catch (e) {
       console.error('未认领地址保留清理失败:', e);
@@ -69,15 +71,17 @@ async function runRetention(env: Env): Promise<void> {
         total += n;
         if (n < RETENTION_BATCH) break;
       }
+      deleted += total;
       if (total > 0) console.log(`保留清理：删除超期邮件 ${total} 封`);
     } catch (e) {
       console.error('全局保留清理失败:', e);
     }
   }
+  return deleted;
 }
 
 /** 草稿附件孤儿清理：上传后未发送、超过 TTL 的 draft（含未完成 multipart）→ 回收 R2 + 删行 */
-async function runDraftAttachmentCleanup(env: Env): Promise<void> {
+async function runDraftAttachmentCleanup(env: Env): Promise<number> {
   const db = createDb(env);
   const cutoff = new Date(Date.now() - DRAFT_ATTACHMENT_TTL_HOURS * 3600 * 1000);
   const stale = await db
@@ -91,7 +95,7 @@ async function runDraftAttachmentCleanup(env: Env): Promise<void> {
     .where(lt(draftAttachments.createdAt, cutoff))
     .limit(RETENTION_BATCH)
     .all();
-  if (stale.length === 0) return;
+  if (stale.length === 0) return 0;
   const cleaned: number[] = [];
   for (const s of stale) {
     if (s.uploadId && s.status === 'uploading') {
@@ -114,72 +118,89 @@ async function runDraftAttachmentCleanup(env: Env): Promise<void> {
     await db.delete(draftAttachments).where(inArray(draftAttachments.id, batch));
   }
   console.log(`草稿附件清理：删除 ${cleaned.length} 个过期草稿`);
+  return cleaned.length;
 }
 
-/** 每日清理：审计日志 90 天 + 过期限流窗口 + 邮件保留策略 */
-export async function runScheduled(env: Env, maintenance = true): Promise<void> {
-  try { await repairUnqueuedNotifications(env); await processNotificationJobs(env); } catch (error) { console.error('通知任务处理失败:', error); }
+interface StepReport {
+  step: string;
+  ms: number;
+  count?: number;
+  failed?: true;
+}
+
+/** 每个步骤独立 try/catch，一步失败不影响后续步骤；记录耗时与处理条数 */
+async function step(report: StepReport[], name: string, task: () => Promise<number | void>): Promise<void> {
+  const started = Date.now();
   try {
-    // Recover a metadata purge interrupted between reservation and transaction completion.
+    const count = await task();
+    report.push({ step: name, ms: Date.now() - started, ...(typeof count === 'number' ? { count } : {}) });
+  } catch (error) {
+    console.error(`定时任务步骤 ${name} 失败:`, error);
+    report.push({ step: name, ms: Date.now() - started, failed: true });
+  }
+}
+
+/** 每 5 分钟：通知补录与投递、清理台账；每日额外：审计日志 90 天 + 过期限流窗口 + 邮件保留策略 */
+export async function runScheduled(env: Env, maintenance = true): Promise<void> {
+  const started = Date.now();
+  const report: StepReport[] = [];
+  await step(report, 'notification.repair', () => repairUnqueuedNotifications(env));
+  await step(report, 'notification.process', async () => (await processNotificationJobs(env)).processed);
+  // Recover a metadata purge interrupted between reservation and transaction completion.
+  await step(report, 'purge.recover', async () => {
     const tokens = await env.db.prepare('SELECT DISTINCT purge_token AS token FROM messages WHERE purge_token IS NOT NULL LIMIT 20').all<{ token: string }>();
     for (const row of tokens.results) await env.db.batch(purgeStatements(env, row.token));
-    await expireDeliveryObjectLeases(env);
-    await expireExternalAttachmentLinks(env);
-    await processStorageCleanup(env, 100);
-  } catch (error) { console.error('持久化清理任务失败:', error); }
-  if (!maintenance) return;
-  await cleanupNotificationJobs(env);
+    return tokens.results.length;
+  });
+  await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
+  await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
+  await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
+  if (maintenance) await runMaintenance(env, report);
+  console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
+}
+
+async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
+  await step(report, 'notification.cleanup', () => cleanupNotificationJobs(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
   const staleWindow = Math.floor(Date.now() / 60000) - 120;
 
   for (const table of ['api_request_logs', 'admin_audit_logs']) {
-    try {
+    await step(report, `${table}.cleanup`, async () => {
+      let deleted = 0;
       const deadline = Date.now() + 5000;
       for (let i = 0; i < 300 && Date.now() < deadline; i++) {
         const result = await env.db.prepare(`DELETE FROM ${table} WHERE id IN
           (SELECT id FROM ${table} WHERE created_at < ? LIMIT 1000)`).bind(cutoff.getTime()).run();
+        deleted += result.meta.changes ?? 0;
         if ((result.meta.changes ?? 0) < 1000) break;
       }
-    } catch (error) { console.error(`${table} 清理失败:`, error); }
+      return deleted;
+    });
   }
-  try {
-    await db.delete(apiRateLimits).where(lt(apiRateLimits.windowStart, staleWindow));
-  } catch (e) {
-    console.error('限流窗口清理失败:', e);
-  }
-  try {
-    await db.delete(sessions).where(lt(sessions.expiresAt, new Date()));
-    await db
-      .delete(idempotencyRecords)
-      .where(and(lt(idempotencyRecords.createdAt, new Date(Date.now() - 2 * DAY_MS)), eq(idempotencyRecords.status, 'completed')));
-  } catch (e) {
-    console.error('会话/幂等记录清理失败:', e);
-  }
-  try {
-    await runRetention(env);
-  } catch (e) {
-    console.error('邮件保留清理失败:', e);
-  }
+  await step(report, 'rate_limits.cleanup', async () =>
+    (await db.delete(apiRateLimits).where(lt(apiRateLimits.windowStart, staleWindow)).run()).meta.changes ?? 0);
+  await step(report, 'sessions.cleanup', async () =>
+    (await db.delete(sessions).where(lt(sessions.expiresAt, new Date())).run()).meta.changes ?? 0);
+  await step(report, 'idempotency.cleanup', async () => (await db
+    .delete(idempotencyRecords)
+    .where(and(lt(idempotencyRecords.createdAt, new Date(Date.now() - 2 * DAY_MS)), eq(idempotencyRecords.status, 'completed')))
+    .run()).meta.changes ?? 0);
+  await step(report, 'retention', () => runRetention(env));
   // 回收站：软删除超过 7 天硬删
-  try {
+  await step(report, 'trash', async () => {
     const trashCutoff = new Date(Date.now() - TRASH_RETENTION_DAYS * DAY_MS);
     const n = await purgeMessagesWhere(
       env,
       and(isNotNull(messages.deletedAt), lt(messages.deletedAt, trashCutoff))!,
     );
     if (n > 0) console.log(`回收站清理：硬删 ${n} 封`);
-  } catch (e) {
-    console.error('回收站清理失败:', e);
-  }
+    return n;
+  });
   // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ 回收 R2 + 删行
-  try {
-    await runDraftAttachmentCleanup(env);
-  } catch (e) {
-    console.error('草稿附件清理失败:', e);
-  }
+  await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
   // 计数器：外发/转发配额按天、登录失败与注册限流按分钟窗口，各自回收过期行
-  try {
+  await step(report, 'counters', async () => {
     await purgeCounters(env, 'out', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, 'fwd-domain', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, 'fwd-target', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
@@ -191,7 +212,5 @@ export async function runScheduled(env: Env, maintenance = true): Promise<void> 
     await purgeCounters(env, 'ai-extract', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
-  } catch (e) {
-    console.error('计数器清理失败:', e);
-  }
+  });
 }

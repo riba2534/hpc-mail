@@ -104,6 +104,7 @@ jobs:
           D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
           CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
+          PLACEMENT_REGION: ${{ vars.PLACEMENT_REGION }}
         run: |
           set -euo pipefail
           sed -i \
@@ -115,6 +116,23 @@ jobs:
             wrangler.toml
           grep -qE '__[A-Z0-9_]+__' wrangler.toml && { echo '::error::wrangler.toml 仍有未注入占位符'; exit 1; } || true
           grep -q 'workers_dev = false' wrangler.toml || { echo '::error::routes/workers_dev 注入失败'; exit 1; }
+          # 可选 placement：把 Worker 固定到 D1 主库附近（如 aws:ap-southeast-1）；模板不写死，未设置则跳过
+          if [ -n "$PLACEMENT_REGION" ]; then
+            echo "$PLACEMENT_REGION" | grep -qE '^[a-z0-9]+:[a-z0-9-]+$' || { echo "::error::PLACEMENT_REGION 格式非法（应形如 aws:ap-southeast-1）"; exit 1; }
+            grep -qx '\[placement\]' wrangler.toml && { echo '::error::wrangler.toml 已存在 [placement] 段'; exit 1; } || true
+            printf '\n[placement]\nregion = "%s"\n' "$PLACEMENT_REGION" >> wrangler.toml
+            grep -qx '\[placement\]' wrangler.toml && grep -qx "region = \"$PLACEMENT_REGION\"" wrangler.toml || { echo '::error::placement 注入失败'; exit 1; }
+            echo "placement region: $PLACEMENT_REGION"
+          else
+            echo '::notice::未设置 PLACEMENT_REGION，跳过 placement 注入'
+          fi
+          # 现存哈希资源由边缘直出、不绕到 placement 区域；缺失文件仍经 Worker 返回 404（build:assets 已在前面执行）
+          node scripts/inject-asset-routes.mjs
+          rules=$(grep -E '^run_worker_first' wrangler.toml | grep -o '"[^"]*"' | wc -l)
+          excluded=$(grep -E '^run_worker_first' wrangler.toml | grep -o '"!/assets/[^"]*"' | wc -l)
+          echo "run_worker_first 共 $rules 条，静态资源排除 $excluded 条"
+          [ "$rules" -le 100 ] || { echo '::error::run_worker_first 超过 Cloudflare 100 条上限'; exit 1; }
+          grep -E '^run_worker_first' wrangler.toml | grep -q '"/assets/\*"' || { echo '::error::run_worker_first 缺少 /assets/* 兜底规则'; exit 1; }
 
       - name: 部署预演（dry-run）
         working-directory: apps/worker

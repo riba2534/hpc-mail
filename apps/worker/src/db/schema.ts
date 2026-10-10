@@ -97,18 +97,25 @@ export const messages = sqliteTable(
   (t) => [
     index('idx_messages_address').on(t.address, t.id),
     index('idx_messages_domain').on(t.domain, t.id),
-    index('idx_messages_direction').on(t.direction, t.id),
-    index('idx_messages_deleted').on(t.deletedAt),
-    // 收件箱主查询（address ∈ 认领地址 + 未删除 + 按 id 倒序）与未读角标的覆盖索引。
-    // D1 不自动跑 ANALYZE，无统计信息时优化器会挑 idx_messages_deleted 沿「未删除」这个
-    // 巨大的等值组倒扫、把地址当残余过滤，代价随全表行数线性增长（20 万行实测 62ms）
+    // 「未删除 + id 倒序」的覆盖索引，替换原 idx_messages_deleted(deleted_at)。
+    // D1 不自动跑 ANALYZE，无统计信息时优化器把 deleted_at IS NULL 当高选择性条件，列表/搜索/
+    // 联系人会沿这个索引倒扫；把 address/direction/is_read 放进索引后残余过滤不必回表，
+    // 新用户/稀疏用户的扫描从回表读整行降为只读索引。原 idx_messages_direction(direction, id)
+    // 必须同时删除，否则收件箱查询会改走它按方向全量倒扫。
+    index('idx_messages_live').on(t.deletedAt, t.id, t.address, t.direction, t.isRead),
+    // 收件箱主查询（address ∈ 认领地址 + 未删除 + 按 id 倒序）。
     index('idx_messages_address_deleted_id').on(t.address, t.deletedAt, t.id),
-    index('idx_messages_direction_read').on(t.direction, t.isRead, t.deletedAt),
+    // 未读角标：按可见地址逐个计数，direction/is_read 在索引内，不读表行。
+    index('idx_messages_visible').on(t.address, t.deletedAt, t.direction, t.isRead),
     index('idx_messages_created_id').on(t.createdAt, t.id),
     index('idx_messages_message_id').on(t.messageId),
     index('idx_messages_in_reply_to').on(t.inReplyTo),
     uniqueIndex('idx_messages_ingest_key').on(t.ingestKey),
     index('idx_messages_notification_outbox').on(t.createdAt, t.id).where(sql`${t.notifyOwnerIds} IS NOT NULL AND ${t.notificationsQueuedAt} IS NULL AND ${t.deletedAt} IS NULL`),
+    // 清理链路按 purge_token / R2 key 反查，绝大多数行为 NULL，部分索引只收非空行。
+    index('idx_messages_purge_token').on(t.purgeToken).where(sql`${t.purgeToken} IS NOT NULL`),
+    index('idx_messages_body_r2').on(t.bodyR2Key).where(sql`${t.bodyR2Key} IS NOT NULL`),
+    index('idx_messages_raw_r2').on(t.rawR2Key).where(sql`${t.rawR2Key} IS NOT NULL`),
   ],
 );
 
@@ -371,7 +378,9 @@ export const notificationJobs = sqliteTable('notification_jobs', {
   lastError: text('last_error').notNull().default(''),
   lastHttpStatus: integer('last_http_status'),
   dedupeKey: text('dedupe_key').notNull().unique(),
-}, (t) => [index('idx_notification_due').on(t.status, t.nextAttemptAt), index('idx_notification_user').on(t.userId, t.createdAt)]);
+}, (t) => [index('idx_notification_due').on(t.status, t.nextAttemptAt), index('idx_notification_user').on(t.userId, t.createdAt),
+  // 通知健康页按 (用户, 通道) 取最新一条
+  index('idx_notification_user_channel').on(t.userId, t.channel, t.id)]);
 
 /** Temporary references protect delivery objects while sending or copying metadata. */
 export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {

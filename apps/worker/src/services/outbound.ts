@@ -309,30 +309,28 @@ async function persistAttachments(
   }
 }
 
-/** Cloudflare 原生发信（send_email binding），逐收件人发送 */
-async function sendViaCloudflare(
-  env: Env,
+/**
+ * 组装外发 MIME 原文。头里写完整 To/Cc，不写 Bcc；同一封邮件的外部收件人共用同一份原文，
+ * 只有 To 为空（仅抄送/密送）时 To 头随信封收件人变化，才按收件人各自组装。
+ */
+async function buildOutboundMime(
   from: ResolvedFrom,
-  toAddr: string,
+  toHeader: string[],
   req: SendMailInput,
   atts: DecodedAttachment[],
   reply: ReplyContext | null,
   text: string,
   html: string,
   messageId: string,
-): Promise<void> {
-  // 动态 import：`cloudflare:email` 在 vitest workerd 里静态加载会崩，
-  // 且集成测试不发外部邮件，延迟到真实发送时才加载
-  const [{ EmailMessage }, { createMimeMessage }] = await Promise.all([
-    import('cloudflare:email'),
-    import('mimetext/browser'),
-  ]);
+): Promise<string> {
+  // 动态 import：mimetext 在 vitest workerd 里静态加载会崩，且集成测试不发外部邮件
+  const { createMimeMessage } = await import('mimetext/browser');
   const msg = createMimeMessage();
   msg.setSender({ name: from.displayName, addr: from.address });
-  // 信封收件人是 toAddr（逐个发送），但头里要写完整的 To/Cc，否则每个收件人看到的都是
+  // 信封收件人逐个发送，但头里要写完整的 To/Cc，否则每个收件人看到的都是
   // 「只发给我一个人」，既无法回复全部、也不知道这是群发；BCC 名单当然不写进头。
   // 站内互投那边存的是完整 {to, cc} 并在详情页展示，两边行为原本是不一致的
-  msg.setRecipients(req.to.length ? req.to : [toAddr]);
+  msg.setRecipients(toHeader);
   if (req.cc.length) msg.setCc(req.cc);
   msg.setSubject(req.subject);
   msg.setHeader('Message-ID', messageId);
@@ -370,8 +368,14 @@ async function sendViaCloudflare(
       ...(inline ? { inline: true, headers: { 'Content-ID': `<${a.contentId}>` } } : {}),
     });
   }
-  const message = new EmailMessage(from.address, toAddr, foldMimeHeaders(msg.asRaw()));
-  await env.email.send(message);
+  return foldMimeHeaders(msg.asRaw());
+}
+
+/** Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文 */
+async function sendViaCloudflare(env: Env, fromAddress: string, toAddr: string, raw: string): Promise<void> {
+  // 动态 import：`cloudflare:email` 在 vitest workerd 里静态加载会崩
+  const { EmailMessage } = await import('cloudflare:email');
+  await env.email.send(new EmailMessage(fromAddress, toAddr, raw));
 }
 
 function summarize(
@@ -472,7 +476,12 @@ export async function sendMail(
   assertSendBodySize(text, html);
   const settings = await getSettings(env);
   const db = createDb(env);
-  const domains = await getRoutableDomains(env, settings);
+  // 只需判断发件域与各收件人域是否可站内路由，按需查询这些域而不是读出全部认领域名
+  const candidateDomains = [
+    ...(req.from.domain ? [req.from.domain] : []),
+    ...[...req.to, ...req.cc, ...req.bcc].map(address => getEmailDomain(normalizeEmail(address))),
+  ];
+  const domains = await getRoutableDomains(env, settings, candidateDomains);
   const from = await resolveFrom(env, sender, req, domains);
   if (req.forwardAttachmentsFrom) {
     const forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
@@ -560,10 +569,21 @@ export async function sendMail(
         else await updateBody;
         storedBody = actualBody;
       }
+      // 原文在循环外按 To 头组装一次（附件 base64 编码只做一次），逐个目标投递并逐个记录结果
+      const rawByToHeader = new Map<string, Promise<string>>();
+      const rawFor = (target: string) => {
+        const toHeader = req.to.length ? req.to : [target];
+        const key = toHeader.join('\n');
+        let raw = rawByToHeader.get(key);
+        if (!raw) {
+          raw = buildOutboundMime(from, toHeader, req, payload.atts, reply, payload.text, payload.html, outgoingMessageId);
+          rawByToHeader.set(key, raw);
+        }
+        return raw;
+      };
       for (const target of externalTargets) {
         try {
-          await sendViaCloudflare(env, from, target, req, payload.atts, reply,
-            payload.text, payload.html, outgoingMessageId);
+          await sendViaCloudflare(env, from.address, target, await rawFor(target));
           outcomes.push({ address: target, status: 'sent' });
         } catch (error) {
           outcomes.push({ address: target, status: 'failed', error: error instanceof Error ? error.message : String(error) });

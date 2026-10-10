@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --port 8787",
-    "test": "node scripts/check-drop-legacy.mjs && vitest run",
+    "dev": "wrangler dev --port 8787 --local",
+    "test": "node scripts/check-drop-legacy.mjs && node scripts/check-inject-asset-routes.mjs && vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "build:assets": "rm -rf dist && cp -R ../web/dist ./dist",
     "deploy": "wrangler d1 migrations apply db --remote && node scripts/seed-admin.mjs --if-env && wrangler deploy",

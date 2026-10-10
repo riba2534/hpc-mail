@@ -1,7 +1,7 @@
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { AppError } from './errors.js';
-import type { AppContext } from '../types.js';
+import type { AppContext, ExecCtx } from '../types.js';
 
 /** 结构化 schema 类型（zod safeParse 的鸭子类型，避免 worker 直接依赖 zod） */
 export interface SafeParser<T> {
@@ -15,6 +15,15 @@ export interface SafeParser<T> {
 /** 统一成功信封 { data } */
 export function ok<T>(c: Context<AppContext>, data: T, status: ContentfulStatusCode = 200) {
   return c.json({ data }, status);
+}
+
+/** Hono 在没有 ExecutionContext 时访问 executionCtx 会抛错；单测等场景返回 null */
+export function execCtx(c: Context<AppContext>): ExecCtx | null {
+  try {
+    return c.executionCtx;
+  } catch {
+    return null;
+  }
 }
 
 /** 取客户端 IP（部署在 Cloudflare 后，仅信任 CF-Connecting-IP） */

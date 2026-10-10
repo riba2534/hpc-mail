@@ -23,7 +23,18 @@ step "首页可访问"
 code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/")
 [ "$code" = "200" ] || fail "GET / 返回 $code"
 
+step "静态资源边缘直出且缺失哈希资源仍为 404"
+asset=$(curl -fsS "$BASE_URL/" | grep -oE '/assets/[A-Za-z0-9._-]+\.js' | head -1)
+[ -n "$asset" ] || fail "首页未引用 /assets/*.js"
+asset_meta=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL$asset")
+echo "$asset_meta" | grep -qE '^200 (text|application)/javascript' || fail "现存静态资源响应异常: $asset $asset_meta"
+curl -sS -D - -o /dev/null "$BASE_URL$asset" | tr -d '\r' | grep -qi '^cache-control:.*immutable' || fail "现存静态资源缺少长缓存: $asset"
+missing_asset=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL/assets/missing-smoke-00000000.js")
+[ "$missing_asset" = "404 text/plain; charset=utf-8" ] || fail "缺失哈希资源未返回 404: $missing_asset"
+
 step "公开配置合法"
+timing=$(curl -sS -D - -o /dev/null "$BASE_URL/api/config" | tr -d '\r' | grep -i '^server-timing:' || true)
+echo "$timing" | grep -q 'app;dur=' || fail "API 响应缺少 Server-Timing"
 config=$(curl -sS "$BASE_URL/api/config")
 mode=$(echo "$config" | jq -r '.data.registrationMode')
 echo "$mode" | grep -qE '^(closed|invite|open)$' || fail "registrationMode 非法: $config"

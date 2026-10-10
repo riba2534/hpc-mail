@@ -31,7 +31,7 @@ export async function processStorageCleanup(env: Env, limit = 100): Promise<numb
   return cleaned;
 }
 
-export async function expireExternalAttachmentLinks(env: Env): Promise<void> {
+export async function expireExternalAttachmentLinks(env: Env): Promise<number> {
   const db = createDb(env);
   const rows = await db.select().from(externalAttachmentLinks).where(lt(externalAttachmentLinks.expiresAt, new Date())).limit(1000).all();
   for (const row of rows) {
@@ -40,11 +40,12 @@ export async function expireExternalAttachmentLinks(env: Env): Promise<void> {
       db.delete(externalAttachmentLinks).where(and(eq(externalAttachmentLinks.attachmentId, row.attachmentId), lt(externalAttachmentLinks.expiresAt, new Date()))),
     ]);
   }
+  return rows.length;
 }
 
-export async function expireDeliveryObjectLeases(env: Env): Promise<void> {
+export async function expireDeliveryObjectLeases(env: Env): Promise<number> {
   const now = Date.now();
-  await env.db.batch([
+  const results = await env.db.batch([
     env.db.prepare('INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM delivery_object_leases WHERE expires_at < ? ORDER BY expires_at, r2_key, token LIMIT 1000').bind(now),
     env.db.prepare(`DELETE FROM attachments WHERE r2_key IN
       (SELECT r2_key FROM delivery_object_leases WHERE expires_at < ? ORDER BY expires_at, r2_key, token LIMIT 1000)
@@ -54,4 +55,5 @@ export async function expireDeliveryObjectLeases(env: Env): Promise<void> {
     env.db.prepare(`DELETE FROM delivery_object_leases WHERE (r2_key, token) IN
       (SELECT r2_key, token FROM delivery_object_leases WHERE expires_at < ? ORDER BY expires_at, r2_key, token LIMIT 1000)`).bind(now),
   ]);
+  return results[2]?.meta.changes ?? 0;
 }

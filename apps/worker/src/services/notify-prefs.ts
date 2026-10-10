@@ -9,6 +9,7 @@ import {
   type UserNotifyPrefs,
 } from '@hpc-mail/shared';
 import { eq, inArray } from 'drizzle-orm';
+import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
 import { settings as settingsTable, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
@@ -91,6 +92,41 @@ export async function getUserNotifyPrefs(env: Env, userId: number): Promise<User
     if (legacy) return legacy;
   }
   return clone(DEFAULT_USER_NOTIFY_PREFS);
+}
+
+/** 通知归属人的启用状态与偏好（投递时需要两者） */
+export interface NotifyOwner {
+  active: boolean;
+  prefs: UserNotifyPrefs;
+}
+
+/**
+ * 一次查询读出多位归属人的状态与偏好（未配置的管理员共用一次旧全局设置读取），
+ * 收件链路据此只读一次、往下传给转发、入队与即时投递。不存在的用户不在结果里。
+ */
+export async function loadNotifyOwners(env: Env, userIds: number[]): Promise<Map<number, NotifyOwner>> {
+  const out = new Map<number, NotifyOwner>();
+  const ids = [...new Set(userIds)];
+  if (!ids.length) return out;
+  const db = createDb(env);
+  let legacy: UserNotifyPrefs | null | undefined;
+  for (const batch of chunk(ids)) {
+    const rows = await db
+      .select({ id: users.id, status: users.status, role: users.role, notifyPrefs: users.notifyPrefs })
+      .from(users)
+      .where(inArray(users.id, batch))
+      .all();
+    for (const row of rows) {
+      let prefs: UserNotifyPrefs;
+      if (row.notifyPrefs) prefs = normalize(row.notifyPrefs);
+      else if (row.role === 'admin') {
+        if (legacy === undefined) legacy = await readLegacyGlobalNotify(env);
+        prefs = clone(legacy ?? DEFAULT_USER_NOTIFY_PREFS);
+      } else prefs = clone(DEFAULT_USER_NOTIFY_PREFS);
+      out.set(row.id, { active: row.status === 'active', prefs });
+    }
+  }
+  return out;
 }
 
 /** 写个人偏好：逐块合并 + secret 掩码保留旧值 + 落库 */
