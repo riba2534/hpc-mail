@@ -5,8 +5,12 @@ import { ApiError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
 import { clearAuthToken } from '@/lib/auth-token';
 import { CurrentUserContext, useAuthToken, useSessionQuery } from '@/lib/use-session';
-import { AppShell } from './app-shell';
+import { lazyWithReload } from './chunk-reload';
 import { FullScreenLoader } from './page-loader';
+import { loadAppShell } from './route-modules';
+
+// 外壳不进登录页入口；已登录启动时 boot-prefetch 会与 /auth/me 并行预取它，通常此时已可同步渲染
+const AppShell = lazyWithReload(loadAppShell, (m) => m.AppShell, <FullScreenLoader />);
 
 export function AuthGuard() {
   const token = useAuthToken();

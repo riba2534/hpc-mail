@@ -39,4 +39,3 @@ export { Tabs, TabsContent, TabsList, TabsTrigger } from './tabs';
 export { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './table';
 export { toast, ToastProvider, type ToastInput, type ToastVariant } from './toast';
 export { Textarea } from './textarea';
-export { Tooltip, TooltipProvider } from './tooltip';

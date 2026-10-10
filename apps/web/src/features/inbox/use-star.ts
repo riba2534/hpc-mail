@@ -5,10 +5,11 @@ import { messageApi } from '@/api/resources';
 import { toast } from '@/components/ui/toast';
 import { getAuthToken } from '@/lib/auth-token';
 import { ApiError } from '@/api/errors';
+import { syncStarState } from './message-cache';
 
 type ListData = InfiniteData<Page<MessageSummary>>;
 
-/** 星标切换：乐观更新列表行与详情缓存（即时高亮），失败回滚，最终失效以对齐服务端。 */
+/** 星标切换：乐观更新列表行与详情缓存（即时高亮），失败或未生效时回滚；成功后不再重拉。 */
 export function useStarMutation(view?: { scope?: 'mine' | 'unclaimed' | 'user'; userId?: number }) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -16,13 +17,19 @@ export function useStarMutation(view?: { scope?: 'mine' | 'unclaimed' | 'user'; 
       messageApi.star([id], starred, view),
     onMutate: async ({ id, starred }) => {
       const token = getAuthToken();
-      await queryClient.cancelQueries({ queryKey: queryKeys.messages.root });
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: queryKeys.messages.lists }),
+        queryClient.cancelQueries({ queryKey: queryKeys.messages.detail(id, view), exact: true }),
+      ]);
       if (token !== getAuthToken()) throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
       const prevDetail = queryClient.getQueryData<MessageDetail>(queryKeys.messages.detail(id, view));
       queryClient.setQueryData<MessageDetail>(queryKeys.messages.detail(id, view), (prev) =>
         prev ? { ...prev, isStarred: starred } : prev,
       );
-      const listSnapshots = queryClient.getQueriesData<ListData>({ queryKey: ['messages', 'list'] });
+      // 只快照并改写含该邮件的列表，回滚时不会用旧快照覆盖其它列表期间的更新
+      const listSnapshots = queryClient
+        .getQueriesData<ListData>({ queryKey: queryKeys.messages.lists })
+        .filter(([, data]) => data?.pages.some((page) => page.items.some((m) => m.id === id)));
       for (const [key, data] of listSnapshots) {
         if (!data) continue;
         queryClient.setQueryData<ListData>(key, {
@@ -43,14 +50,18 @@ export function useStarMutation(view?: { scope?: 'mine' | 'unclaimed' | 'user'; 
       ctx?.listSnapshots?.forEach(([key, data]) => queryClient.setQueryData(key, data));
       toast({ title: '操作失败，请重试', variant: 'error' });
     },
-    onSuccess: (result, { id }, ctx) => {
-      if (ctx?.token !== getAuthToken() || result.changed > 0) return;
+    onSuccess: (result, { id, starred }, ctx) => {
+      if (ctx?.token !== getAuthToken()) return;
+      if (result.changed > 0) {
+        // 乐观更新已对齐服务端；只把星标列表的成员变化落到缓存，不发请求
+        syncStarState(queryClient, [id], starred, { refetchActive: false });
+        return;
+      }
       if (ctx.prevDetail !== undefined) queryClient.setQueryData(queryKeys.messages.detail(id, view), ctx.prevDetail);
       ctx.listSnapshots.forEach(([key, data]) => queryClient.setQueryData(key, data));
       toast({ title: '星标状态未改变，正在重新加载' });
-    },
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.detail(id, view), exact: true });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.lists });
     },
   });
 }

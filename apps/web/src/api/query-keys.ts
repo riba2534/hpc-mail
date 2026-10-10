@@ -20,9 +20,13 @@ export const queryKeys = {
 
   messages: {
     root: ['messages'] as const,
+    lists: ['messages', 'list'] as const,
     list: (filters: Partial<ListMessagesQuery>) => ['messages', 'list', filters] as const,
+    details: ['messages', 'detail'] as const,
     detail: (id: number, view?: { scope?: string; userId?: number }) =>
       ['messages', 'detail', id, view] as const,
+    thread: (id: number, view?: { scope?: string; userId?: number }) =>
+      ['messages', 'thread', id, view] as const,
     unreadCount: ['messages', 'unread-count'] as const,
   },
 

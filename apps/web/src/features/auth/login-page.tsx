@@ -1,14 +1,12 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { type FormEvent, useState } from 'react';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
-import {
-  type LoginResponse,
-  loginRequestSchema,
-  registerRequestSchema,
-} from '@hpc-mail/shared';
+import type { LoginResponse } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { authApi } from '@/api/resources';
+import { prefetchAuthedRoute } from '@/app/boot-prefetch';
+import logoUrl from '@/assets/logo.webp';
 import { Button } from '@/components/ui/button';
 import { FormField } from '@/components/ui/form-field';
 import { GITHUB_REPO_URL, GithubIcon } from '@/components/ui/github-link';
@@ -21,6 +19,17 @@ import { usePublicConfig } from '@/lib/use-config';
 import { useAuthToken } from '@/lib/use-session';
 
 type Mode = 'login' | 'register';
+
+// zod 契约只在提交时用于前置校验：不进登录首屏，输入框聚焦时预取；加载失败允许重试
+let contractPromise: Promise<typeof import('@hpc-mail/shared')> | undefined;
+function loadContract() {
+  contractPromise ??= import('@hpc-mail/shared').catch((error: unknown) => {
+    contractPromise = undefined;
+    throw error;
+  });
+  return contractPromise;
+}
+const preloadContract = () => void loadContract().catch(() => {});
 
 export function LoginPage() {
   const token = useAuthToken();
@@ -36,6 +45,7 @@ export function LoginPage() {
   const [totp, setTotp] = useState('');
   const [totpRequired, setTotpRequired] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [validating, setValidating] = useState(false);
 
   const fromState = (location.state as { from?: string } | null)?.from;
   const redirectTo = fromState && fromState !== '/login' ? fromState : '/inbox';
@@ -49,6 +59,8 @@ export function LoginPage() {
     setAuthToken(data.token);
     queryClient.setQueryData(queryKeys.sessionForRevision(getAuthRevision()), data.user);
     void queryClient.invalidateQueries({ queryKey: queryKeys.session });
+    const target = new URL(redirectTo, globalThis.location.origin);
+    prefetchAuthedRoute(queryClient, target.pathname, target.search);
     navigate(redirectTo, { replace: true });
   };
 
@@ -83,25 +95,30 @@ export function LoginPage() {
 
   if (token) return <Navigate to={redirectTo} replace />;
 
-  const pending = loginMutation.isPending || registerMutation.isPending;
+  const pending = loginMutation.isPending || registerMutation.isPending || validating;
 
-  const handleSubmit = (event: FormEvent) => {
+  const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
+    if (pending) return;
     setError(null);
+    setValidating(true);
+    // 契约加载失败时跳过前置校验，由服务端校验兜底
+    const contract = await loadContract().catch(() => null);
+    setValidating(false);
     if (mode === 'login') {
-      const parsed = loginRequestSchema.safeParse({ username, password, totp: totp || undefined });
-      if (!parsed.success) {
+      const parsed = contract?.loginRequestSchema.safeParse({ username, password, totp: totp || undefined });
+      if (parsed && !parsed.success) {
         setError(parsed.error.issues[0]?.message ?? '请检查输入');
         return;
       }
       loginMutation.mutate();
     } else {
-      const parsed = registerRequestSchema.safeParse({
+      const parsed = contract?.registerRequestSchema.safeParse({
         username,
         password,
         inviteCode: needsInvite ? inviteCode : undefined,
       });
-      if (!parsed.success) {
+      if (parsed && !parsed.success) {
         setError(parsed.error.issues[0]?.message ?? '请检查输入');
         return;
       }
@@ -122,7 +139,7 @@ export function LoginPage() {
     <main className="grid min-h-dvh place-items-center bg-canvas px-4 py-10">
       <div className="w-full max-w-sm">
         <div className="mb-6 flex flex-col items-center gap-2 text-center">
-          <img src="/logo.png" alt="" className="size-12 rounded-lg" />
+          <img src={logoUrl} alt="" className="size-12 rounded-lg" />
           <h1 className="text-lg font-semibold text-ink">{config?.siteTitle ?? 'HPC Mail'}</h1>
         </div>
 
@@ -140,7 +157,7 @@ export function LoginPage() {
             />
           )}
 
-          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+          <form onSubmit={handleSubmit} onFocus={preloadContract} className="flex flex-col gap-4">
             <FormField label="用户名" required>
               {(field) => (
                 <Input

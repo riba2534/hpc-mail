@@ -6,6 +6,10 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const config = vi.hoisted(() => ({ mode: 'closed' as 'closed' | 'invite' | 'open' }));
+const login = vi.hoisted(() => vi.fn(async () => {
+  throw new Error('offline');
+}));
+vi.mock('@/api/resources', () => ({ authApi: { login, register: vi.fn() } }));
 
 vi.mock('@/lib/use-config', () => ({
   usePublicConfig: () => ({
@@ -49,5 +53,32 @@ describe('LoginPage 注册模式分支', () => {
     renderPage();
     await user.click(screen.getByRole('radio', { name: '注册' }));
     expect(screen.queryByText('邀请码')).toBeNull();
+  });
+});
+
+describe('LoginPage 提交前校验', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    login.mockClear();
+    config.mode = 'closed';
+  });
+
+  it('提交时按需加载契约，非法用户名不发请求', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(screen.getByLabelText(/用户名/, { selector: 'input' }), 'A!');
+    await user.type(screen.getByLabelText(/密码/, { selector: 'input' }), 'secret');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('用户名需为 3-32 位');
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  it('校验通过后发起登录', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(screen.getByLabelText(/用户名/, { selector: 'input' }), 'alice');
+    await user.type(screen.getByLabelText(/密码/, { selector: 'input' }), 'secret');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+    await vi.waitFor(() => expect(login).toHaveBeenCalledTimes(1));
   });
 });

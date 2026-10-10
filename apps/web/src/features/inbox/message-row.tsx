@@ -1,5 +1,5 @@
 import { Check, KeyRound, Paperclip, Star } from 'lucide-react';
-import type { MouseEvent } from 'react';
+import { memo, type MouseEvent } from 'react';
 import { Link } from 'react-router-dom';
 import type { MessageSummary, OutboundStatus } from '@hpc-mail/shared';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
@@ -22,7 +22,8 @@ function outboundRecipientLabel(message: MessageSummary): string {
   return to.length === 1 ? `发至 ${to[0]}` : `发至 ${to[0]} +${to.length - 1}`;
 }
 
-export function MessageRow({
+/** 列表行：props 均为稳定引用或原始值，memo 后轮询/翻页只重渲染真正变化的行 */
+export const MessageRow = memo(function MessageRow({
   message,
   href,
   onToggleStar,
@@ -30,6 +31,8 @@ export function MessageRow({
   selectionActive = false,
   onToggleSelect,
   shared = false,
+  now,
+  onOpenIntent,
 }: {
   message: MessageSummary;
   href: string;
@@ -39,6 +42,10 @@ export function MessageRow({
   onToggleSelect?: (id: number, event: MouseEvent) => void;
   /** 这封信来自共享给当前用户的管理员邮箱 */
   shared?: boolean;
+  /** 相对时间的基准；由列表按分钟更新，memo 行才能刷新「n 分钟前」 */
+  now?: number;
+  /** 悬停/聚焦/触摸行时上报（null = 离开），供列表预取详情 */
+  onOpenIntent?: (id: number | null) => void;
 }) {
   const outbound = message.direction === 'outbound';
   const unread = !outbound && !message.isRead;
@@ -77,7 +84,15 @@ export function MessageRow({
           </button>
         )}
 
-        <Link to={href} className="block min-w-0 flex-1">
+        <Link
+          to={href}
+          className="block min-w-0 flex-1"
+          onMouseEnter={() => onOpenIntent?.(message.id)}
+          onMouseLeave={() => onOpenIntent?.(null)}
+          onFocus={() => onOpenIntent?.(message.id)}
+          onBlur={() => onOpenIntent?.(null)}
+          onTouchStart={() => onOpenIntent?.(message.id)}
+        >
           <div className="flex items-baseline justify-between gap-3">
             <span className="flex min-w-0 items-center gap-1.5">
               {unread && <span className="size-2 shrink-0 rounded-full bg-accent" aria-label="未读" />}
@@ -85,7 +100,7 @@ export function MessageRow({
                 {primary}
               </span>
             </span>
-            <span className="shrink-0 text-xs text-ink-tertiary">{formatRelativeTime(message.createdAt)}</span>
+            <span className="shrink-0 text-xs text-ink-tertiary">{formatRelativeTime(message.createdAt, now)}</span>
           </div>
           <div className="mt-0.5 flex items-center gap-2">
             <span className={cn('truncate text-sm', unread ? 'font-medium text-ink' : 'text-ink-secondary')}>
@@ -138,4 +153,4 @@ export function MessageRow({
       </button>
     </div>
   );
-}
+});

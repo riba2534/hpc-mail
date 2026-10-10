@@ -1,12 +1,8 @@
 import { useCallback, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { type InboxFilters, parseInboxFilters } from './inbox-query';
 
-export interface InboxFilters {
-  domain: string | null;
-  address: string | null;
-  unread: boolean;
-  q: string;
-}
+export type { InboxFilters } from './inbox-query';
 
 function domainOf(address: string | null): string | null {
   if (!address) return null;
@@ -21,15 +17,7 @@ function domainOf(address: string | null): string | null {
 export function useInboxFilters() {
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const filters = useMemo<InboxFilters>(
-    () => ({
-      domain: searchParams.get('domain') || null,
-      address: searchParams.get('address') || null,
-      unread: searchParams.get('unread') === '1',
-      q: searchParams.get('q') ?? '',
-    }),
-    [searchParams],
-  );
+  const filters = useMemo<InboxFilters>(() => parseInboxFilters(searchParams), [searchParams]);
 
   const mutate = useCallback(
     (mutator: (params: URLSearchParams) => void) => {

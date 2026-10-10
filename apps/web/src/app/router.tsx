@@ -1,63 +1,62 @@
-import { lazy, Suspense } from 'react';
+import type { ComponentType } from 'react';
 import { createBrowserRouter, Navigate } from 'react-router-dom';
+import { LoginPage } from '@/features/auth/login-page';
 import { AdminGuard } from './admin-guard';
 import { AuthGuard } from './auth-guard';
-import { FullScreenLoader } from './page-loader';
+import { lazyWithReload } from './chunk-reload';
 import { NotFoundPage } from './not-found-page';
+import { PageLoader } from './page-loader';
 import { RouteErrorPage } from './route-error-page';
+import {
+  loadApiKeysPage,
+  loadComposePage,
+  loadInboxPage,
+  loadMailboxesPage,
+  loadMessagePage,
+  loadProfilePage,
+  loadSentPage,
+  loadStarredPage,
+  loadTrashPage,
+  type ModuleLoader,
+  preloadable,
+} from './route-modules';
 
-const LoginPage = lazy(() => import('@/features/auth/login-page').then((m) => ({ default: m.LoginPage })));
-const InboxPage = lazy(() => import('@/features/inbox/inbox-page').then((m) => ({ default: m.InboxPage })));
-const MessagePage = lazy(() => import('@/features/message/message-page').then((m) => ({ default: m.MessagePage })));
-const ComposePage = lazy(() => import('@/features/compose/compose-page').then((m) => ({ default: m.ComposePage })));
-const SentPage = lazy(() => import('@/features/sent/sent-page').then((m) => ({ default: m.SentPage })));
-const StarredPage = lazy(() =>
-  import('@/features/starred/starred-page').then((m) => ({ default: m.StarredPage })),
+const page = <M,>(load: ModuleLoader<M>, pick: (module: M) => ComponentType) =>
+  lazyWithReload(load, pick, <PageLoader />);
+
+const InboxPage = page(loadInboxPage, (m) => m.InboxPage);
+const MessagePage = page(loadMessagePage, (m) => m.MessagePage);
+const ComposePage = page(loadComposePage, (m) => m.ComposePage);
+const SentPage = page(loadSentPage, (m) => m.SentPage);
+const StarredPage = page(loadStarredPage, (m) => m.StarredPage);
+const TrashPage = page(loadTrashPage, (m) => m.TrashPage);
+const MailboxesPage = page(loadMailboxesPage, (m) => m.MailboxesPage);
+const ApiKeysPage = page(loadApiKeysPage, (m) => m.ApiKeysPage);
+const ProfilePage = page(loadProfilePage, (m) => m.ProfilePage);
+const UsersPage = page(preloadable(() => import('@/features/admin/users/users-page')), (m) => m.UsersPage);
+const AdminUserMailPage = page(
+  preloadable(() => import('@/features/admin/users/admin-user-mail-page')),
+  (m) => m.AdminUserMailPage,
 );
-const TrashPage = lazy(() =>
-  import('@/features/trash/trash-page').then((m) => ({ default: m.TrashPage })),
+const AdminMailPage = page(preloadable(() => import('@/features/admin/mail/admin-mail-page')), (m) => m.AdminMailPage);
+const InvitesPage = page(preloadable(() => import('@/features/admin/invites/invites-page')), (m) => m.InvitesPage);
+const DomainsPage = page(preloadable(() => import('@/features/admin/domains/domains-page')), (m) => m.DomainsPage);
+const SettingsPage = page(preloadable(() => import('@/features/admin/settings/settings-page')), (m) => m.SettingsPage);
+const AuditPage = page(preloadable(() => import('@/features/admin/audit/audit-page')), (m) => m.AuditPage);
+const AddressesPage = page(
+  preloadable(() => import('@/features/admin/addresses/addresses-page')),
+  (m) => m.AddressesPage,
 );
-const MailboxesPage = lazy(() =>
-  import('@/features/mailboxes/mailboxes-page').then((m) => ({ default: m.MailboxesPage })),
-);
-const ApiKeysPage = lazy(() => import('@/features/api-keys/api-keys-page').then((m) => ({ default: m.ApiKeysPage })));
-const ProfilePage = lazy(() => import('@/features/profile/profile-page').then((m) => ({ default: m.ProfilePage })));
-const UsersPage = lazy(() => import('@/features/admin/users/users-page').then((m) => ({ default: m.UsersPage })));
-const AdminUserMailPage = lazy(() =>
-  import('@/features/admin/users/admin-user-mail-page').then((m) => ({ default: m.AdminUserMailPage })),
-);
-const AdminMailPage = lazy(() =>
-  import('@/features/admin/mail/admin-mail-page').then((m) => ({ default: m.AdminMailPage })),
-);
-const InvitesPage = lazy(() =>
-  import('@/features/admin/invites/invites-page').then((m) => ({ default: m.InvitesPage })),
-);
-const DomainsPage = lazy(() =>
-  import('@/features/admin/domains/domains-page').then((m) => ({ default: m.DomainsPage })),
-);
-const SettingsPage = lazy(() =>
-  import('@/features/admin/settings/settings-page').then((m) => ({ default: m.SettingsPage })),
-);
-const AuditPage = lazy(() =>
-  import('@/features/admin/audit/audit-page').then((m) => ({ default: m.AuditPage })),
-);
-const AddressesPage = lazy(() =>
-  import('@/features/admin/addresses/addresses-page').then((m) => ({ default: m.AddressesPage })),
-);
-const SharedMailboxesPage = lazy(() =>
-  import('@/features/admin/shared-mailboxes/shared-mailboxes-page').then((m) => ({
-    default: m.SharedMailboxesPage,
-  })),
+const SharedMailboxesPage = page(
+  preloadable(() => import('@/features/admin/shared-mailboxes/shared-mailboxes-page')),
+  (m) => m.SharedMailboxesPage,
 );
 
 export const router = createBrowserRouter([
   {
     path: '/login',
-    element: (
-      <Suspense fallback={<FullScreenLoader />}>
-        <LoginPage />
-      </Suspense>
-    ),
+    // 登录页静态打进入口：未登录首屏不再多一跳 chunk 请求
+    element: <LoginPage />,
     errorElement: <RouteErrorPage />,
   },
   {

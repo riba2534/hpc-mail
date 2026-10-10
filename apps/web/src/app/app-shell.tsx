@@ -25,6 +25,7 @@ import { Suspense, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { clearAuthToken } from '@/lib/auth-token';
 import { authApi } from '@/api/resources';
+import logoUrl from '@/assets/logo.webp';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -41,8 +42,14 @@ import { cn } from '@/lib/cn';
 import { usePublicConfig } from '@/lib/use-config';
 import { useKeyboardShortcuts } from '@/lib/use-keyboard-shortcuts';
 import { useCurrentUser } from '@/lib/use-session';
-import { ChangePasswordDialog } from './change-password-dialog';
+import { lazyWithReload } from './chunk-reload';
 import { PageLoader } from './page-loader';
+import { preloadable } from './route-modules';
+
+const ChangePasswordDialog = lazyWithReload(
+  preloadable(() => import('./change-password-dialog')),
+  (m) => m.ChangePasswordDialog,
+);
 
 interface NavEntry {
   to: string;
@@ -189,6 +196,8 @@ function UserMenu() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [passwordOpen, setPasswordOpen] = useState(false);
+  // 首次打开才加载对话框 chunk；之后保持挂载，关闭动画与原先一致
+  const [passwordMounted, setPasswordMounted] = useState(false);
 
   const handleLogout = async () => {
     try {
@@ -227,7 +236,12 @@ function UserMenu() {
             <User className="size-4 text-ink-tertiary" />
             个人设置
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setPasswordOpen(true)}>
+          <DropdownMenuItem
+            onSelect={() => {
+              setPasswordMounted(true);
+              setPasswordOpen(true);
+            }}
+          >
             <Lock className="size-4 text-ink-tertiary" />
             修改密码
           </DropdownMenuItem>
@@ -237,7 +251,7 @@ function UserMenu() {
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
+      {passwordMounted && <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />}
     </>
   );
 }
@@ -256,7 +270,7 @@ export function AppShell() {
     <div className="flex min-h-dvh flex-col bg-canvas md:flex-row">
       <aside className="sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-line bg-surface md:flex md:w-16 lg:w-[220px]">
         <div className="flex h-14 items-center border-b border-line px-4 lg:px-5">
-          <img src="/logo.png" alt="" className="size-7 shrink-0 rounded-md" />
+          <img src={logoUrl} alt="" className="size-7 shrink-0 rounded-md" />
           <span className="ml-2 hidden truncate text-sm font-semibold text-ink lg:inline">{siteTitle}</span>
         </div>
         <div className="flex-1 overflow-y-auto">
@@ -291,7 +305,7 @@ export function AppShell() {
               <NavSections isAdmin={isAdmin} full unreadCount={unreadCount} onNavigate={() => setMenuOpen(false)} />
             </SheetContent>
           </Sheet>
-          <img src="/logo.png" alt="" className="size-7 shrink-0 rounded-md md:hidden" />
+          <img src={logoUrl} alt="" className="size-7 shrink-0 rounded-md md:hidden" />
           <span className="truncate text-sm font-semibold text-ink md:hidden">{siteTitle}</span>
           <div className="ml-auto flex items-center gap-1">
             <GithubIconLink />

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 import { cn } from '@/lib/cn'
 import { sanitizeEmailHtml } from '../sanitize-email-html'
 
@@ -47,10 +47,10 @@ export function EmailHtml({
   const frameRef = useRef<HTMLIFrameElement>(null)
   const trustedOriginsKey = trustedImageOrigins.join('\n')
 
+  // 绘制前同步换上可信骨架（含本封邮件的 CSP）并清空旧正文：切换邮件时旧内容不会残留一帧。
   useLayoutEffect(() => {
-    const iframe = frameRef.current
-    const frameDocument = iframe?.contentDocument
-    if (!iframe || !frameDocument) return
+    const frameDocument = frameRef.current?.contentDocument
+    if (!frameDocument) return
 
     // 先创建可信骨架，再用 DOM API 写入正文，避免把邮件字符串插进 raw-text 上下文。
     frameDocument.open()
@@ -66,6 +66,15 @@ export function EmailHtml({
     const style = frameDocument.createElement('style')
     style.textContent = FRAME_BASE_STYLES
     frameDocument.head.replaceChildren(csp, referrer, style)
+    // The key intentionally tracks array contents rather than its reference.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [html, allowRemoteImages, trustedOriginsKey])
+
+  // 消毒与写入正文较重（大邮件可达数百毫秒），放到首帧绘制之后，页头与操作栏先出现。
+  useEffect(() => {
+    const iframe = frameRef.current
+    const frameDocument = iframe?.contentDocument
+    if (!iframe || !frameDocument?.body) return
 
     const content = frameDocument.createElement('div')
     content.id = 'email-content'

@@ -1,10 +1,11 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
 import { AlertCircle, Inbox as InboxIcon, MailOpen, RotateCcw, SearchX, Star, Trash2, X } from 'lucide-react';
-import { type MouseEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type MouseEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ListMessagesQuery } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
+import { loadMessagePage, warmModule } from '@/app/route-modules';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
@@ -13,10 +14,17 @@ import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import type { MessageSummary } from '@hpc-mail/shared';
 import { useSharedMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
-import { mailHref } from './mail-view';
+import { listMailView, mailHref } from './mail-view';
+import { syncReadState, syncRemovedMessages, syncStarState } from './message-cache';
+import { messageDetailQueryOptions } from './message-queries';
 import { MessageRow } from './message-row';
 import { useMessagesQuery } from './use-messages';
 import { useStarMutation } from './use-star';
+
+/** 距已加载末尾不足这么多行就开始拉下一页（用户已开始滚动时） */
+const PREFETCH_ROWS = 20;
+/** 悬停/聚焦行这么久才预取详情，划过不算 */
+const DETAIL_PREFETCH_DELAY_MS = 100;
 
 export interface MailListProps {
   query: Partial<ListMessagesQuery>;
@@ -28,6 +36,8 @@ export interface MailListProps {
   variant?: 'inbox' | 'trash';
   /** 审计他人已认领邮件：可看、可星标，不能标已读/删除 */
   readOnly?: boolean;
+  /** 列表为空时替代默认空态（含筛选无结果） */
+  emptyContent?: ReactNode;
 }
 
 function ListSkeleton() {
@@ -46,6 +56,29 @@ function ListSkeleton() {
   );
 }
 
+/** 分钟级时钟：memo 行据此刷新「n 分钟前」 */
+function useMinuteClock(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = globalThis.setInterval(() => setNow(Date.now()), 60_000);
+    return () => globalThis.clearInterval(timer);
+  }, []);
+  return now;
+}
+
+/** 空闲时预取详情页 chunk，点开第一封邮件不再等 chunk */
+function useIdleWarm(load: () => Promise<unknown>, enabled: boolean): void {
+  useEffect(() => {
+    if (!enabled) return;
+    if (typeof globalThis.requestIdleCallback === 'function') {
+      const handle = globalThis.requestIdleCallback(() => warmModule(load), { timeout: 3_000 });
+      return () => globalThis.cancelIdleCallback(handle);
+    }
+    const timer = globalThis.setTimeout(() => warmModule(load), 1_500);
+    return () => globalThis.clearTimeout(timer);
+  }, [load, enabled]);
+}
+
 export function MailList({
   query,
   hasActiveFilters = false,
@@ -54,30 +87,53 @@ export function MailList({
   emptyDescription,
   variant = 'inbox',
   readOnly = false,
+  emptyContent,
 }: MailListProps) {
   const queryClient = useQueryClient();
   const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } =
     useMessagesQuery(query);
-  const items = data?.pages.flatMap((page) => page.items) ?? [];
+  const items = useMemo(() => data?.pages.flatMap((page) => page.items) ?? [], [data]);
+  const now = useMinuteClock();
+  useIdleWarm(loadMessagePage, items.length > 0);
   const { data: sharedMailboxes } = useSharedMailboxesQuery();
   const sharedAddresses = useMemo(
     () => new Set((sharedMailboxes ?? []).map((mailbox) => mailbox.address)),
     [sharedMailboxes],
   );
 
-  const starView =
-    query.scope === 'unclaimed' || query.scope === 'user'
-      ? { scope: query.scope, userId: query.userId }
-      : undefined;
-  const star = useStarMutation(starView);
-  const handleToggleStar = (message: MessageSummary) =>
-    star.mutate({ id: message.id, starred: !message.isStarred });
+  // 与行链接 /mail/:id?scope=… 解析出的上下文一致：星标与详情预取都写入详情页会读取的 queryKey
+  const mailView = useMemo(
+    () => listMailView({ scope: query.scope, userId: query.userId }),
+    [query.scope, query.userId],
+  );
+  const { mutate: toggleStar } = useStarMutation(mailView);
+  const handleToggleStar = useCallback(
+    (message: MessageSummary) => toggleStar({ id: message.id, starred: !message.isStarred }),
+    [toggleStar],
+  );
+
+  // ---- 悬停/聚焦行时预取详情（GET 无副作用；已读由详情页单独 POST）----
+  const prefetchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const handleOpenIntent = useCallback(
+    (id: number | null) => {
+      globalThis.clearTimeout(prefetchTimer.current);
+      if (id === null) return;
+      prefetchTimer.current = globalThis.setTimeout(() => {
+        void queryClient.prefetchQuery(messageDetailQueryOptions(id, mailView));
+      }, DETAIL_PREFETCH_DELAY_MS);
+    },
+    [queryClient, mailView],
+  );
+  useEffect(() => () => globalThis.clearTimeout(prefetchTimer.current), []);
 
   // ---- 批量选择 ----
   const [selection, setSelection] = useState<Set<number>>(new Set());
   const [purgeIds, setPurgeIds] = useState<number[]>([]);
   const lastClickedRef = useRef<number | null>(null);
   const loadedIds = useMemo(() => items.map((m) => m.id), [items]);
+  // 连选读最新 id 序列，回调本身保持稳定，新邮件到达不会让所有 memo 行重渲染
+  const loadedIdsRef = useRef(loadedIds);
+  loadedIdsRef.current = loadedIds;
 
   const clearSelection = useCallback(() => {
     setSelection(new Set());
@@ -92,6 +148,7 @@ export function MailList({
 
   const toggleSelect = useCallback(
     (id: number, event: MouseEvent) => {
+      const loadedIds = loadedIdsRef.current;
       setSelection((prev) => {
         const next = new Set(prev);
         // Shift 连选：选中上次点击到本次之间的所有行
@@ -111,70 +168,80 @@ export function MailList({
         return next;
       });
     },
-    [loadedIds],
+    [],
   );
 
   const allSelected = loadedIds.length > 0 && loadedIds.every((id) => selection.has(id));
 
-  const invalidateMessages = () => {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
-  };
-
   // 未认领视图的批量已读/删除必须显式带 scope，否则后端只动自己认领的地址
   const mutationScope = query.scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
+
+  // 批量操作先按 id 就地更新缓存；服务端实际生效数与按本地状态预期的不一致时
+  // （部分无权限、或已在别处改变），就地结果不可信，退回整表重拉对齐
+  const itemById = useMemo(() => new Map(items.map((m) => [m.id, m])), [items]);
+  const reconcileLists = (applied: number, expected: number) => {
+    if (applied !== expected) void queryClient.invalidateQueries({ queryKey: queryKeys.messages.lists });
+  };
 
   const batchRead = useMutation({
     mutationFn: ({ ids, isRead }: { ids: number[]; isRead: boolean }) =>
       messageApi.markRead(ids, isRead, mutationScope),
-    onSuccess: ({ changed }, { isRead }) => {
+    onSuccess: ({ changed }, { ids, isRead }) => {
       toast({ title: changed ? `已将 ${changed} 封标记为${isRead ? '已读' : '未读'}` : '没有邮件状态改变', variant: 'success' });
       clearSelection();
-      invalidateMessages();
+      const expected = ids.filter((id) => itemById.get(id)?.isRead !== isRead).length;
+      syncReadState(queryClient, ids, isRead);
+      reconcileLists(changed, expected);
     },
     onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
   });
 
   const batchStar = useMutation({
-    mutationFn: (ids: number[]) => messageApi.star(ids, true, starView),
-    onSuccess: ({ changed }) => {
+    mutationFn: (ids: number[]) => messageApi.star(ids, true, mailView),
+    onSuccess: ({ changed }, ids) => {
       toast({ title: changed ? `已为 ${changed} 封加星标` : '没有邮件状态改变', variant: 'success' });
       clearSelection();
-      invalidateMessages();
+      const expected = ids.filter((id) => !itemById.get(id)?.isStarred).length;
+      syncStarState(queryClient, ids, true);
+      reconcileLists(changed, expected);
     },
     onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
   });
 
   const batchDelete = useMutation({
     mutationFn: (ids: number[]) => messageApi.remove(ids, mutationScope),
-    onSuccess: (result) => {
+    onSuccess: (result, ids) => {
       if (result.deleted === 0) {
         toast({ title: '这些邮件不能删除', variant: 'error' });
         return;
       }
       toast({ title: `已删除 ${result.deleted} 封`, variant: 'success' });
       clearSelection();
-      invalidateMessages();
+      syncRemovedMessages(queryClient, ids, 'live');
+      reconcileLists(result.deleted, ids.length);
     },
     onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
   });
 
   const batchRestore = useMutation({
     mutationFn: (ids: number[]) => messageApi.restore(ids, mutationScope),
-    onSuccess: ({ changed }) => {
+    onSuccess: ({ changed }, ids) => {
       toast({ title: changed ? `已恢复 ${changed} 封` : '没有可恢复的邮件', variant: 'success' });
       clearSelection();
-      invalidateMessages();
+      syncRemovedMessages(queryClient, ids, 'trash');
+      reconcileLists(changed, ids.length);
     },
     onError: () => toast({ title: '恢复失败，请重试', variant: 'error' }),
   });
 
   const batchPurge = useMutation({
     mutationFn: (ids: number[]) => messageApi.purge(ids, mutationScope),
-    onSuccess: ({ changed }) => {
+    onSuccess: ({ changed }, ids) => {
       toast({ title: changed ? `已永久删除 ${changed} 封` : '没有可永久删除的邮件', variant: 'success' });
       setPurgeIds([]);
       clearSelection();
-      invalidateMessages();
+      syncRemovedMessages(queryClient, ids, 'trash');
+      reconcileLists(changed, ids.length);
     },
     onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
   });
@@ -202,13 +269,14 @@ export function MailList({
   });
   const virtualItems = virtualizer.getVirtualItems();
 
+  const scrolled = (virtualizer.scrollOffset ?? 0) > 0;
   useEffect(() => {
     const last = virtualItems[virtualItems.length - 1];
-    if (!last) return;
-    if (last.index >= items.length - 1 && hasNextPage && !isFetchingNextPage) {
-      void fetchNextPage();
-    }
-  }, [virtualItems, items.length, hasNextPage, isFetchingNextPage, fetchNextPage]);
+    if (!last || !hasNextPage || isFetchingNextPage) return;
+    // 首屏只在内容不足一屏时续页；开始滚动后提前约 20 行续页，滚到底前下一页已就绪
+    const threshold = scrolled ? PREFETCH_ROWS : 0;
+    if (last.index >= items.length - 1 - threshold) void fetchNextPage();
+  }, [virtualItems, items.length, hasNextPage, isFetchingNextPage, fetchNextPage, scrolled]);
 
   if (isLoading) return <ListSkeleton />;
 
@@ -229,6 +297,7 @@ export function MailList({
   }
 
   if (items.length === 0) {
+    if (emptyContent) return <>{emptyContent}</>;
     return hasActiveFilters ? (
       <EmptyState
         icon={SearchX}
@@ -368,6 +437,8 @@ export function MailList({
                 selectionActive={selectionActive}
                 onToggleSelect={readOnly ? undefined : toggleSelect}
                 shared={sharedAddresses.has(message.address)}
+                now={now}
+                onOpenIntent={handleOpenIntent}
               />
             </div>
           );

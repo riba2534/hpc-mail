@@ -1,8 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Download, FileDown, Forward, ImageOff, MailOpen, MoreHorizontal, Paperclip, Reply, ReplyAll, Star, Trash2 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import type { MessageDetail } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
@@ -20,7 +19,9 @@ import { toast } from '@/components/ui/toast';
 import { buildForward, buildReply, buildReplyAll, buildResend } from '@/features/compose/compose-init';
 import { useSharedMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import { Badge } from '@/components/ui/badge';
-import { mailHref } from '@/features/inbox/mail-view';
+import { mailHref, parseMailView } from '@/features/inbox/mail-view';
+import { syncReadState, syncRemovedMessages } from '@/features/inbox/message-cache';
+import { messageDetailQueryOptions } from '@/features/inbox/message-queries';
 import { useStarMutation } from '@/features/inbox/use-star';
 import { cn } from '@/lib/cn';
 import { countRemoteImages } from './count-remote-images';
@@ -41,12 +42,9 @@ export function MessagePage() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const scopeRaw = searchParams.get('scope');
-  const scope: 'mine' | 'unclaimed' | 'user' | undefined =
-    scopeRaw === 'unclaimed' || scopeRaw === 'user' || scopeRaw === 'mine' ? scopeRaw : undefined;
-  const userIdRaw = Number(searchParams.get('userId'));
-  const userId = Number.isInteger(userIdRaw) && userIdRaw > 0 ? userIdRaw : undefined;
-  const view = scope ? { scope, userId } : undefined;
+  // 与列表行链接、悬停预取、启动预取解析同一查询串，命中同一个详情缓存
+  const view = parseMailView(searchParams);
+  const scope = view?.scope;
   const auditUser = scope === 'user';
   const mutationScope = scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -55,27 +53,24 @@ export function MessagePage() {
 
   const { data: sharedMailboxes, isPending: sharedPending } = useSharedMailboxesQuery();
   const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
-    queryKey: queryKeys.messages.detail(messageId, view),
-    queryFn: ({ signal }) => messageApi.detail(messageId, view, signal),
+    ...messageDetailQueryOptions(messageId, view),
     enabled: Number.isInteger(messageId) && messageId > 0,
   });
 
   const star = useStarMutation(view);
 
   const { data: threadData } = useQuery({
-    queryKey: ['messages', 'thread', messageId, view],
+    queryKey: queryKeys.messages.thread(messageId, view),
     queryFn: ({ signal }) => messageApi.thread(messageId, view, signal),
     enabled: Number.isInteger(messageId) && messageId > 0,
   });
   const thread = threadData?.items ?? [];
 
   const markRead = useMutation({
-    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope; view: typeof view }) => messageApi.markRead([args.id], args.isRead, args.scope),
-    onSuccess: (result, { id, isRead, view: targetView }) => {
-      queryClient.setQueryData<MessageDetail>(queryKeys.messages.detail(id, targetView), (prev) =>
-        prev && result.changed > 0 ? { ...prev, isRead } : prev,
-      );
-      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
+    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope }) => messageApi.markRead([args.id], args.isRead, args.scope),
+    onSuccess: (result, { id, isRead }) => {
+      // 只同步这一封的已读状态与未读数；列表只标记过期，回到列表时由首页探测/单页重拉对齐
+      if (result.changed > 0) syncReadState(queryClient, [id], isRead);
     },
   });
 
@@ -83,7 +78,7 @@ export function MessagePage() {
     if (auditUser) return;
     if (message && !message.isRead && markedRef.current !== message.id) {
       markedRef.current = message.id;
-      markRead.mutate({ id: message.id, isRead: true, scope: mutationScope, view });
+      markRead.mutate({ id: message.id, isRead: true, scope: mutationScope });
     }
     // 只在消息首次加载为未读时触发一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -107,14 +102,14 @@ export function MessagePage() {
         return;
       }
       toast({ title: '邮件已删除', variant: 'success' });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.root });
+      syncRemovedMessages(queryClient, [messageId], 'live');
       goBack();
     },
     onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
   });
 
   const handleMarkUnread = () => {
-    markRead.mutate({ id: messageId, isRead: false, scope: mutationScope, view });
+    markRead.mutate({ id: messageId, isRead: false, scope: mutationScope });
     goBack();
   };
 
@@ -140,6 +135,16 @@ export function MessagePage() {
       toast({ title: '下载失败', variant: 'error' });
     }
   };
+
+  // 大邮件解析 DOM / 跑正则较贵：只在正文变化时计算，切换图片开关、星标等不再重算
+  const bodyHtml = message?.bodyHtml;
+  const remoteImageCount = useMemo(() => (bodyHtml ? countRemoteImages(bodyHtml) : 0), [bodyHtml]);
+  const extractedOtp = useMemo(
+    () => (message && message.direction !== 'outbound' && !message.verificationCode
+      ? extractOtp(message.subject, message.bodyText)?.code
+      : undefined),
+    [message?.direction, message?.verificationCode, message?.subject, message?.bodyText],
+  );
 
   if (isLoading) {
     return (
@@ -175,11 +180,8 @@ export function MessagePage() {
   const shared = (sharedMailboxes ?? []).some((mailbox) => mailbox.address === message.address);
   const canActAsOwner = !auditUser && !shared && !sharedPending;
   // 验证码 banner 只对收到的邮件有意义，自己发出的邮件不提取/不展示
-  const otpCode = outbound
-    ? undefined
-    : message.verificationCode || extractOtp(message.subject, message.bodyText)?.code;
+  const otpCode = outbound ? undefined : message.verificationCode || extractedOtp;
   const recipients = [...message.recipients.to, ...message.recipients.cc];
-  const remoteImageCount = message.bodyHtml ? countRemoteImages(message.bodyHtml) : 0;
   const sendIssue = outbound && (message.errorDetail || message.status === 'failed' || message.status === 'bounced');
   const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
 

@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createContext, useCallback, useContext, useSyncExternalStore } from 'react';
 import type { SessionUser } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
@@ -13,16 +13,20 @@ export function useAuthToken(): string | null {
   return useSyncExternalStore(subscribe, getAuthToken, () => null);
 }
 
-/** ['session'] 查询：有 token 时拉取当前用户 */
-export function useSessionQuery() {
-  const token = useAuthToken();
-  return useQuery({
-    queryKey: queryKeys.sessionForRevision(getAuthRevision()),
+/** 当前用户查询；启动预取与 AuthGuard 共用，按 token 代次隔离缓存 */
+export function sessionQueryOptions(revision: number) {
+  return queryOptions({
+    queryKey: queryKeys.sessionForRevision(revision),
     queryFn: () => authApi.me(),
-    enabled: Boolean(token),
     staleTime: 60_000,
     retry: false,
   });
+}
+
+/** ['session'] 查询：有 token 时拉取当前用户 */
+export function useSessionQuery() {
+  const token = useAuthToken();
+  return useQuery({ ...sessionQueryOptions(getAuthRevision()), enabled: Boolean(token) });
 }
 
 /** 已认证外壳内向下传递已解析的当前用户，避免重复请求 */
