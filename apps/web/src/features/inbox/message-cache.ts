@@ -1,4 +1,4 @@
-import type { InfiniteData, Query, QueryClient } from '@tanstack/react-query';
+import type { InfiniteData, Query, QueryClient, QueryKey } from '@tanstack/react-query';
 import type { ListMessagesQuery, MessageDetail, MessageSummary, Page } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 
@@ -122,18 +122,88 @@ export function syncRemovedMessages(client: QueryClient, ids: readonly number[],
   refreshUnreadCount(client);
 }
 
-/** 全部已读（个人邮箱的收件）：就地标记已读并移出「未读」筛选，详情只标记过期。 */
-export function syncAllRead(client: QueryClient): void {
-  updateLists(
-    client,
-    (item, filters) => {
-      if (item.direction !== 'inbound') return item;
-      if (filters.unread) return null;
-      return item.isRead ? item : { ...item, isRead: true };
-    },
-    isMineList,
-  );
+/** 全部已读的作用范围：与请求体一致；ownedAddresses 用于跳过共享给自己的邮件（它们的已读状态不变） */
+export interface ReadAllScope {
+  domain?: string;
+  address?: string;
+  q?: string;
+  ownedAddresses?: ReadonlySet<string>;
+}
+
+/**
+ * 全部已读（个人邮箱的收件）：就地标记命中范围的邮件已读并移出「未读」筛选，详情只标记过期。
+ * 关键词范围无法在本地判断，只标记过期由服务端结果对齐。
+ */
+export function syncAllRead(client: QueryClient, scope: ReadAllScope = {}): void {
+  if (!scope.q) {
+    updateLists(
+      client,
+      (item, filters) => {
+        if (item.direction !== 'inbound') return item;
+        if (scope.domain && item.domain !== scope.domain) return item;
+        if (scope.address && item.address !== scope.address) return item;
+        if (scope.ownedAddresses && !scope.ownedAddresses.has(item.address)) return item;
+        if (filters.unread) return null;
+        return item.isRead ? item : { ...item, isRead: true };
+      },
+      isMineList,
+    );
+  }
   void client.invalidateQueries({ queryKey: queryKeys.messages.details, refetchType: 'none' });
+  refreshLists(client);
+  refreshUnreadCount(client);
+}
+
+/** 删除前各列表里这批邮件的快照，撤销时据此放回原列表 */
+export type ListMembership = Array<{ queryKey: QueryKey; items: MessageSummary[] }>;
+
+export function snapshotListMembership(client: QueryClient, ids: readonly number[]): ListMembership {
+  const idSet = new Set(ids);
+  const snapshot: ListMembership = [];
+  for (const query of client.getQueryCache().findAll({ queryKey: queryKeys.messages.lists })) {
+    if (filtersOf(query).trash) continue;
+    const data = query.state.data as MessageListData | undefined;
+    const items = data?.pages.flatMap((page) => page.items.filter((item) => idSet.has(item.id))) ?? [];
+    if (items.length > 0) snapshot.push({ queryKey: query.queryKey, items });
+  }
+  return snapshot;
+}
+
+/** 按 id 倒序把条目插回分页列表（已存在的不重复插入） */
+function insertById(data: MessageListData, items: MessageSummary[]): MessageListData {
+  const present = new Set(data.pages.flatMap((page) => page.items.map((item) => item.id)));
+  const pages = data.pages.map((page) => ({ ...page, items: [...page.items] }));
+  for (const item of items) {
+    if (present.has(item.id)) continue;
+    let target = pages.findIndex((page) => page.items.some((existing) => existing.id < item.id));
+    let position = target === -1 ? -1 : pages[target]!.items.findIndex((existing) => existing.id < item.id);
+    // 落在两页之间时接到上一页末尾，保持原有的页边界与游标语义
+    if (target === -1 || (position === 0 && target > 0)) {
+      target = target === -1 ? pages.length - 1 : target - 1;
+      position = -1;
+    }
+    const page = pages[target];
+    if (!page) continue;
+    page.items.splice(position === -1 ? page.items.length : position, 0, item);
+    present.add(item.id);
+  }
+  return { ...data, pages };
+}
+
+/** 撤销删除（恢复成功）后：放回删除前所在的列表，从回收站列表移除，未读数刷新。 */
+export function syncRestoredMessages(client: QueryClient, ids: readonly number[], membership: ListMembership): void {
+  const idSet = new Set(ids);
+  for (const { queryKey, items } of membership) {
+    const restored = items.filter((item) => idSet.has(item.id));
+    if (restored.length === 0) continue;
+    client.setQueryData<MessageListData>(queryKey, (data) => (data ? insertById(data, restored) : undefined));
+  }
+  updateLists(client, (item) => (idSet.has(item.id) ? null : item), (filters) => Boolean(filters.trash));
+  void client.invalidateQueries({
+    queryKey: queryKeys.messages.details,
+    predicate: (query) => idSet.has(query.queryKey[2] as number),
+    refetchType: 'none',
+  });
   refreshLists(client);
   refreshUnreadCount(client);
 }

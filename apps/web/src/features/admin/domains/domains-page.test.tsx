@@ -50,4 +50,26 @@ describe('domain configuration safety', () => {
     expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({title:expect.stringContaining('重新加载')}));
     client.clear();
   });
+  it('已有域名时接入指南默认折叠，可手动展开', async () => {
+    mocks.get.mockResolvedValue({domains:{revision:2,list:[{domain:'old.example',public:false,perUserLimit:0}]}});
+    const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
+    await screen.findByText('old.example');
+    const toggle = screen.getByRole('button', {name:/如何接入一个新域名/});
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('在 Cloudflare 为该域开启 Email Routing')).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('在 Cloudflare 为该域开启 Email Routing')).toBeInTheDocument();
+    client.clear();
+  });
+  it('还没有域名时接入指南默认展开', async () => {
+    mocks.get.mockResolvedValue({domains:{revision:1,list:[]}});
+    const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
+    await screen.findByText('还没有配置收件域名');
+    expect(screen.getByRole('button', {name:/如何接入一个新域名/})).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('在 Cloudflare 为该域开启 Email Routing')).toBeInTheDocument();
+    client.clear();
+  });
 });

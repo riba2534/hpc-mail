@@ -7,7 +7,9 @@ import {
   type MessageListData,
   syncAllRead,
   syncReadState,
+  snapshotListMembership,
   syncRemovedMessages,
+  syncRestoredMessages,
   syncStarState,
 } from './message-cache';
 
@@ -178,5 +180,45 @@ describe('cache sync after mutations', () => {
     expect(list(inbox)?.pages[0]?.items.map((m) => m.isRead)).toEqual([true, false]);
     expect(ids(list(unread))).toEqual([[]]);
     expect(list(unclaimed)?.pages[0]?.items[0]?.isRead).toBe(false);
+  });
+
+  it('scoped read-all skips other domains and shared mail, and leaves keyword scopes to the server', () => {
+    const { client, seedList, list, listState } = setup();
+    const inbox = { scope: 'mine' as const };
+    seedList(inbox, data({
+      items: [
+        mail(4, { domain: 'a.example', address: 'me@a.example' }),
+        mail(3, { domain: 'a.example', address: 'shared@a.example' }),
+        mail(2, { domain: 'b.example', address: 'me@b.example' }),
+      ],
+      nextCursor: null,
+    }));
+
+    syncAllRead(client, { domain: 'a.example', ownedAddresses: new Set(['me@a.example', 'me@b.example']) });
+    expect(list(inbox)?.pages[0]?.items.map((m) => m.isRead)).toEqual([true, false, false]);
+
+    syncAllRead(client, { q: 'invoice' });
+    expect(list(inbox)?.pages[0]?.items.map((m) => m.isRead)).toEqual([true, false, false]);
+    expect(listState(inbox)?.isInvalidated).toBe(true);
+  });
+
+  it('undo puts deleted mail back into the lists it came from, in order', () => {
+    const { client, seedList, list } = setup();
+    const inbox = { scope: 'mine' as const };
+    const unread = { scope: 'mine' as const, unread: true };
+    const trash = { scope: 'mine' as const, trash: true };
+    seedList(inbox, data(page([9, 8], 'c8'), page([7, 6], null)));
+    seedList(unread, data(page([8, 6], null)));
+    seedList(trash, data(page([], null)));
+
+    const membership = snapshotListMembership(client, [8, 6]);
+    syncRemovedMessages(client, [8, 6], 'live');
+    expect(ids(list(inbox))).toEqual([[9], [7]]);
+    seedList(trash, data(page([8, 6], null)));
+
+    syncRestoredMessages(client, [8, 6], membership);
+    expect(ids(list(inbox))).toEqual([[9, 8], [7, 6]]);
+    expect(ids(list(unread))).toEqual([[8, 6]]);
+    expect(ids(list(trash))).toEqual([[]]);
   });
 });

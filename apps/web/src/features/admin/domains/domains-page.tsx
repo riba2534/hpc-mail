@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowDown,
   CheckCircle2,
+  ChevronDown,
   ExternalLink,
   Globe,
   Plus,
@@ -28,6 +29,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { toast } from '@/components/ui/toast';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+import { cn } from '@/lib/cn';
 
 const WORKER_NAME = 'hpc-cloud-mail';
 const CLOUDFLARE_DASH = 'https://dash.cloudflare.com';
@@ -132,7 +134,7 @@ function DomainRow({
     <li className="flex flex-col gap-2.5 rounded-md border border-line px-3 py-2.5">
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="truncate font-mono text-sm text-ink">{entry.domain}</span>
+          <span className="truncate text-sm font-medium text-ink">{entry.domain}</span>
           <StatusBadge isFetching={isFetching} status={status} />
           {entry.public && <Badge tone="accent">公开</Badge>}
         </div>
@@ -187,6 +189,8 @@ export function DomainsPage() {
   const [newDomain, setNewDomain] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // 接入指南：还没有域名时默认展开，已有域名时默认折叠；用户手动切换后以手动为准
+  const [guideToggled, setGuideToggled] = useState<boolean | null>(null);
 
   const list = settings?.domains.list ?? [];
   const affected = removing ? (allMailboxes ?? []).filter((box) => box.domain === removing) : [];
@@ -221,6 +225,7 @@ export function DomainsPage() {
       toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' });
     },
   });
+  const guideOpen = guideToggled ?? (!isLoading && list.length === 0);
   const canEdit = settings !== undefined && !isLoading && !isError && !persist.isPending;
 
   /** 局部更新某域名条目并落库 */
@@ -273,62 +278,81 @@ export function DomainsPage() {
       />
 
       {/* 接入向导 */}
-      <section className="flex flex-col gap-4 rounded-lg border border-line bg-surface p-5">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">如何接入一个新域名</h2>
-          <p className="mt-0.5 text-[13px] text-ink-secondary">
-            步骤 ①② 在 Cloudflare 后台完成（本站无法代办），步骤 ③ 在本页下方完成。
-          </p>
-        </div>
+      <section className="rounded-lg border border-line bg-surface">
+        <h2 className="text-sm font-semibold text-ink">
+          <button
+            type="button"
+            aria-expanded={guideOpen}
+            aria-controls="domain-onboarding-guide"
+            onClick={() => setGuideToggled(!guideOpen)}
+            className="flex w-full items-start justify-between gap-3 rounded-lg px-5 py-4 text-left transition-colors hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            <span className="flex flex-col gap-0.5">
+              <span>如何接入一个新域名</span>
+              <span className="text-[13px] font-normal text-ink-secondary">
+                步骤 ①② 在 Cloudflare 后台完成（本站无法代办），步骤 ③ 在本页下方完成。
+              </span>
+            </span>
+            <ChevronDown
+              aria-hidden
+              className={cn('mt-0.5 size-4 shrink-0 text-ink-tertiary transition-transform', guideOpen && 'rotate-180')}
+            />
+          </button>
+        </h2>
 
-        <ol className="flex flex-col gap-5">
-          <GuideStep n={1} title="在 Cloudflare 为该域开启 Email Routing">
-            <p>
-              进入目标域名所在的 Cloudflare 账户 → 选择该域名 → 左侧菜单 <b>Email</b> →{' '}
-              <b>Email Routing</b> → 点击开启。Cloudflare 会自动为该域写入所需的 MX 与 SPF 记录（无需手动配）。
-            </p>
-            <div>
-              <Button asChild variant="secondary" size="sm">
-                <a href={CLOUDFLARE_DASH} target="_blank" rel="noreferrer">
-                  打开 Cloudflare 控制台
-                  <ExternalLink className="size-3.5" />
-                </a>
-              </Button>
-            </div>
-          </GuideStep>
+        {guideOpen && (
+          <div id="domain-onboarding-guide" className="border-t border-line px-5 pb-5 pt-4">
+            <ol className="flex flex-col gap-5">
+              <GuideStep n={1} title="在 Cloudflare 为该域开启 Email Routing">
+                <p>
+                  进入目标域名所在的 Cloudflare 账户 → 选择该域名 → 左侧菜单 <b>Email</b> →{' '}
+                  <b>Email Routing</b> → 点击开启。Cloudflare 会自动为该域写入所需的 MX 与 SPF 记录（无需手动配）。
+                </p>
+                <div>
+                  <Button asChild variant="secondary" size="sm">
+                    <a href={CLOUDFLARE_DASH} target="_blank" rel="noreferrer">
+                      打开 Cloudflare 控制台
+                      <ExternalLink className="size-3.5" />
+                    </a>
+                  </Button>
+                </div>
+              </GuideStep>
 
-          <GuideStep n={2} title="创建 Catch-all 规则，指向本系统 Worker">
-            <p>
-              在 Email Routing → <b>Routing rules</b> → <b>Catch-all address</b> → 编辑 → 动作选{' '}
-              <b>Send to a Worker</b> → 选择下面这个 Worker。这一步让任意前缀（如 <span className="font-mono">abc@你的域</span>）的邮件全部进入本系统。
-            </p>
-            <div className="flex items-center gap-2">
-              <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">
-                {WORKER_NAME}
-              </code>
-              <CopyButton value={WORKER_NAME} label="复制 Worker 名" size="sm" />
-            </div>
-            <p className="text-ink-tertiary">
-              ⚠️ Catch-all 动作必须选「Send to a Worker」，不要选「转发到某邮箱」，否则邮件不会进入本系统。
-            </p>
-          </GuideStep>
+              <GuideStep n={2} title="创建 Catch-all 规则，指向本系统 Worker">
+                <p>
+                  在 Email Routing → <b>Routing rules</b> → <b>Catch-all address</b> → 编辑 → 动作选{' '}
+                  <b>Send to a Worker</b> → 选择下面这个 Worker。这一步让任意前缀（如 abc@你的域）的邮件全部进入本系统。
+                </p>
+                <div className="flex items-center gap-2">
+                  <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">
+                    {WORKER_NAME}
+                  </code>
+                  <CopyButton value={WORKER_NAME} label="复制 Worker 名" size="sm" />
+                </div>
+                <p className="flex items-start gap-1.5 text-ink-tertiary">
+                  <AlertTriangle aria-hidden className="mt-[3px] size-3.5 shrink-0 text-caution" />
+                  <span>Catch-all 动作必须选「Send to a Worker」，不要选「转发到某邮箱」，否则邮件不会进入本系统。</span>
+                </p>
+              </GuideStep>
 
-          <GuideStep n={3} title="在本页下方把域名添加进系统并按需公开">
-            <p className="flex flex-wrap items-center gap-1.5">
-              添加后默认<b>仅管理员可用</b>；打开该域名的「公开」开关后普通用户才可见、可认领，并可设每人认领上限。
-              <ArrowDown className="size-3.5 text-ink-tertiary" />
-            </p>
-          </GuideStep>
+              <GuideStep n={3} title="在本页下方把域名添加进系统并按需公开">
+                <p>
+                  添加后默认<b>仅管理员可用</b>；打开该域名的「公开」开关后普通用户才可见、可认领，并可设每人认领上限。
+                  <ArrowDown aria-hidden className="ml-1 inline size-3.5 align-[-2px] text-ink-tertiary" />
+                </p>
+              </GuideStep>
 
-          <GuideStep n={4} title="（可选）把常用外部邮箱加为已验证目标">
-            <p>
-              对外发信与转发默认即可送达任意外部邮箱。若额外在 Email Routing →{' '}
-              <b>Destination addresses</b> 验证目标邮箱，邮箱转发将走 Cloudflare 原生通道、
-              原样保留邮件头与签名（保真度更高）。
-            </p>
-            <p className="text-ink-tertiary">站内地址之间互发直接落库、即时送达。</p>
-          </GuideStep>
-        </ol>
+              <GuideStep n={4} title="（可选）把常用外部邮箱加为已验证目标">
+                <p>
+                  对外发信与转发默认即可送达任意外部邮箱。若额外在 Email Routing →{' '}
+                  <b>Destination addresses</b> 验证目标邮箱，邮箱转发将走 Cloudflare 原生通道、
+                  原样保留邮件头与签名（保真度更高）。
+                </p>
+                <p className="text-ink-tertiary">站内地址之间互发直接落库、即时送达。</p>
+              </GuideStep>
+            </ol>
+          </div>
+        )}
       </section>
 
       {/* 本站域名列表 */}

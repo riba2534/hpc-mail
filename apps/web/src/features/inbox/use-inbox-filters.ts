@@ -4,7 +4,18 @@ import { type InboxFilters, parseInboxFilters } from './inbox-query';
 
 export type { InboxFilters } from './inbox-query';
 
-function domainOf(address: string | null): string | null {
+let rememberedAddress: string | null = null;
+
+/** 收件箱当前筛选的地址：写信页在没有上次发件身份时据此预选发件地址 */
+export function rememberFilterAddress(address: string | null): void {
+  rememberedAddress = address;
+}
+
+export function rememberedFilterAddress(): string | null {
+  return rememberedAddress;
+}
+
+export function domainOf(address: string | null): string | null {
   if (!address) return null;
   const at = address.lastIndexOf('@');
   return at >= 0 ? address.slice(at + 1) : null;
@@ -80,6 +91,15 @@ export function useInboxFilters() {
     [mutate],
   );
 
+  /** 清除域名/地址/未读，保留搜索词（移动端筛选面板用） */
+  const clearFacets = useCallback(() => {
+    mutate((params) => {
+      params.delete('domain');
+      params.delete('address');
+      params.delete('unread');
+    });
+  }, [mutate]);
+
   const reset = useCallback(() => {
     mutate((params) => {
       params.delete('domain');
@@ -89,5 +109,5 @@ export function useInboxFilters() {
     });
   }, [mutate]);
 
-  return { filters, setDomain, setAddress, setUnread, setQuery, reset };
+  return { filters, setDomain, setAddress, setUnread, setQuery, clearFacets, reset };
 }

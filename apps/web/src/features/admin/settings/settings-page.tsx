@@ -6,12 +6,23 @@ import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
+import { UnsavedChangesGuard } from '@/components/unsaved-changes-guard';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
+import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/components/ui/toast';
+
+/** 保留前缀文本 → 数组：逗号（含全角）、顿号、空白、换行均可分隔，转小写并去重 */
+export function parseReservedLocalParts(text: string): string[] {
+  const items = text
+    .split(/[\s,，、]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return [...new Set(items)];
+}
 
 function Section({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
@@ -95,6 +106,8 @@ export function SettingsPage() {
     queryFn: () => adminApi.getSettings(),
   });
   const [draft, setDraft] = useState<Settings | null>(null);
+  // 保留前缀输入框的原始文本：输入过程中保留用户敲的分隔符，失焦或重置草稿时再规范化显示
+  const [reservedText, setReservedText] = useState<string | null>(null);
 
   useEffect(() => {
     if (data && draft === null) setDraft(structuredClone(data));
@@ -117,6 +130,7 @@ export function SettingsPage() {
     onSuccess: (saved) => {
       queryClient.setQueryData(queryKeys.admin.settings, saved);
       setDraft(structuredClone(saved));
+      setReservedText(null);
       void queryClient.invalidateQueries({ queryKey: queryKeys.config });
       toast({ title: '设置已保存', variant: 'success' });
     },
@@ -145,8 +159,9 @@ export function SettingsPage() {
   const dirty = JSON.stringify(draft) !== JSON.stringify(data);
 
   return (
-    <div className="mx-auto max-w-3xl pb-16">
+    <div className="mx-auto max-w-3xl pb-20">
       <PageHeader title="系统设置" description="站点级配置，保存后立即生效。" />
+      <UnsavedChangesGuard when={dirty} description="系统设置有未保存的更改，离开后这些更改会丢失。" />
 
       <div className="flex flex-col gap-4">
         <Section title="站点">
@@ -263,31 +278,38 @@ export function SettingsPage() {
           <label className="flex flex-col gap-1.5">
             <span className="text-sm font-medium text-ink">保留前缀</span>
             <span className="text-xs text-ink-tertiary">
-              普通用户禁止认领这些前缀（防冒充官方身份），逗号分隔。
+              普通用户禁止认领这些前缀（防冒充官方身份）。可用逗号、空格或换行分隔，自动转为小写并去重。
             </span>
-            <Input
-              value={draft.mailbox_policy.reservedLocalParts.join(', ')}
+            <Textarea
+              rows={3}
+              value={reservedText ?? draft.mailbox_policy.reservedLocalParts.join(', ')}
               placeholder="admin, postmaster, abuse, noreply"
-              onChange={(event) =>
-                patch(
-                  (s) =>
-                    void (s.mailbox_policy.reservedLocalParts = event.target.value
-                      .split(/[,\s]+/)
-                      .map((x) => x.trim().toLowerCase())
-                      .filter(Boolean)),
-                )
-              }
+              onChange={(event) => {
+                const text = event.target.value;
+                setReservedText(text);
+                patch((s) => void (s.mailbox_policy.reservedLocalParts = parseReservedLocalParts(text)));
+              }}
+              onBlur={() => setReservedText(null)}
             />
+            <span className="text-xs text-ink-tertiary">共 {draft.mailbox_policy.reservedLocalParts.length} 个</span>
           </label>
         </Section>
       </div>
 
       {dirty && (
-        <div className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-surface/95 px-4 py-3 backdrop-blur md:pl-[220px]">
+        // 移动端停在底部导航（4rem + 安全区）之上；桌面贴底并让开左侧栏
+        <div className="fixed inset-x-0 bottom-[calc(4rem+env(safe-area-inset-bottom))] z-40 border-t border-line bg-surface px-4 py-3 shadow-md md:bottom-0 md:left-16 md:px-6 md:pb-[calc(0.75rem+env(safe-area-inset-bottom))] lg:left-[220px]">
           <div className="mx-auto flex max-w-3xl items-center justify-between gap-3">
             <span className="text-sm text-ink-secondary">有未保存的更改</span>
             <div className="flex items-center gap-2">
-              <Button variant="secondary" onClick={() => setDraft(structuredClone(data))} disabled={save.isPending}>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setDraft(structuredClone(data));
+                  setReservedText(null);
+                }}
+                disabled={save.isPending}
+              >
                 放弃
               </Button>
               <Button loading={save.isPending} onClick={() => save.mutate(draft)}>

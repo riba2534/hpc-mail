@@ -1,23 +1,33 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus, Ticket } from 'lucide-react';
+import { AlertTriangle, MoreHorizontal, Plus, Ticket } from 'lucide-react';
 import { type FormEvent, useState } from 'react';
-import { type Invite, createInviteRequestSchema } from '@hpc-mail/shared';
+import { Link } from 'react-router-dom';
+import { type Invite, type RegistrationMode, createInviteRequestSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CardList, CardListItem } from '@/components/ui/card-list';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { CopyButton } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { EmptyState } from '@/components/ui/empty-state';
 import { FormField } from '@/components/ui/form-field';
+import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
+import { useIsMobile } from '@/lib/use-media-query';
 
 const STATUS_META: Record<Invite['status'], { label: string; tone: BadgeTone }> = {
   usable: { label: '可用', tone: 'positive' },
@@ -25,6 +35,51 @@ const STATUS_META: Record<Invite['status'], { label: string; tone: BadgeTone }> 
   expired: { label: '已过期', tone: 'neutral' },
   revoked: { label: '已作废', tone: 'critical' },
 };
+
+const MODE_LABELS: Record<RegistrationMode, string> = {
+  closed: '关闭',
+  invite: '邀请码',
+  open: '开放',
+};
+
+const MODE_HINTS: Partial<Record<RegistrationMode, string>> = {
+  open: '当前为开放注册，邀请码不生效。',
+  closed: '当前已关闭注册，邀请码不能用于注册。',
+};
+
+/** 当前注册模式：只有「邀请码」模式下邀请码才起作用，其余模式给出提示 */
+function RegistrationModeNotice() {
+  const { data: settings } = useQuery({ queryKey: queryKeys.admin.settings, queryFn: () => adminApi.getSettings() });
+  if (!settings) return null;
+  const mode = settings.register_mode;
+  const hint = MODE_HINTS[mode];
+  return (
+    <div
+      className={
+        hint
+          ? 'mb-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-caution/40 bg-caution-soft/40 px-4 py-3 text-sm'
+          : 'mb-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-line bg-surface px-4 py-3 text-sm'
+      }
+    >
+      <span className="flex items-center gap-2 text-ink-secondary">
+        当前注册模式
+        <Badge tone={mode === 'invite' ? 'accent' : 'caution'}>{MODE_LABELS[mode]}</Badge>
+      </span>
+      {hint && (
+        <span className="flex items-center gap-1.5 text-ink">
+          <AlertTriangle aria-hidden className="size-4 shrink-0 text-caution" />
+          {hint}
+        </span>
+      )}
+      <Link
+        to="/admin/settings"
+        className="ml-auto text-sm font-medium text-accent underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      >
+        {hint ? '前往系统设置修改' : '系统设置'}
+      </Link>
+    </div>
+  );
+}
 
 function CreateInviteDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const queryClient = useQueryClient();
@@ -144,7 +199,13 @@ function CreateInviteDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   );
 }
 
+function usedByLabel(invite: Invite): string {
+  if (invite.usedBy.length === 0) return '';
+  return invite.usedBy.slice(0, 3).join('、') + (invite.usedBy.length > 3 ? ` +${invite.usedBy.length - 3}` : '');
+}
+
 export function InvitesPage() {
+  const isMobile = useIsMobile();
   const queryClient = useQueryClient();
   const { data, isLoading } = useQuery({ queryKey: queryKeys.admin.invites, queryFn: () => adminApi.listInvites() });
   const [createOpen, setCreateOpen] = useState(false);
@@ -174,6 +235,7 @@ export function InvitesPage() {
           </Button>
         }
       />
+      <RegistrationModeNotice />
 
       {isLoading ? (
         <Skeleton className="h-40 w-full rounded-lg" />
@@ -185,6 +247,52 @@ export function InvitesPage() {
           action={<Button onClick={() => setCreateOpen(true)}>生成邀请码</Button>}
           className="rounded-lg border border-line bg-surface"
         />
+      ) : isMobile ? (
+        <CardList>
+          {invites.map((invite) => {
+            const status = STATUS_META[invite.status];
+            return (
+              <CardListItem
+                key={invite.id}
+                title={
+                  <>
+                    <code className="truncate font-mono text-sm text-ink">{invite.code}</code>
+                    <CopyButton value={invite.code} size="sm" />
+                  </>
+                }
+                subtitle={invite.note || undefined}
+                meta={
+                  <>
+                    <Badge tone={status.tone}>{status.label}</Badge>
+                    <span>
+                      已用 {invite.usedCount} / {invite.maxUses}
+                    </span>
+                    <span>{invite.expiresAt ? `${formatDateTime(invite.expiresAt)} 到期` : '永久有效'}</span>
+                    {invite.usedBy.length > 0 && <span title={invite.usedBy.join('、')}>注册者 {usedByLabel(invite)}</span>}
+                  </>
+                }
+                actions={
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <IconButton size="sm" aria-label="更多操作">
+                        <MoreHorizontal className="size-4" />
+                      </IconButton>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent>
+                      <DropdownMenuItem
+                        tone="danger"
+                        disabled={invite.status !== 'usable'}
+                        onSelect={() => setRevoking(invite)}
+                      >
+                        作废邀请码
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                }
+              />
+            );
+          })}
+        </CardList>
       ) : (
         <Table>
           <TableHeader>
@@ -222,8 +330,7 @@ export function InvitesPage() {
                   <TableCell className="text-ink-secondary">
                     {invite.usedBy.length > 0 ? (
                       <span className="text-sm" title={invite.usedBy.join('、')}>
-                        {invite.usedBy.slice(0, 3).join('、')}
-                        {invite.usedBy.length > 3 ? ` +${invite.usedBy.length - 3}` : ''}
+                        {usedByLabel(invite)}
                       </span>
                     ) : (
                       '—'

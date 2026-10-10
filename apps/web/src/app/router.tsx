@@ -21,6 +21,12 @@ import {
   preloadable,
 } from './route-modules';
 
+/** 路由默认标签页标题；外壳读取最深一层的 handle.title，页面可用 useDocumentTitle 覆盖 */
+export interface RouteHandle {
+  title?: string;
+}
+const title = (value: string): RouteHandle => ({ title: value });
+
 const page = <M,>(load: ModuleLoader<M>, pick: (module: M) => ComponentType) =>
   lazyWithReload(load, pick, <PageLoader />);
 
@@ -65,32 +71,32 @@ export const router = createBrowserRouter([
     errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <Navigate to="/inbox" replace /> },
-      { path: 'inbox', element: <InboxPage /> },
-      { path: 'mail/:id', element: <MessagePage /> },
-      { path: 'compose', element: <ComposePage /> },
-      { path: 'sent', element: <SentPage /> },
-      { path: 'starred', element: <StarredPage /> },
-      { path: 'trash', element: <TrashPage /> },
-      { path: 'mailboxes', element: <MailboxesPage /> },
-      { path: 'api-keys', element: <ApiKeysPage /> },
-      { path: 'profile', element: <ProfilePage /> },
+      { path: 'inbox', element: <InboxPage />, handle: title('收件箱') },
+      { path: 'mail/:id', element: <MessagePage />, handle: title('邮件详情') },
+      { path: 'compose', element: <ComposePage />, handle: title('写邮件') },
+      { path: 'sent', element: <SentPage />, handle: title('已发送') },
+      { path: 'starred', element: <StarredPage />, handle: title('星标') },
+      { path: 'trash', element: <TrashPage />, handle: title('回收站') },
+      { path: 'mailboxes', element: <MailboxesPage />, handle: title('我的邮箱') },
+      { path: 'api-keys', element: <ApiKeysPage />, handle: title('API Keys') },
+      { path: 'profile', element: <ProfilePage />, handle: title('个人设置') },
       {
         path: 'admin',
         element: <AdminGuard />,
         children: [
           { index: true, element: <Navigate to="/admin/users" replace /> },
-          { path: 'users', element: <UsersPage /> },
-          { path: 'users/:userId/mail', element: <AdminUserMailPage /> },
-          { path: 'mail', element: <AdminMailPage /> },
-          { path: 'invites', element: <InvitesPage /> },
-          { path: 'domains', element: <DomainsPage /> },
-          { path: 'addresses', element: <AddressesPage /> },
-          { path: 'shared-mailboxes', element: <SharedMailboxesPage /> },
-          { path: 'settings', element: <SettingsPage /> },
-          { path: 'audit', element: <AuditPage /> },
+          { path: 'users', element: <UsersPage />, handle: title('用户管理') },
+          { path: 'users/:userId/mail', element: <AdminUserMailPage />, handle: title('用户邮件') },
+          { path: 'mail', element: <AdminMailPage />, handle: title('全站邮件') },
+          { path: 'invites', element: <InvitesPage />, handle: title('邀请码') },
+          { path: 'domains', element: <DomainsPage />, handle: title('收件域名') },
+          { path: 'addresses', element: <AddressesPage />, handle: title('全站地址') },
+          { path: 'shared-mailboxes', element: <SharedMailboxesPage />, handle: title('共享邮箱') },
+          { path: 'settings', element: <SettingsPage />, handle: title('系统设置') },
+          { path: 'audit', element: <AuditPage />, handle: title('操作审计') },
         ],
       },
-      { path: '*', element: <NotFoundPage /> },
+      { path: '*', element: <NotFoundPage />, handle: title('页面不存在') },
     ],
   },
 ]);

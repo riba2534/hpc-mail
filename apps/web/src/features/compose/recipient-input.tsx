@@ -75,7 +75,7 @@ export function RecipientInput({
       <div
         className={cn(
           'flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border border-line-strong bg-surface px-2 py-1.5 focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20',
-          error && 'border-critical focus-within:border-critical focus-within:ring-critical/20',
+          (error || aria['aria-invalid']) && 'border-critical focus-within:border-critical focus-within:ring-critical/20',
         )}
       >
         {value.map((email) => (

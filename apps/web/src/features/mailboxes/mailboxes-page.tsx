@@ -1,13 +1,23 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { AtSign, Pencil, Plus, Trash2 } from 'lucide-react';
+import { AtSign, Inbox, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-react';
 import { type FormEvent, useEffect, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import type { Mailbox } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
+import { CardList, CardListItem } from '@/components/ui/card-list';
+import { CopyButton } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { EmptyState } from '@/components/ui/empty-state';
 import { FormField } from '@/components/ui/form-field';
 import { IconButton } from '@/components/ui/icon-button';
@@ -17,6 +27,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
 import { useDomains } from '@/lib/use-config';
+import { useIsMobile } from '@/lib/use-media-query';
 import { ClaimDialog } from './claim-dialog';
 import { useMailboxesQuery } from './use-mailboxes';
 
@@ -152,17 +163,106 @@ function ReleaseDialog({
   );
 }
 
+export const inboxHref = (address: string) => `/inbox?address=${encodeURIComponent(address)}`;
+
+/** 地址：点击进入只看该地址的收件箱，旁边一键复制 */
+function AddressCell({ address }: { address: string }) {
+  return (
+    <span className="flex min-w-0 items-center gap-1.5">
+      <Link
+        to={inboxHref(address)}
+        title="查看该地址的邮件"
+        className="truncate font-medium text-ink underline-offset-4 hover:text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      >
+        {address}
+      </Link>
+      <CopyButton value={address} ariaLabel={`复制 ${address}`} size="sm" className="h-7 shrink-0 border-transparent px-1.5" />
+    </span>
+  );
+}
+
+function MailboxCards({
+  items,
+  onEdit,
+  onRelease,
+}: {
+  items: Mailbox[];
+  onEdit: (mailbox: Mailbox) => void;
+  onRelease: (mailbox: Mailbox) => void;
+}) {
+  const navigate = useNavigate();
+  return (
+    <CardList>
+      {items.map((mailbox) => (
+        <CardListItem
+          key={mailbox.id}
+          title={<AddressCell address={mailbox.address} />}
+          subtitle={mailbox.displayName || undefined}
+          meta={
+            <>
+              <span>{mailbox.messageCount} 封邮件</span>
+              <span>认领于 {formatDateTime(mailbox.createdAt)}</span>
+            </>
+          }
+          actions={
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton size="sm" aria-label={`${mailbox.address} 的更多操作`}>
+                  <MoreHorizontal className="size-4" />
+                </IconButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem onSelect={() => navigate(inboxHref(mailbox.address))}>
+                  <Inbox className="size-4 text-ink-tertiary" />
+                  查看邮件
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => onEdit(mailbox)}>
+                  <Pencil className="size-4 text-ink-tertiary" />
+                  编辑备注
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem tone="danger" onSelect={() => onRelease(mailbox)}>
+                  <Trash2 className="size-4" />
+                  释放地址
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          }
+        />
+      ))}
+    </CardList>
+  );
+}
+
 export function MailboxesPage() {
   const queryClient = useQueryClient();
+  const isMobile = useIsMobile();
   const domainsQuery = useDomains();
   const { data: visibleDomains } = domainsQuery;
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(false);
+  const [searchParams, setSearchParams] = useSearchParams();
   const [claimOpen, setClaimOpen] = useState(false);
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [editing, setEditing] = useState<Mailbox | null>(null);
 
   const invalidateMailboxes = () =>
     invalidateMailboxOwnership(queryClient);
+
+  // /mailboxes?claim=1：从空收件箱等入口直达认领。域名就绪后打开一次并清掉参数，刷新不会重复弹出
+  const wantsClaim = searchParams.get('claim') === '1';
+  useEffect(() => {
+    if (!wantsClaim || visibleDomains === undefined) return;
+    if (visibleDomains.length > 0) setClaimOpen(true);
+    else toast({ title: '暂无可认领的域名', description: '管理员开放域名后即可认领地址。' });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('claim');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [wantsClaim, visibleDomains, setSearchParams]);
 
   const items = mailboxes ?? [];
 
@@ -192,6 +292,8 @@ export function MailboxesPage() {
           action={<Button disabled={!visibleDomains?.length} onClick={() => setClaimOpen(true)}>认领地址</Button>}
           className="rounded-lg border border-line bg-surface"
         />
+      ) : isMobile ? (
+        <MailboxCards items={items} onEdit={setEditing} onRelease={setReleasing} />
       ) : (
         <Table>
           <TableHeader>
@@ -206,7 +308,9 @@ export function MailboxesPage() {
           <TableBody>
             {items.map((mailbox) => (
               <TableRow key={mailbox.id}>
-                <TableCell className="font-medium">{mailbox.address}</TableCell>
+                <TableCell>
+                  <AddressCell address={mailbox.address} />
+                </TableCell>
                 <TableCell className="text-ink-secondary">{mailbox.displayName || '—'}</TableCell>
                 <TableCell className="text-ink-secondary">{mailbox.messageCount}</TableCell>
                 <TableCell className="text-ink-tertiary">{formatDateTime(mailbox.createdAt)}</TableCell>

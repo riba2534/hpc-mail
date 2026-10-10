@@ -8,6 +8,7 @@ export const SheetTrigger = DialogPrimitive.Trigger;
 export const SheetClose = DialogPrimitive.Close;
 
 const SIDES = {
+  left: 'inset-y-0 left-0 h-full w-[85vw] max-w-xs border-r',
   right: 'inset-y-0 right-0 h-full w-full max-w-md border-l',
   bottom: 'inset-x-0 bottom-0 max-h-[85dvh] w-full rounded-t-lg border-t',
 } as const;

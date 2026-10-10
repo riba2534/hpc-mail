@@ -276,6 +276,35 @@ function neutralizeForms(windowObject: Window, root: ParentNode): void {
   })
 }
 
+function pixelDimension(value: string | null): number | null {
+  const match = /^\s*(\d+(?:\.\d+)?)(?:px)?\s*$/i.exec(value ?? '')
+  return match ? Number(match[1]) : null
+}
+
+/**
+ * 被拦截的图片换成同尺寸的占位框并显示 alt，版式不塌陷；1–2px 的跟踪像素直接移除。
+ * 沿用图片已消毒的内联样式（如 display:block），尺寸只取纯数字的 width/height 属性。
+ */
+function replaceWithPlaceholder(windowObject: Window, image: HTMLImageElement): void {
+  const width = pixelDimension(image.getAttribute('width'))
+  const height = pixelDimension(image.getAttribute('height'))
+  if ((width !== null && width <= 2) || (height !== null && height <= 2)) {
+    image.remove()
+    return
+  }
+  const placeholder = windowObject.document.createElement('span')
+  const style = image.getAttribute('style')
+  if (style) placeholder.setAttribute('style', style)
+  if (width !== null) placeholder.style.width = `${width}px`
+  if (height !== null) placeholder.style.height = `${height}px`
+  placeholder.className = 'remote-image-blocked'
+  placeholder.setAttribute('role', 'img')
+  const alt = (image.getAttribute('alt') ?? '').trim()
+  placeholder.setAttribute('aria-label', alt || '已拦截的图片')
+  placeholder.textContent = alt
+  image.replaceWith(placeholder)
+}
+
 /**
  * Sanitizes hostile email markup for an isolated rendering surface.
  * HTTPS images render by default without a referrer; callers may disable
@@ -350,16 +379,18 @@ export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOption
   })
 
   template.content.querySelectorAll<HTMLImageElement>('img').forEach((image) => {
-    if (!isSafeImage(image.getAttribute('src'), baseOrigin, trustedOrigins, allowRemoteImages)) {
-      image.removeAttribute('src')
-      image.classList.add('remote-image-blocked')
-    }
+    const sourceAllowed = isSafeImage(image.getAttribute('src'), baseOrigin, trustedOrigins, allowRemoteImages)
     const sourceSet = sanitizeSourceSet(
       image.getAttribute('srcset'),
       baseOrigin,
       trustedOrigins,
       allowRemoteImages,
     )
+    if (!sourceAllowed && !sourceSet) {
+      replaceWithPlaceholder(windowObject, image)
+      return
+    }
+    if (!sourceAllowed) image.removeAttribute('src')
     if (sourceSet) image.setAttribute('srcset', sourceSet)
     else image.removeAttribute('srcset')
     image.setAttribute('loading', 'lazy')

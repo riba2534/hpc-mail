@@ -31,11 +31,22 @@ const frameCsp = (allowRemoteImages: boolean) => [
 const FRAME_BASE_STYLES = `
   :root { color-scheme: light; }
   html, body { margin: 0; min-width: 0; color: #0f172a; background: transparent; }
-  #email-content { min-width: 0; overflow-wrap: anywhere; }
+  body {
+    font-family: 'PingFang SC', 'HarmonyOS Sans SC', 'Noto Sans SC', 'Segoe UI', system-ui, -apple-system, 'Microsoft YaHei', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  /* flow-root：首尾元素的外边距不再穿透到容器外，测得的高度才包含它们，末段不会被裁掉 */
+  #email-content { display: flow-root; min-width: 0; overflow-wrap: anywhere; }
   #email-content img { max-width: 100%; height: auto; }
   #email-content table { max-width: 100%; }
   #email-content pre { max-width: 100%; overflow: auto; white-space: pre-wrap; }
-  #email-content .remote-image-blocked { display: none !important; }
+  #email-content .remote-image-blocked {
+    display: inline-block; box-sizing: border-box; max-width: 100%; min-width: 24px; min-height: 24px;
+    padding: 4px 6px; overflow: hidden; vertical-align: middle; text-align: center;
+    border: 1px dashed oklch(85% 0.006 260); border-radius: 4px; background: oklch(96.6% 0.003 247);
+    color: oklch(51% 0.012 260); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere;
+  }
 `
 
 export function EmailHtml({

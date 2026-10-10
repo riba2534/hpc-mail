@@ -1,5 +1,5 @@
 import { clearAuthToken, getAuthToken } from '@/lib/auth-token';
-import { ApiError } from './errors';
+import { ApiError, NETWORK_ERROR_MESSAGE } from './errors';
 
 const API_BASE = '/api';
 
@@ -81,7 +81,7 @@ export function xhrSend<T>(opts: XhrSendOptions): Promise<T> {
       if (err.unauthorized && token && token === getAuthToken()) clearAuthToken();
       reject(err);
     };
-    xhr.onerror = () => reject(new ApiError('网络请求失败', { code: 'network' }));
+    xhr.onerror = () => reject(new ApiError(NETWORK_ERROR_MESSAGE, { code: 'network' }));
     xhr.ontimeout = () => reject(new ApiError('请求超时，请稍后重试', { code: 'timeout' }));
     xhr.onabort = () => reject(new ApiError('上传已取消', { code: 'timeout' }));
 

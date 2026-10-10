@@ -20,10 +20,12 @@ export interface IconButtonProps extends ComponentPropsWithRef<'button'> {
   'aria-label': string;
 }
 
-export function IconButton({ className, variant = 'ghost', size = 'md', type = 'button', ...props }: IconButtonProps) {
+/** 纯图标按钮：aria-label 同时作为原生 title 提示（可用 title 覆盖） */
+export function IconButton({ className, variant = 'ghost', size = 'md', type = 'button', title, ...props }: IconButtonProps) {
   return (
     <button
       type={type}
+      title={title ?? props['aria-label']}
       className={cn(
         'inline-grid place-items-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-canvas disabled:pointer-events-none disabled:opacity-50',
         VARIANTS[variant],

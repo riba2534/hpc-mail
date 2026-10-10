@@ -53,7 +53,8 @@ describe('sanitizeEmailHtml：正常内容不被误伤', () => {
     const host = reparse(`<p onclick="alert(1)">x</p><script>alert(2)</script><img src="javascript:alert(3)">`)
     expect(host.querySelector('script')).toBeNull()
     expect(host.querySelector('p')?.getAttribute('onclick')).toBeNull()
-    expect(host.querySelector('img')?.getAttribute('src')).toBeNull()
+    expect(host.querySelector('img[src]')).toBeNull()
+    expect(host.querySelector('.remote-image-blocked')).not.toBeNull()
   })
 
   it('二次解析后仍拦截嵌套表单与命名空间 mXSS 载荷', () => {
@@ -70,5 +71,28 @@ describe('sanitizeEmailHtml：正常内容不被误伤', () => {
         expect(attribute.name.toLowerCase().startsWith('on')).toBe(false)
       }
     }
+  })
+})
+
+describe('被拦截的远程图片', () => {
+  it('换成保留尺寸与 alt 的占位框，跟踪像素直接移除', () => {
+    const html = sanitizeEmailHtml(
+      '<img src="https://tracker.example/p.gif" width="1" height="1"><img src="https://cdn.example/logo.png" width="120" height="40" alt="公司标志" style="display:block">',
+      { allowRemoteImages: false },
+    )
+    const template = document.createElement('template')
+    template.innerHTML = html
+    expect(template.content.querySelectorAll('img')).toHaveLength(0)
+    const placeholders = template.content.querySelectorAll<HTMLElement>('.remote-image-blocked')
+    expect(placeholders).toHaveLength(1)
+    expect(placeholders[0]!.textContent).toBe('公司标志')
+    expect(placeholders[0]!.style.width).toBe('120px')
+    expect(placeholders[0]!.style.height).toBe('40px')
+    expect(placeholders[0]!.style.display).toBe('block')
+  })
+
+  it('允许远程图片时原样保留', () => {
+    const html = sanitizeEmailHtml('<img src="https://cdn.example/logo.png" alt="x">', { allowRemoteImages: true })
+    expect(html).toContain('src="https://cdn.example/logo.png"')
   })
 })

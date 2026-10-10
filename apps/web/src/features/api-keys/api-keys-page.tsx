@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { KeyRound, Plus, Power, ScrollText, Trash2 } from 'lucide-react';
+import { KeyRound, MoreHorizontal, Plus, Power, ScrollText, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 import type { ApiKeyStatus, ApiKeySummary } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
@@ -8,7 +8,15 @@ import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CardList, CardListItem } from '@/components/ui/card-list';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { EmptyState } from '@/components/ui/empty-state';
 import { IconButton } from '@/components/ui/icon-button';
 import { SegmentedControl } from '@/components/ui/segmented-control';
@@ -16,6 +24,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
 import { formatDateTime, formatRelativeTime } from '@/lib/format';
+import { useIsMobile } from '@/lib/use-media-query';
 import { useCurrentUser } from '@/lib/use-session';
 import { AuditLogDialog } from './audit-log-dialog';
 import { CreateApiKeyDialog } from './create-api-key-dialog';
@@ -30,6 +39,7 @@ export function ApiKeysPage() {
   const user = useCurrentUser();
   const isAdmin = user.role === 'admin';
   const queryClient = useQueryClient();
+  const isMobile = useIsMobile();
   const [view, setView] = useState<'mine' | 'all'>('mine');
   const [createOpen, setCreateOpen] = useState(false);
   const [deleting, setDeleting] = useState<ApiKeySummary | null>(null);
@@ -98,6 +108,64 @@ export function ApiKeysPage() {
           description="创建一个密钥以通过开放 API 访问邮箱。"
           className="rounded-lg border border-line bg-surface"
         />
+      ) : isMobile ? (
+        <CardList>
+          {items.map((key) => {
+            const status = STATUS_META[key.status];
+            return (
+              <CardListItem
+                key={key.id}
+                title={<span className="truncate">{key.name}</span>}
+                subtitle={
+                  <code className="font-mono text-xs">
+                    {key.keyPrefix}…{key.keySuffix}
+                  </code>
+                }
+                meta={
+                  <>
+                    <Badge tone={status.tone}>{status.label}</Badge>
+                    {view === 'all' && key.ownerUsername && <span>{key.ownerUsername}</span>}
+                    <span title={key.scopes.join(', ')}>{key.scopes.length} 项权限</span>
+                    <span title={key.lastUsedAt ? formatDateTime(key.lastUsedAt) : ''}>
+                      {key.lastUsedAt ? `最近使用 ${formatRelativeTime(key.lastUsedAt)}` : '从未使用'}
+                    </span>
+                  </>
+                }
+                actions={
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <IconButton size="sm" aria-label="更多操作">
+                        <MoreHorizontal className="size-4" />
+                      </IconButton>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent>
+                      <DropdownMenuItem onSelect={() => setAuditKey(key)}>
+                        <ScrollText className="size-4 text-ink-tertiary" />
+                        审计日志
+                      </DropdownMenuItem>
+                      {editable && (
+                        <>
+                          <DropdownMenuItem
+                            disabled={key.status === 'revoked' || toggleStatus.isPending}
+                            onSelect={() => toggleStatus.mutate(key)}
+                          >
+                            <Power className="size-4 text-ink-tertiary" />
+                            {key.status === 'active' ? '停用' : '启用'}
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem tone="danger" onSelect={() => setDeleting(key)}>
+                            <Trash2 className="size-4" />
+                            删除密钥
+                          </DropdownMenuItem>
+                        </>
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                }
+              />
+            );
+          })}
+        </CardList>
       ) : (
         <Table>
           <TableHeader>

@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowRightLeft, AtSign, Search, Trash2 } from 'lucide-react';
+import { ArrowRightLeft, AtSign, MoreHorizontal, Search, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import type { Mailbox } from '@hpc-mail/shared';
 import { invalidateMailboxOwnership } from '@/api/query-keys';
@@ -7,7 +7,14 @@ import { mailboxApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
+import { CardList, CardListItem } from '@/components/ui/card-list';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { EmptyState } from '@/components/ui/empty-state';
 import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
@@ -15,6 +22,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
+import { useIsMobile } from '@/lib/use-media-query';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import { TransferMailboxDialog } from './transfer-mailbox-dialog';
 
@@ -83,6 +91,7 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
 }
 
 export function AddressesPage() {
+  const isMobile = useIsMobile();
   const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
   const [q, setQ] = useState('');
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
@@ -115,6 +124,41 @@ export function AddressesPage() {
           title={q ? '没有匹配的地址' : '还没有任何认领地址'}
           className="rounded-lg border border-line bg-surface"
         />
+      ) : isMobile ? (
+        <CardList>
+          {filtered.map((mailbox) => (
+            <CardListItem
+              key={mailbox.id}
+              title={<span className="truncate">{mailbox.address}</span>}
+              subtitle={`归属 ${mailbox.ownerUsername || '—'}`}
+              meta={
+                <>
+                  <span>{mailbox.messageCount} 封邮件</span>
+                  <span>{formatDateTime(mailbox.createdAt)} 认领</span>
+                </>
+              }
+              actions={
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <IconButton size="sm" aria-label="更多操作">
+                      <MoreHorizontal className="size-4" />
+                    </IconButton>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent>
+                    <DropdownMenuItem onSelect={() => setTransferring(mailbox)}>
+                      <ArrowRightLeft className="size-4 text-ink-tertiary" />
+                      过户给其他用户
+                    </DropdownMenuItem>
+                    <DropdownMenuItem tone="danger" onSelect={() => setReleasing(mailbox)}>
+                      <Trash2 className="size-4" />
+                      强制释放
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              }
+            />
+          ))}
+        </CardList>
       ) : (
         <Table>
           <TableHeader>

@@ -1,6 +1,7 @@
 export { Avatar, type AvatarProps } from './avatar';
 export { Badge, type BadgeTone } from './badge';
 export { Button, type ButtonProps, type ButtonVariant, type ButtonSize } from './button';
+export { CardList, CardListItem, type CardListItemProps } from './card-list';
 export { Checkbox } from './checkbox';
 export { Combobox, type ComboboxOption, type ComboboxProps } from './combobox';
 export { ConfirmDialog, type ConfirmDialogProps } from './confirm-dialog';

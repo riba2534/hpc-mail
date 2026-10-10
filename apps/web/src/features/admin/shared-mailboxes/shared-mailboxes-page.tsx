@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Search, Share2, X } from 'lucide-react';
+import { MoreHorizontal, Search, Share2, X } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { MailboxShareGrant } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -9,14 +9,24 @@ import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { CardList, CardListItem } from '@/components/ui/card-list';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { EmptyState } from '@/components/ui/empty-state';
+import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
+import { useIsMobile } from '@/lib/use-media-query';
 
 function errorText(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.message : fallback;
@@ -153,6 +163,7 @@ function ShareDialog({
 }
 
 export function SharedMailboxesPage() {
+  const isMobile = useIsMobile();
   const queryClient = useQueryClient();
   const shares = useQuery({
     queryKey: queryKeys.admin.mailboxShares,
@@ -226,6 +237,63 @@ export function SharedMailboxesPage() {
           description={q ? undefined : '先在「我的邮箱」认领一个地址，再回来把它共享给用户。'}
           className="rounded-lg border border-line bg-surface"
         />
+      ) : isMobile ? (
+        <CardList>
+          {filtered.map((item) => (
+            <CardListItem
+              key={item.mailboxId}
+              title={<span className="truncate">{item.address}</span>}
+              subtitle={item.grantees.length === 0 ? '尚未共享' : `共享给 ${item.grantees.length} 人`}
+              meta={
+                item.grantees.length > 0 ? (
+                  <>
+                    {item.grantees.map((grantee) => (
+                      <Badge key={grantee.userId} tone="neutral">
+                        {grantee.username}
+                      </Badge>
+                    ))}
+                  </>
+                ) : undefined
+              }
+              actions={
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <IconButton size="sm" aria-label="更多操作">
+                      <MoreHorizontal className="size-4" />
+                    </IconButton>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent>
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        setCreating(false);
+                        setEditing(item);
+                      }}
+                    >
+                      编辑共享名单
+                    </DropdownMenuItem>
+                    {item.grantees.length > 0 && <DropdownMenuSeparator />}
+                    {item.grantees.map((grantee) => (
+                      <DropdownMenuItem
+                        key={grantee.userId}
+                        tone="danger"
+                        onSelect={() =>
+                          setRevokeTarget({
+                            mailboxId: item.mailboxId,
+                            userId: grantee.userId,
+                            address: item.address,
+                            username: grantee.username,
+                          })
+                        }
+                      >
+                        取消与 {grantee.username} 共享
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              }
+            />
+          ))}
+        </CardList>
       ) : (
         <Table>
           <TableHeader>

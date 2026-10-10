@@ -26,6 +26,7 @@ export function Avatar({ avatarUrl, name, className }: AvatarProps) {
 
   return (
     <span
+      role="img"
       aria-label={name}
       className={cn(
         'grid shrink-0 place-items-center rounded-full bg-accent-soft font-semibold uppercase text-accent',

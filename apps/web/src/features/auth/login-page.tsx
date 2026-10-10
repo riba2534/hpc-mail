@@ -19,6 +19,28 @@ import { usePublicConfig } from '@/lib/use-config';
 import { useAuthToken } from '@/lib/use-session';
 
 type Mode = 'login' | 'register';
+type Field = 'username' | 'password' | 'confirmPassword' | 'inviteCode' | 'totp';
+type FieldErrors = Partial<Record<Field, string>>;
+
+const CONTRACT_FIELDS: ReadonlySet<string> = new Set<Field>(['username', 'password', 'inviteCode', 'totp']);
+
+/** zod 校验问题按字段归位；归不到字段的第一条作为表单级错误 */
+function mapIssues(issues: ReadonlyArray<{ path: PropertyKey[]; message: string }>): {
+  fields: FieldErrors;
+  form: string | null;
+} {
+  const fields: FieldErrors = {};
+  let form: string | null = null;
+  for (const issue of issues) {
+    const key = issue.path[0];
+    if (typeof key === 'string' && CONTRACT_FIELDS.has(key)) {
+      fields[key as Field] ??= issue.message;
+    } else {
+      form ??= issue.message;
+    }
+  }
+  return { fields, form };
+}
 
 // zod 契约只在提交时用于前置校验：不进登录首屏，输入框聚焦时预取；加载失败允许重试
 let contractPromise: Promise<typeof import('@hpc-mail/shared')> | undefined;
@@ -41,10 +63,12 @@ export function LoginPage() {
   const [mode, setMode] = useState<Mode>('login');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [inviteCode, setInviteCode] = useState('');
   const [totp, setTotp] = useState('');
   const [totpRequired, setTotpRequired] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [validating, setValidating] = useState(false);
 
   const fromState = (location.state as { from?: string } | null)?.from;
@@ -70,7 +94,8 @@ export function LoginPage() {
     onError: (err) => {
       if (err instanceof ApiError && err.code === 'totp_required') {
         setTotpRequired(true);
-        setError(totp ? '两步验证码错误' : null);
+        setError(null);
+        if (totp) setFieldErrors({ totp: '两步验证码错误' });
         return;
       }
       // 已进入 2FA 步骤时，错误多为验证码不对
@@ -89,6 +114,7 @@ export function LoginPage() {
       toast({ title: '注册成功，请登录', variant: 'success' });
       setMode('login');
       setPassword('');
+      setConfirmPassword('');
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : '注册失败，请重试'),
   });
@@ -97,42 +123,64 @@ export function LoginPage() {
 
   const pending = loginMutation.isPending || registerMutation.isPending || validating;
 
+  const clearFieldError = (field: Field) =>
+    setFieldErrors((prev) => {
+      if (!prev[field]) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+
+  /** 不依赖契约的前置检查：空字段与两次密码一致性，立即提示 */
+  const checkRequired = (): FieldErrors => {
+    const errors: FieldErrors = {};
+    if (!username.trim()) errors.username = '请输入用户名';
+    if (!password) errors.password = '请输入密码';
+    if (mode === 'login') {
+      if (totpRequired && !totp.trim()) errors.totp = '请输入两步验证码';
+    } else {
+      if (!confirmPassword) errors.confirmPassword = '请再次输入密码';
+      else if (confirmPassword !== password) errors.confirmPassword = '两次输入的密码不一致';
+      if (needsInvite && !inviteCode.trim()) errors.inviteCode = '请输入邀请码';
+    }
+    return errors;
+  };
+
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (pending) return;
     setError(null);
+    const required = checkRequired();
+    setFieldErrors(required);
+    if (Object.keys(required).length > 0) return;
+
     setValidating(true);
     // 契约加载失败时跳过前置校验，由服务端校验兜底
     const contract = await loadContract().catch(() => null);
     setValidating(false);
-    if (mode === 'login') {
-      const parsed = contract?.loginRequestSchema.safeParse({ username, password, totp: totp || undefined });
-      if (parsed && !parsed.success) {
-        setError(parsed.error.issues[0]?.message ?? '请检查输入');
-        return;
-      }
-      loginMutation.mutate();
-    } else {
-      const parsed = contract?.registerRequestSchema.safeParse({
-        username,
-        password,
-        inviteCode: needsInvite ? inviteCode : undefined,
-      });
-      if (parsed && !parsed.success) {
-        setError(parsed.error.issues[0]?.message ?? '请检查输入');
-        return;
-      }
-      if (needsInvite && !inviteCode.trim()) {
-        setError('请输入邀请码');
-        return;
-      }
-      registerMutation.mutate();
+    const parsed =
+      mode === 'login'
+        ? contract?.loginRequestSchema.safeParse({ username, password, totp: totp || undefined })
+        : contract?.registerRequestSchema.safeParse({
+            username,
+            password,
+            inviteCode: needsInvite ? inviteCode : undefined,
+          });
+    if (parsed && !parsed.success) {
+      const mapped = mapIssues(parsed.error.issues);
+      setFieldErrors(mapped.fields);
+      setError(mapped.form ?? (Object.keys(mapped.fields).length > 0 ? null : '请检查输入'));
+      return;
     }
+    if (mode === 'login') loginMutation.mutate();
+    else registerMutation.mutate();
   };
 
   const switchMode = (next: Mode) => {
     setMode(next);
     setError(null);
+    setFieldErrors({});
+    setConfirmPassword('');
   };
 
   return (
@@ -158,42 +206,71 @@ export function LoginPage() {
           )}
 
           <form onSubmit={handleSubmit} onFocus={preloadContract} className="flex flex-col gap-4">
-            <FormField label="用户名" required>
+            <FormField label="用户名" required error={fieldErrors.username}>
               {(field) => (
                 <Input
                   {...field}
                   autoComplete="username"
                   placeholder="小写字母/数字，3-32 位"
                   value={username}
-                  onChange={(event) => setUsername(event.target.value)}
+                  invalid={Boolean(fieldErrors.username)}
+                  onChange={(event) => {
+                    setUsername(event.target.value);
+                    clearFieldError('username');
+                  }}
                 />
               )}
             </FormField>
-            <FormField label="密码" required>
+            <FormField label="密码" required error={fieldErrors.password}>
               {(field) => (
                 <PasswordInput
                   {...field}
                   autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
                   placeholder={mode === 'register' ? '至少 8 位' : '请输入密码'}
                   value={password}
-                  onChange={(event) => setPassword(event.target.value)}
+                  invalid={Boolean(fieldErrors.password)}
+                  onChange={(event) => {
+                    setPassword(event.target.value);
+                    clearFieldError('password');
+                  }}
                 />
               )}
             </FormField>
+            {mode === 'register' && (
+              <FormField label="确认密码" required error={fieldErrors.confirmPassword}>
+                {(field) => (
+                  <PasswordInput
+                    {...field}
+                    autoComplete="new-password"
+                    placeholder="再次输入密码"
+                    value={confirmPassword}
+                    invalid={Boolean(fieldErrors.confirmPassword)}
+                    onChange={(event) => {
+                      setConfirmPassword(event.target.value);
+                      clearFieldError('confirmPassword');
+                    }}
+                  />
+                )}
+              </FormField>
+            )}
             {mode === 'register' && needsInvite && (
-              <FormField label="邀请码" required>
+              <FormField label="邀请码" required error={fieldErrors.inviteCode}>
                 {(field) => (
                   <Input
                     {...field}
                     placeholder="请输入邀请码"
                     value={inviteCode}
-                    onChange={(event) => setInviteCode(event.target.value)}
+                    invalid={Boolean(fieldErrors.inviteCode)}
+                    onChange={(event) => {
+                      setInviteCode(event.target.value);
+                      clearFieldError('inviteCode');
+                    }}
                   />
                 )}
               </FormField>
             )}
             {mode === 'login' && totpRequired && (
-              <FormField label="两步验证码" required>
+              <FormField label="两步验证码" required error={fieldErrors.totp}>
                 {(field) => (
                   <Input
                     {...field}
@@ -202,13 +279,17 @@ export function LoginPage() {
                     autoComplete="one-time-code"
                     placeholder="6 位验证码或恢复码"
                     value={totp}
-                    onChange={(event) => setTotp(event.target.value)}
+                    invalid={Boolean(fieldErrors.totp)}
+                    onChange={(event) => {
+                      setTotp(event.target.value);
+                      clearFieldError('totp');
+                    }}
                   />
                 )}
               </FormField>
             )}
 
-        {error && <p role="alert" className="text-sm text-critical">{error}</p>}
+            {error && <p role="alert" className="text-sm text-critical">{error}</p>}
 
             <Button type="submit" loading={pending} disabled={configLoading} className="mt-1 w-full">
               {mode === 'login' ? '登录' : '注册并登录'}

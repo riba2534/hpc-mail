@@ -14,7 +14,14 @@ import { FilterBar } from '@/features/inbox/filter-bar';
 import { MailList } from '@/features/inbox/mail-list';
 import { useInboxFilters } from '@/features/inbox/use-inbox-filters';
 import { useAdminMailDirection } from '@/features/admin/mail/admin-mail-page';
-import { useDomains } from '@/lib/use-config';
+
+/** 用户实际拥有的域名：从其认领地址取 @ 之后的部分，去重排序 */
+export function ownedDomains(addresses: readonly string[]): string[] {
+  const domains = addresses
+    .map((address) => address.slice(address.lastIndexOf('@') + 1).toLowerCase())
+    .filter(Boolean);
+  return [...new Set(domains)].sort();
+}
 
 const DIRECTION_OPTIONS = [
   { value: 'inbound', label: '收件箱' },
@@ -26,7 +33,6 @@ export function AdminUserMailPage() {
   const userId = Number(rawId);
   const { filters, setDomain, setAddress, setUnread, setQuery, reset } = useInboxFilters();
   const { direction, setDirection } = useAdminMailDirection();
-  const { data: visibleDomains } = useDomains();
   const { data: users, isLoading } = useQuery({ queryKey: queryKeys.admin.users, queryFn: () => adminApi.listUsers() });
 
   const user = users?.find((item) => item.id === userId);
@@ -40,6 +46,8 @@ export function AdminUserMailPage() {
       })),
     [user],
   );
+
+  const userDomains = useMemo(() => ownedDomains(user?.mailboxes ?? []), [user]);
 
   const hasActiveFilters = Boolean(
     filters.domain || filters.address || (isInbound && filters.unread) || filters.q,
@@ -99,10 +107,11 @@ export function AdminUserMailPage() {
           value={direction}
           onValueChange={setDirection}
           options={DIRECTION_OPTIONS}
+          className="self-start"
         />
         <FilterBar
           filters={filters}
-          domains={visibleDomains ?? []}
+          domains={userDomains}
           addressOptions={addressOptions}
           addressLabel="用户地址"
           showUnread={isInbound}

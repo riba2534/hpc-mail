@@ -23,6 +23,7 @@
     "@tanstack/react-virtual": "^3.14.6",
     "clsx": "^2.1.1",
     "dompurify": "^3.4.16",
+    "lean-qr": "^2.7.4",
     "lucide-react": "^1.24.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

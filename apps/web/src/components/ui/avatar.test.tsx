@@ -9,9 +9,10 @@ describe('Avatar', () => {
     expect(img).toHaveAttribute('src', 'https://cdn.test/a.png');
   });
 
-  it('无 avatarUrl 时回退到用户名首字母', () => {
+  it('无 avatarUrl 时回退到用户名首字母，并以 img 角色朗读用户名', () => {
     render(<Avatar avatarUrl={null} name="alice" />);
-    expect(screen.queryByRole('img')).toBeNull();
-    expect(screen.getByText('al')).toBeInTheDocument();
+    const placeholder = screen.getByRole('img', { name: 'alice' });
+    expect(placeholder.tagName).toBe('SPAN');
+    expect(placeholder).toHaveTextContent('al');
   });
 });

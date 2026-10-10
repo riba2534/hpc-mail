@@ -6,6 +6,7 @@ import { queryKeys } from '@/api/query-keys';
 import { notifyPrefsApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
 import { QueryErrorState } from '@/components/query-error-state';
+import { UnsavedChangesGuard } from '@/components/unsaved-changes-guard';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
@@ -35,19 +36,43 @@ function ToggleRow({
   checked,
   onChange,
 }: {
-  label: ReactNode;
+  label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
     <label className="flex cursor-pointer items-center justify-between gap-3">
       <span className="text-sm font-medium text-ink">{label}</span>
-      <Switch checked={checked} onCheckedChange={onChange} />
+      <Switch checked={checked} onCheckedChange={onChange} aria-label={label} />
     </label>
   );
 }
 
-export function ForwardingSection() {
+/** 通道区块：开关打开才展开配置项；关闭时保留已填内容，只是不显示 */
+function ChannelBlock({
+  label,
+  enabled,
+  onToggle,
+  children,
+}: {
+  label: string;
+  enabled: boolean;
+  onToggle: (v: boolean) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-2.5 border-t border-line pt-4">
+      <ToggleRow label={label} checked={enabled} onChange={onToggle} />
+      {enabled && children}
+    </div>
+  );
+}
+
+type TestChannel = 'feishu' | 'pushdeer';
+
+const TEST_HINT = '有未保存的改动时会先自动保存，再用保存后的配置发送测试。';
+
+export function ForwardingSection({ id }: { id?: string }) {
   const user = useCurrentUser();
   const isAdmin = user.role === 'admin';
   const queryClient = useQueryClient();
@@ -57,6 +82,7 @@ export function ForwardingSection() {
   });
   const [validationError, setValidationError] = useState<string | null>(null);
   const [draft, setDraft] = useState<UserNotifyPrefs | null>(null);
+  const [testing, setTesting] = useState<TestChannel | null>(null);
 
   useEffect(() => {
     if (data) setDraft(structuredClone(data));
@@ -75,21 +101,19 @@ export function ForwardingSection() {
       toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' }),
   });
 
-  const testFeishu = useMutation({
-    mutationFn: () => notifyPrefsApi.testFeishu(),
-    onSuccess: () => { void queryClient.invalidateQueries({queryKey:queryKeys.notificationHealth}); toast({ title: '测试卡片已发送', variant: 'success' }); },
-    onError: (err) => toast({ title: err instanceof ApiError ? err.message : '发送失败', variant: 'error' }),
-  });
-
-  const testPushdeer = useMutation({
-    mutationFn: () => notifyPrefsApi.testPushdeer(),
-    onSuccess: () => { void queryClient.invalidateQueries({queryKey:queryKeys.notificationHealth}); toast({ title: '测试消息已发送至 PushDeer', variant: 'success' }); },
+  const sendTest = useMutation({
+    mutationFn: (channel: TestChannel) =>
+      channel === 'feishu' ? notifyPrefsApi.testFeishu() : notifyPrefsApi.testPushdeer(),
+    onSuccess: (_data, channel) => {
+      void queryClient.invalidateQueries({queryKey:queryKeys.notificationHealth});
+      toast({ title: channel === 'feishu' ? '测试卡片已发送' : '测试消息已发送至 PushDeer', variant: 'success' });
+    },
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '发送失败', variant: 'error' }),
   });
 
   if (isLoading || (data !== undefined && draft === null)) {
     return (
-      <section className="rounded-lg border border-line bg-surface p-5">
+      <section id={id} className="scroll-mt-20 rounded-lg border border-line bg-surface p-5">
         <Skeleton className="h-40 w-full rounded-md" />
       </section>
     );
@@ -97,7 +121,11 @@ export function ForwardingSection() {
 
 
   if (isError || !draft || !data) {
-    return <QueryErrorState error={error} onRetry={() => void refetch()} />;
+    return (
+      <div id={id} className="scroll-mt-20">
+        <QueryErrorState error={error} onRetry={() => void refetch()} />
+      </div>
+    );
   }
 
   const dirty = JSON.stringify(draft) !== JSON.stringify(data);
@@ -109,8 +137,38 @@ export function ForwardingSection() {
     });
   };
 
+  /** 校验并保存当前草稿；校验或保存失败返回 false */
+  const saveDraft = async (): Promise<boolean> => {
+    const parsed = updateNotifyPrefsRequestSchema.safeParse(draft);
+    if (!parsed.success) {
+      setValidationError(parsed.error.issues[0]?.message ?? '请检查配置');
+      return false;
+    }
+    setValidationError(null);
+    try {
+      await save.mutateAsync(draft);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // 测试只会用服务端已保存的配置：有未保存改动时先自动保存，避免「测的不是眼前这份」
+  const runTest = async (channel: TestChannel) => {
+    setTesting(channel);
+    try {
+      if (dirty && !(await saveDraft())) return;
+      await sendTest.mutateAsync(channel).catch(() => {});
+    } finally {
+      setTesting(null);
+    }
+  };
+
+  const testLabel = (base: string) => (dirty ? `保存并${base}` : base);
+
   return (
-    <section className="flex flex-col gap-5 rounded-lg border border-line bg-surface p-5">
+    <section id={id} tabIndex={-1} className="flex scroll-mt-20 flex-col gap-5 rounded-lg border border-line bg-surface p-5 focus:outline-none">
+      <UnsavedChangesGuard when={dirty} description="转发与通知有未保存的改动，离开后这些改动会丢失。" />
       <div>
         <h2 className="text-sm font-semibold text-ink">转发与通知</h2>
         <p className="mt-0.5 text-[13px] text-ink-secondary">
@@ -121,12 +179,11 @@ export function ForwardingSection() {
       </div>
 
       {/* 邮箱转发 */}
-      <div className="flex flex-col gap-2.5 border-t border-line pt-4">
-        <ToggleRow
-          label="转发到邮箱"
-          checked={draft.forward.enabled}
-          onChange={(v) => patch((d) => void (d.forward.enabled = v))}
-        />
+      <ChannelBlock
+        label="转发到邮箱"
+        enabled={draft.forward.enabled}
+        onToggle={(v) => patch((d) => void (d.forward.enabled = v))}
+      >
         <RecipientInput
           aria-label="转发目标邮箱"
           value={draft.forward.addresses}
@@ -137,15 +194,14 @@ export function ForwardingSection() {
           任意邮箱均可转发。已在 Cloudflare Email Routing 验证过的地址走原生转发（原样保留邮件）；
           未验证的地址由系统以 no-reply@收件域名 中转重发（标注原始发件人，直接回复即回给对方）。
         </p>
-      </div>
+      </ChannelBlock>
 
       {/* 飞书通知 */}
-      <div className="flex flex-col gap-2.5 border-t border-line pt-4">
-        <ToggleRow
-          label="飞书通知"
-          checked={draft.feishu.enabled}
-          onChange={(v) => patch((d) => void (d.feishu.enabled = v))}
-        />
+      <ChannelBlock
+        label="飞书通知"
+        enabled={draft.feishu.enabled}
+        onToggle={(v) => patch((d) => void (d.feishu.enabled = v))}
+      >
         <label className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">Webhook URL</span>
           <Input
@@ -181,27 +237,27 @@ export function ForwardingSection() {
             摘要仅推送正文前 200 字；全文会把完整正文（含敏感信息）推送到群里，请谨慎。
           </span>
         </div>
-        <div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <Button
             type="button"
             variant="secondary"
             size="sm"
-            loading={testFeishu.isPending}
-            onClick={() => testFeishu.mutate()}
+            loading={testing === 'feishu'}
+            disabled={testing !== null}
+            onClick={() => void runTest('feishu')}
           >
-            发送测试卡片
+            {testLabel('发送测试卡片')}
           </Button>
-          <span className="ml-2 text-xs text-ink-tertiary">测试用当前已保存的配置，未保存的改动不生效。</span>
+          <span className="text-xs text-ink-tertiary">{TEST_HINT}</span>
         </div>
-      </div>
+      </ChannelBlock>
 
       {/* PushDeer 通知 */}
-      <div className="flex flex-col gap-2.5 border-t border-line pt-4">
-        <ToggleRow
-          label="PushDeer 通知"
-          checked={draft.pushdeer.enabled}
-          onChange={(v) => patch((d) => void (d.pushdeer.enabled = v))}
-        />
+      <ChannelBlock
+        label="PushDeer 通知"
+        enabled={draft.pushdeer.enabled}
+        onToggle={(v) => patch((d) => void (d.pushdeer.enabled = v))}
+      >
         <label className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">PushKey</span>
           <PasswordInput
@@ -227,27 +283,27 @@ export function ForwardingSection() {
             若使用自建 PushDeer 服务器，请输入完整服务地址（如 https://pushdeer.example.com）。
           </span>
         </label>
-        <div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <Button
             type="button"
             variant="secondary"
             size="sm"
-            loading={testPushdeer.isPending}
-            onClick={() => testPushdeer.mutate()}
+            loading={testing === 'pushdeer'}
+            disabled={testing !== null}
+            onClick={() => void runTest('pushdeer')}
           >
-            发送测试消息
+            {testLabel('发送测试消息')}
           </Button>
-          <span className="ml-2 text-xs text-ink-tertiary">测试用当前已保存的配置，未保存的改动不生效。</span>
+          <span className="text-xs text-ink-tertiary">{TEST_HINT}</span>
         </div>
-      </div>
+      </ChannelBlock>
 
       {/* 通用 webhook */}
-      <div className="flex flex-col gap-2.5 border-t border-line pt-4">
-        <ToggleRow
-          label="通用 Webhook"
-          checked={draft.webhook.enabled}
-          onChange={(v) => patch((d) => void (d.webhook.enabled = v))}
-        />
+      <ChannelBlock
+        label="通用 Webhook"
+        enabled={draft.webhook.enabled}
+        onToggle={(v) => patch((d) => void (d.webhook.enabled = v))}
+      >
         <label className="flex flex-col gap-1.5">
           <span className="text-sm text-ink-secondary">Webhook URL</span>
           <Input
@@ -304,17 +360,12 @@ export function ForwardingSection() {
             </p>
           </div>
         </details>
-      </div>
+      </ChannelBlock>
 
       {validationError && <p role="alert" className="text-sm text-critical">{validationError}</p>}
       <div className="flex items-center justify-end gap-3 border-t border-line pt-4">
         {dirty && <span className="text-xs text-ink-tertiary">有未保存的改动</span>}
-        <Button disabled={!dirty} loading={save.isPending} onClick={() => {
-          const parsed = updateNotifyPrefsRequestSchema.safeParse(draft);
-          if (!parsed.success) { setValidationError(parsed.error.issues[0]?.message ?? '请检查配置'); return; }
-          setValidationError(null);
-          save.mutate(draft);
-        }}>
+        <Button disabled={!dirty || testing !== null} loading={save.isPending && testing === null} onClick={() => void saveDraft()}>
           保存
         </Button>
       </div>

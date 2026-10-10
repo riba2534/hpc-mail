@@ -2,6 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import {
   AtSign,
   ChevronDown,
+  Keyboard,
   Globe,
   Inbox,
   KeyRound,
@@ -21,8 +22,8 @@ import {
   Users,
   type LucideIcon,
 } from 'lucide-react';
-import { Suspense, useState } from 'react';
-import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { type MouseEvent, Suspense, useEffect, useState } from 'react';
+import { NavLink, Outlet, useLocation, useMatches, useNavigate } from 'react-router-dom';
 import { clearAuthToken } from '@/lib/auth-token';
 import { authApi } from '@/api/resources';
 import logoUrl from '@/assets/logo.webp';
@@ -40,11 +41,14 @@ import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
 import { useUnreadCount } from '@/features/inbox/use-unread-count';
 import { cn } from '@/lib/cn';
 import { usePublicConfig } from '@/lib/use-config';
+import { formatDocumentTitle, useTitleOverride } from '@/lib/use-document-title';
 import { useKeyboardShortcuts } from '@/lib/use-keyboard-shortcuts';
 import { useCurrentUser } from '@/lib/use-session';
 import { lazyWithReload } from './chunk-reload';
 import { PageLoader } from './page-loader';
 import { preloadable } from './route-modules';
+import type { RouteHandle } from './router';
+import { ShortcutsHelpDialog } from './shortcuts-help-dialog';
 
 const ChangePasswordDialog = lazyWithReload(
   preloadable(() => import('./change-password-dialog')),
@@ -87,6 +91,48 @@ const MOBILE_NAV: NavEntry[] = [
 
 function formatBadge(count: number): string {
   return count > 99 ? '99+' : String(count);
+}
+
+/** 邮件详情与写信页在移动端全屏：不显示底部导航 */
+export function hidesBottomNav(pathname: string): boolean {
+  return /^\/mail\/[^/]+\/?$/.test(pathname) || /^\/compose\/?$/.test(pathname);
+}
+
+/** 标签页标题：页面覆盖（如邮件主题）优先，其次路由默认标题；带未读数前缀 */
+function useShellDocumentTitle(siteTitle: string, unreadCount: number) {
+  const matches = useMatches();
+  const override = useTitleOverride();
+  const routeTitle =
+    [...matches].reverse().map((match) => (match.handle as RouteHandle | undefined)?.title).find(Boolean) ?? null;
+  const pageTitle = override ?? routeTitle;
+
+  useEffect(() => {
+    document.title = formatDocumentTitle(pageTitle, siteTitle, unreadCount);
+  }, [pageTitle, siteTitle, unreadCount]);
+
+  // 退出登录等卸载外壳时不留下旧的未读数
+  useEffect(() => () => void (document.title = siteTitle), [siteTitle]);
+}
+
+const MAIN_ID = 'main-content';
+
+function SkipLink() {
+  const focusMain = (event: MouseEvent<HTMLAnchorElement>) => {
+    const main = document.getElementById(MAIN_ID);
+    if (!main) return;
+    // 不改 URL 哈希，直接把焦点移到主内容（focus 会把它滚入视口）
+    event.preventDefault();
+    main.focus();
+  };
+  return (
+    <a
+      href={`#${MAIN_ID}`}
+      onClick={focusMain}
+      className="sr-only rounded-md bg-accent px-3 py-2 text-sm font-medium text-on-accent focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[60] focus:outline-none focus:ring-2 focus:ring-focus focus:ring-offset-2"
+    >
+      跳到主内容
+    </a>
+  );
 }
 
 function ComposeButton({ full, onNavigate }: { full: boolean; onNavigate?: () => void }) {
@@ -191,7 +237,7 @@ function NavSections({
   );
 }
 
-function UserMenu() {
+function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
   const user = useCurrentUser();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -245,6 +291,11 @@ function UserMenu() {
             <Lock className="size-4 text-ink-tertiary" />
             修改密码
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={onShowShortcuts}>
+            <Keyboard className="size-4 text-ink-tertiary" />
+            键盘快捷键
+            <kbd className="ml-auto font-sans text-xs text-ink-tertiary">?</kbd>
+          </DropdownMenuItem>
           <DropdownMenuItem tone="danger" onSelect={handleLogout}>
             <LogOut className="size-4" />
             退出登录
@@ -260,14 +311,19 @@ export function AppShell() {
   const user = useCurrentUser();
   const { data: config } = usePublicConfig();
   const { data: unread } = useUnreadCount();
+  const { pathname } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const isAdmin = user.role === 'admin';
   const siteTitle = config?.siteTitle ?? 'HPC Mail';
   const unreadCount = unread?.unread ?? 0;
-  useKeyboardShortcuts();
+  const bottomNavHidden = hidesBottomNav(pathname);
+  useKeyboardShortcuts({ onHelp: () => setShortcutsOpen(true) });
+  useShellDocumentTitle(siteTitle, unreadCount);
 
   return (
     <div className="flex min-h-dvh flex-col bg-canvas md:flex-row">
+      <SkipLink />
       <aside className="sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-line bg-surface md:flex md:w-16 lg:w-[220px]">
         <div className="flex h-14 items-center border-b border-line px-4 lg:px-5">
           <img src={logoUrl} alt="" className="size-7 shrink-0 rounded-md" />
@@ -301,7 +357,7 @@ export function AppShell() {
                 <Menu className="size-5" />
               </IconButton>
             </SheetTrigger>
-            <SheetContent side="right" title={siteTitle}>
+            <SheetContent side="left" title={siteTitle}>
               <NavSections isAdmin={isAdmin} full unreadCount={unreadCount} onNavigate={() => setMenuOpen(false)} />
             </SheetContent>
           </Sheet>
@@ -309,11 +365,20 @@ export function AppShell() {
           <span className="truncate text-sm font-semibold text-ink md:hidden">{siteTitle}</span>
           <div className="ml-auto flex items-center gap-1">
             <GithubIconLink />
-            <UserMenu />
+            <UserMenu onShowShortcuts={() => setShortcutsOpen(true)} />
           </div>
         </header>
 
-        <main className="flex-1 px-4 pb-24 pt-4 md:px-6 md:pb-8">
+        <main
+          id={MAIN_ID}
+          tabIndex={-1}
+          className={cn(
+            'flex-1 px-4 pt-4 focus:outline-none md:px-6 md:pb-8',
+            bottomNavHidden
+              ? 'pb-[calc(1rem+env(safe-area-inset-bottom))]'
+              : 'pb-[calc(6rem+env(safe-area-inset-bottom))]',
+          )}
+        >
           {config?.require2fa && !user.twoFactorEnabled ? (
             // 后端此时会对除 2FA 绑定以外的接口返回 totp_setup_required(403)，
             // 继续渲染常规页面只会满屏报错——直接换成阻塞式引导
@@ -336,7 +401,15 @@ export function AppShell() {
         </main>
       </div>
 
-      <nav className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-4 border-t border-line bg-surface md:hidden">
+      <nav
+        aria-label="主导航"
+        // 仅在可见时带标记：Toast 等路由外的层据此在小屏避让底部导航
+        data-bottom-nav={bottomNavHidden ? undefined : ''}
+        className={cn(
+          'fixed inset-x-0 bottom-0 z-30 grid-cols-4 border-t border-line bg-surface pb-[env(safe-area-inset-bottom)] md:hidden',
+          bottomNavHidden ? 'hidden' : 'grid',
+        )}
+      >
         {MOBILE_NAV.map((entry) => {
           const Icon = entry.icon;
           const showCount = entry.to === '/inbox' && unreadCount > 0;
@@ -364,6 +437,7 @@ export function AppShell() {
           );
         })}
       </nav>
+      <ShortcutsHelpDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
     </div>
   );
 }

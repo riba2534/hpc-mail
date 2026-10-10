@@ -20,6 +20,7 @@ import type {
   Invite,
   ListMessagesQuery,
   LoginRequest,
+  MarkAllReadRequest,
   LoginResponse,
   Mailbox,
   MailboxAvailability,
@@ -125,7 +126,9 @@ export const messageApi = {
   unreadCount: () => api.get<{ unread: number }>('/messages/unread-count'),
   markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed') =>
     api.post<{ changed: number }, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
-  markAllRead: () => api.post<{ changed: number }, Record<string, never>>('/messages/read-all', {}),
+  /** 按筛选（domain/address/q）收窄范围的全部已读；只处理自己认领的地址 */
+  markAllRead: (body: MarkAllReadRequest = {}) =>
+    api.post<{ changed: number }, MarkAllReadRequest>('/messages/read-all', body),
   star: (
     ids: number[],
     starred: boolean,

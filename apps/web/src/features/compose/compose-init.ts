@@ -17,6 +17,8 @@ export interface ComposeInitial {
   forwardAttachmentsFrom?: number;
   /** 页面标题用；不靠主题前缀猜测（中文「转发:」会误判） */
   mode?: 'reply' | 'forward' | 'resend';
+  /** 来源邮件 id：决定草稿场景（reply:/forward:/resend:<id>），各场景草稿互不覆盖 */
+  sourceMessageId?: number;
 }
 
 function withPrefix(subject: string, prefix: 'Re' | 'Fwd'): string {
@@ -68,6 +70,7 @@ export function buildReply(message: MessageDetail): ComposeInitial {
     isHtml: false,
     replyToMessageId: message.id,
     mode: 'reply',
+    sourceMessageId: message.id,
   };
 }
 
@@ -88,6 +91,7 @@ export function buildReplyAll(message: MessageDetail): ComposeInitial {
     isHtml: false,
     replyToMessageId: message.id,
     mode: 'reply',
+    sourceMessageId: message.id,
   };
 }
 
@@ -104,6 +108,7 @@ export function buildForward(message: MessageDetail): ComposeInitial {
     isHtml: false,
     forwardAttachmentsFrom: hasAttachments ? message.id : undefined,
     mode: 'forward',
+    sourceMessageId: message.id,
   };
 }
 
@@ -124,5 +129,6 @@ export function buildResend(message: MessageDetail, failedOnly = false): Compose
     isHtml: Boolean(message.bodyHtml),
     forwardAttachmentsFrom: message.attachments.length ? message.id : undefined,
     mode: 'resend',
+    sourceMessageId: message.id,
   };
 }
