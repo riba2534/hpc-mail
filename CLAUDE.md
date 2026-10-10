@@ -12,7 +12,7 @@ pnpm workspace monorepo，Node ≥22.12、pnpm 10。
 
 ```bash
 pnpm install
-pnpm dev          # 并行起 worker(:8787, wrangler dev) + web(:3002, vite)，vite 把 /api /v1 代理到 worker
+pnpm dev          # 并行起 worker(:8787, wrangler dev --local) + web(:3002, vite)，vite 只把 /api、/v1 路径代理到 worker；--local 下 Workers AI 不可用，只走正则提码
 pnpm build        # web 构建 → 产物拷进 apps/worker/dist（Worker 以 assets 形式托管前端）
 pnpm test         # 全部包 vitest（pnpm -r test）
 pnpm typecheck    # 全部包 tsc（pnpm -r typecheck）
@@ -48,13 +48,24 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 - **邮件可见性靠 `address` 动态关联，`messages` 表不存 `user_id`**。用户「认领」一个地址（`mailboxes` 表一行）即可见该地址**全部历史邮件**（含认领前收到的）。这是需求的核心建模，别退回「收件时固化归属人」的老路。
 - **收件域名完全由 `settings.domains.list`（数据库）驱动，没有任何写死 fallback**。`env.domain` 已删除；`services/domain.ts` 的 `getDomains()` 纯读 settings。全新部署初始域名为空（合法状态，管理员在 `/admin/domains` 页手动加）。加域名还需先在 Cloudflare 给该域配 Email Routing catch-all 指向本 Worker。
-- **外发只走 Cloudflare `send_email` binding**。`outbound.ts` 单通道；站内互投直接落库。2026-07 线上实测确认：该 binding **已可发送到任意外部地址**（Cloudflare 早期"仅限已验证 destination"的限制已放开，别再按旧限制设计）。（Resend 兜底通道已按需求彻底移除。）
+- **外发只走 Cloudflare `send_email` binding**。`outbound.ts` 单通道；站内互投直接落库。2026-07 线上实测确认：该 binding **已可发送到任意外部地址**（Cloudflare 早期"仅限已验证 destination"的限制已放开，别再按旧限制设计）；前提是 Workers Paid 计划，Free 计划只能发往账户内已验证地址（README 已注明）。（Resend 兜底通道已按需求彻底移除。）
 - **D1 单行上限 ~2MB**：正文 >256KB 时 D1 存 64KB 截断预览、完整正文落 R2（`bodyR2Key`）。附件一律 R2（key 前缀 `att/{messageId}/`）。删除邮件时，D1 元数据和 `storage_cleanup_jobs` 在同一事务中变更；R2 删除失败保留清理台账重试。共享附件或 `external_attachment_links` 的 90 天引用存续期间保留对象。
 - **转发/通知按「收件地址所属用户」分流（三层归属）**：域名（默认仅管理员，可 `public` 开放）→ 地址（已认领 / 未认领，**未认领归管理员**）→ 收件后按归属人的**个人偏好**处理。个人偏好存 `users.notify_prefs`（JSON：飞书 / 通用 webhook / 邮箱转发），端点 `/api/me/notify-prefs`。`inbound.ts` / `outbound.ts` 用 `resolveNotifyOwnerIds(address)` 解析 owner（未认领→`getActiveAdminIds`），**按收信当时认领状态结算**。**gmail_forward/feishu/notify_webhook 已从系统设置移除、下放为个人偏好**；管理员未配置时惰性继承旧全局值（`readLegacyGlobalNotify`）。别退回「一份全局配置套所有入站邮件」的老路。
 - **管理员看邮件的入口**：个人 `/inbox` 只看自己认领；`/admin/mail` 只看未认领地址（`scope=unclaimed`）；已认领用户的收发件走 `/admin/users/:id/mail`（`scope=user&userId=`）。读接口 admin 缺省不再等于全表；`scope=all` 已删除。
 - **收件链路（`inbound.ts`）失败隔离**：原始 .eml、完整正文或附件持久化失败会 throw（触发 SMTP 重试）；稳定 ingestKey 支持 pending/degraded 修复，转为完整状态的单个请求才进入后处理。邮箱转发异步独立执行（按 owner 个人转发目标）：原生 `message.forward()` 优先（仅对已验证 destination 生效、原样转发），失败降级 `relayForward`——以 `no-reply@收件域名` 经 `send_email` 中转重发（保留原始标题/正文/附件，Reply-To 指回原发件人）；AI 提码和通知走 `ctx.waitUntil`；`notification_jobs` 使用收件时 `notify_owner_ids` 快照、去重键、独立 10 秒超时及有限重试，Webhook 默认不自动重试。处理租约结果不明标 unknown，不自动重复外发。快照不参与邮件可见性。
 - **鉴权**：JWT（`sub/sid/epoch/uepoch`）+ D1 `sessions` 强一致会话；改密/禁用原子 bump `users.auth_version` 即时踢线。KV 仅在升级/回滚过渡期双写，不再作为鉴权真源。**RBAC 只有 admin/user 两角色 + `requireAuth`/`requireAdmin` 两中间件**，无 perm 表。
+- **延迟主因是 Worker 到 D1 的往返次数**（D1 主库单区域，SQL 本身亚毫秒）。`requireAuth` 把会话、用户、security 设置和两条限流计数合成一个 `db.batch`；`/v1` 鉴权写入同样批量，审计日志走 `waitUntil`。新增中间件或热路径时别再加串行 D1/KV 往返；会话与用户状态不得加 TTL 缓存（改密即时踢线）。settings 有 15 秒 isolate 缓存，域名认领等强一致校验用 `getSettingsFresh`。
+- **Placement 由 CI 按 GitHub Variable `PLACEMENT_REGION` 注入**（模板不写死，各部署 D1 位置不同）；placement 只作用于 fetch，email/scheduled 不受影响。**不能从 `run_worker_first` 删掉 `/assets/*`**：数组形式下缺失路径会 SPA 回退为 200 HTML（线上实测）；部署时 `scripts/inject-asset-routes.mjs` 为现存文件注入 `!/assets/<文件>` 排除规则走边缘直出，缺失文件仍进 Worker 返回 404（总条目上限 100）。
+- **D1 没有 STAT4，规划器常选错索引**（ANALYZE 无效）。可见性条件不要写成 `owned OR shared`，用地址集合 `UNION`；需要时用 `INDEXED BY`（通知补录）或一元 `+domain` 压掉错误索引；改索引前对所有 messages 查询跑 EXPLAIN 回归（见 `test/perf-optimizations.test.ts`）。
+- **共享邮件的已读状态属于所有者**：成员的已读/未读操作、全部已读都不生效，未读数与 `unread=1` 筛选也不含共享邮件；前端按已读样式显示共享邮件。
+- **验证链接**：入站时由 `services/link-extract.ts` 提取到 `messages.verification_link`（宁缺毋滥，与提码同一开关，不回填历史）；前端比对链接域名与发件域，不一致时提示。
 - **`cloudflare:email` 和 `mimetext` 必须在 `outbound.ts` 里动态 `import()`**（静态 import 会让 vitest 的 workerd 加载即崩）；mimetext 用 `mimetext/browser` 入口（避免 nodejs_compat 依赖）。
+
+## 前端约定
+
+- 页面懒加载用 `src/app/route-modules.ts` 的 `preloadable` 登记、router 里 `page()` 注册，**不要用 `React.lazy`**（Suspense 300ms 揭示节流会拖慢热启动）；chunk 失败由 `chunk-reload.ts` 自动刷新一次。
+- 入口与登录页不静态引入 `@hpc-mail/shared` 运行时值或重依赖（登录路由 JS 约 109KB br）；新依赖按需动态加载。Radix Tooltip 已移除，提示用原生 `title`。
+- `boot-prefetch.ts` 启动时并行预取会话、外壳与路由 chunk、收件箱数据，queryKey 与页面共用 `messageListQueryOptions` 等定义（`boot-prefetch.test.tsx` 校验一致）。写操作后用 `features/inbox/message-cache.ts` 就地更新缓存，别整体 invalidate `messages.root`。
 
 ## 测试注意事项
 
