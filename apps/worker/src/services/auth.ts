@@ -143,38 +143,27 @@ async function issueToken(env: Env, user: typeof users.$inferSelect, ctx?: ExecC
   return signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: user.authVersion });
 }
 
-export async function login(
-  env: Env,
-  req: LoginRequest,
-  ip: string,
-  ctx?: ExecCtx | null,
-): Promise<LoginResponse> {
-  await assertLoginAllowed(env, req.username, ip);
+/** Create a normal, revocable session for an explicitly bound OIDC subject. */
+export async function loginOidcUser(env: Env, userId: number, ip: string, ctx?: ExecCtx | null): Promise<LoginResponse> {
   const db = createDb(env);
-  let user = await db.select().from(users).where(eq(users.username, req.username)).get();
-  if (user && !user.authVersionMigrated) {
+  let user = await db.select().from(users).where(eq(users.id, userId)).get();
+  if (!user || user.status !== 'active') throw new AppError('bad_credentials', '单点登录失败');
+  if (!user.authVersionMigrated) {
     await getUserEpoch(env, user.id);
-    user = await db.select().from(users).where(eq(users.id, user.id)).get();
+    user = await db.select().from(users).where(eq(users.id, userId)).get();
   }
-  const valid = user ? await verifyPassword(req.password, user.passwordHash) : false;
-  if (!user || !valid) {
-    await recordLoginFailure(env, req.username, ip);
-    throw new AppError('bad_credentials', '用户名或密码错误');
+  if (!user || user.status !== 'active') throw new AppError('bad_credentials', '单点登录失败');
+  // A provider login must never silently bypass the app's own 2FA policy.
+  if (user.totpEnabledAt || (await getSettings(env, ctx)).security.require2fa) {
+    throw new AppError('bad_credentials', '此账号需要本地两步验证，请使用密码登录');
   }
-  if (user.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
-
-  try {
-    await verifyLoginTwoFactor(env, user, req.totp);
-  } catch (e) {
-    // 验证码错误计入失败限流；仅「需要验证码」的提示不计
-    if (e instanceof AppError && e.code === 'bad_credentials') {
-      await recordLoginFailure(env, req.username, ip);
-    }
-    throw e;
-  }
-
   const token = await issueToken(env, user, ctx);
-  await resetLoginFailures(env, req.username, ip);
+  await recordSuccessfulLogin(env, user, ip, ctx);
+  return { token, user: toSessionUser(user) };
+}
+
+async function recordSuccessfulLogin(env: Env, user: typeof users.$inferSelect, ip: string, ctx?: ExecCtx | null): Promise<void> {
+  const db = createDb(env);
   const previousIp = user.lastLoginIp;
   await db
     .update(users)
@@ -218,6 +207,42 @@ export async function login(
       })(),
     );
   }
+
+}
+
+export async function login(
+  env: Env,
+  req: LoginRequest,
+  ip: string,
+  ctx?: ExecCtx | null,
+): Promise<LoginResponse> {
+  await assertLoginAllowed(env, req.username, ip);
+  const db = createDb(env);
+  let user = await db.select().from(users).where(eq(users.username, req.username)).get();
+  if (user && !user.authVersionMigrated) {
+    await getUserEpoch(env, user.id);
+    user = await db.select().from(users).where(eq(users.id, user.id)).get();
+  }
+  const valid = user ? await verifyPassword(req.password, user.passwordHash) : false;
+  if (!user || !valid) {
+    await recordLoginFailure(env, req.username, ip);
+    throw new AppError('bad_credentials', '用户名或密码错误');
+  }
+  if (user.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
+
+  try {
+    await verifyLoginTwoFactor(env, user, req.totp);
+  } catch (e) {
+    // 验证码错误计入失败限流；仅「需要验证码」的提示不计
+    if (e instanceof AppError && e.code === 'bad_credentials') {
+      await recordLoginFailure(env, req.username, ip);
+    }
+    throw e;
+  }
+
+  const token = await issueToken(env, user, ctx);
+  await resetLoginFailures(env, req.username, ip);
+  await recordSuccessfulLogin(env, user, ip, ctx);
 
   return { token, user: toSessionUser(user) };
 }

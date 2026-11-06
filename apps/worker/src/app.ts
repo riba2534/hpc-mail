@@ -12,6 +12,7 @@ import adminUsers from './routes/admin/users.js';
 import apiKeys from './routes/api-keys.js';
 import attachments from './routes/attachments.js';
 import auth from './routes/auth.js';
+import oidc from './routes/oidc.js';
 import uploads from './routes/uploads.js';
 import avatar from './routes/avatar.js';
 import config from './routes/config.js';
@@ -38,6 +39,7 @@ export function createApp() {
   const api = new Hono<AppContext>();
   api.get('/openapi.json', (c) => c.json(buildSessionOpenApiSpec(new URL(c.req.url).origin)));
   api.route('/auth', auth);
+  api.route('/auth/oidc', oidc);
   api.route('/avatar', avatar);
   api.route('/config', config);
   api.route('/domains', domains);

@@ -219,6 +219,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, 'api-wait', minuteWindow(1) - 120);
     await purgeCounters(env, 'auth-user', minuteWindow(1) - 120);
     await purgeCounters(env, 'auth-global', minuteWindow(1) - 120);
+    await purgeCounters(env, 'oidc-login', minuteWindow(1) - 120);
+    await purgeCounters(env, 'oidc-handoff', minuteWindow(1) - 120);
     await purgeCounters(env, HOSTED_DNS_RATE_SCOPE, minuteWindow(1) - 120);
     await purgeCounters(env, HOSTED_DNS_SITE_RATE_SCOPE, minuteWindow(1) - 120);
     await purgeCounters(env, 'ai-extract', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
