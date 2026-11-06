@@ -8,12 +8,19 @@ import { MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-dns.js'
 /** Complete JWT-session contract; API keys are never accepted for these operations. */
 export function buildSessionOpenApiSpec(origin: string) {
   const admin = { role: 'admin' as const };
+  const oidcRedirect = (summary: string, description: string) => {
+    const base = operation(summary, str, { public: true, status: 302, description });
+    return { ...base, responses: { ...(base.responses as Record<string, unknown>), 302: { description: 'Redirect', headers: { Location: { schema: str } } } } };
+  };
   const paths: Paths = {
     '/openapi.json': { get: specificationOperation() },
     '/config': { get: operation('Read public site configuration', ref('PublicConfig'), { public: true }) },
     '/avatar/{userId}': { get: operation('Download a public avatar', str, { public: true, binary: 'application/octet-stream', parameters: [query('v', str, 'Avatar version from avatarUrl; cache-busting value.') ] }) },
     '/auth/login': { post: operation('Sign in and create a JWT session', ref('LoginResponse'), { public: true, request: 'LoginRequest',
       description: 'If enabled, supply a six-digit TOTP or a recovery code in totp. A 401 error.code=totp_required means retry login with that code. The session token is different from an hpcm_ API key. New sessions are guarded against concurrent password/2FA changes.' }) },
+    '/auth/oidc/start': { get: oidcRedirect('Start an optional OIDC login', 'Redirects to the configured OIDC provider after creating an HTTP-only state cookie.') },
+    '/auth/oidc/callback': { get: oidcRedirect('Complete an OIDC provider callback', 'Validates the provider response and redirects to the login page with an encrypted handoff cookie.') },
+    '/auth/oidc/exchange': { post: operation('Exchange an OIDC handoff for a session', ref('LoginResponse'), { public: true, description: 'Requires the same-origin HTTP-only handoff cookie and Origin header.' }) },
     '/auth/register': { post: operation('Register a user and create a session', ref('LoginResponse'), { public: true, request: 'RegisterRequest', status: 201,
       description: 'Subject to closed/invite/open registration policy and IP limits. Invite mode requires inviteCode.' }) },
     '/auth/me': { get: operation('Read the current session user', ref('SessionUser')) },

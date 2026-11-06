@@ -64,6 +64,7 @@ import { xhrSend, type UploadProgress } from './upload-client';
 // ---- auth ----
 export const authApi = {
   login: (body: LoginRequest) => api.post<LoginResponse, LoginRequest>('/auth/login', body, { token: null }),
+  oidcExchange: () => api.post<LoginResponse>('/auth/oidc/exchange', undefined, { token: null }),
   register: (body: RegisterRequest) =>
     api.post<LoginResponse, RegisterRequest>('/auth/register', body, { token: null }),
   logout: () => api.post<void>('/auth/logout'),

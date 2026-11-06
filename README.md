@@ -257,6 +257,35 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 
 **5. 初始化**：打开 `https://<CUSTOM_DOMAIN>`，用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录，进管理后台「域名」页（`/admin/domains`）添加第一个域名。加域名之前站点可以登录，但普通用户没有任何地址可认领、也无法发信。
 
+## 可选：OIDC 单点登录
+
+默认关闭，原有用户名密码登录始终保留。当前版本支持将 **一个已有用户**绑定到
+OIDC 身份，不按邮箱或用户名自动匹配，也不会自动注册。配置前先在 OIDC 提供方创建
+机密客户端，回调地址为 `https://你的站点域名/api/auth/oidc/callback`，启用授权码、
+PKCE S256 和 `client_secret_basic`，取得该用户在此客户端下的稳定 `sub`。
+
+部署后通过 `wrangler secret put <名称>` 交互式设置以下 Worker Secrets；不要把密钥
+写入仓库、命令历史或 Actions 日志。缺任一项时单点登录入口不显示：
+
+| Secret | 内容 |
+| --- | --- |
+| `oidc_issuer` | OIDC issuer 的 HTTPS URL，与 discovery 的 `issuer` 完全一致（包括尾随 `/`） |
+| `oidc_client_id` | 客户端 ID |
+| `oidc_client_secret` | 客户端密钥 |
+| `oidc_subject` | 允许登录的精确 OIDC `sub`，不是邮箱地址 |
+| `oidc_user_id` | 要绑定的已有 HPC Mail 用户数字 ID |
+
+`site_origin` 必须是站点的规范 HTTPS origin（例如 `https://mail.example.com`），
+与回调域名一致。用户数字 ID 可通过 D1 只读查询
+`SELECT id, username FROM users` 确认。配置完成后，在提供方完成登录即可进入该
+账号。必须在提供方限制允许登录的账号并启用合适的 MFA；更改 IdP 或数据库后应重新
+核对身份绑定。删除 `oidc_client_secret` 可关闭入口。
+
+安全边界：回调验证签名、issuer、audience、subject、nonce 和 PKCE；不信任客户端
+提供的身份头。**若该用户启用了 HPC Mail 自身的 TOTP，或全站强制两步验证，OIDC 登录
+会拒绝，须继续使用本地密码和 TOTP**，避免绕过现有安全策略。仅登录过程经过 OIDC；
+本地会话生命周期、权限和登出仍由 HPC Mail 管理。
+
 ## 开放 API
 
 在网页「API Keys」页创建密钥（明文仅展示一次），即可用脚本或 AI Agent 收发邮件：

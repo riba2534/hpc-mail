@@ -266,6 +266,8 @@ export interface DomainClaudeStats {
 
 /** 公开配置（无鉴权 GET /api/config） */
 export interface PublicConfig {
+  /** True when an explicit OIDC identity binding is configured. */
+  oidcEnabled?: boolean;
   siteTitle: string;
   registrationMode: z.infer<typeof registerModeSchema>;
   domains: string[];

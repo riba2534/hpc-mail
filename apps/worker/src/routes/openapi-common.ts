@@ -155,7 +155,7 @@ export const schemas: Record<string, Schema> = {
     forward: object({ domainLimit: int, targetLimit: int, windowEndsAt: date,
       targets: array(object({ address: str, attempts: int, remaining: int })), domains: array(object({ domain: str, attempts: int, remaining: int })) }) }),
   DomainStatus: object({ domain: str, inList: bool, mxReady: bool, spfReady: bool, mxRecords: array(str), resolved: bool }),
-  PublicConfig: object({ siteTitle: str, registrationMode: { type: 'string', enum: ['closed', 'invite', 'open'] }, domains: array(str), require2fa: bool,
+  PublicConfig: object({ oidcEnabled: bool, siteTitle: str, registrationMode: { type: 'string', enum: ['closed', 'invite', 'open'] }, domains: array(str), require2fa: bool,
     translationEnabled: { ...bool, description: 'translation.enabled is on and ai_model has baseUrl, apiKey and model configured; provider details are never public.' },
     hostedDomainsEnabled: { ...bool, description: 'hosted_domains.enabled is on and the Worker has Cloudflare credentials, so users can add their own domains.' } }),
   HostedDomain: (() => {

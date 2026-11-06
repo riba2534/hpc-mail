@@ -5,7 +5,7 @@ import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const config = vi.hoisted(() => ({ mode: 'closed' as 'closed' | 'invite' | 'open' }));
+const config = vi.hoisted(() => ({ mode: 'closed' as 'closed' | 'invite' | 'open', oidcEnabled: false }));
 const login = vi.hoisted(() => vi.fn(async () => {
   throw new Error('offline');
 }));
@@ -16,7 +16,7 @@ vi.mock('@/api/resources', () => ({ authApi: { login, register } }));
 
 vi.mock('@/lib/use-config', () => ({
   usePublicConfig: () => ({
-    data: { siteTitle: 'HPC Mail', registrationMode: config.mode, domains: [] },
+    data: { siteTitle: 'HPC Mail', registrationMode: config.mode, domains: [], oidcEnabled: config.oidcEnabled },
     isLoading: false,
   }),
 }));
@@ -33,13 +33,26 @@ function renderPage(children: ReactNode = <LoginPage />) {
 }
 
 describe('LoginPage 注册模式分支', () => {
-  beforeEach(() => localStorage.clear());
+  beforeEach(() => { localStorage.clear(); config.oidcEnabled = false; });
 
   it('closed 模式不显示注册入口', () => {
     config.mode = 'closed';
     renderPage();
     expect(screen.queryByRole('radio', { name: '注册' })).toBeNull();
     expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument();
+  });
+
+  it('只在配置 OIDC 时显示登录入口', () => {
+    config.oidcEnabled = true;
+    renderPage();
+    expect(screen.getByRole('link', { name: '使用单点登录' })).toHaveAttribute('href', '/api/auth/oidc/start');
+  });
+
+  it('显示 OIDC 回调错误并从地址栏移除状态', async () => {
+    globalThis.history.replaceState({}, '', '/login?oidc=error');
+    renderPage();
+    expect(await screen.findByRole('alert')).toHaveTextContent('单点登录失败');
+    expect(globalThis.location.search).toBe('');
   });
 
   it('invite 模式的注册需要邀请码字段', async () => {

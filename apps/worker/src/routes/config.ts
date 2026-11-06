@@ -5,6 +5,7 @@ import { getPublicDomains } from '../services/domain.js';
 import { hostedDomainsAvailable } from '../services/hosted-domain.js';
 import { getSettings, isTranslationReady } from '../services/setting.js';
 import type { AppContext } from '../types.js';
+import { oidcConfigured } from '../services/oidc.js';
 
 const app = new Hono<AppContext>();
 
@@ -15,6 +16,7 @@ const app = new Hono<AppContext>();
 app.get('/', async (c) => {
   const settings = await getSettings(c.env);
   const config: PublicConfig = {
+    oidcEnabled: oidcConfigured(c.env),
     siteTitle: settings.site.title,
     registrationMode: settings.register_mode,
     domains: await getPublicDomains(c.env, settings),

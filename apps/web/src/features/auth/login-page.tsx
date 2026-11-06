@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
 import type { LoginResponse } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -70,6 +70,7 @@ export function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [validating, setValidating] = useState(false);
+  const oidcStarted = useRef(false);
 
   const fromState = (location.state as { from?: string } | null)?.from;
   const redirectTo = fromState && fromState !== '/login' ? fromState : '/inbox';
@@ -118,6 +119,19 @@ export function LoginPage() {
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : '注册失败，请重试'),
   });
+
+  useEffect(() => {
+    if (oidcStarted.current) return;
+    const url = new URL(globalThis.location.href);
+    const result = url.searchParams.get('oidc');
+    if (!result) return;
+    oidcStarted.current = true;
+    url.searchParams.delete('oidc');
+    globalThis.history.replaceState(globalThis.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+    if (result !== 'success') { setError('单点登录失败，请重试或使用密码登录'); return; }
+    setValidating(true);
+    void authApi.oidcExchange().then(applySession).catch(() => setError('单点登录失败，请重试或使用密码登录')).finally(() => setValidating(false));
+  }, []);
 
   if (token) return <Navigate to={redirectTo} replace />;
 
@@ -295,6 +309,11 @@ export function LoginPage() {
               {mode === 'login' ? '登录' : '注册并登录'}
             </Button>
           </form>
+          {mode === 'login' && config?.oidcEnabled && (
+            <a href="/api/auth/oidc/start" className="mt-4 block text-center text-sm text-ink underline">
+              使用单点登录
+            </a>
+          )}
         </div>
 
         <a

@@ -13,6 +13,12 @@ export interface Env {
   build_sha?: string;
   /** secret：JWT 签名密钥 */
   jwt_secret: string;
+  /** Optional OIDC login: explicitly bind one issuer subject to an existing user. */
+  oidc_issuer?: string;
+  oidc_client_id?: string;
+  oidc_client_secret?: string;
+  oidc_subject?: string;
+  oidc_user_id?: string;
   /** secret：托管域名使用的站长 Cloudflare API Token；与 cf_account_id 都配置时才启用托管域名 */
   cf_api_token?: string;
   /** secret：站长 Cloudflare 账户 ID（资源 ID 不入库，由 CI 注入） */
