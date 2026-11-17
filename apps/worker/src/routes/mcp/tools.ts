@@ -169,10 +169,9 @@ export const TOOLS: { [N in McpToolName]: ToolDefinition<N> } = {
     title: '列出与搜索邮件',
     description: '列出或搜索邮件（GET /v1/messages，需要 mail.read），按 id 从新到旧。q 搜主题、发件人与正文；address、domain、direction、unread、starred 收窄范围；afterId 只取 id 更大的邮件；nextCursor 不为 null 时把它作为 cursor 取下一页。摘要已带 preview、verificationCode 与 verificationLink，多数情况不必再读详情。',
     annotations: READ_ONLY,
-    run: async (rest, args) => {
-      const page = await rest<Page<MessageSummary>>({ method: 'GET', path: '/v1/messages', query: mcpSearchQuery(args) });
-      return args.response_format === 'detailed' ? page as unknown as Result : { items: page.items.map(conciseSummary), nextCursor: page.nextCursor };
-    },
+    run: async (rest, args) => detailed(args.response_format,
+      await rest<Page<MessageSummary>>({ method: 'GET', path: '/v1/messages', query: mcpSearchQuery(args) }),
+      (page) => ({ items: page.items.map(conciseSummary), nextCursor: page.nextCursor })),
   },
   get_message: {
     title: '读取邮件',
@@ -185,11 +184,9 @@ export const TOOLS: { [N in McpToolName]: ToolDefinition<N> } = {
     title: '等待新邮件',
     description: '等待下一封新来信（GET /v1/messages/wait，需要 mail.read），最长 timeout 秒（默认 25，最大 50）。先用 search_messages 取最新一封的 id 作为 afterId，再触发对方发信；命中时返回 id 大于 afterId、符合全部条件的最早一封，超时返回 message=null。无论是否命中，都用返回的 scannedThroughId 作为下一次的 afterId。等验证码时加 hasCode=true，并用 address、from 或 subjectContains 收窄范围；detailed 时命中的邮件带完整正文。',
     annotations: READ_ONLY,
-    run: async (rest, args) => {
-      const found = await rest<WaitMessageResult>({ method: 'GET', path: '/v1/messages/wait', query: mcpWaitQuery(args) });
-      return args.response_format === 'detailed' ? found as unknown as Result
-        : { message: found.message ? conciseSummary(found.message) : null, scannedThroughId: found.scannedThroughId };
-    },
+    run: async (rest, args) => detailed(args.response_format,
+      await rest<WaitMessageResult>({ method: 'GET', path: '/v1/messages/wait', query: mcpWaitQuery(args) }),
+      (found) => ({ message: found.message ? conciseSummary(found.message) : null, scannedThroughId: found.scannedThroughId })),
   },
 };
 

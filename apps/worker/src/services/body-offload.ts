@@ -1,4 +1,5 @@
-import { htmlToText } from '../lib/text.js';
+import { runLimited } from '../lib/concurrency.js';
+import { mailText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { BODY_PREVIEW_BYTES, bodyFitsInline, searchableBody, type StoredBody } from './mail-body.js';
 import { bodyKey } from './storage.js';
@@ -104,7 +105,7 @@ function planFor(row: ScanRow): Plan | null {
 
 /** 新形态 D1 里的搜索文本，与新写入同一口径（searchableBody） */
 function searchText(full: StoredBody): string {
-  return searchableBody(full.text, { get htmlText() { return htmlToText(full.html); } });
+  return searchableBody(full.text, mailText(full.text, full.html));
 }
 
 /** 写 R2 并回读逐字节比对，返回 D1 改写语句 */
@@ -130,13 +131,6 @@ async function shrinkRow(env: Env, plan: Extract<Plan, { kind: 'shrink' }>): Pro
   if (!full.text.startsWith(plan.text) || !full.html.startsWith(plan.html)) throw new Error('D1 预览与 R2 正文不一致');
   return env.db.prepare(`UPDATE messages SET body_text = ?1, body_html = '' WHERE id = ?2 AND body_r2_key = ?3`)
     .bind(searchText({ text: full.text, html: full.html }), plan.id, plan.key);
-}
-
-async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) await task(items[next++]!);
-  }));
 }
 
 /**
