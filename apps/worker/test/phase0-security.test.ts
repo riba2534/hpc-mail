@@ -1,4 +1,5 @@
 import {
+  MAX_API_GLOBAL_REQUESTS_PER_MINUTE,
   MAX_API_USER_REQUESTS_PER_MINUTE,
   MAX_AUTH_USER_REQUESTS_PER_MINUTE,
   type ApiScope,
@@ -23,20 +24,24 @@ import {
 import { AppError } from '../src/lib/errors.js';
 import { signToken } from '../src/lib/jwt.js';
 import { hashPassword } from '../src/lib/password.js';
-import { createApiKey, revokeAllApiKeysQuery } from '../src/services/api-key.js';
+import { createApiKey, revokeAllApiKeysQuery, revokeApiKey, updateApiKey } from '../src/services/api-key.js';
 import {
   beginIdempotentSend,
   bindIdempotentSend,
   completeIdempotentSend,
   failIdempotentSend,
+  type IdempotencyActor,
   type IdempotencyHandle,
 } from '../src/services/idempotency.js';
 import { purgeMatchingMessages } from '../src/services/message-lifecycle.js';
+import { sendMail } from '../src/services/outbound.js';
+import { runScheduled } from '../src/services/scheduled.js';
 import { enqueueMailNotifications, processNotificationJobs, retryNotificationJob } from '../src/services/notification-jobs.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { bumpCounter, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import type { Env } from '../src/types.js';
 
 const app = createApp();
 const IP = '198.51.100.23';
@@ -90,6 +95,27 @@ const logsOf = (apiKeyId: number) => createDb(env).select().from(apiRequestLogs)
 async function awayFromMinuteBoundary(): Promise<void> {
   const left = 60_000 - (Date.now() % 60_000);
   if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
+}
+
+/** 匹配的语句真正执行前先跑一次 hook，用来在「读校验」与「写」之间插入并发操作 */
+function beforeStatement(pattern: RegExp, hook: () => Promise<unknown>): Env {
+  let triggered = false;
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+    get(target, property) {
+      if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args));
+      const method = Reflect.get(target, property);
+      if (typeof method !== 'function') return method;
+      return async (...args: unknown[]) => {
+        if (!triggered && ['first', 'all', 'run', 'raw'].includes(String(property))) { triggered = true; await hook(); }
+        return method.apply(target, args);
+      };
+    },
+  });
+  return { ...env, db: new Proxy(env.db, { get(target, property) {
+    if (property === 'prepare') return (query: string) => pattern.test(query) ? wrap(target.prepare(query)) : target.prepare(query);
+    const value = Reflect.get(target, property);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } }) } as Env;
 }
 
 async function enableApi() {
@@ -220,11 +246,65 @@ describe('R04 全站限流桶不被单个用户打满', () => {
     const hotKey = await keyFor(hot.id);
     await bumpCounter(env, 'api-user', String(hot.id), minute, MAX_API_USER_REQUESTS_PER_MINUTE);
     const before = (await readCounter(env, 'api-global', 'instance', minute)).count;
-    for (let i = 0; i < 4; i++) expect((await call('/v1/status', hotKey.key)).status).toBe(429);
+    for (let i = 0; i < 4; i++) {
+      const response = await call('/v1/status', hotKey.key);
+      expect(response.status).toBe(429);
+      expect(((await response.json()) as { error: { message: string } }).error.message).toContain('账户级');
+    }
     expect((await readCounter(env, 'api-global', 'instance', minute)).count).toBe(before);
     const calm = await seedUser('p0-api-calm');
     expect((await call('/v1/status', (await keyFor(calm.id)).key)).status).toBe(200);
     expect((await readCounter(env, 'api-global', 'instance', minute)).count).toBe(before + 1);
+  });
+
+  it('/v1：全站总桶超限与账户级超限给出不同的 429 文案', async () => {
+    await enableApi();
+    await awayFromMinuteBoundary();
+    const minute = minuteWindow(1);
+    const user = await seedUser('p0-api-global');
+    const key = await keyFor(user.id);
+    const before = (await readCounter(env, 'api-global', 'instance', minute)).count;
+    const fill = MAX_API_GLOBAL_REQUESTS_PER_MINUTE - before;
+    await bumpCounter(env, 'api-global', 'instance', minute, fill);
+    try {
+      const response = await call('/v1/status', key.key);
+      expect(response.status).toBe(429);
+      const message = ((await response.json()) as { error: { message: string } }).error.message;
+      expect(message).toContain('API 总调用频率超限');
+      expect(message).not.toContain('账户级');
+    } finally {
+      // 全站桶同文件共享，撤掉人为填充，后续用例不受影响
+      await bumpCounter(env, 'api-global', 'instance', minute, -fill);
+    }
+  });
+});
+
+describe('API Key 管理的并发守卫', () => {
+  it('已吊销的 Key 不能被并发的编辑改回 active', async () => {
+    const user = await seedUser('p0-update-revoked');
+    const key = await keyFor(user.id);
+    await createDb(env).update(apiKeys).set({ status: 'disabled' }).where(eq(apiKeys.id, key.id));
+    // 编辑先读到 disabled，写入前被吊销
+    const racing = beforeStatement(/^update "api_keys"/i, () => revokeApiKey(env, key.id, user.id));
+    await expect(updateApiKey(racing, key.id, { status: 'active' }, user.id)).rejects.toMatchObject({ code: 'not_found' });
+    expect((await createDb(env).select().from(apiKeys).where(eq(apiKeys.id, key.id)).get())!.status).toBe('revoked');
+  });
+
+  it('改密后仍在途的旧令牌（鉴权版本已过期）不能再创建 Key', async () => {
+    const user = await seedUser('p0-create-epoch');
+    const db = createDb(env);
+    await db.update(users).set({ authVersion: 1 }).where(eq(users.id, user.id));
+    const req = { name: 'stale', scopes: ['mail.read'] as ApiScope[], rateLimit: 120, allowedIps: [] };
+    await expect(createApiKey(env, user.id, req, 0)).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(await db.select().from(apiKeys).where(eq(apiKeys.userId, user.id)).all()).toHaveLength(0);
+    expect((await createApiKey(env, user.id, req, 1)).status).toBe('active');
+  });
+
+  it('网页创建 Key 带令牌鉴权版本，正常会话照常创建', async () => {
+    const user = await seedUser('p0-create-http');
+    const response = await call('/api/api-keys', await jwtFor(user.id),
+      jsonInit('POST', { name: 'web', scopes: ['mail.read'], rateLimit: 60 }));
+    expect(response.status).toBe(201);
   });
 });
 
@@ -324,6 +404,23 @@ describe('X02 通知载荷随邮件删除与任务终态清空', () => {
     expect(skipped!.payload).toEqual({});
   });
 
+  it('按 dedupe_key 前缀清空时不误清 id 前缀相同或相邻的其他邮件', async () => {
+    const user = await seedUser('p0-purge-prefix');
+    await updateUserNotifyPrefs(env, user.id, { webhook });
+    const base = 8_800_000 + Math.floor(Math.random() * 100_000);
+    const ids = [base, base * 10 + 3, base + 1];
+    const jobs: number[] = [];
+    for (const id of ids) {
+      const address = `p0-prefix-${id}@hpc.email`;
+      await createDb(env).insert(messages).values({ id, direction: 'inbound', address, domain: 'hpc.email',
+        fromAddress: 'sender@example.net', subject: 'secret subject 482913', preview: 'secret', status: 'received' });
+      jobs.push((await notify(user.id, id, address))[0]!);
+    }
+    expect(await purgeMatchingMessages(env, sql`${messages.id} = ${base}`)).toBe(1);
+    expect((await jobOf(jobs[0]!))!.payload).toEqual({});
+    for (const job of jobs.slice(1)) expect(JSON.stringify((await jobOf(job))!.payload)).toContain('482913');
+  });
+
   it('推送成功清空载荷；失败保留载荷供重试', async () => {
     const user = await seedUser('p0-terminal');
     await updateUserNotifyPrefs(env, user.id, { webhook });
@@ -370,7 +467,7 @@ describe('R22 幂等发信可以安全重试', () => {
   const recordOf = (handle: IdempotencyHandle) => createDb(env).select().from(idempotencyRecords).where(and(
     eq(idempotencyRecords.actorType, handle.actor.type), eq(idempotencyRecords.actorId, handle.actor.id),
     eq(idempotencyRecords.key, handle.key))).get();
-  async function owner(who: ReturnType<typeof actor>, key: string, body: unknown): Promise<IdempotencyHandle> {
+  async function owner(who: IdempotencyActor, key: string, body: unknown): Promise<IdempotencyHandle> {
     const start = await beginIdempotentSend(env, who, key, body);
     if (start.kind !== 'owner' || !start.handle) throw new Error('expected owner');
     return start.handle;
@@ -453,12 +550,72 @@ describe('R22 幂等发信可以安全重试', () => {
     expect((await createDb(env).select().from(messages).where(eq(messages.id, okRow.id)).get())!.status).toBe('pending');
   });
 
+  it('收回 3 天前的 failed 记录并完成后，每日维护不删除，同 Key 仍重放原结果', async () => {
+    const who = actor();
+    const key = `p0-aged-${rand()}`;
+    const handle = await owner(who, key, request('aged'));
+    await failIdempotentSend(env, handle, new AppError('internal', 'D1 暂不可用'));
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    await createDb(env).update(idempotencyRecords).set({ createdAt: old, updatedAt: old }).where(and(
+      eq(idempotencyRecords.actorType, who.type), eq(idempotencyRecords.actorId, who.id), eq(idempotencyRecords.key, key)));
+    const reclaimed = await owner(who, key, request('aged'));
+    await completeIdempotentSend(env, reclaimed, { id: 424242 } as never);
+    // 维护会顺带处理同文件前面用例留下的待推送通知，拦下外部请求
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ok: true })));
+    await runScheduled(env);
+    const replay = await beginIdempotentSend(env, who, key, request('aged'));
+    expect(replay.kind).toBe('replay');
+    if (replay.kind === 'replay') expect(replay.response.id).toBe(424242);
+  });
+
+  it('绑定幂等键的 batch 抛 D1 异常时，未外发的发件行标为 failed，不留永久 pending', async () => {
+    await updateSettings(env, {
+      domains: { list: [{ domain: 'hpc.email', public: true, perUserLimit: 0 }] },
+      code_extract: { enabled: false, aiEnabled: false },
+      quota: { dailyOutbound: 0, dailyRecipients: 0 },
+    });
+    const user = await seedUser('p0-bind-throw');
+    const local = `p0-bind-throw-${rand()}`;
+    await createDb(env).insert(mailboxes).values({ address: `${local}@hpc.email`, domain: 'hpc.email', userId: user.id });
+    const subject = `p0 bind throw ${rand()}`;
+    const req = { from: { localPart: local, domain: 'hpc.email' }, to: [`p0-rcpt-${rand()}@hpc.email`], cc: [], bcc: [], subject, text: 'hi' };
+    const who = { type: 'user' as const, id: user.id };
+    const handle = await owner(who, `p0-bind-throw-${rand()}`, req);
+    // 含幂等绑定语句的 batch 整体失败（D1 事务回滚、抛异常）
+    const binding = new WeakSet<object>();
+    const faulty = { ...env, db: new Proxy(env.db, { get(target, property) {
+      if (property === 'prepare') return (query: string) => {
+        const statement = target.prepare(query);
+        if (/^update "idempotency_records"/i.test(query)) {
+          binding.add(statement);
+          const bind = statement.bind.bind(statement);
+          statement.bind = (...args: unknown[]) => { const bound = bind(...args); binding.add(bound); return bound; };
+        }
+        return statement;
+      };
+      if (property === 'batch') return async (list: D1PreparedStatement[]) => {
+        if (list.some((statement) => binding.has(statement))) throw new Error('injected D1 failure');
+        return target.batch(list);
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } }) } as Env;
+    await expect(sendMail(faulty, { waitUntil: () => {} }, { userId: user.id, role: 'user' }, req, [], 'https://hpc.email', handle))
+      .rejects.toThrow('injected D1 failure');
+    const row = await createDb(env).select().from(messages).where(eq(messages.subject, subject)).get();
+    expect(row).toMatchObject({ direction: 'outbound', status: 'failed' });
+    expect(row!.errorDetail).toContain('injected D1 failure');
+    expect(await recordOf(handle)).toMatchObject({ status: 'pending', messageId: null });
+  });
+
   it('/api 发信：403 后认领发件地址，用同一 Key、同一内容重试成功', async () => {
     await updateSettings(env, {
       domains: { list: [{ domain: 'hpc.email', public: true, perUserLimit: 0 }] },
       code_extract: { enabled: false, aiEnabled: false },
       quota: { dailyOutbound: 0, dailyRecipients: 0 },
     });
+    // 站内投递会顺带处理队列里所有待推送通知（含前面用例留下的），拦下外部请求
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ok: true })));
     const user = await seedUser('p0-send');
     const jwt = await jwtFor(user.id);
     const local = `p0-send-${rand()}`;

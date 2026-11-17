@@ -22,8 +22,12 @@ export function purgeStatements(env: Env, token: string): D1PreparedStatement[] 
     env.db.prepare(`DELETE FROM stars WHERE message_id IN (${selected})`).bind(token),
     // 译文是邮件内容的派生副本，必须随邮件一起删除
     env.db.prepare(`DELETE FROM message_translations WHERE message_id IN (${selected})`).bind(token),
-    // 通知载荷含主题、验证码、链接与正文前 4000 字，同属派生副本；任务行保留供通知健康页查看
-    env.db.prepare(`UPDATE notification_jobs SET payload = '{}' WHERE message_id IN (${selected}) AND payload <> '{}'`).bind(token),
+    // 通知载荷含主题、验证码、链接与正文前 4000 字，同属派生副本；任务行保留供通知健康页查看。
+    // message_id 无索引，按 dedupe_key 的 'mail:{id}:' 前缀走唯一索引做范围查找（';' 是 ':' 的下一个字符）；
+    // CROSS JOIN 固定先按 purge_token 取邮件、再逐封查任务
+    env.db.prepare(`UPDATE notification_jobs SET payload = '{}' WHERE payload <> '{}' AND id IN (
+      SELECT j.id FROM messages m CROSS JOIN notification_jobs j
+      WHERE m.purge_token = ? AND j.dedupe_key >= 'mail:' || m.id || ':' AND j.dedupe_key < 'mail:' || m.id || ';')`).bind(token),
     env.db.prepare('DELETE FROM messages WHERE purge_token = ?').bind(token),
   ];
 }

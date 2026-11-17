@@ -3,6 +3,9 @@ import { createDb } from '../db/client.js';
 import { rateCounters } from '../db/schema.js';
 import type { Env } from '../types.js';
 
+/** /v1 被拒请求的明细节流计数（每 Key 每分钟一格） */
+export const API_REJECT_SCOPE = 'api-reject';
+
 export interface CounterValue {
   count: number;
   units: number;

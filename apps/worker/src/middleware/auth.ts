@@ -64,6 +64,7 @@ export const requireAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   const authUser = (await fastAuth(c, claims)) ?? (await slowAuth(c, claims));
   c.set('user', authUser);
   c.set('sessionId', claims.sid);
+  c.set('authEpoch', claims.uepoch);
   await next();
 };
 

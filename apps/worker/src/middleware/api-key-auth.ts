@@ -15,6 +15,7 @@ import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { getSettings, settingsQuery } from '../services/setting.js';
 import {
   andGuards,
+  API_REJECT_SCOPE,
   counterResult,
   counterStatement,
   counterWithinGuard,
@@ -25,8 +26,6 @@ import type { AppContext, Env } from '../types.js';
 const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
 const LAST_USED_THROTTLE_MS = 60_000;
 const AUDIT_PATH_MAX = 256;
-/** 被拒请求的明细节流计数（每 Key 每分钟一格） */
-export const API_REJECT_SCOPE = 'api-reject';
 
 function clientIp(c: Context<AppContext>): string {
   const value = c.req.header('CF-Connecting-IP') || '';
@@ -150,7 +149,12 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     if (requestCount > row.rateLimit) throw new AppError('rate_limited', 'API 调用频率超限');
 
     // Key 级限制之外再加用户级与实例级总桶，避免创建多个 Key 横向放大额度。
-    // 实例桶的守卫包含 Key 级与用户级未超限：无返回即用户桶已超限、未计入，有返回则只需再看实例桶本身。
+    // 用户桶与 Key 级计数同一事务，Key 未超限时必有返回；实例桶的守卫包含 Key 级与用户级未超限，
+    // 无返回即用户桶已超限、未计入。两种超限分开提示，调用方能区分是自己账户超额还是全站繁忙
+    const userRate = counterResult(results[1]);
+    if (!userRate || userRate.count > MAX_API_USER_REQUESTS_PER_MINUTE) {
+      throw new AppError('rate_limited', 'API 调用频率超限（账户级），请稍后重试');
+    }
     const globalRate = counterResult(results[2]);
     if (!globalRate || globalRate.count > MAX_API_GLOBAL_REQUESTS_PER_MINUTE) {
       throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
