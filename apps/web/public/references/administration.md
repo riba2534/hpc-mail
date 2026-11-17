@@ -111,7 +111,7 @@ jq -n --argjson owner "$HPC_OWNER_ID" \
 
 运维脚本（批量建邮箱、共享、过户、释放，查归属、托管域名与 Claude 状态）用管理员 Key 调 `/v1/admin/*`，不要直连 D1 写 SQL：这些接口与 `/api/admin/*` 一样逐项校验、在事务里提交并写管理审计。
 
-**管理员 Key** 是管理员账户创建、勾选 `admin` scope（网页「管理员能力」）的 API Key，IP 白名单与有效期可选。`GET /v1/me` 的 `key.effectiveRole` 为 `admin` 才能调用；普通用户的 Key、没带 `admin` 的管理员 Key 一律 403 `forbidden`，`fix` 写明怎么创建。除 `admin` 外不需要其他 scope，限流同其他 `/v1` 请求。写操作每项一行管理审计，操作人记为「用户名（API Key #id）」，detail 末尾带 `批量请求 <请求 id>`。shell 示例复用[入口指南](../skill.md)，设 `API="$BASE/v1"`、`AUTH` 为管理员 Key。
+**管理员 Key** 是管理员账户创建、勾选 `admin` scope（网页「管理员能力」）的 API Key，IP 白名单与有效期可选。`GET /v1/me` 的 `key.effectiveRole` 为 `admin` 才能调用；普通用户的 Key、没带 `admin` 的管理员 Key 一律 403 `forbidden`，`fix` 写明怎么创建。除 `admin` 外不需要其他 scope，限流同其他 `/v1` 请求。写操作每项一行管理审计，操作人是 Key 所属管理员的用户名，detail 末尾为 `批量请求 <请求 id>（API Key #id）`。shell 示例复用[入口指南](../skill.md)，设 `API="$BASE/v1"`、`AUTH` 为管理员 Key。
 
 ### 写入
 
