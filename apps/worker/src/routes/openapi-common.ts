@@ -12,7 +12,8 @@ import {
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
   ALLOWED_CUSTOM_HEADERS, MAX_CUSTOM_HEADER_VALUE_BYTES, MAX_CUSTOM_NON_X_HEADERS, MAX_CUSTOM_HEADERS_TOTAL_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_SEND_REQUEST_BYTES, MAX_REPLY_TO, MAX_DISPLAY_NAME_LENGTH,
-  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES,
+  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES, MAX_ATTACHMENT_FILE_BYTES, URL_ATTACHMENT_MAX_REDIRECTS, URL_ATTACHMENT_TIMEOUT_MS,
+  MAX_BATCH_SEND_ITEMS,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 
@@ -98,6 +99,14 @@ const attachmentFields = base64Attachment!.properties as Record<string, Schema>;
 const urlAttachmentFields = urlAttachment!.properties as Record<string, Schema>;
 urlAttachmentFields.contentId = { ...urlAttachmentFields.contentId, description: contentIdDescription };
 urlAttachmentFields.disposition = { ...urlAttachmentFields.disposition, description: dispositionDescription };
+urlAttachmentFields.url = { ...urlAttachmentFields.url, examples: ['https://files.example.com/report.pdf'],
+  description: `Public https URL fetched by the server. Only the default port 443, no credentials. Private, loopback, link-local (including cloud metadata 169.254.169.254), CGNAT, multicast, reserved and documentation addresses are refused, as literal IPs or as DNS answers (A and AAAA), and so are internal hostnames (localhost, *.local, *.internal…) and this site itself: 400 attachment_url_forbidden. Up to ${URL_ATTACHMENT_MAX_REDIRECTS} redirects are followed, each hop checked again; the whole fetch must finish within ${URL_ATTACHMENT_TIMEOUT_MS / 1000} seconds. DNS failure, timeout, non-2xx, too many redirects, empty content or a length mismatch return 422 attachment_url_fetch_failed. Each file is at most ${MAX_ATTACHMENT_FILE_BYTES / MIB} MiB and counts toward the ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB total; a response without Content-Length is limited to ${SINGLE_UPLOAD_THRESHOLD_BYTES / MIB} MiB (413 payload_too_large). Errors carry details.url. Fetched content is stored like an upload (counts toward the per-user pending-upload quota until sent).` };
+urlAttachmentFields.filename = { ...urlAttachmentFields.filename, description: 'Optional; defaults to the Content-Disposition filename, else the last URL path segment, else attachment.' };
+urlAttachmentFields.contentType = { ...urlAttachmentFields.contentType, description: 'Optional; defaults to the response Content-Type (parameters removed), else application/octet-stream.' };
+delete urlAttachmentFields.content;
+delete attachmentFields.url;
+sendProperties.attachments = { ...sendProperties.attachments,
+  description: `Base64 items ({filename, contentType, content}) and URL items ({url}) in any order, at most ${MAX_ATTACHMENTS} together with attachmentTokens. An item cannot have both url and content.` };
 attachmentFields.content = {
   type: 'string', minLength: 1, pattern: '^[A-Za-z0-9+/\\s]+(?:=\\s*){0,2}$',
   description: `Base64 without a data: prefix; whitespace and line breaks are removed before decoding. Base64 attachments together decode to at most ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / MIB} MiB (413 payload_too_large); upload larger files to /uploads and use attachmentTokens.`,
@@ -177,9 +186,9 @@ const delivery = object({ id: positiveId, messageId: nullable(positiveId), targe
   attempts: int, maxAttempts: positiveId, lastError: str, lastHttpStatus: nullable(int), createdAt: date, updatedAt: date,
   nextAttemptAt: date, lastAttemptAt: nullable(date),
 });
-export const schemas: Record<string, Schema> = {
-  Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
-    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient was attempted and rejected, nothing was delivered; details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422.' },
+/** 错误信封里的 error 对象：统一错误信封与批量发送的逐项结果共用 */
+const errorObjectSchema: Schema = object({ code: { type: 'string', enum: ERROR_CODES,
+    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient was attempted and rejected, nothing was delivered; details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. attachment_url_forbidden (400): a URL attachment points to a disallowed address (not https, credentials, non-443 port, private/loopback/link-local/metadata/reserved IP or a hostname resolving to one, or this site); details.url names it. attachment_url_fetch_failed (422): fetching a URL attachment failed (DNS, timeout, non-2xx, too many redirects, empty or length mismatch); details.url names it. draft_state_conflict (409): the draft status does not allow the operation (sending cannot be changed or deleted, sent cannot be changed) or expectedVersion is stale; details.draftStatus and details.draftVersion give the current state. draft_limit_reached (409): too many unsent drafts; send or delete some first.' },
     message: { ...str, description: 'Human-readable Chinese explanation; wording may change.' },
     fix: { ...str, description: 'Optional: one actionable correction, e.g. which scope to add or which endpoint to call first.' },
     docs: { type: 'string', format: 'uri', description: 'Optional: absolute URL of the matching section in /references/errors.md on this site.' },
@@ -187,8 +196,13 @@ export const schemas: Record<string, Schema> = {
       headers: { ...array(str), description: 'header_not_allowed and header value errors: offending header names as written in the request.' },
       messageId: { ...positiveId, description: 'delivery_failed: id of the recorded outbound message (visible in direction=outbound lists).' },
       recipientOutcomes: { ...array(recipientOutcome), description: 'delivery_failed: per-recipient results, all failed.' },
-    }, ['headers', 'messageId', 'recipientOutcomes']), description: 'Optional structured data, present only on the codes above.' },
-  }, ['fix', 'docs', 'details']),
+      url: { ...str, description: 'attachment_url_forbidden, attachment_url_fetch_failed and URL-attachment payload_too_large: the offending address, possibly a redirect target.' },
+      draftStatus: { type: 'string', enum: ['draft', 'scheduled', 'sending', 'sent', 'failed'], description: 'draft_state_conflict: the draft’s current status.' },
+      draftVersion: { ...positiveId, description: 'draft_state_conflict: the draft’s current version.' },
+    }, ['headers', 'messageId', 'recipientOutcomes', 'url', 'draftStatus', 'draftVersion']), description: 'Optional structured data, present only on the codes above.' },
+  }, ['fix', 'docs', 'details']);
+export const schemas: Record<string, Schema> = {
+  Error: object({ error: errorObjectSchema,
     requestId: { ...str, description: `Same value as the X-Request-ID response header, which every response carries; ${clientRequestIdRule}, anything else is replaced by a server-generated UUID.` } }),
   MessageSummary: messageSummary,
   MessageDetail: object({ ...summaryProperties, replyTo: array(str), recipients: object({ to: array(str), cc: array(str), bcc: array(str) }),
@@ -352,6 +366,21 @@ export const schemas: Record<string, Schema> = {
   })(),
   AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),
   SendMailRequest: send, MailAddress: mailAddress,
+  BatchSendRequest: object({ items: { type: 'array', minItems: 1, maxItems: MAX_BATCH_SEND_ITEMS,
+    items: { allOf: [ref('SendMailRequest'), { type: 'object', properties: { idempotencyKey: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$',
+      description: 'Optional per-item Idempotency-Key with the same rules as the header. Without it, an Idempotency-Key request header derives <header>:<index> (0-based) for each item.' } } }] },
+    description: `1–${MAX_BATCH_SEND_ITEMS} independent send requests, each exactly a POST /messages body plus an optional idempotencyKey.` } }),
+  BatchSendResult: object({
+    items: { ...array(object({
+      index: { ...int, description: 'Position in the request items array.' },
+      ok: { ...bool, description: 'true when the item would have returned 201 alone (partial recipient failure included; inspect message.status and recipientOutcomes).' },
+      httpStatus: { type: 'integer', description: 'The status this item would have returned as a single POST /messages: 201, or 400/403/404/409/413/422/429/500.' },
+      idempotencyKey: { ...str, description: 'The key used for this item; omitted when none.' },
+      message: ref('MessageSummary'),
+      error: { ...errorObjectSchema, description: 'Same object as a single-send error envelope’s error (code, message, fix, docs, details).' },
+    }, ['idempotencyKey', 'message', 'error'])), description: 'One result per request item, sorted by index.' },
+    succeeded: int, failed: int,
+  }),
   ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
   MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
@@ -430,14 +459,14 @@ export function sendMailOperation(scope?: string): Operation {
   const keyScopes = scope
     ? ` API keys need ${scope}; replyToMessageId or forwardAttachmentsFrom additionally require mail.read (403 without it).` : '';
   const base = operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope, status: 201, parameters: [idempotencyHeader],
-    description: `HTTP 201 means at least one recipient succeeded: status is sent or delivered (or unknown when replaying an interrupted send). Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient was attempted and rejected the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. There is no separate reply or forward endpoint (POST /messages/{id} does not exist): set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
+    description: `HTTP 201 means at least one recipient succeeded: status is sent or delivered (or unknown when replaying an interrupted send). Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient was attempted and rejected the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported, and {url} attachments are fetched by the server (https only, SSRF-checked, size, timeout and redirect limits). Large external attachments become signed links valid for 90 days independently of sent-mail deletion. There is no separate reply or forward endpoint (POST /messages/{id} does not exist): set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
   const error = (description: string) => ({ description, content: { 'application/json': { schema: ref('Error') } } });
   return { ...base,
     responses: { ...(base.responses as Record<string, unknown>),
-      400: error('validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, or a hosted-domain sender whose sending is not ready.'),
+      400: error('validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, a hosted-domain sender whose sending is not ready, or attachment_url_forbidden for a disallowed URL attachment (details.url).'),
       403: error('forbidden: the API key lacks a scope (fix names it), or the sender identity is not allowed (fix points to GET /identities); shared mailboxes never send.'),
       413: error(`payload_too_large: request body over ${MAX_SEND_REQUEST_BYTES / 1024 / 1024} MiB (rejected before parsing), base64 attachments over ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB combined, or all attachments over ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB. Upload large files and use attachmentTokens.`),
-      422: error('delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key.'),
+      422: error('delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key. attachment_url_fetch_failed: a URL attachment could not be fetched (details.url); nothing was sent and the same key may be retried.'),
       429: error('rate_limited: request rate, or the daily outbound mail/recipient quota (GET /v1/me shows usage).'),
       500: error('internal: the server failed before every recipient was attempted. Retry the identical request with the same Idempotency-Key to fetch the result: it may be 201, or 422 delivery_failed whose recipientOutcomes show recipients that were never attempted.'),
     },

@@ -404,7 +404,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
       for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
       expect(envelope.required).toEqual(['code', 'message']);
-      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'url', 'draftStatus', 'draftVersion']);
       expect(error.docs).toMatchObject({ format: 'uri' });
     }
   });

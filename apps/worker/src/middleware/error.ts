@@ -43,6 +43,22 @@ export const DEFAULT_ERROR_HINTS: Partial<Record<ErrorCode, AppErrorHints>> = {
     fix: '稍后重试（/v1 请求见 X-RateLimit-Reset 响应头）；GET /v1/me 可查看 Key 的速率上限与今日外发用量',
     docs: `${ERRORS_DOC}#rate_limited`,
   },
+  draft_state_conflict: {
+    fix: '先 GET /drafts/:id 读取草稿当前的 status 与 version：发送中的等它结束；已发送的结果看 messageId；版本变了就基于最新内容重新修改',
+    docs: `${ERRORS_DOC}#draft_state_conflict`,
+  },
+  draft_limit_reached: {
+    fix: '未发送的草稿已达上限：先发送或删除不需要的草稿（GET /drafts 列出），再创建',
+    docs: `${ERRORS_DOC}#draft_limit_reached`,
+  },
+  attachment_url_forbidden: {
+    fix: '只能引用公网可访问的 https 地址；内网或本站的文件先下载，再用 POST /v1/uploads（网页会话用 /api/uploads）上传后写进 attachmentTokens',
+    docs: `${ERRORS_DOC}#attachment_url_forbidden`,
+  },
+  attachment_url_fetch_failed: {
+    fix: '确认地址能公开访问（预签名链接未过期、不需要登录），或先下载再用 POST /v1/uploads（网页会话用 /api/uploads）上传后写进 attachmentTokens',
+    docs: `${ERRORS_DOC}#attachment_url_fetch_failed`,
+  },
 };
 
 /** 每请求分配 requestId 并回显 X-Request-ID */
@@ -64,24 +80,30 @@ function absoluteDocs(c: Context<AppContext>, docs: string): string {
   catch { return docs; }
 }
 
-/** 统一错误信封：{ error:{code,message,fix?,docs?,details?}, requestId } + 语义化状态码 */
-export function onError(err: Error, c: Context<AppContext>): Response {
-  const rid = c.get('requestId') ?? crypto.randomUUID();
+/**
+ * 错误 → 信封里的 error 对象与 HTTP 状态：AppError 按错误码补默认 fix/docs，其他异常一律 internal。
+ * 5xx 记一行结构化日志。统一信封与批量发送的逐项结果共用。
+ */
+export function errorObject(
+  err: unknown,
+  c: Context<AppContext>,
+  requestId = c.get('requestId'),
+): { status: number; error: ApiErrorBody['error'] } {
+  const log = (errorClass: string, message: string) => console.error(JSON.stringify({
+    level: 'error',
+    requestId,
+    operation: `${c.req.method} ${c.req.path}`,
+    errorClass,
+    message,
+  }));
   if (err instanceof AppError) {
-    if (err.status >= 500) {
-      console.error(JSON.stringify({
-        level: 'error',
-        requestId: rid,
-        operation: `${c.req.method} ${c.req.path}`,
-        errorClass: err.code,
-        message: err.message,
-      }));
-    }
+    if (err.status >= 500) log(err.code, err.message);
     const defaults = DEFAULT_ERROR_HINTS[err.code] ?? {};
     const fix = err.hints.fix ?? defaults.fix;
     const docs = err.hints.docs ?? defaults.docs;
     const details = err.hints.details;
-    const body: ApiErrorBody = {
+    return {
+      status: err.status,
       error: {
         code: err.code,
         message: err.message,
@@ -89,20 +111,17 @@ export function onError(err: Error, c: Context<AppContext>): Response {
         ...(docs ? { docs: absoluteDocs(c, docs) } : {}),
         ...(details ? { details } : {}),
       },
-      requestId: rid,
     };
-    return c.json(body, err.status as ContentfulStatusCode);
   }
-  console.error(JSON.stringify({
-    level: 'error',
-    requestId: rid,
-    operation: `${c.req.method} ${c.req.path}`,
-    errorClass: err.name || 'Error',
-    message: err.message || 'unhandled error',
-  }));
-  const body: ApiErrorBody = {
-    error: { code: 'internal', message: '服务器内部错误' },
-    requestId: rid,
-  };
-  return c.json(body, 500);
+  const error = err instanceof Error ? err : new Error(String(err));
+  log(error.name || 'Error', error.message || 'unhandled error');
+  return { status: 500, error: { code: 'internal', message: '服务器内部错误' } };
+}
+
+/** 统一错误信封：{ error:{code,message,fix?,docs?,details?}, requestId } + 语义化状态码 */
+export function onError(err: Error, c: Context<AppContext>): Response {
+  const rid = c.get('requestId') ?? crypto.randomUUID();
+  const { status, error } = errorObject(err, c, rid);
+  const body: ApiErrorBody = { error, requestId: rid };
+  return c.json(body, status as ContentfulStatusCode);
 }

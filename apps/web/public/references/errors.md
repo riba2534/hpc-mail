@@ -8,7 +8,7 @@
 
 - `code` 稳定，按它分支；`message` 是给人看的中文说明，可能调整措辞。
 - `fix`（可选）是可以直接照做的改正建议；`docs`（可选）指向本页对应小节，按请求的站点补成绝对 URL。
-- `details`（可选）是结构化补充：`headers` 列出出问题的邮件头；`messageId` 与 `recipientOutcomes` 出现在 `delivery_failed` 上。
+- `details`（可选）是结构化补充：`headers` 列出出问题的邮件头；`messageId` 与 `recipientOutcomes` 出现在 `delivery_failed` 上；`url` 出现在 URL 附件的错误上；`draftStatus` 与 `draftVersion` 出现在 `draft_state_conflict` 上。
 - 报告问题时附上 `requestId`（与响应头 `X-Request-ID` 相同）。
 
 下面各节对应 `docs` 链接的锚点；其余错误码见文末[其他错误码](#其他错误码)。
@@ -58,6 +58,22 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 ## rate_limited
 
 请求频率或每日外发配额超限（HTTP 429）。按 `X-RateLimit-Reset` 或错误信息稍后重试，设总期限，不要换 Key 绕过账户级限制；`GET /v1/me` 查看速率上限与今日外发用量（`outbound.resetsAt` 是配额重置时间）。
+
+## attachment_url_forbidden
+
+URL 附件的地址不允许拉取（HTTP 400），没有发出，`details.url` 是被拒的地址（重定向时是跳转目标）。只接受公网可访问的 `https://` 地址，默认端口 443，地址里不能带账号密码；IP 字面量或域名解析结果落在内网、回环、链路本地（含云元数据 `169.254.169.254`）、CGNAT、组播、保留或文档网段时拒绝，`localhost`、`*.local`、`*.internal` 等内网主机名与本站自身的地址也拒绝。重定向的每一跳都按同样规则检查。内网或本站的文件先下载，再用 `POST /v1/uploads`（JWT 用 `POST /api/uploads`）上传后写进 `attachmentTokens`。详见[附件](attachments.md#url-附件)。
+
+## attachment_url_fetch_failed
+
+URL 附件拉取失败（HTTP 422），没有发出，`details.url` 是出错的地址。`message` 写明原因：DNS 解析失败或解析不到地址、连接失败、超过 15 秒未完成、对方返回非 2xx、重定向超过 3 次或没有跳转地址、内容为空、实际长度与 `Content-Length` 不符。错误信息不包含对方返回的正文。确认地址能公开访问（预签名链接未过期、不需要登录）后重试；同一个 `Idempotency-Key` 可以继续用。也可以先下载再走上传 token。
+
+## draft_state_conflict
+
+草稿当前的状态不允许这个操作，或 `expectedVersion` 与当前版本不同（HTTP 409），`details.draftStatus` 与 `details.draftVersion` 给出当前状态与版本。发送中（`sending`）的草稿不能修改或删除，等它结束；已发送（`sent`）的草稿不能修改，结果看 `messageId` 对应的发件记录；版本不同说明有人（网页或其他 Agent）先改过，先 `GET /drafts/:id` 读取最新内容再修改。被草稿引用的上传附件不能用 `DELETE /uploads/:token` 删除，也是这个错误码：通过修改草稿移除它。详见[草稿与定时发送](drafts.md)。
+
+## draft_limit_reached
+
+未发送（`sent` 以外）的草稿已达每人 100 份的上限（HTTP 409）。先发送或删除不需要的草稿（`GET /drafts?status=draft` 列出），再创建。已发送的草稿保留 7 天后自动删除，不计入上限。
 
 ## 其他错误码
 
