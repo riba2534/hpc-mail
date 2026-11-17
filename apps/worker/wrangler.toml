@@ -24,7 +24,8 @@ enabled = true
 # email/scheduled handler 不受 placement 影响。
 
 [triggers]
-crons = ["*/5 * * * *", "0 16 * * *"]
+# 每分钟一次只派发到期的定时草稿（精度 1 分钟内）；每 5 分钟常规任务；每日 16:00 维护
+crons = ["* * * * *", "*/5 * * * *", "0 16 * * *"]
 
 [vars]
 # 系统域名不再写死在 vars，改由 settings.domains.list（管理端维护）；见 services/domain.ts

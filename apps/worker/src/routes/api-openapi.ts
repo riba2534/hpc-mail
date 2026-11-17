@@ -1,6 +1,6 @@
 import { HOSTED_DOMAIN_STATUSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
   page, pageQuery, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 
@@ -107,6 +107,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       security: [{ sessionToken: [] }, { attachmentSignature: [], attachmentExpiry: [] }],
       description: 'JWT mode enforces the same visibility as message detail, including scope/userId: administrators reviewing another user pass scope=user&userId=, or scope=unclaimed for unclaimed addresses. Ordinary users get 403 for unclaimed/user and an invalid scope returns 400. Signed mode requires both exp and sig, ignores scope, and may serve retained external links after sent-mail deletion. Session-API message detail URLs are aligned to the hour and valid for 1–2 hours, so repeated reads within an hour return the same URL; /v1 detail URLs expire after 5 minutes. Returns binary bytes with safe MIME/download headers.' }) },
     ...uploadPaths(),
+    ...draftPaths(),
     '/me/notify-prefs': {
       get: operation('Read masked personal notification and forwarding preferences', ref('NotifyPrefs')),
       put: operation('Update personal notification and forwarding preferences', ref('NotifyPrefs'), { request: 'UpdateNotifyPrefsRequest',

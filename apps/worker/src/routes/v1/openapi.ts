@@ -1,6 +1,6 @@
 import { API_SCOPES, MAX_BATCH_SEND_ITEMS, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, hostedDomainBatchPaths, hostedDomainPaths, idempotencyHeader, identitiesDescription, int, listQuery,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, idempotencyHeader, identitiesDescription, int, listQuery,
   mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths,
   usedSchemas, type Paths,
 } from '../openapi-common.js';
@@ -83,6 +83,7 @@ export function buildOpenApiSpec(origin: string) {
     '/messages/{id}/attachments/{attId}': { get: operation('Download a visible message attachment', str, { scope: 'mail.read', parameters: scopeQuery, binary: 'application/octet-stream',
       description: 'Binary bytes with a safe Content-Type/Content-Disposition, without a data envelope. Attachment must belong to message id and the message must be visible.' }) },
     ...uploadPaths('mail.send'),
+    ...draftPaths(true),
     ...hostedDomainBatchPaths('domain.write'),
   };
   return {

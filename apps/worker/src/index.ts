@@ -1,7 +1,7 @@
 import { createApp, isApiPath } from './app.js';
 import { routeLabel } from './lib/http.js';
 import { handleInbound } from './services/inbound.js';
-import { runScheduled } from './services/scheduled.js';
+import { DRAFT_DISPATCH_CRON, runDraftDispatch, runScheduled } from './services/scheduled.js';
 import type { Env } from './types.js';
 
 const app = createApp();
@@ -117,7 +117,8 @@ export default {
     await handleInbound(message, env, ctx);
   },
 
-  async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === DRAFT_DISPATCH_CRON) return runDraftDispatch(env, ctx);
     await runScheduled(env, event.cron === '0 16 * * *', event.cron);
   },
 };

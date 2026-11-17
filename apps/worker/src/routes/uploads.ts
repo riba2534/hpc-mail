@@ -218,6 +218,13 @@ export function createUploadRoutes(authentication: MiddlewareHandler<AppContext>
     const db = createDb(c.env);
     const row = await db.select().from(draftAttachments).where(eq(draftAttachments.token, token)).get();
     if (!row || row.userId !== user.id) throw new AppError('not_found', '上传会话不存在');
+    // 服务端草稿引用中的附件归草稿管理：直接删掉会让草稿（可能已安排定时发送）到点缺附件
+    if (row.draftId !== null) {
+      throw new AppError('draft_state_conflict', `该附件属于草稿 #${row.draftId}，不能直接删除`, {
+        fix: `通过 PATCH /drafts/${row.draftId} 修改 attachmentTokens 把它移出草稿，或删除整份草稿`,
+        docs: '/references/drafts.md#附件',
+      });
+    }
     if (row.uploadId && row.status === 'uploading') {
       await c.env.r2.resumeMultipartUpload(row.r2Key, row.uploadId).abort();
       await db.delete(draftAttachments).where(eq(draftAttachments.id, row.id));

@@ -7,6 +7,7 @@
 ## 操作说明
 
 - [Agent 技能说明](/skill.md)：30 秒上手（`/v1/me` 自查 Key、`/v1/identities` 选发件身份）、常用配方（等验证码、发信、回复转发、附件与内联图片、临时地址、增量同步、接入自有域名）、权限模型、能力地图和参考文档入口。
+- [草稿与定时发送](/references/drafts.md)：Agent 建草稿等用户在网页确认后发送、`sendAt` 定时发送与取消、批量发送见[发送](/references/mail.md#批量发送)。
 - [错误码说明](/references/errors.md)：错误信封的 `fix`/`docs`/`details`，以及每个错误码的含义与改正方法。
 - [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox/domain scopes 操作邮件、邮箱与托管域名。
 - [远程 MCP](/references/mcp.md)：MCP 客户端接入 `/mcp`（Streamable HTTP，hpcm_ API Key 认证），10 个收发与地址管理工具。

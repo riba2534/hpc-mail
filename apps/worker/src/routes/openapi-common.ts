@@ -16,7 +16,7 @@ import {
   MAIL_AUTH_RESULTS, PROMPT_INJECTION_REASONS,
   MAX_HOSTED_DOMAIN_BATCH, batchCreateHostedDomainsRequestSchema, batchCheckHostedDomainsRequestSchema,
   MAX_ATTACHMENT_FILE_BYTES, URL_ATTACHMENT_MAX_REDIRECTS, URL_ATTACHMENT_TIMEOUT_MS,
-  MAX_BATCH_SEND_ITEMS,
+  MAX_BATCH_SEND_ITEMS, DRAFT_STATUSES, MAX_DRAFTS_PER_USER, SENT_DRAFT_RETENTION_DAYS, draftInputSchema,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
@@ -210,6 +210,39 @@ function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
     succeeded: int, failed: int,
   });
 }
+/** 服务端草稿：请求体与发信相同、字段都可暂缺；响应按 shared 的 DraftSummary / Draft */
+const draftInput = fromZod(draftInputSchema);
+{
+  const fields = draftInput.properties as Record<string, Schema>;
+  const sendFields = sendProperties;
+  for (const name of ['to', 'cc', 'bcc', 'replyTo', 'headers', 'attachmentTokens', 'attachments']) {
+    if (sendFields[name]) fields[name] = { ...sendFields[name], default: undefined };
+  }
+  fields.from = { anyOf: [sendFields.from!, { type: 'null' }], description: 'Same forms as SendMailRequest.from; null clears it.' };
+  fields.sendAt = { anyOf: [{ type: 'string', maxLength: 40 }, { type: 'null' }], examples: ['2026-11-18T09:00:00+08:00'],
+    description: 'ISO 8601 with a time zone (or a date, meaning UTC midnight), at least 1 minute and at most 30 days ahead by server time. Setting it schedules the draft (status scheduled) and requires a complete send request; null cancels the schedule (status draft).' };
+  fields.expectedVersion = { ...fields.expectedVersion, description: 'PATCH only: the version you read. A different current version returns 409 draft_state_conflict.' };
+  draftInput.description = `Every field is optional. POST: omitted fields start empty. PATCH: omitted fields keep their value, null clears from/replyToMessageId/forwardAttachmentsFrom/sendAt. attachments (base64 or {url}) are stored as uploads when saved and the draft keeps only tokens; when attachments or attachmentTokens is present the attachment set is replaced by the newly stored ones followed by attachmentTokens, so list existing tokens in attachmentTokens to keep them. Draft attachments count toward the per-user pending-upload quota and do not expire while referenced. At most ${MAX_DRAFTS_PER_USER} unsent drafts per user (409 draft_limit_reached).`;
+}
+const draftStatus: Schema = { type: 'string', enum: DRAFT_STATUSES,
+  description: 'draft: editable; scheduled: will be sent by the per-minute cron at sendAt; sending: in progress, cannot be changed or deleted; sent: a send ran, see messageId for its result (partial failure or unknown included); failed: nobody received it, edit and send again.' };
+const draftSummaryProperties = {
+  id: positiveId, status: draftStatus, version: { ...positiveId, description: 'Increments on every change; send it back as expectedVersion to guard edits.' },
+  from: nullable({ type: 'object', description: 'Stored sender in the parsed form: {mailboxId} or {localPart, domain, displayName?}.' }),
+  to: array(ref('MailAddress')), cc: array(ref('MailAddress')), bcc: array(ref('MailAddress')),
+  subject: str, preview: str, attachmentCount: int,
+  sendAt: nullable(date), messageId: { ...nullable(positiveId), description: 'Outbound message created by the send (GET /messages/{id}); null before sending.' },
+  errorDetail: { ...str, description: 'Why the last send failed or a scheduled send was cancelled; empty when none.' },
+  createdVia: { type: 'string', enum: ['web', 'api'], description: 'api: created with an API key (an agent draft awaiting review).' },
+  apiKeyName: { ...nullable(str), description: 'Name of the creating API key; null for web drafts or deleted keys.' },
+  createdAt: date, updatedAt: date, sentAt: nullable(date),
+};
+const draftSummary = object(draftSummaryProperties);
+const draft = object({ ...draftSummaryProperties, replyTo: array(ref('MailAddress')), text: str, html: str,
+  headers: { type: 'object', additionalProperties: str }, replyToMessageId: nullable(positiveId), forwardAttachmentsFrom: nullable(positiveId),
+  attachments: array(object({ token: str, filename: str, mimeType: str, size: int, contentId: str,
+    disposition: { type: 'string', enum: ['attachment', 'inline'] } })) });
+
 /** 错误信封里的 error 对象：统一错误信封与批量发送的逐项结果共用 */
 const errorObjectSchema: Schema = object({ code: { type: 'string', enum: ERROR_CODES,
     description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. attachment_url_forbidden (400): a URL attachment points to a disallowed address (not https, credentials, non-443 port, private/loopback/link-local/metadata/reserved IP or a hostname resolving to one, or this site); details.url names it. attachment_url_fetch_failed (422): fetching a URL attachment failed (DNS, timeout, non-2xx, too many redirects, empty or length mismatch); details.url names it. draft_state_conflict (409): the draft status does not allow the operation (sending cannot be changed or deleted, sent cannot be changed) or expectedVersion is stale; details.draftStatus and details.draftVersion give the current state. draft_limit_reached (409): too many unsent drafts; send or delete some first.' },
@@ -442,6 +475,7 @@ export const schemas: Record<string, Schema> = {
   SingleUploadResult: object({ token: str, filename: str, size: int, mimeType: str }),
   MultipartInitResult: object({ token: str, uploadId: str, partBytes: positiveId, partCount: positiveId }),
   MultipartPartResult: object({ partNumber: positiveId, etag: str }), MultipartCompleteResult: object({ token: str, size: int }),
+  DraftInput: draftInput, DraftSummary: draftSummary, Draft: draft, DraftPage: page(ref('DraftSummary')),
 };
 export const query = (name: string, schema: Schema, description?: string, required = false): Schema => ({ name, in: 'query', required, schema, ...(description ? { description } : {}) });
 export const scopeQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed', 'user'] }, 'Default mine. unclaimed/user are administrator-only; user requires userId. Shared inboxes add read-only inbound visibility.'),
@@ -606,6 +640,31 @@ export function hostedDomainBatchPaths(scope?: string): Paths {
       description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domains, same rules as POST /hosted-domains for each. ${budget} Each attempted item counts toward the ${MAX_HOSTED_CREATES_PER_MINUTE} additions per user per minute and costs 2 site-wide calls when reserved (plus 5 for background preconfiguration). A rate_limited, forbidden (per-user hosted or pending limit) or user_disabled failure stops the batch: the remaining items fail with the same code without being attempted. Other failures, such as 409 for a domain already used, affect only that item. Ordinary users may keep only hosted_domains.maxPendingPerUser domains pending at once. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
     '/hosted-domains/batch-check': { post: operation('Check several hosted domains now', ref('HostedDomainBatchCheckResult'), { request: 'BatchCheckHostedDomainsRequest', scope,
       description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domain ids, same rules as POST /hosted-domains/{id}/check for each (owner or administrator; members get forbidden and other users not_found for that item only). ${budget} Each attempted item counts toward the ${MAX_HOSTED_CHECKS_PER_MINUTE} checks per user per minute; a check that reaches Cloudflare costs 4 site-wide calls. rate_limited or user_disabled stops the batch. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
+  };
+}
+/** 服务端草稿与定时发送：/api 与 /v1 同形，API Key 读需 mail.read 或 mail.send，写与发送需 mail.send */
+export function draftPaths(keyScopes = false): Paths {
+  const read = keyScopes ? { 'x-required-scopes-any-of': ['mail.read', 'mail.send'] } : {};
+  const write = keyScopes ? 'mail.send' : undefined;
+  const sourceRule = keyScopes ? { 'x-conditional-scopes': [{ scope: 'mail.read', when: 'the draft content has replyToMessageId or forwardAttachmentsFrom' }] } : {};
+  return {
+    '/drafts': {
+      get: { ...operation('List your drafts', ref('DraftPage'), { parameters: [
+        query('status', draftStatus), ...pageQuery],
+        description: `Your own drafts only (administrators too), newest first, including API-created ones (createdVia=api) awaiting review in the web UI. Sent drafts stay listed for ${SENT_DRAFT_RETENTION_DAYS} days.${keyScopes ? ' Requires mail.read or mail.send.' : ''}` }), ...read },
+      post: { ...operation('Create a draft, optionally scheduled', ref('Draft'), { request: 'DraftInput', scope: write, status: 201,
+        parameters: [{ ...idempotencyHeader, description: 'Optional, same rules as for sends. The same key and body return 200 with the existing draft (in its current state); a different body returns 409 idempotency_mismatch.' }],
+        description: 'Saves a draft (status draft) or, with sendAt, schedules it (status scheduled; the content must then be a complete send request, else 400). base64 and {url} attachments are stored right away, so a scheduled send uses what was fetched at save time. A user reviews and sends agent drafts in the web UI, or anyone with mail.send calls POST /drafts/{id}/send.' }), ...sourceRule },
+    },
+    '/drafts/{id}': {
+      get: { ...operation('Read a draft with its full content', ref('Draft')), ...read },
+      patch: { ...operation('Change, schedule or unschedule a draft', ref('Draft'), { request: 'DraftInput', scope: write,
+        description: 'Allowed while status is draft, scheduled or failed; sending or sent return 409 draft_state_conflict. Omitted fields keep their value. sendAt schedules, sendAt:null cancels the schedule. A scheduled draft must stay a complete send request. expectedVersion guards against overwriting someone else’s edit.' }), ...sourceRule },
+      delete: operation('Delete a draft and release its attachments', success, { scope: write,
+        description: 'Not while sending (409 draft_state_conflict). Deleting a sent draft only removes the draft; the outbound message stays.' }),
+    },
+    '/drafts/{id}/send': { post: { ...operation('Send a draft now', ref('MessageSummary'), { scope: write, status: 201,
+      description: 'Same result as POST /messages: 201 with the outbound summary (partial failure included), 422 delivery_failed when every recipient was rejected (the draft becomes failed and keeps its attachments), other 4xx before anything is sent (the draft keeps its previous status and records errorDetail). Works from draft, scheduled or failed and ignores sendAt. Exactly once per draft: a sent draft replays the original summary with 201; a draft being sent returns 409 send_in_progress. The daily outbound quota applies as for any send.' }), ...sourceRule } },
   };
 }
 export function uploadPaths(scope?: string): Paths {

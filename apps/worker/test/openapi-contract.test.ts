@@ -17,6 +17,7 @@ import attachmentsDoc from '../../web/public/references/attachments.md?raw';
 import authDoc from '../../web/public/references/auth-and-http.md?raw';
 import errorsDoc from '../../web/public/references/errors.md?raw';
 import mailDoc from '../../web/public/references/mail.md?raw';
+import draftsDoc from '../../web/public/references/drafts.md?raw';
 import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
 import mcpDoc from '../../web/public/references/mcp.md?raw';
 import notificationsDoc from '../../web/public/references/notifications.md?raw';
@@ -489,6 +490,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     'references/administration.md': administrationDoc, 'references/attachments.md': attachmentsDoc,
     'references/auth-and-http.md': authDoc, 'references/errors.md': errorsDoc, 'references/mail.md': mailDoc,
     'references/mailboxes-and-domains.md': mailboxesDoc, 'references/mcp.md': mcpDoc, 'references/notifications.md': notificationsDoc,
+    'references/drafts.md': draftsDoc,
   };
   /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */
   const documentedAsMissing = ['POST /messages/{id}'];
