@@ -27,16 +27,16 @@ export const RECEIPT_LEGACY_AUTH_CUTOFF_MS = Date.UTC(2026, 10, 17, 16);
  */
 const TRUSTED = `(${CLAUDE_AUTHENTIC} OR (auth IS NULL AND created_at < ${RECEIPT_LEGACY_AUTH_CUTOFF_MS}))`;
 /** 可以作为收据采集的来信（未加 messages 别名，列名直接引用） */
-export const RECEIPT_SQL = `(direction = 'inbound' AND send_channel <> 'internal' AND ${CLAUDE_RECEIPT_SUBJECT}
+const RECEIPT_SQL = `(direction = 'inbound' AND send_channel <> 'internal' AND ${CLAUDE_RECEIPT_SUBJECT}
   AND ${CLAUDE_OFFICIAL_SENDER} AND ${TRUSTED})`;
 const NOT_RECORDED = 'NOT EXISTS (SELECT 1 FROM claude_receipts r WHERE r.message_id = messages.id)';
 
 /** 定时任务每轮只采最近这段时间的收据；更早的由游标回填负责 */
-export const RECEIPT_WINDOW_MS = 60 * 60_000;
+const RECEIPT_WINDOW_MS = 60 * 60_000;
 /** 最近窗口单轮最多处理的收据数 */
 const WINDOW_LIMIT = 50;
 /** 回填单轮按 id 检查的行数与最多记录的收据数 */
-export const RECEIPT_BACKFILL_SCAN_ROWS = 1000;
+const RECEIPT_BACKFILL_SCAN_ROWS = 1000;
 const BACKFILL_MAX_RECEIPTS = 200;
 /** 单轮最多读 R2 全文的次数与时长（正文里找不到金额、且全文在 R2 时才读）；超出的收据留给下一轮 */
 const R2_READS_PER_RUN = 10;
@@ -123,18 +123,12 @@ async function recordOf(env: Env, row: ReceiptRow, budget: Budget): Promise<Rece
       const full = await readMailBody(env, { bodyText: row.body_text, bodyHtml: '', bodyR2Key: row.body_r2_key });
       const fromText = parseClaudeReceipt(full.bodyText);
       const fromFull = fromText.amountCents === null && full.bodyHtml ? parseClaudeReceipt(htmlToText(full.bodyHtml)) : fromText;
-      parsed = {
-        amountCents: fromFull.amountCents,
-        currency: fromFull.currency,
-        cardLast4: fromFull.cardLast4 ?? parsed.cardLast4,
-      };
+      parsed = { ...fromFull, cardLast4: fromFull.cardLast4 ?? parsed.cardLast4 };
     } catch (error) {
       console.error('收据全文读取失败，按 D1 正文记录:', row.id, error);
     }
   }
-  return {
-    messageId: Number(row.id), address: row.address, domain: row.domain, receivedAt: Number(row.created_at), subject: row.subject, ...parsed,
-  };
+  return { messageId: row.id, address: row.address, domain: row.domain, receivedAt: row.created_at, subject: row.subject, ...parsed };
 }
 
 /** 一条语句写入一批收据；已记录的邮件跳过 */
@@ -176,18 +170,15 @@ export const RECEIPT_BACKFILL_SCAN_SQL = `WITH scanned AS MATERIALIZED (
   FROM scanned s LEFT JOIN messages m ON s.receipt AND m.id = s.id
   ORDER BY s.id`;
 
-function emptyProgress(): ReceiptBackfillProgress {
-  return { cursor: 0, recorded: 0, caughtUp: false, updatedAt: 0 };
-}
+const EMPTY_PROGRESS: ReceiptBackfillProgress = { cursor: 0, recorded: 0, caughtUp: false, updatedAt: 0 };
 
+/** 进度行缺失、损坏或游标不合法时从头开始 */
 function parseProgress(raw: string | undefined): ReceiptBackfillProgress {
-  if (raw === undefined) return emptyProgress();
   try {
-    const value = JSON.parse(raw) as Partial<ReceiptBackfillProgress>;
-    if (!Number.isSafeInteger(value.cursor) || value.cursor! < 0) return emptyProgress();
-    return { ...emptyProgress(), ...value };
+    const value = JSON.parse(raw ?? '{}') as Partial<ReceiptBackfillProgress>;
+    return Number.isSafeInteger(value.cursor) && value.cursor! >= 0 ? { ...EMPTY_PROGRESS, ...value } : EMPTY_PROGRESS;
   } catch {
-    return emptyProgress();
+    return EMPTY_PROGRESS;
   }
 }
 
@@ -208,7 +199,7 @@ export async function backfillClaudeReceipts(env: Env, now = Date.now(), scanRow
   let cursor = progress.cursor;
   let caughtUp = results.length < scanRows;
   for (const row of results) {
-    if (Number(row.created_at) >= now - RECEIPT_WINDOW_MS) {
+    if (row.created_at >= now - RECEIPT_WINDOW_MS) {
       caughtUp = true;
       break;
     }
@@ -225,7 +216,7 @@ export async function backfillClaudeReceipts(env: Env, now = Date.now(), scanRow
       }
       records.push(record);
     }
-    cursor = Number(row.id);
+    cursor = row.id;
   }
 
   if (!records.length && cursor === progress.cursor && caughtUp === progress.caughtUp) return 0;
