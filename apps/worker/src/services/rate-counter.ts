@@ -111,16 +111,19 @@ export interface CounterLimit {
  * 「前一计数这次刚好占满」与「前一计数早已满、这次没占」读到的是同一个值。
  */
 export async function reserveCounters(env: Env, items: CounterLimit[]): Promise<boolean[]> {
-  const guardOf = (item: CounterLimit) =>
-    item.limit > 0 ? counterWithinGuard(item.scope, item.subject, item.window, item.limit - 1) : undefined;
-  const results = await env.db.batch(items.map((item) =>
-    counterStatement(env, item.scope, item.subject, item.window, 1, 0, guardOf(item))));
+  const results = await env.db.batch(items.map((item) => reserveStatement(env, item)));
   const full = results.map((result) => counterResult(result) === null);
   if (full.some(Boolean)) {
     const taken = items.filter((_, index) => !full[index]);
     if (taken.length) await releaseCounters(env, taken);
   }
   return full;
+}
+
+/** 占一格的单条语句（已满时不递增、结果无行，counterResult 为 null），供调用方与自己的读语句合进同一个 batch */
+export function reserveStatement(env: Env, item: CounterLimit): D1PreparedStatement {
+  const guard = item.limit > 0 ? counterWithinGuard(item.scope, item.subject, item.window, item.limit - 1) : undefined;
+  return counterStatement(env, item.scope, item.subject, item.window, 1, 0, guard);
 }
 
 /** 退回 reserveCounters 占到的格子（窗口用占位时的那个，跨窗口也不会退到新窗口上） */

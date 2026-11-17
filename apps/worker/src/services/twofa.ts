@@ -10,13 +10,10 @@ import { verifyReauthPassword } from './reauth.js';
 
 /** 开始登记：先重新验证密码（拿到会话令牌的人不能给账号绑上自己的验证器），再生成密钥（未启用） */
 export async function setupTwoFactor(env: Env, userId: number, password: string): Promise<TwoFactorSetup> {
-  await verifyReauthPassword(env, userId, password);
-  const db = createDb(env);
-  const user = await db.select().from(users).where(eq(users.id, userId)).get();
-  if (!user) throw new AppError('not_found', '用户不存在');
-  if (user.totpEnabledAt) throw new AppError('conflict', '两步验证已启用');
+  const user = await verifyReauthPassword(env, userId, password);
+  if (user.totpEnabled) throw new AppError('conflict', '两步验证已启用');
   const secret = generateTotpSecret();
-  await db
+  await createDb(env)
     .update(users)
     .set({ totpSecret: secret, totpEnabledAt: null, totpRecoveryCodes: null, totpLastStep: null })
     .where(eq(users.id, userId));
@@ -53,12 +50,8 @@ export async function enableTwoFactor(env: Env, userId: number, code: string): P
  * 只是取消未完成的登记时不影响其他会话。返回的 token 替换当前会话。
  */
 export async function disableTwoFactor(env: Env, userId: number, password: string): Promise<TwoFactorDisabled> {
-  await verifyReauthPassword(env, userId, password);
-  const db = createDb(env);
-  const user = await db.select().from(users).where(eq(users.id, userId)).get();
-  if (!user) throw new AppError('not_found', '用户不存在');
-  const enabled = user.totpEnabledAt !== null;
-  const updated = await db
+  const { totpEnabled: enabled } = await verifyReauthPassword(env, userId, password);
+  const updated = await createDb(env)
     .update(users)
     .set({ totpSecret: null, totpEnabledAt: null, totpRecoveryCodes: null, totpLastStep: null,
       ...(enabled ? { authVersion: sql`${users.authVersion} + 1` } : {}) })
