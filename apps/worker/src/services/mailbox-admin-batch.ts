@@ -10,7 +10,8 @@
  */
 import {
   MAX_MAILBOX_GRANTEES,
-  type AdminBatchClaimRequest, type AdminBatchReleaseRequest, type AdminBatchShareRequest, type AdminBatchTransferRequest,
+  type AdminBatchClaimRequest, type AdminBatchReleaseRequest, type AdminBatchReplaceSharesRequest, type AdminBatchShareRequest,
+  type AdminBatchTransferRequest, type AdminClaimAndShareRequest, type AdminClaimAndShareResult,
   type AdminMailboxBatchItemResult, type AdminMailboxBatchResult, type BatchClaimMailboxResult, type ErrorCode,
   type Role, type UserMailboxPolicy, type UserStatus,
 } from '@hpc-mail/shared';
@@ -164,6 +165,34 @@ export async function adminClaimMailboxes(env: Env, actor: AuditActor, req: Admi
     }
   }
   return result;
+}
+
+/**
+ * 认领后共享（/v1/admin/mailboxes/batch/claim）：先按 adminClaimMailboxes 为 userId 认领，再把本次认领到的地址
+ * 按 adminShareMailboxes 追加共享给 shareUserIds（expectedOwnerId 为 userId）。被分享人在认领之前先复核，不合规时整批 400、
+ * 什么都不认领；认领提交之后共享整体失败时认领保留，每个认领到的地址在 shares 里记为 failed 并带该错误。
+ */
+export async function adminClaimAndShare(env: Env, actor: AuditActor, req: AdminClaimAndShareRequest, tag: string): Promise<AdminClaimAndShareResult> {
+  const userIds = [...new Set(req.shareUserIds ?? [])];
+  if (userIds.length) {
+    const grantees = await env.db.prepare('SELECT username, status FROM users WHERE id IN (SELECT value FROM json_each(?))')
+      .bind(JSON.stringify(userIds)).all<{ username: string; status: UserStatus }>();
+    assertShareTargets(grantees.results, userIds.length);
+  }
+  const claim = await adminClaimMailboxes(env, actor, req, tag);
+  if (!userIds.length) return { ...claim, shares: null };
+  if (!claim.claimed.length) return { ...claim, shares: summarize([]) };
+  try {
+    const shares = await adminShareMailboxes(env, actor,
+      { userIds, items: claim.claimed.map((mailbox) => ({ address: mailbox.address, expectedOwnerId: req.userId })) }, tag);
+    return { ...claim, shares };
+  } catch (error) {
+    if (!(error instanceof AppError)) console.error('认领后的共享失败，认领已保留:', error);
+    const { code, message } = error instanceof AppError
+      ? error : { code: 'internal' as const, message: '共享失败，认领已保留，请对这些地址重试批量共享' };
+    return { ...claim, shares: summarize(claim.claimed.map((mailbox) => ({ address: mailbox.address, status: 'failed',
+      mailboxId: mailbox.id, ownerId: mailbox.userId, error: { code, message }, addedShares: 0 }))) };
+  }
 }
 
 /** 批量释放：与单个释放同一套写入（releaseTargets），全部可释放项一个事务；每项一行 mailbox.release */
@@ -344,5 +373,58 @@ export async function adminUnshareMailboxes(env: Env, actor: AuditActor, req: Ad
   return finish(results, accepted, (row) => {
     const count = counts.get(row.id) ?? 0;
     return itemResult(row.address, row, count ? 'done' : 'unchanged', { revokedShares: count });
+  });
+}
+
+/**
+ * 批量替换共享名单：每个邮箱的共享成员替换为 userIds（空数组即清空）。被分享人规则同共享（存在、启用、非系统保留，否则整批 400）；
+ * userIds 含该邮箱所有者的项失败，名单已是目标集合的项为 unchanged。其余项一个事务，闸门复核所有者与被分享人状态；
+ * 审计写在变更之前，按本次实际移除与新增的人分别记 mailbox.unshare、mailbox.share（每项各至多一行）。
+ */
+export async function adminReplaceShares(env: Env, actor: AuditActor, req: AdminBatchReplaceSharesRequest, tag: string): Promise<AdminMailboxBatchResult> {
+  const userIds = [...new Set(req.userIds)];
+  const { rows, grantees, members } = await loadShareContext(env, req.items.map((item) => item.address), userIds);
+  assertShareTargets(grantees, userIds.length);
+  const { results, accepted } = partition(req.items, rows, (item, row) => {
+    if (userIds.includes(row.user_id)) return failure(item.address, row, 'validation_failed', '邮箱所有者已经拥有访问权限，无需共享');
+    const current = members.get(row.id) ?? new Set<number>();
+    return current.size === userIds.length && userIds.every((userId) => current.has(userId))
+      ? itemResult(item.address, row, 'unchanged', { addedShares: 0, revokedShares: 0 }) : null;
+  });
+  if (!accepted.length) return summarize(results);
+
+  const items = JSON.stringify(accepted.map(({ row }) => ({ id: row.id, ownerId: row.user_id, address: row.address })));
+  const granteeJson = JSON.stringify(userIds);
+  const suffix = `；${tag}${auditSuffix(actor)}`;
+  // 本项名单里要移除的成员 s、要新增的成员 g
+  const isRemoved = `s.mailbox_id = json_extract(j.value, '$.id') AND s.user_id NOT IN (SELECT value FROM json_each(?3))`;
+  const isNew = `NOT EXISTS (SELECT 1 FROM mailbox_shares s WHERE s.mailbox_id = json_extract(j.value, '$.id') AND s.user_id = g.value)`;
+  const [, , , removed, inserted] = await commit(env, [
+    batchGateStatement(env, `${OWNER_CHANGED_SQL}
+      UNION ALL SELECT 1 FROM json_each(?2) g WHERE NOT EXISTS (SELECT 1 FROM users WHERE id = g.value AND status = 'active')`,
+    items, granteeJson),
+    env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+      SELECT ?1, ${ACTOR_NAME_SQL}, 'mailbox.unshare', json_extract(j.value, '$.address'),
+        '替换共享名单，移除 ' || (SELECT group_concat(u.username, '、') FROM mailbox_shares s JOIN users u ON u.id = s.user_id WHERE ${isRemoved}) || ?4, ?2
+      FROM json_each(?5) j WHERE EXISTS (SELECT 1 FROM mailbox_shares s WHERE ${isRemoved})`)
+      .bind(actor.id, actor.ip, granteeJson, suffix, items),
+    env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+      SELECT ?1, ${ACTOR_NAME_SQL}, 'mailbox.share', json_extract(j.value, '$.address'),
+        '替换共享名单，新增 ' || (SELECT group_concat(u.username, '、') FROM json_each(?3) g JOIN users u ON u.id = g.value WHERE ${isNew}) || ?4, ?2
+      FROM json_each(?5) j WHERE EXISTS (SELECT 1 FROM json_each(?3) g WHERE ${isNew})`)
+      .bind(actor.id, actor.ip, granteeJson, suffix, items),
+    env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id IN (${IDS_SQL}) AND user_id NOT IN (SELECT value FROM json_each(?2))
+      RETURNING mailbox_id`).bind(items, granteeJson),
+    // INSERT ... SELECT 需带 WHERE 才能接 ON CONFLICT
+    env.db.prepare(`INSERT INTO mailbox_shares (mailbox_id, user_id, granted_by)
+      SELECT json_extract(j.value, '$.id'), g.value, ?1 FROM json_each(?2) j, json_each(?3) g WHERE 1
+      ON CONFLICT (mailbox_id, user_id) DO NOTHING RETURNING mailbox_id`).bind(actor.id, items, granteeJson),
+  ]);
+  const revokedCounts = countByMailbox(removed?.results);
+  const addedCounts = countByMailbox(inserted?.results);
+  return finish(results, accepted, (row) => {
+    const revokedShares = revokedCounts.get(row.id) ?? 0;
+    const addedShares = addedCounts.get(row.id) ?? 0;
+    return itemResult(row.address, row, revokedShares || addedShares ? 'done' : 'unchanged', { addedShares, revokedShares });
   });
 }

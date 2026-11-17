@@ -1,7 +1,10 @@
 import { z } from 'zod';
 import { MAX_MAILBOX_GRANTEES, type Role, type UserStatus } from '../constants.js';
 import { usernameSchema } from './auth.js';
-import { adminBatchMailboxRefsSchema, domainSchema, mailboxAddressSchema } from './mailbox.js';
+import {
+  adminBatchClaimRequestSchema, adminBatchMailboxRefsSchema, domainSchema, mailboxAddressSchema,
+  type AdminMailboxBatchResult, type BatchClaimMailboxResult,
+} from './mailbox.js';
 import type { UserMailboxPolicy } from './mailbox-policy.js';
 
 /**
@@ -94,6 +97,21 @@ export const adminBatchReplaceSharesRequestSchema = z.object({
   items: adminBatchMailboxRefsSchema,
 });
 export type AdminBatchReplaceSharesRequest = z.infer<typeof adminBatchReplaceSharesRequestSchema>;
+
+/** 同 /api/admin 批量认领；shareUserIds 给了就把本次认领到的地址再追加共享给这些用户（规则同批量共享） */
+export const adminClaimAndShareRequestSchema = adminBatchClaimRequestSchema.extend({
+  shareUserIds: z.array(z.number().int().positive()).max(MAX_MAILBOX_GRANTEES).optional(),
+});
+export type AdminClaimAndShareRequest = z.infer<typeof adminClaimAndShareRequestSchema>;
+
+export interface AdminClaimAndShareResult extends BatchClaimMailboxResult {
+  /**
+   * 对本次 claimed 的地址追加共享的逐项结果（同批量共享，与 claimed 同序；taken 里的地址不共享）。
+   * 没给 shareUserIds 或为空数组时为 null。共享在认领提交之后执行：这一步整体失败（如提交前被分享人被禁用）时认领保留，
+   * 每项记为 failed 并带该错误，可对这些地址重试批量共享
+   */
+  shares: AdminMailboxBatchResult | null;
+}
 
 // ---------- Claude 事实 ----------
 
