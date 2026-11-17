@@ -76,7 +76,8 @@ const VALUE_PATTERNS: Record<string, { pattern: RegExp; message: string }> = {
   },
 };
 
-function utf8Bytes(value: string): number {
+/** 字符串的 UTF-8 字节数 */
+export function utf8ByteLength(value: string): number {
   let bytes = 0;
   for (const char of value) {
     const cp = char.codePointAt(0)!;
@@ -134,7 +135,7 @@ export function checkCustomHeaders(input: Record<string, string>): CustomHeaderC
     seen.set(key, original);
     if (typeof value !== 'string' || value.trim() === '') return fail(original, '值不能为空');
     if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(value)) return fail(original, '值不能包含换行或控制字符');
-    if (utf8Bytes(value) > MAX_CUSTOM_HEADER_VALUE_BYTES) return fail(original, `值超过 ${MAX_CUSTOM_HEADER_VALUE_BYTES} 字节`);
+    if (utf8ByteLength(value) > MAX_CUSTOM_HEADER_VALUE_BYTES) return fail(original, `值超过 ${MAX_CUSTOM_HEADER_VALUE_BYTES} 字节`);
     // 查表只认自有属性：canonical 只会是白名单名或 X- 头，这里再防一层原型链上的同名属性
     if (Object.hasOwn(ALLOWED, canonical) && ALLOWED[canonical] && /[^\x20-\x7e\t]/.test(value)) return fail(original, '该头只接受可打印 ASCII');
     const allowedValues = Object.hasOwn(ENUM_VALUES, canonical) ? ENUM_VALUES[canonical] : undefined;
@@ -147,7 +148,7 @@ export function checkCustomHeaders(input: Record<string, string>): CustomHeaderC
       return fail(original, '只能为 List-Unsubscribe=One-Click（区分大小写）');
     }
     if (!canonical.startsWith('X-')) nonX++;
-    total += utf8Bytes(canonical) + 2 + utf8Bytes(value) + 2;
+    total += utf8ByteLength(canonical) + 2 + utf8ByteLength(value) + 2;
   }
   if (nonX > MAX_CUSTOM_NON_X_HEADERS) {
     return { ok: false, code: 'validation_failed', message: `非 X- 头最多 ${MAX_CUSTOM_NON_X_HEADERS} 个`, headers: normalized.filter(([name]) => !name.startsWith('X-')).map(([, , original]) => original) };
@@ -163,4 +164,9 @@ export function checkCustomHeaders(input: Record<string, string>): CustomHeaderC
     }
   }
   return { ok: true, headers: Object.fromEntries(normalized.map(([name, value]) => [name, value.trim()])) };
+}
+
+/** headers 里是否带了线程头（In-Reply-To / References）：回复站内邮件时由服务端按原信生成 */
+export function hasThreadingHeaders(headers: Record<string, string> | undefined): boolean {
+  return headers !== undefined && Object.keys(headers).some((name) => name === 'In-Reply-To' || name === 'References');
 }
