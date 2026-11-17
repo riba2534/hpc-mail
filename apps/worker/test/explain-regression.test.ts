@@ -8,7 +8,7 @@ import { encodeCursor } from '../src/lib/pagination.js';
 import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
 import { purgeStatements } from '../src/services/message-lifecycle.js';
 import {
-  countUnread, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
+  countUnread, findNextMessage, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
 } from '../src/services/message.js';
 
 /**
@@ -176,10 +176,11 @@ describe('执行计划回归：默认视图按地址取数', () => {
     for (const p of bySubject) expectNoFullScan(p.plan, p.sql);
   });
 
-  it('mailboxes 列表的 messageCount 子查询按地址走索引', async () => {
+  it('mailboxes 列表的 messageCount 子查询按地址走索引，canSend 所需的托管域名按唯一索引逐行查', async () => {
     for (const opts of [{ userId: admin.userId }, { all: true }]) {
       const [list] = await capturePlans((e) => listMailboxes(e, opts));
       expect(list!.plan).toMatch(/CORRELATED SCALAR SUBQUERY \d+ \| SEARCH messages USING COVERING INDEX \w+ \(address=\?\)/);
+      expect(list!.plan).toMatch(/SEARCH hosted_domains USING INDEX \w+ \(domain=\?\)/);
       expectNoFullScan(list!.plan, JSON.stringify(opts));
     }
   });
@@ -220,6 +221,83 @@ describe('执行计划回归：主人邮件很多、匹配很少', () => {
       expect(statement!.plan, label).toContain(VISIBLE_FULL_PREFIX);
       expect(statement!.rowsRead, label).toBeLessThan(100);
     }
+  });
+});
+
+describe('执行计划回归：wait 的地址与域名过滤', () => {
+  it('指定地址、只给 domain、什么都不给：自己与审计范围都逐地址按 id 取，没有新信时读取量与全站新信数量无关', async () => {
+    const db = createDb(env);
+    const [user, sharer] = await db.insert(users).values([
+      { username: 'wait-plan', passwordHash: 'x', role: 'user', authVersionMigrated: true },
+      { username: 'wait-plan-sharer', passwordHash: 'x', role: 'user', authVersionMigrated: true },
+    ]).returning({ id: users.id });
+    const [, , , shared] = await db.insert(mailboxes).values([
+      { address: 'w1@waitplan.test', domain: 'waitplan.test', userId: user!.id },
+      { address: 'w2@waitplan.test', domain: 'waitplan.test', userId: user!.id },
+      { address: 'w3@waitplan-other.test', domain: 'waitplan-other.test', userId: user!.id },
+      { address: 's1@waitplan.test', domain: 'waitplan.test', userId: sharer!.id },
+    ]).returning({ id: mailboxes.id });
+    await db.insert(mailboxShares).values({ mailboxId: shared!.id, userId: user!.id, grantedBy: sharer!.id });
+    const head = await env.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM messages').first<{ id: number }>();
+    // afterId 之后全站来了别人的新信，一半落在同一个 catch-all 域的未认领地址上：
+    // 沿 idx_messages_live 按 id 扫、或沿 idx_messages_domain 扫该域，每次轮询都要读完它们
+    const noise = (address: string, count: number) => env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+      INSERT INTO messages (direction, address, domain, from_address, subject, preview, status)
+      SELECT 'inbound', ?, substr(?, instr(?, '@') + 1), 'f@example.net', 's', 'p', 'received' FROM n`).bind(count, address, address, address).run();
+    await noise('noise@waitplan-noise.test', 1000);
+    await noise('stranger@waitplan.test', 1000);
+    const owner: Viewer = { userId: user!.id, role: 'user' };
+    const audit: Viewer = { ...admin, scope: 'user', targetUserId: user!.id };
+    const unclaimed: Viewer = { ...admin, scope: 'unclaimed' };
+    const cases: [string, Viewer, { address?: string[]; domain?: string }][] = [
+      ['单地址', owner, { address: ['w1@waitplan.test'] }], ['多地址', owner, { address: ['w1@waitplan.test', 'w2@waitplan.test'] }],
+      ['未认领多地址', unclaimed, { address: ['quiet1@waitplan-noise.test', 'quiet2@waitplan-noise.test'] }],
+      ['只给 domain', owner, { domain: 'waitplan.test' }], ['不给地址与域名', owner, {}],
+      ['审计他人只给 domain', audit, { domain: 'waitplan.test' }], ['审计他人不给地址与域名', audit, {}],
+    ];
+    const measure = async () => {
+      const rowsRead: Record<string, number> = {};
+      for (const [label, viewer, filter] of cases) {
+        let found: Awaited<ReturnType<typeof findNextMessage>> | undefined;
+        const [scan] = onMessages(await capturePlans(async (e) => { found = await findNextMessage(e, viewer, { afterId: head!.id, ...filter }); }));
+        expect(found, label).toEqual({ message: null, scannedThroughId: head!.id });
+        expect(scan!.plan, label).toContain(BY_ADDRESS);
+        expectNoFullScan(scan!.plan, label);
+        expect(scan!.plan, label).not.toContain('idx_messages_domain');
+        expect(scan!.rowsRead, label).toBeLessThan(50);
+        rowsRead[label] = scan!.rowsRead;
+      }
+      return rowsRead;
+    };
+    const before = await measure();
+    await noise('stranger@waitplan.test', 2000);
+    expect(await measure()).toEqual(before);
+
+    // domain 并进认领与共享两支地址子查询：mailboxes 上用一元 + 压掉 idx_mailboxes_domain，只读调用者自己的邮箱行，不读全站该域的认领行
+    const [ownDomain] = onMessages(await capturePlans((e) => findNextMessage(e, owner, { afterId: head!.id, domain: 'waitplan.test' })));
+    expect(ownDomain!.sql.match(/\+"mailboxes"\."domain" = \?/g)).toHaveLength(2);
+    expect(ownDomain!.plan).not.toContain('idx_mailboxes_domain');
+    // 收窄后其他域的地址不再逐个探查：调用者在别的域有 300 个地址时，只给 domain 比不给少读约 300 行
+    const [many] = await db.insert(users).values({ username: 'wait-plan-many', passwordHash: 'x', role: 'user', authVersionMigrated: true })
+      .returning({ id: users.id });
+    await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+      INSERT INTO mailboxes (address, domain, user_id) SELECT 'm' || i || '@waitplan-many.test', 'waitplan-many.test', ? FROM n`).bind(many!.id).run();
+    await db.insert(mailboxes).values({ address: 'many@waitplan.test', domain: 'waitplan.test', userId: many!.id });
+    const rowsRead = async (filter: { domain?: string }) =>
+      onMessages(await capturePlans((e) => findNextMessage(e, { userId: many!.id, role: 'user' }, { afterId: head!.id, ...filter })))[0]!.rowsRead;
+    expect(await rowsRead({}) - await rowsRead({ domain: 'waitplan.test' })).toBeGreaterThanOrEqual(300);
+    // 未认领范围的地址集合不可枚举，domain 交给规划器走 idx_messages_domain（只读该域的新信）
+    const [byDomain] = onMessages(await capturePlans((e) => findNextMessage(e, unclaimed, { afterId: head!.id, domain: 'waitplan-noise.test' })));
+    expect(byDomain!.plan).toContain('idx_messages_domain (domain=? AND id>?)');
+
+    // include=body 命中后带同一组条件复核整行，仍按主键取一行
+    const [hit] = await db.insert(messages).values({ direction: 'inbound', address: 'w1@waitplan.test', domain: 'waitplan.test',
+      fromAddress: 'f@example.net', subject: 'hit', preview: 'p', status: 'received' }).returning({ id: messages.id });
+    let found: Awaited<ReturnType<typeof findNextMessage>> | undefined;
+    const [, full] = onMessages(await capturePlans(async (e) => { found = await findNextMessage(e, owner, { afterId: hit!.id - 1, domain: 'waitplan.test', include: 'body' }); }));
+    expect(found!.message).toMatchObject({ id: hit!.id, bodyText: '' });
+    expect(full!.plan).toMatch(/^SEARCH messages USING INTEGER PRIMARY KEY \(rowid=\?\)/);
+    expect(full!.rowsRead).toBeLessThan(10);
   });
 });
 

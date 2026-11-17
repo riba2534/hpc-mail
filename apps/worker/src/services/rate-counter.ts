@@ -5,6 +5,8 @@ import type { Env } from '../types.js';
 
 /** /v1 被拒请求的明细节流计数（每 Key 每分钟一格） */
 export const API_REJECT_SCOPE = 'api-reject';
+/** 普通用户外发日配额（count=封数，units=收件人数；subject 为 userId，按天窗口） */
+export const OUTBOUND_QUOTA_SCOPE = 'out';
 
 export interface CounterValue {
   count: number;
@@ -92,6 +94,39 @@ export async function bumpCounter(
 ): Promise<CounterValue> {
   const row = counterResult(await counterStatement(env, scope, subject, window, delta, units).all());
   return { count: row?.count ?? delta, units: row?.units ?? units };
+}
+
+/** 一个带上限的计数；limit 为 0 表示不限（照常计数，不设守卫） */
+export interface CounterLimit {
+  scope: string;
+  subject: string;
+  window: number;
+  limit: number;
+}
+
+/**
+ * 一组计数一起占一格：各自守卫递增（已满的不再累加），返回每个计数是否已满。
+ * 有已满的计数时，把这次在其他计数上占到的格子退回——被拒的请求不推高任何计数。
+ * 不能把多个计数串成一个守卫链：后一条语句只看得到前一条递增后的值，
+ * 「前一计数这次刚好占满」与「前一计数早已满、这次没占」读到的是同一个值。
+ */
+export async function reserveCounters(env: Env, items: CounterLimit[]): Promise<boolean[]> {
+  const guardOf = (item: CounterLimit) =>
+    item.limit > 0 ? counterWithinGuard(item.scope, item.subject, item.window, item.limit - 1) : undefined;
+  const results = await env.db.batch(items.map((item) =>
+    counterStatement(env, item.scope, item.subject, item.window, 1, 0, guardOf(item))));
+  const full = results.map((result) => counterResult(result) === null);
+  if (full.some(Boolean)) {
+    const taken = items.filter((_, index) => !full[index]);
+    if (taken.length) await releaseCounters(env, taken);
+  }
+  return full;
+}
+
+/** 退回 reserveCounters 占到的格子（窗口用占位时的那个，跨窗口也不会退到新窗口上） */
+export async function releaseCounters(env: Env, items: CounterLimit[]): Promise<void> {
+  if (!items.length) return;
+  await env.db.batch(items.map((item) => counterStatement(env, item.scope, item.subject, item.window, -1)));
 }
 
 /** 只读当前值（不递增），用于「超限则拒绝」之外的展示/判断 */

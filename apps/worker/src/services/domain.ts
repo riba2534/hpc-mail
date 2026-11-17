@@ -1,4 +1,4 @@
-import { HOSTED_DOMAIN_USABLE_STATUSES, type Settings } from '@hpc-mail/shared';
+import { HOSTED_DOMAIN_USABLE_STATUSES, type SendIdentityBlockReason, type Settings } from '@hpc-mail/shared';
 import { eq, inArray } from 'drizzle-orm';
 import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
@@ -62,14 +62,29 @@ const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${stat
 /** 托管域名站内投递：已生效或被暂停（由收件方拒收）走站内，等待 NS、已迁走或删除中按真实 DNS 外发 */
 const INTERNAL_HOSTED_STATUSES: readonly string[] = [...HOSTED_DOMAIN_USABLE_STATUSES, 'suspended'];
 
+/**
+ * 发件域名状态的唯一判定（发信校验、发件身份、邮箱列表的 canSend 共用）：只看托管域名行
+ * （LEFT JOIN 没匹配时各列为 null），不是托管域名（系统域名、已移出列表的旧域名）返回 null 即可发；
+ * 托管域名需未停用且发信已就绪。
+ */
+export function hostedSendBlock(
+  hosted: { status: string | null; sendingStatus: string | null } | undefined,
+): Extract<SendIdentityBlockReason, 'hosted_domain_unavailable' | 'hosted_sending_not_ready'> | null {
+  if (!hosted?.status) return null;
+  if (!(HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(hosted.status)) return 'hosted_domain_unavailable';
+  return hosted.sendingStatus === 'ready' ? null : 'hosted_sending_not_ready';
+}
+
 /** 从托管域名发信需该域发信已就绪；系统域名不受此限 */
 export async function assertHostedSendable(env: Env, settings: Settings, domain: string): Promise<void> {
   if (settings.domains.list.some((entry) => entry.domain === domain)) return;
   const row = await createDb(env).select({ status: hostedDomains.status, sendingStatus: hostedDomains.sendingStatus })
     .from(hostedDomains).where(eq(hostedDomains.domain, domain)).get();
-  if (!row) return;
-  if (!(HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(row.status) || row.sendingStatus !== 'ready') {
-    throw new AppError('validation_failed', '该域名的发信尚未生效或已停用');
+  if (hostedSendBlock(row)) {
+    throw new AppError('validation_failed', '该域名的发信尚未生效或已停用', {
+      fix: '先调 GET /v1/identities（网页会话用 /api/identities），从 canSend=true 的地址里选一个作为 from；托管域名要等发信就绪后才能使用',
+      docs: '/references/errors.md#forbidden-sender',
+    });
   }
 }
 

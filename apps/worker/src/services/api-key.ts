@@ -1,6 +1,9 @@
 import {
   API_KEY_PREFIX,
   MAX_API_KEYS_PER_USER,
+  MAX_API_USER_REQUESTS_PER_MINUTE,
+  MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
+  type ApiKeySelf,
   type ApiKeySummary,
   type ApiRequestLogEntry,
   type ApiScope,
@@ -11,11 +14,13 @@ import {
 } from '@hpc-mail/shared';
 import { and, desc, eq, lt, ne, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
-import { apiKeys, apiRequestLogs, users } from '../db/schema.js';
+import { apiKeys, apiRequestLogs, rateCounters, users } from '../db/schema.js';
 import { bytesToHex, sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { encodeCursor, decodeCursor } from '../lib/pagination.js';
 import type { Env } from '../types.js';
+import { dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
+import { getSettings } from './setting.js';
 
 type ApiKeyRow = typeof apiKeys.$inferSelect;
 
@@ -134,6 +139,45 @@ async function requireKey(db: Db, id: number, userId?: number): Promise<ApiKeyRo
   if (!row || row.status === 'revoked') throw new AppError('not_found', 'API Key 不存在');
   if (userId !== undefined && row.userId !== userId) throw new AppError('not_found', 'API Key 不存在');
   return row;
+}
+
+/**
+ * GET /v1/me：Key 行、用户行与今日外发计数合成一个 batch；配额上限取设置（鉴权刚读过，命中 isolate 缓存）。
+ * 管理员不占外发配额，上限按 0 返回并标 exempt。
+ */
+export async function getApiKeySelf(env: Env, keyId: number, userId: number, now = new Date()): Promise<ApiKeySelf> {
+  const db = createDb(env);
+  const [[keyRows, userRows, counterRows], settings] = await Promise.all([
+    db.batch([
+      db.select().from(apiKeys).where(eq(apiKeys.id, keyId)),
+      db.select({ id: users.id, username: users.username, role: users.role }).from(users).where(eq(users.id, userId)),
+      db.select({ count: rateCounters.count, units: rateCounters.units }).from(rateCounters)
+        .where(and(eq(rateCounters.scope, OUTBOUND_QUOTA_SCOPE), eq(rateCounters.subject, String(userId)), eq(rateCounters.window, dayWindow(now)))),
+    ]),
+    getSettings(env),
+  ]);
+  const [key] = keyRows;
+  const [user] = userRows;
+  // 鉴权之后、读取之前被吊销或删除：按无效 Key 处理
+  if (!key || key.status === 'revoked' || !user) throw new AppError('unauthorized', 'API Key 无效');
+  const exempt = user.role === 'admin';
+  return {
+    key: {
+      id: key.id, name: key.name, keyPrefix: key.keyPrefix, keySuffix: key.keySuffix, scopes: key.scopes as ApiScope[],
+      rateLimit: key.rateLimit, allowedIps: key.allowedIps,
+      expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null, createdAt: key.createdAt.toISOString(),
+    },
+    user,
+    limits: { userRequestsPerMinute: MAX_API_USER_REQUESTS_PER_MINUTE, waitPollsPerMinute: MAX_WAIT_POLLS_PER_USER_PER_MINUTE },
+    outbound: {
+      sent: counterRows[0]?.count ?? 0,
+      recipients: counterRows[0]?.units ?? 0,
+      dailyLimit: exempt ? 0 : settings.quota.dailyOutbound,
+      dailyRecipientLimit: exempt ? 0 : settings.quota.dailyRecipients,
+      exempt,
+      resetsAt: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString(),
+    },
+  };
 }
 
 export async function getApiKey(env: Env, id: number, userId?: number): Promise<ApiKeySummary> {

@@ -386,7 +386,7 @@ export function SettingsPage() {
 
         <Section
           title="外发配额"
-          description="限制普通用户每日外发量，防被盗账号脚本化群发。管理员不受限。0 表示不限。"
+          description="限制每日外发量，防被盗账号脚本化群发。外发上限只限普通用户，管理员不受限；转发中转上限含管理员。0 表示不限。"
         >
           <NumberRow
             label="每日外发邮件上限"
@@ -402,6 +402,30 @@ export function SettingsPage() {
             onChange={(v) => patch((s) => void (s.quota.dailyRecipients = v))}
             max={1000000}
             suffix="人/天"
+          />
+          <NumberRow
+            label="转发中转全站每日上限"
+            description="自动转发的目标未经 Cloudflare 验证时，以 no-reply@收件域名 重新发送，占用账户发信额度；原生转发不计入。"
+            value={draft.quota.relayDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayDaily = v))}
+            max={100000}
+            suffix="封/天"
+          />
+          <NumberRow
+            label="转发中转每人每日上限"
+            description="已认领地址按认领人计，同一封信转给多个目标各计一次；原生转发不计入。"
+            value={draft.quota.relayPerUserDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayPerUserDaily = v))}
+            max={100000}
+            suffix="封/天"
+          />
+          <NumberRow
+            label="未认领地址转发中转每日上限"
+            description="未认领地址的来信归全体管理员，任何人都能往这类地址灌信，全体管理员共用这一个额度，不按人数叠加；原生转发不计入。"
+            value={draft.quota.relayUnclaimedDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayUnclaimedDaily = v))}
+            max={100000}
+            suffix="封/天"
           />
         </Section>
 

@@ -17,6 +17,7 @@ import avatar from './routes/avatar.js';
 import config from './routes/config.js';
 import domains from './routes/domains.js';
 import hostedDomains from './routes/hosted-domains.js';
+import identities from './routes/identities.js';
 import internal from './routes/internal.js';
 import mailboxes from './routes/mailboxes.js';
 import messages from './routes/messages.js';
@@ -43,6 +44,7 @@ export function createApp() {
   api.route('/config', config);
   api.route('/domains', domains);
   api.route('/hosted-domains', hostedDomains);
+  api.route('/identities', identities);
   api.route('/mailboxes', mailboxes);
   api.route('/messages', messages);
   api.route('/me/notify-prefs', notifyPrefs);

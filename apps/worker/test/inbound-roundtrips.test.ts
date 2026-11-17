@@ -274,15 +274,15 @@ describe('收件链路 Ack 前往返', () => {
     expect(row?.notifyOwnerIds).toEqual([owner.userId]);
   });
 
-  it('原始 .eml 字节不被 handleInbound 内的任何闭包捕获（否则随 waitUntil 后处理一直驻留内存）', () => {
-    // workerd 里无法观测堆，用源码结构断言：rawBytes 只出现在 handleInbound 函数体自身的语句里
+  it('原始 .eml 字节不被收件链路内的任何闭包捕获（否则随 waitUntil 后处理一直驻留内存）', () => {
+    // workerd 里无法观测堆，用源码结构断言：rawBytes 只出现在 receiveInbound 函数体自身的语句里
     expect(closureCaptures('const f = async () => { await put(k, rawBytes); };', 'rawBytes')).toBe(1);
     expect(closureCaptures('items.map((x) => put(x, rawBytes));', 'rawBytes')).toBe(1);
     expect(closureCaptures('function g() { return rawBytes; }', 'rawBytes')).toBe(1);
     expect(closureCaptures('if (a) { await put(k, rawBytes); } const p = Promise.all([put(k, rawBytes), f((x) => x)]);', 'rawBytes')).toBe(0);
     const source = String(inboundSource);
-    const start = source.indexOf('export async function handleInbound(');
-    const bodyStart = source.indexOf('{', source.indexOf(': Promise<void>', start));
+    const start = source.indexOf('async function receiveInbound(');
+    const bodyStart = source.indexOf('{', source.indexOf(': Promise<InboundResult>', start));
     const body = source.slice(bodyStart + 1, matchingBrace(source, bodyStart));
     expect(stripCommentsAndStrings(body)).toContain('rawBytes');
     expect(closureCaptures(body, 'rawBytes')).toBe(0);

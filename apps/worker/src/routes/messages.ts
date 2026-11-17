@@ -1,13 +1,11 @@
 import {
   deleteMessagesRequestSchema,
-  internalSendMailSchema,
   listMessagesQuerySchema,
   markReadRequestSchema,
   markAllReadRequestSchema,
   starMessagesRequestSchema,
   translateMessageRequestSchema,
   type MessageListPage,
-  type MessageSummary,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { execCtx, ok, parseBody, parseId, parseQuery } from '../lib/http.js';
@@ -32,14 +30,8 @@ import {
 import { messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
 import { pageHead } from '../lib/pagination.js';
-import { decodeInlineAttachments, sendMail } from '../services/outbound.js';
-import {
-  beginIdempotentSend,
-  completeIdempotentSend,
-  failIdempotentSend,
-} from '../services/idempotency.js';
 import { translateMessage } from '../services/translate.js';
-import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
+import { handleSend } from './send-handler.js';
 import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
@@ -75,48 +67,9 @@ app.get('/', async (c) => {
   return ok(c, body);
 });
 
-app.post('/send', async (c) => {
+app.post('/send', (c) => {
   const user = c.get('user')!;
-  const req = await parseBody(c, internalSendMailSchema);
-  const idem = await beginIdempotentSend(
-    c.env,
-    { type: 'user', id: user.id },
-    c.req.header('Idempotency-Key'),
-    req,
-  );
-  if (idem.kind === 'replay') return ok(c, idem.response, 201);
-  let summary: MessageSummary;
-  try {
-    // 兼容两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端），合并后送 sendMail
-    const decoded = decodeInlineAttachments(req.attachments);
-    const fromTokens = await resolveDraftAttachments(c.env, user.id, req.attachmentTokens);
-    const attachments = [...decoded, ...fromTokens];
-    const origin = new URL(c.req.url).origin;
-    summary = await sendMail(
-      c.env,
-      c.executionCtx,
-      { userId: user.id, role: user.role },
-      req,
-      attachments,
-      origin,
-      idem.handle,
-    );
-    try { await completeIdempotentSend(c.env, idem.handle, summary); }
-    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
-  } catch (error) {
-    await failIdempotentSend(c.env, idem.handle, error);
-    throw error;
-  }
-  // 发送成功后回收 token 引用的草稿附件（base64 内联的无草稿，跳过）。
-  // 不能让回收失败翻转整个请求的结果：邮件此刻已经真发出去了，这里再抛 500 会让前端提示
-  // 「发送失败，请重试」，用户一重发、token 又还在，收件人就收到两封。回收失败留给
-  // 24h 的草稿清理任务兜底
-  try {
-    await consumeDraftAttachments(c.env, user.id, req.attachmentTokens);
-  } catch (e) {
-    console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', e);
-  }
-  return ok(c, summary, 201);
+  return handleSend(c, { type: 'user', id: user.id }, { userId: user.id, role: user.role });
 });
 
 app.post('/read', async (c) => {

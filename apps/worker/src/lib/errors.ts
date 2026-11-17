@@ -1,13 +1,22 @@
-import { ERROR_STATUS, type ErrorCode } from '@hpc-mail/shared';
+import { ERROR_STATUS, type ApiErrorDetails, type ErrorCode } from '@hpc-mail/shared';
+
+/** 错误信封的可选补充：fix 给调用方（尤其 Agent）的改正建议；docs 站内文档路径（如 /references/errors.md#x）；details 结构化信息 */
+export interface AppErrorHints {
+  fix?: string;
+  docs?: string;
+  details?: ApiErrorDetails;
+}
 
 /** 业务错误：code 决定响应错误码与默认 HTTP 状态；个别场景（如上游投递失败 502）可显式指定状态 */
 export class AppError extends Error {
   readonly code: ErrorCode;
+  readonly hints: AppErrorHints;
   readonly status: number;
 
-  constructor(code: ErrorCode, message?: string, status: number = ERROR_STATUS[code]) {
+  constructor(code: ErrorCode, message?: string, hints: AppErrorHints = {}, status: number = ERROR_STATUS[code]) {
     super(message ?? code);
     this.code = code;
+    this.hints = hints;
     this.status = status;
     this.name = 'AppError';
   }

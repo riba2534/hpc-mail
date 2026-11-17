@@ -55,25 +55,31 @@ describe('草稿附件解析', () => {
       seedDraft(uid, 20 * 1024 * 1024, { writeContent: false }),
       seedDraft(uid, 20 * 1024 * 1024, { writeContent: false }),
     ]);
-    await expect(resolveDraftAttachments(env, uid, tokens)).rejects.toMatchObject({
+    await expect(resolveDraftAttachments(env, uid, tokens, crypto.randomUUID())).rejects.toMatchObject({
       code: 'payload_too_large',
     });
   });
 
-  it('合计未超上限时正常解析出内容', async () => {
+  it('合计未超上限时解析为草稿对象的引用，不读内容', async () => {
     const uid = await seedUser(`up-ok-${crypto.randomUUID().slice(0, 8)}`);
-    const token = await seedDraft(uid, 512);
-    const atts = await resolveDraftAttachments(env, uid, [token]);
-    expect(atts).toHaveLength(1);
-    expect(atts[0]!.bytes.byteLength).toBeGreaterThan(0);
-    // base64 改为惰性计算，解析阶段不应预先算好
-    expect(atts[0]!.base64).toBeUndefined();
+    // 内容不写 R2：解析阶段若去读对象会报错
+    const token = await seedDraft(uid, 512, { writeContent: false });
+    const atts = await resolveDraftAttachments(env, uid, [token, { token, contentId: 'ignored' }], crypto.randomUUID());
+    expect(atts).toEqual([{ filename: `${token}.bin`, mimeType: 'application/octet-stream', contentId: '',
+      disposition: 'attachment', r2Key: draftKey(uid, token), size: 512 }]);
+  });
+
+  it('token 对象写法带内联参数：只给 contentId 时按 inline', async () => {
+    const uid = await seedUser(`up-inline-${crypto.randomUUID().slice(0, 8)}`);
+    const [a, b] = [await seedDraft(uid, 8), await seedDraft(uid, 8)];
+    const atts = await resolveDraftAttachments(env, uid, [{ token: a, contentId: 'logo' }, { token: b, contentId: 'pic', disposition: 'attachment' }], crypto.randomUUID());
+    expect(atts.map((att) => [att.contentId, att.disposition])).toEqual([['logo', 'inline'], ['pic', 'attachment']]);
   });
 
   it('未上传完成的 token 被拒', async () => {
     const uid = await seedUser(`up-pending-${crypto.randomUUID().slice(0, 8)}`);
     const token = await seedDraft(uid, 128, { status: 'uploading' });
-    await expect(resolveDraftAttachments(env, uid, [token])).rejects.toMatchObject({
+    await expect(resolveDraftAttachments(env, uid, [token], crypto.randomUUID())).rejects.toMatchObject({
       code: 'validation_failed',
     });
   });
@@ -82,18 +88,18 @@ describe('草稿附件解析', () => {
     const owner = await seedUser(`up-owner-${crypto.randomUUID().slice(0, 8)}`);
     const other = await seedUser(`up-other-${crypto.randomUUID().slice(0, 8)}`);
     const token = await seedDraft(owner, 128);
-    await expect(resolveDraftAttachments(env, other, [token])).rejects.toMatchObject({
+    await expect(resolveDraftAttachments(env, other, [token], crypto.randomUUID())).rejects.toMatchObject({
       code: 'validation_failed',
     });
   });
 
-  it('回收后 R2 对象与 D1 行都清掉', async () => {
+  it('回收只删草稿行，对象留给已发出邮件的附件行引用', async () => {
     const uid = await seedUser(`up-consume-${crypto.randomUUID().slice(0, 8)}`);
     const token = await seedDraft(uid, 256);
     const key = draftKey(uid, token);
     expect(await env.r2.get(key)).not.toBeNull();
     await consumeDraftAttachments(env, uid, [token]);
-    expect(await env.r2.get(key)).toBeNull();
+    expect(await env.r2.get(key)).not.toBeNull();
     const db = createDb(env);
     const row = await db
       .select()

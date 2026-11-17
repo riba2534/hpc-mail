@@ -1,8 +1,11 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { AppError } from '../../lib/errors.js';
 import { ok } from '../../lib/http.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
+import { getApiKeySelf } from '../../services/api-key.js';
 import { getVisibleDomains } from '../../services/domain.js';
+import { listSendIdentities } from '../../services/identities.js';
 import type { AppContext } from '../../types.js';
 import { createUploadRoutes } from '../uploads.js';
 import v1Mailboxes from './mailboxes.js';
@@ -25,6 +28,24 @@ app.use(
 app.get('/status', apiKeyAuth, (c) => {
   const key = c.get('apiKey')!;
   return ok(c, { status: 'operational', userId: key.userId, role: key.role, scopes: key.scopes });
+});
+
+/** 当前 Key、所属用户、速率上限与今日外发用量；任何有效 Key 都能自查，不要求 scope */
+app.get('/me', apiKeyAuth, async (c) => {
+  const key = c.get('apiKey')!;
+  return ok(c, await getApiKeySelf(c.env, key.id, key.userId));
+});
+
+/** 能用哪些地址发信：发信前选身份（mail.send）或盘点邮箱（mailbox.read）都需要，两者有其一即可 */
+app.get('/identities', apiKeyAuth, async (c) => {
+  const key = c.get('apiKey')!;
+  if (!key.scopes.includes('mail.send') && !key.scopes.includes('mailbox.read')) {
+    throw new AppError('forbidden', '需要 API scope: mail.send 或 mailbox.read', {
+      fix: '这把 Key 需要 mail.send 或 mailbox.read 其中之一：在网页「API Key」页面加上，或换用带其中一个 scope 的 Key（GET /v1/me 可查看当前 scopes）',
+      docs: '/references/errors.md#forbidden-scope',
+    });
+  }
+  return ok(c, await listSendIdentities(c.env, { userId: key.userId, role: key.role }));
 });
 
 // 与网页及认领校验共用用户的公共/专属规则。

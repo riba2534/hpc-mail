@@ -336,8 +336,14 @@ export function MessagePage() {
     ? uniqueAddresses(message.recipients.bcc, new Set([...toRecipients, ...ccRecipients].map((address) => address.toLowerCase())))
     : [];
   const multipleRecipients = message.recipients.to.length + message.recipients.cc.length > 1;
-  const sendIssue = outbound && (message.errorDetail || message.status === 'failed' || message.status === 'bounced');
+  // pending：投递还在进行，结果未回填，不算问题；unknown：投递中断，部分收件人可能已收到
+  const deliveryPending = outbound && message.status === 'pending';
+  const deliveryUnknown = outbound && message.status === 'unknown';
+  const sendIssue = outbound && !deliveryPending && (deliveryUnknown || message.errorDetail || message.status === 'failed');
   const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
+  const unknownRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'unknown') ?? [];
+  // 正文里已经就地显示的内联图不再在附件区重复列出
+  const listedAttachments = message.attachments.filter((attachment) => !attachment.inline);
   const canMarkUnread = readStateWritable && !outbound;
   const hasMobileMenu = canActAsOwner || canMarkUnread || message.hasRaw || translation.available;
 
@@ -483,13 +489,22 @@ export function MessagePage() {
 
         <div className="flex flex-col gap-4 px-4 py-5 sm:px-5">
           {translation.translated && <TranslationBar translation={translation} />}
+          {deliveryPending && (
+            <p role="status" className="rounded-md border border-line bg-canvas px-3 py-2.5 text-sm text-ink-secondary">投递中，结果尚未回填</p>
+          )}
           {sendIssue && (
-            <div className="rounded-md border border-critical/40 bg-critical-soft px-3 py-2.5 text-sm">
-              <p className="font-medium text-critical">
-                {message.status === 'failed' ? '发送失败' : message.status === 'bounced' ? '退信' : '部分收件人失败'}
+            <div className={cn('rounded-md border px-3 py-2.5 text-sm', deliveryUnknown ? 'border-caution/40 bg-caution-soft' : 'border-critical/40 bg-critical-soft')}>
+              <p className={cn('font-medium', deliveryUnknown ? 'text-caution' : 'text-critical')}>
+                {deliveryUnknown ? '投递结果未确认：部分收件人可能已收到，补发前先确认'
+                  : message.status === 'failed' ? '发送失败' : '部分收件人失败'}
               </p>
               {message.errorDetail && (
                 <p className="mt-1 break-words text-ink-secondary">{message.errorDetail}</p>
+              )}
+              {unknownRecipients.length > 0 && (
+                <ul aria-label="结果未确认的收件人" className="mt-1 list-disc pl-4 text-ink-secondary">
+                  {unknownRecipients.map((outcome) => <li key={outcome.address}>{outcome.address}：{outcome.error || '结果未确认'}</li>)}
+                </ul>
               )}
               {failedRecipients.length > 0 && (
                 <ul className="mt-1 list-disc pl-4 text-ink-secondary">
@@ -551,14 +566,14 @@ export function MessagePage() {
             <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
           )}
 
-          {message.attachments.length > 0 && (
+          {listedAttachments.length > 0 && (
             <div className="border-t border-line pt-4">
               <p className="mb-2 flex items-center gap-1.5 text-sm font-medium text-ink-secondary">
                 <Paperclip className="size-4" />
-                {message.attachments.length} 个附件
+                {listedAttachments.length} 个附件
               </p>
               <ul className="flex flex-col gap-2">
-                {message.attachments.map((attachment) => {
+                {listedAttachments.map((attachment) => {
                   const Icon = attachmentIcon(attachment.mimeType, attachment.filename);
                   return (
                     <li key={attachment.id}>

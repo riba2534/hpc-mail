@@ -1,4 +1,7 @@
-import { MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS } from '@hpc-mail/shared';
+import {
+  ALLOWED_CUSTOM_HEADERS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
+  MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, internalSendMailSchema,
+} from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
@@ -11,6 +14,7 @@ import llmsDoc from '../../web/public/llms.txt?raw';
 import administrationDoc from '../../web/public/references/administration.md?raw';
 import attachmentsDoc from '../../web/public/references/attachments.md?raw';
 import authDoc from '../../web/public/references/auth-and-http.md?raw';
+import errorsDoc from '../../web/public/references/errors.md?raw';
 import mailDoc from '../../web/public/references/mail.md?raw';
 import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
 import notificationsDoc from '../../web/public/references/notifications.md?raw';
@@ -154,7 +158,8 @@ describe('OpenAPI routes and public contracts', () => {
     const send = specs.v1.components.schemas.SendMailRequest!;
     const fields = send.properties as Record<string, Schema>;
     expect(send.required).toEqual(expect.arrayContaining(['from', 'to', 'subject']));
-    expect(fields.from!.oneOf).toHaveLength(2);
+    expect(fields.from!.oneOf).toHaveLength(4);
+    expect(fields.from).not.toHaveProperty('anyOf');
     expect(fields.attachments!.items).toMatchObject({ type: 'object', required: ['filename', 'contentType', 'content'] });
     expect(fields.attachmentTokens).toMatchObject({ type: 'array', maxItems: 10 });
     expect(send['x-max-body-utf8-bytes']).toBe(1048576);
@@ -310,6 +315,163 @@ describe('Phase-0 hardening is reflected in both OpenAPI documents', () => {
   });
 });
 
+describe('Agent 接口第 1 期反映在 OpenAPI 中', () => {
+  const dataOf = (operation: Schema) => {
+    const responses = operation.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>;
+    return responses['200']!.content['application/json']!.schema.properties.data;
+  };
+
+  it('发件身份、/v1/me 与邮箱 canSend', () => {
+    expect(dataOf(specs.api.paths['/identities']!.get!)).toEqual({ $ref: '#/components/schemas/SendIdentities' });
+    const identities = specs.v1.paths['/identities']!.get!;
+    expect(dataOf(identities)).toEqual({ $ref: '#/components/schemas/SendIdentities' });
+    expect(identities['x-required-scopes-any-of']).toEqual(['mail.send', 'mailbox.read']);
+    const entry = ((specs.v1.components.schemas.SendIdentities!.properties as Record<string, Schema>).identities!.items as Schema).properties as Record<string, Schema>;
+    expect((entry.reason!.anyOf as Schema[])[0]!.enum).toEqual(['hosted_sending_not_ready', 'hosted_domain_unavailable', 'shared_readonly']);
+    const me = specs.v1.paths['/me']!.get!;
+    expect(me).not.toHaveProperty('x-required-scopes');
+    expect(dataOf(me)).toEqual({ $ref: '#/components/schemas/ApiKeySelf' });
+    expect(specs.v1.components.schemas.ApiKeySelf!.required).toEqual(['key', 'user', 'limits', 'outbound']);
+    expect(specs.api.components.schemas).not.toHaveProperty('ApiKeySelf');
+    for (const spec of Object.values(specs)) {
+      expect(spec.components.schemas.Mailbox!.properties).toHaveProperty('canSend');
+      expect(spec.components.schemas.Mailbox!.required).not.toContain('canSend');
+    }
+  });
+
+  it('批量认领、批量可用性、随机后缀方案在 /v1 按 scope 开放，与 /api 同形', () => {
+    const scopes = { '/mailboxes/batch': ['post', 'mailbox.write'], '/mailboxes/availability/batch': ['post', 'mailbox.read'], '/mailboxes/random-plan': ['get', 'mailbox.read'] } as const;
+    for (const [path, [method, scope]] of Object.entries(scopes)) {
+      const v1 = specs.v1.paths[path]![method]!;
+      const api = specs.api.paths[path]![method]!;
+      expect(v1['x-required-scopes'], path).toEqual([scope]);
+      expect(api, path).not.toHaveProperty('x-required-scopes');
+      expect(v1.responses, path).toEqual(api.responses);
+      expect(v1.requestBody, path).toEqual(api.requestBody);
+      expect(v1.parameters, path).toEqual(api.parameters);
+    }
+  });
+
+  it('wait 的多地址、domain、include=body，内联附件标记与非法 cursor', () => {
+    const wait = specs.v1.paths['/messages/wait']!.get!;
+    const params = Object.fromEntries((wait.parameters as Array<{ name: string; schema: Schema; description?: string }>).map(param => [param.name, param]));
+    expect(params.address!.description).toContain('repeat the parameter');
+    expect(params.domain!.schema).toMatchObject({ type: 'string', pattern: expect.any(String) });
+    expect(params.include!.schema).toEqual({ type: 'string', enum: ['body'] });
+    const message = (dataOf(wait).properties as Record<string, Schema>).message!;
+    expect(message.anyOf).toEqual([{ $ref: '#/components/schemas/MessageSummary' }, { $ref: '#/components/schemas/MessageDetail' }, { type: 'null' }]);
+    for (const spec of Object.values(specs)) {
+      expect((spec.components.schemas.Attachment!.properties as Record<string, Schema>).inline).toMatchObject({ type: 'boolean' });
+      const outcome = ((spec.components.schemas.MessageSummary!.properties as Record<string, Schema>).recipientOutcomes!.items as Schema).properties as Record<string, Schema>;
+      expect(outcome.status!.enum).toContain('unknown');
+    }
+    const cursors = [specs.v1.paths['/messages']!.get!, specs.api.paths['/messages']!.get!, specs.api.paths['/admin/audit-logs']!.get!, specs.api.paths['/api-keys/{id}/logs']!.get!]
+      .map(operation => (operation.parameters as Array<{ name: string; description: string }>).find(param => param.name === 'cursor')!.description);
+    for (const description of cursors) expect(description).toContain('400 validation_failed');
+  });
+});
+
+describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () => {
+  const props = (schema: Schema) => schema.properties as Record<string, Schema>;
+
+  it('发信请求：from 四种写法、MailAddress 收件人、replyTo、headers 规则、内联附件与 token 对象', () => {
+    for (const spec of Object.values(specs)) {
+      const send = spec.components.schemas.SendMailRequest!;
+      const fields = props(send);
+      expect((fields.from!.oneOf as Schema[]).map(variant => variant.title))
+        .toEqual(['Mailbox id', 'Local part and domain', 'Address string', 'Address object']);
+      for (const name of ['to', 'cc', 'bcc', 'replyTo']) expect(fields[name]!.items, name).toEqual({ $ref: '#/components/schemas/MailAddress' });
+      expect(fields.replyTo!.maxItems).toBe(MAX_REPLY_TO);
+      expect(spec.components.schemas.MailAddress!.oneOf).toHaveLength(2);
+      expect(fields.headers).toMatchObject({ type: 'object', 'x-allowed-headers': ALLOWED_CUSTOM_HEADERS });
+      for (const text of ['header_not_allowed', 'details.headers', 'replyToMessageId']) expect(fields.headers!.description).toContain(text);
+      const attachment = props(fields.attachments!.items as Schema);
+      expect(attachment.contentId!.description).toContain('cid:');
+      expect(attachment.disposition).toMatchObject({ enum: ['attachment', 'inline'] });
+      const [token, tokenObject] = (fields.attachmentTokens!.items as Schema).oneOf as Schema[];
+      expect(token).toMatchObject({ type: 'string' });
+      expect(props(tokenObject!)).toHaveProperty('contentId');
+      expect(send['x-max-inline-attachment-bytes']).toBe(MAX_INLINE_ATTACHMENT_TOTAL_BYTES);
+      expect(send['x-max-request-bytes']).toBe(MAX_SEND_REQUEST_BYTES);
+    }
+    expect(specs.api.components.schemas.SendMailRequest).toEqual(specs.v1.components.schemas.SendMailRequest);
+  });
+
+  it('错误信封带可选的 fix/docs/details，错误码含 header_not_allowed 与 delivery_failed', () => {
+    for (const spec of Object.values(specs)) {
+      const envelope = props(spec.components.schemas.Error!).error!;
+      const error = props(envelope);
+      expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
+      for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
+      expect(envelope.required).toEqual(['code', 'message']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes']);
+      expect(error.docs).toMatchObject({ format: 'uri' });
+    }
+  });
+
+  it('两个发信端点：201 只表示至少一个收件人成功，400/413/422/500 有发信专属说明，/api 与 /v1 一致', () => {
+    const v1 = specs.v1.paths['/messages']!.post!;
+    const api = specs.api.paths['/messages/send']!.post!;
+    expect(v1.responses).toEqual(api.responses);
+    for (const operation of [v1, api]) {
+      const responses = operation.responses as Record<string, { description: string }>;
+      expect(operation.description).toContain('at least one recipient succeeded');
+      expect(operation.description).not.toMatch(/total (recipient|delivery) failure/);
+      expect(responses['400']!.description).toContain('header_not_allowed');
+      expect(responses['413']!.description).toContain('before parsing');
+      expect(responses['422']!.description).toContain('delivery_failed');
+      expect(responses['500']!.description).toContain('Idempotency-Key');
+    }
+    expect(api).not.toHaveProperty('x-conditional-scopes');
+    expect(api).not.toHaveProperty('x-required-scopes');
+  });
+
+  it('发件状态与逐收件人结果写明 pending 与 unknown', () => {
+    for (const spec of Object.values(specs)) {
+      const summary = props(spec.components.schemas.MessageSummary!);
+      expect(summary.status!['x-outbound-values']).toEqual(OUTBOUND_STATUSES);
+      for (const status of OUTBOUND_STATUSES) expect(summary.status!.description).toContain(status);
+      expect(props(summary.recipientOutcomes!.items as Schema).status!.description).toContain('unknown');
+    }
+  });
+
+  it('Agent 文档写明第 1 期的发件身份、自查、发信格式与错误码', () => {
+    for (const text of ['GET /me', 'GET /identities', 'canSend', 'delivery_failed', 'header_not_allowed', 'In-Reply-To', 'replyTo',
+      'contentId', 'cid:', 'include=body', 'error.fix', 'POST /mailboxes/batch', 'unknown']) {
+      expect(skillDoc, text).toContain(text);
+    }
+    for (const anchor of ['validation_failed', 'header_not_allowed', 'payload_too_large', 'forbidden-scope', 'forbidden-sender',
+      'idempotency_mismatch', 'send_in_progress', 'source_unavailable', 'delivery_failed', 'rate_limited']) {
+      expect(errorsDoc).toMatch(new RegExp(`^## ${anchor}$`, 'm'));
+    }
+    expect(llmsDoc).toContain('/references/errors.md');
+    for (const heading of ['### 发件身份', '### 收件人与显示名', '### 自定义邮件头', '### 结果与状态']) expect(mailDoc).toContain(`\n${heading}\n`);
+    for (const header of ALLOWED_CUSTOM_HEADERS) expect(mailDoc, header).toContain(`\`${header}\``);
+    expect(mailDoc).toContain('include=body');
+    expect(attachmentsDoc).toContain('\n## 内联图片\n');
+    expect(mailboxesDoc).toContain('\n## 发件身份\n');
+    expect(authDoc).toContain('GET /v1/me');
+  });
+
+  it('文档里的完整发信请求示例都能通过发信 schema', () => {
+    const examples = [mailDoc, attachmentsDoc].flatMap(doc => [...doc.matchAll(/```json\n([\s\S]*?)```/g)].map(match => match[1]!))
+      .filter(block => block.includes('"from"'));
+    expect(examples.length).toBeGreaterThanOrEqual(3);
+    for (const block of examples) {
+      const parsed = internalSendMailSchema.safeParse(JSON.parse(block));
+      expect(parsed.success, `${block}\n${JSON.stringify(parsed.error?.issues)}`).toBe(true);
+    }
+  });
+
+  it('超过 100 行的参考文件开头有目录', () => {
+    const references = { administration: administrationDoc, attachments: attachmentsDoc, auth: authDoc, errors: errorsDoc,
+      mail: mailDoc, mailboxes: mailboxesDoc, notifications: notificationsDoc };
+    for (const [name, doc] of Object.entries(references)) {
+      if (doc.split('\n').length > 100) expect(doc.split('\n').slice(0, 5).join('\n'), name).toContain('## 目录');
+    }
+  });
+});
+
 /**
  * Agent 文档里写到的端点必须真实存在：skill.md 的 hpc 调用按 /v1 核对，
  * 「`METHOD /path`」与带 /v1、/api 前缀的路径按对应规格核对，相对链接与锚点必须能解析。
@@ -318,7 +480,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
   const docs: Record<string, string> = {
     'skill.md': skillDoc, 'llms.txt': llmsDoc,
     'references/administration.md': administrationDoc, 'references/attachments.md': attachmentsDoc,
-    'references/auth-and-http.md': authDoc, 'references/mail.md': mailDoc,
+    'references/auth-and-http.md': authDoc, 'references/errors.md': errorsDoc, 'references/mail.md': mailDoc,
     'references/mailboxes-and-domains.md': mailboxesDoc, 'references/notifications.md': notificationsDoc,
   };
   /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */

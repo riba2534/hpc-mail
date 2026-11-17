@@ -119,9 +119,13 @@ describe('批量认领', () => {
     expect(result.claimed.map((box) => box.address)).toEqual([`${first.localPart}@${openDomain}`, `${history.localPart}@${openDomain}`]);
     expect(result.claimed.map((box) => box.messageCount)).toEqual([0, 2]);
     expect(result).toMatchObject({ taken: [taken, first], notAttempted: [], stoppedBy: null });
-    // 与 GET /mailboxes（单个认领后读回的同一形状）逐字段一致
+    // 与 GET /mailboxes（单个认领后读回的同一形状）逐字段一致；canSend 只由列表接口返回
     const listed = await data<Mailbox[]>(await request('/mailboxes', f.user.jwt));
-    for (const box of result.claimed) expect(box).toEqual(listed.find((entry) => entry.id === box.id));
+    for (const box of result.claimed) {
+      const { canSend, ...entry } = listed.find((item) => item.id === box.id)!;
+      expect(canSend).toBe(true);
+      expect(box).toEqual(entry);
+    }
     const single = await data<Mailbox>(await request('/mailboxes', f.user.jwt, 'POST', f.item('single')), 201);
     expect(Object.keys(result.claimed[0]!).sort()).toEqual(Object.keys(single).sort());
   });

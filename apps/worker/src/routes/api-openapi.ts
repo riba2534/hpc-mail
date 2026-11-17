@@ -1,7 +1,7 @@
-import { HOSTED_DOMAIN_STATUSES, MAX_BATCH_CLAIM, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE } from '@hpc-mail/shared';
+import { HOSTED_DOMAIN_STATUSES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, okResult, operation,
-  page, pageQuery, query, ref, scopeQuery, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
+  page, pageQuery, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
 
@@ -31,6 +31,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'An enrolled account must supply its current password or a valid TOTP code.' }) },
     '/auth/logout': { post: operation('Revoke the current session', success) },
     '/domains': { get: operation('List configured domains visible to this user', array(str), { description: 'Returns data as an array, unlike /v1/domains data.domains. Ordinary users see public domains or the domains allowed by their dedicated mailboxPolicy. Dedicated policies replace public visibility and quotas; explicitly granted private domains are allowed. Active hosted domains follow the system domains: those the caller owns or was granted, or every active hosted domain for administrators, who may claim addresses on any user’s hosted domain. Adding/managing system domains requires administrator settings; users host their own domains with /hosted-domains; claiming an address is a separate operation.' }) },
+    '/identities': { get: operation('List sender identities', ref('SendIdentities'), { description: identitiesDescription }) },
     '/hosted-domains': {
       get: operation('List hosted domains the caller owns or was granted', array(ref('HostedDomain')), {
         description: 'Users can host their own domains on this site. Each item has role owner or member; administrators also see only their own here and use /admin/hosted-domains for all.' }),
@@ -86,14 +87,7 @@ export function buildSessionOpenApiSpec(origin: string) {
         query('limit', { type: 'integer', minimum: 1, maximum: 20, default: 20 })],
       description: 'JWT only. Returns only id, username and role for active candidates; no account details or mailbox lists. hasMore means refine the search.'
     }) },
-    '/mailboxes/batch': { post: operation('Claim several addresses in order', ref('BatchClaimMailboxResult'), { request: 'BatchMailboxRequest',
-      description: 'Same rules as POST /mailboxes, applied to each item in request order. Each item accepts optional strategy; claude rechecks current suspension facts inside the write transaction and stops with forbidden when a domain has any historical suspension. An already-claimed address is skipped into taken and the batch continues; any other error stops the batch, keeps the addresses already claimed and reports stoppedBy with the remaining items in notAttempted.' }) },
-    '/mailboxes/availability/batch': { post: operation('Check availability of several addresses', array(ref('MailboxAvailability')), { request: 'BatchMailboxRequest',
-      description: 'Advisory only, same rules as GET /mailboxes/availability. Results follow request order.' }) },
-    '/mailboxes/random-plan': { get: operation('Allocate random suffixes for a batch claim', ref('ClaimPlan'), {
-      parameters: [query('count', { type: 'integer', minimum: 1, maximum: MAX_BATCH_CLAIM }, 'Number of addresses to allocate.', true),
-        query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: only zero-suspension domains, balanced by Claude accounts plus pending claims.', true)],
-      description: 'JWT only. Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy excludes every domain with any historical Claude suspension from both items and pool, regardless of paid status or deprecated thresholds. It balances accounts plus recent pending claims and stops at claim_random.dailyLimit or claim quotas without spilling over to suspended domains. Generate prefixes, then pass strategy=claude on each item for availability and actual claims, including after manual suffix changes. Claims atomically recheck suspension facts; a plan does not reserve eligibility.' }) },
+    ...mailboxBatchPaths(),
     '/mailboxes/availability': { get: operation('Check mailbox availability', ref('MailboxAvailability'), { parameters: [query('localPart', str, undefined, true), query('domain', str, undefined, true), query('strategy', claimStrategy)],
       description: 'Advisory only, not a reservation. Same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit, domain_unavailable or claude_suspended. Claim still re-checks everything.' }) },
     '/mailboxes/{id}': {
@@ -104,8 +98,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/messages': { get: operation('List mail with cursor pagination', ref('SessionMessagePage'), { parameters: listQuery, description: 'unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt. Inbound summaries carry verificationLink (empty when none was detected).' }) },
     '/messages/sync': { get: operation('Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: listQuery,
       description: 'Lightweight polling for the list view: accepts the same filters as GET /messages (cursor and afterId are ignored). Refetch the list only when head differs from the head returned with its first page.' }) },
-    '/messages/send': { post: operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', status: 201, parameters: [idempotencyHeader],
-      description: 'HTTP 201 may contain partial or total delivery failure. Inspect status/errorDetail/recipientOutcomes; retry only failed recipients. sent means provider acceptance, not confirmed destination-inbox delivery. Use base64 attachments or draft attachmentTokens; source forwarding attachments count toward the total. Large external attachments become independent 90-day signed links.' }) },
+    '/messages/send': { post: sendMailOperation() },
     '/messages/read': { post: operation('Mark selected owned messages read/unread', changed, { request: 'MarkReadRequest', parameters: mutationQuery,
       description: 'Changes only mail at addresses the caller owns (or unclaimed addresses with administrator scope=unclaimed). Shared mail is silently skipped; changed counts actual matches.' }) },
     '/messages/read-all': { post: operation('Mark incoming messages read, optionally narrowed by filters', changed, { parameters: mutationQuery, request: 'MarkAllReadRequest', requestRequired: false,

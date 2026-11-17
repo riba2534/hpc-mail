@@ -4,7 +4,7 @@ import { getEmailDomain, getLocalPart, normalizeEmail } from '../lib/email-addre
 import { encodeBodyBase64, foldMimeHeaders } from '../lib/mime.js';
 import type { Env } from '../types.js';
 import { getDomains } from './domain.js';
-import { sendViaCloudflare } from './outbound.js';
+import { cloudflareSender } from './outbound.js';
 import { getSettings } from './setting.js';
 
 /**
@@ -123,7 +123,8 @@ export async function sendCanaryMail(env: Env, from: string, to: string, nonce: 
   // 签名头在折行之后加：单行约 120 字节远低于 998 上限，原样一行收件端无需反折行
   const exp = Math.floor(Date.now() / 1000) + CANARY_VALID_SECONDS;
   const header = `${CANARY_HEADER}: ${await canaryHeaderValue(env, nonce, normalizeEmail(to), exp)}\r\n`;
-  await sendViaCloudflare(env, from, to, header + foldMimeHeaders(msg.asRaw()));
+  const send = await cloudflareSender(env, from);
+  await send(to, header + foldMimeHeaders(msg.asRaw()));
 }
 
 /**

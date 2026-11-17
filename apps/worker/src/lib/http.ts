@@ -1,3 +1,4 @@
+import { ERROR_CODES, type IssueErrorParams } from '@hpc-mail/shared';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { AppError } from './errors.js';
@@ -9,7 +10,18 @@ export interface SafeParser<T> {
     data: unknown,
   ):
     | { success: true; data: T }
-    | { success: false; error: { issues: Array<{ message?: string }> } };
+    | { success: false; error: { issues: Array<{ message?: string; params?: unknown }> } };
+}
+
+/**
+ * 校验失败转错误：取第一条 issue；它带 IssueErrorParams（shared schema 的自定义 issue）时，
+ * 用其中的错误码与 fix/docs/details，否则为 validation_failed。
+ */
+function issueError(issue: { message?: string; params?: unknown } | undefined): AppError {
+  const params = (issue?.params ?? {}) as IssueErrorParams;
+  const code = params.errorCode && (ERROR_CODES as readonly string[]).includes(params.errorCode)
+    ? params.errorCode : 'validation_failed';
+  return new AppError(code, issue?.message ?? '参数校验失败', { fix: params.fix, docs: params.docs, details: params.details });
 }
 
 /** 统一成功信封 { data } */
@@ -77,17 +89,13 @@ export async function parseBody<T>(c: Context<AppContext>, schema: SafeParser<T>
     throw new AppError('validation_failed', '请求体不是合法 JSON');
   }
   const result = schema.safeParse(raw);
-  if (!result.success) {
-    throw new AppError('validation_failed', result.error.issues[0]?.message ?? '参数校验失败');
-  }
+  if (!result.success) throw issueError(result.error.issues[0]);
   return result.data;
 }
 
 /** safeParse query，失败抛 validation_failed */
 export function parseQuery<T>(c: Context<AppContext>, schema: SafeParser<T>): T {
   const result = schema.safeParse(c.req.query());
-  if (!result.success) {
-    throw new AppError('validation_failed', result.error.issues[0]?.message ?? '参数校验失败');
-  }
+  if (!result.success) throw issueError(result.error.issues[0]);
   return result.data;
 }

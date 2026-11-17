@@ -3,7 +3,6 @@ import {
   listMessagesQuerySchema,
   markReadRequestSchema,
   MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
-  internalSendMailSchema,
   starMessagesRequestSchema,
   markAllReadRequestSchema,
   waitMessagesQuerySchema,
@@ -32,13 +31,7 @@ import {
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import { decodeInlineAttachments, sendMail } from '../../services/outbound.js';
-import {
-  beginIdempotentSend,
-  completeIdempotentSend,
-  failIdempotentSend,
-} from '../../services/idempotency.js';
-import { consumeDraftAttachments, resolveDraftAttachments } from '../../services/upload.js';
+import { handleSend } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -54,41 +47,13 @@ app.get('/', async (c) => {
   return ok(c, await listMessages(c.env, viewerFromKey(key, query), query));
 });
 
-app.post('/', async (c) => {
+app.post('/', (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
-  const req = await parseBody(c, internalSendMailSchema);
-  // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
-  if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
-  const idem = await beginIdempotentSend(
-    c.env,
-    { type: 'api_key', id: key.id },
-    c.req.header('Idempotency-Key'),
-    req,
-  );
-  if (idem.kind === 'replay') return ok(c, idem.response, 201);
-  try {
-    const attachments = [...decodeInlineAttachments(req.attachments),
-      ...await resolveDraftAttachments(c.env, key.userId, req.attachmentTokens)];
-    const origin = new URL(c.req.url).origin;
-    const summary = await sendMail(
-      c.env,
-      c.executionCtx,
-      { userId: key.userId, role: key.role },
-      req,
-      attachments,
-      origin,
-      idem.handle,
-    );
-    try { await completeIdempotentSend(c.env, idem.handle, summary); }
-    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
-    try { await consumeDraftAttachments(c.env, key.userId, req.attachmentTokens); }
-    catch (error) { console.error('已发送邮件的草稿回收延迟:', error); }
-    return ok(c, summary, 201);
-  } catch (error) {
-    await failIdempotentSend(c.env, idem.handle, error);
-    throw error;
-  }
+  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, (req) => {
+    // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
+    if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
+  });
 });
 
 /** 标记已读/未读——Agent 处理完邮件后维护状态用（需 mail.write） */
@@ -160,11 +125,16 @@ app.get('/unread-count', async (c) => {
  * 轮询配额在请求开始时按本次最多轮询次数一次性预占（1 次写），结束时退还未用部分，
  * 不再每 2 秒写一次计数；预占超限即拒绝，并发长轮询仍受同一上限约束。
  * from/subjectContains/hasCode 跳过不匹配的新邮件；scannedThroughId 让调用方超时后也能推进游标。
+ * address（最多 20 个）与 domain 收窄范围；include=body 命中时直接返回详情结构，省一次详情请求。
  */
 app.get('/wait', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
-  const query = parseQuery(c, waitMessagesQuerySchema);
+  // 重复的 address 参数（?address=a&address=b）先用逗号合并，与逗号分隔写法走同一校验
+  const addresses = c.req.queries('address');
+  const query = parseQuery(c, {
+    safeParse: (raw) => waitMessagesQuerySchema.safeParse({ ...(raw as Record<string, string>), address: addresses?.join(',') }),
+  });
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
   const signal = c.req.raw.signal;
@@ -186,9 +156,9 @@ app.get('/wait', async (c) => {
       if (signal.aborted) return empty();
       polls++;
       const found = await findNextMessage(c.env, viewer, {
-        afterId: cursor, address: query.address,
+        afterId: cursor, address: query.address, domain: query.domain, include: query.include,
         from: query.from, subjectContains: query.subjectContains, hasCode: query.hasCode,
-      });
+      }, V1_ATTACHMENT_TTL_SECONDS);
       cursor = found.scannedThroughId;
       if (found.message) return ok(c, found);
       const remaining = deadline - Date.now();

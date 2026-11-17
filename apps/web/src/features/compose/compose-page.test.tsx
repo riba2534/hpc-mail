@@ -52,7 +52,7 @@ describe('ComposePage complete delivery',()=>{
     fireEvent.click(await screen.findByRole('button',{name:'继续编辑'}));
     fireEvent.click(screen.getByRole('button',{name:'发送'}));
     await waitFor(()=>expect(mocks.send).toHaveBeenCalledOnce());
-    expect(mocks.send.mock.calls[0]![0]).toMatchObject({from:{mailboxId:10},bcc:['secret@example.com'],html:'<b>saved</b>',attachmentTokens:['saved-token'],replyToMessageId:77,forwardAttachmentsFrom:88});
+    expect(mocks.send.mock.calls[0]![0]).toMatchObject({from:{mailboxId:10},bcc:[{address:'secret@example.com',name:''}],html:'<b>saved</b>',attachmentTokens:[{token:'saved-token'}],replyToMessageId:77,forwardAttachmentsFrom:88});
     expect(localStorage.getItem(draftKeyForUser(1))).toBeNull();
     client.clear();
   });
@@ -109,6 +109,25 @@ describe('ComposePage complete delivery',()=>{
     const client=show({fromAddress:'first@one.example',to:['to@example.com','failed@example.com'],subject:'test',body:'body'});
     fireEvent.click(screen.getByRole('button',{name:'发送'}));
     await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:expect.stringContaining('1 个收件人发送失败')})));
+    client.clear();
+  });
+  it('201 + status unknown：提示先向收件人核对再补发，进入详情页而不是报成功',async()=>{
+    mocks.send.mockResolvedValueOnce({id:23,status:'unknown',errorDetail:'投递结果未确认，可能已送达，补发前先向收件人核对: to@example.com: timeout',
+      recipientOutcomes:[{address:'to@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人的投递结果未确认',
+      description:expect.stringContaining('请先向收件人核对')})));
+    expect(mocks.toast).not.toHaveBeenCalledWith(expect.objectContaining({variant:'success'}));
+    expect(await screen.findByText('mail page')).toBeInTheDocument();
+    client.clear();
+  });
+  it('部分送达、部分失败、部分未确认：标题同时说明失败与未确认',async()=>{
+    mocks.send.mockResolvedValueOnce({id:24,status:'sent',errorDetail:'部分收件人失败',recipientOutcomes:[{address:'to@example.com',status:'sent'},
+      {address:'bad@example.com',status:'failed',error:'rejected'},{address:'slow@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com','bad@example.com','slow@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人发送失败，1 个收件人的投递结果未确认'})));
     client.clear();
   });
 });
@@ -377,6 +396,47 @@ describe('idempotency error codes', () => {
     expect(mocks.send.mock.calls[1]![1]).toBeTruthy();
     expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
     await screen.findByText('sent page');
+    client.clear();
+  });
+
+  it('delivery_failed lists each recipient reason, links to the failed record and sends again with a fresh key', async () => {
+    mocks.send
+      .mockRejectedValueOnce(new ApiError('全部收件人投递失败: to@example.com: destination not verified', {
+        code: 'delivery_failed', httpStatus: 422,
+        details: { messageId: 55, recipientOutcomes: [{ address: 'to@example.com', status: 'failed', error: 'destination not verified' }] },
+      }))
+      .mockResolvedValueOnce({ id: 23, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show(initial);
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('所有收件人都没有收到');
+    expect(alert).toHaveTextContent('to@example.com：destination not verified');
+    expect(screen.getByRole('link', { name: '查看失败记录' })).toHaveAttribute('href', '/mail/55');
+    expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
+    expect(savedKey()).toBeUndefined();
+    const oldKey = mocks.send.mock.calls[0]![1];
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![1]).toBeTruthy();
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
+    client.clear();
+  });
+});
+
+describe('resend of unconfirmed recipients', () => {
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('lists unconfirmed recipients without adding them to the retry', async () => {
+    mocks.send.mockResolvedValue({ id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show({ fromAddress: 'first@one.example', to: ['failed@example.com'], subject: 'retry', body: 'body', mode: 'resend',
+      sourceMessageId: 7, unconfirmed: ['maybe@example.com'] });
+    expect(screen.getByRole('status')).toHaveTextContent('投递结果未确认，可能已经收到，没有自动加入：maybe@example.com');
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].to).toEqual([{ address: 'failed@example.com', name: '' }]);
     client.clear();
   });
 });
