@@ -65,14 +65,14 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 hpc '/identities' | jq '.data'
 # {"identities":[{"kind":"owned","mailboxId":42,"address":"alice@example.org","domain":"example.org","displayName":"Alice","canSend":true,"reason":null},
 #   {"kind":"shared","mailboxId":57,"address":"team@example.org","domain":"example.org","displayName":"","canSend":false,"reason":"shared_readonly"}],
-#  "domains":[]}
+#  "domains":[{"domain":"mydomain.example","kind":"hosted","anyLocalPart":true}]}
 ```
 
 - `identities` 先列自己认领的邮箱（`kind=owned`），再列共享给自己的邮箱（`kind=shared`），各按地址排序。
 - `canSend=true` 的项可以作为发信的 `from`：写 `{mailboxId}`、地址字符串（可加显示名 `"Alice <alice@example.org>"`）或 `{address,name}`，见[邮件参考](mail.md#发件身份)。
 - `canSend=false` 时 `reason` 说明原因：`hosted_sending_not_ready`（托管域名的发信尚未开通，等域名进度里 `steps.sending` 变成 ready）、`hosted_domain_unavailable`（托管域名被暂停、NS 已移走或删除中）、`shared_readonly`（共享邮箱只读，永远不能发信）。用这些地址发信分别返回 400 和 403。
-- `domains` 只对管理员有内容：全部系统域名（`kind:"system"`、`anyLocalPart:true`），管理员可以在这些域名上用任意前缀发信。普通用户为空数组。
-- 管理员凭 `mailboxId` 使用他人邮箱发信的能力不变，但这些邮箱不在 `identities` 里。仍有存量邮箱的旧域名、托管域名上的地址写法也只对管理员开放，不能推断任意外部域名可用。
+- `domains` 列出可以用任意前缀发信的域名（`anyLocalPart:true`）：管理员先得到全部系统域名（`kind:"system"`）；随后是调用者作为**所有者**、已生效且发信就绪的托管域名（`kind:"hosted"`）。在 `kind:"hosted"` 的域名上 `from` 写 `{localPart,domain}` 或 `"Name <任意前缀@该域>"`，未认领的地址发出时自动认领给所有者（不占全站每人认领上限），发件记录和之后的回信都在他名下；地址已被别人（例如域名成员）认领时返回 403。域名成员与共享邮箱不会得到这些项。
+- 管理员凭 `mailboxId` 使用他人邮箱发信的能力不变，但这些邮箱不在 `identities` 里。管理员还可以用仍有存量邮箱的旧域名、任何托管域名上的地址写法；不能推断任意外部域名可用。
 
 ## 批量认领
 

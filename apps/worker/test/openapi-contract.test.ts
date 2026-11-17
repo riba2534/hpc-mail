@@ -566,3 +566,44 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     expect(broken).toEqual([]);
   });
 });
+
+describe('PR4b：回复/转发接口与托管域名任意前缀在 OpenAPI 与文档中一致', () => {
+  it('/v1 有 reply/forward，需要 mail.send+mail.read，请求体严格、错误含 from_required；/api 没有', () => {
+    for (const op of ['reply', 'forward'] as const) {
+      const operation = specs.v1.paths[`/messages/{id}/${op}`]!.post!;
+      expect(operation['x-required-scopes']).toEqual(['mail.send', 'mail.read']);
+      const request = (operation.requestBody as { content: Record<string, { schema: Schema }> }).content['application/json']!.schema;
+      const schema = specs.v1.components.schemas[(request.$ref as string).split('/').pop()!]!;
+      expect(schema.additionalProperties).toBe(false);
+      expect(Object.keys(schema.properties as object)).toEqual(op === 'reply'
+        ? ['replyAll', 'text', 'html', 'quote', 'from', 'attachments', 'attachmentTokens', 'headers']
+        : ['to', 'cc', 'bcc', 'note', 'includeOriginal', 'from']);
+      const responses = operation.responses as Record<string, { description: string }>;
+      expect(responses['400']!.description).toContain('from_required');
+      expect(responses['404']!.description).toContain('source_unavailable');
+      expect(responses).toHaveProperty('201');
+      expect(responses).toHaveProperty('422');
+      expect(specs.api.paths).not.toHaveProperty(`/messages/{id}/${op}`);
+    }
+    const reply = specs.v1.components.schemas.ReplyMessageRequest!.properties as Record<string, Schema>;
+    expect(reply.quote!.default).toBe(true);
+    expect(reply.replyAll!.default).toBe(false);
+    expect((specs.v1.components.schemas.ForwardMessageRequest!.properties as Record<string, Schema>).includeOriginal!.default).toBe(true);
+    const errorCode = ((specs.v1.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).code!;
+    expect(errorCode.enum).toContain('from_required');
+  });
+
+  it('identities 的 domains 有 kind=hosted，发信说明写明托管所有者任意前缀；文档同步', () => {
+    for (const spec of Object.values(specs)) {
+      const domains = (spec.components.schemas.SendIdentities!.properties as Record<string, Schema>).domains!;
+      expect(((domains.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual(['system', 'hosted']);
+      expect(spec.components.schemas.SendMailRequest!.description).toContain('owner of a hosted domain');
+    }
+    expect(mailDoc).toContain('POST /v1/messages/:id/reply');
+    expect(mailDoc).toContain('POST /v1/messages/:id/forward');
+    expect(mailDoc).toContain('kind:"hosted"');
+    expect(errorsDoc).toMatch(/^## from_required$/m);
+    expect(skillDoc).toContain('/reply');
+    expect(mailboxesDoc).toContain('kind:"hosted"');
+  });
+});

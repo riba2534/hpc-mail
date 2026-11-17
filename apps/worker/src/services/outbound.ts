@@ -119,7 +119,11 @@ export interface SendMailInput {
   html?: string;
   replyToMessageId?: number;
   forwardAttachmentsFrom?: number;
+  /** 回复/转发接口已按同一可见口径读过的来源邮件：上面两个 id 指向它时不再重复读取 */
+  verifiedSource?: VerifiedSource;
 }
+
+type VerifiedSource = Pick<typeof messages.$inferSelect, 'id' | 'messageId' | 'inReplyTo' | 'references'>;
 
 interface ResolvedFrom {
   address: string;
@@ -281,8 +285,9 @@ async function loadForwardedAttachments(
   sourceMessageId: number,
   alreadyCount: number,
   alreadyBytes: number,
+  verified?: VerifiedSource,
 ): Promise<StoredAttachment[]> {
-  await loadSourceMessage(env, sender, sourceMessageId, '转发的原邮件不存在或不可见');
+  if (verified?.id !== sourceMessageId) await loadSourceMessage(env, sender, sourceMessageId, '转发的原邮件不存在或不可见');
   const rows = await db
     .select()
     .from(attachmentsTable)
@@ -488,9 +493,11 @@ async function resolveReply(
   env: Env,
   sender: Sender,
   replyToMessageId: number | undefined,
+  verified?: VerifiedSource,
 ): Promise<{ reply: ReplyContext | null; inReplyTo: string | null; references: string }> {
   if (!replyToMessageId) return { reply: null, inReplyTo: null, references: '' };
-  const orig = await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见');
+  const orig = verified?.id === replyToMessageId
+    ? verified : await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见');
   if (!orig.messageId) return { reply: null, inReplyTo: null, references: '' };
   const references = [...new Set([orig.references, orig.inReplyTo, orig.messageId]
     .filter(Boolean).flatMap(value => value!.match(/<[^<>\s]+>/g) ?? []))].join(' ');
@@ -590,7 +597,7 @@ export async function sendMail(
   await assertHostedSendable(env, settings, from.domain);
   if (req.forwardAttachmentsFrom) {
     const forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
-      attachments.length, attachments.reduce((sum, att) => sum + attachmentSize(att), 0));
+      attachments.length, attachments.reduce((sum, att) => sum + attachmentSize(att), 0), req.verifiedSource);
     attachments = [...attachments, ...forwarded];
     const siteOrigin = env.site_origin ?? origin;
     // 补发/重发沿用的正文里有上次注入的下载区块：这些附件会重新带上，先去掉旧区块再判断是否重新注入，
@@ -622,7 +629,7 @@ export async function sendMail(
   const uniqueTargets = [...new Set([...recipients.to, ...recipients.cc, ...recipients.bcc])];
   const externalTargets = uniqueTargets.filter(address => !domains.includes(getEmailDomain(address)));
   const internalTargets = uniqueTargets.filter(address => domains.includes(getEmailDomain(address)));
-  const resolved = await resolveReply(env, sender, req.replyToMessageId);
+  const resolved = await resolveReply(env, sender, req.replyToMessageId, req.verifiedSource);
   // 回复站内邮件由 replyToMessageId 生成线程头；只知道站外 Message-ID 时由 headers 自带（两者互斥由 schema 保证），
   // 同样写进发件行与站内副本，线程才能连上
   const thread = resolved.reply

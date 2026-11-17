@@ -105,7 +105,7 @@ sendProperties.attachmentTokens = { ...sendProperties.attachmentTokens,
   description: 'Completed upload tokens from /uploads: a token string, or {token, contentId?, disposition?} to embed it as an inline image. Tokens are consumed by a finished send.',
   items: { oneOf: [{ ...tokenString, title: 'Token' }, { ...tokenObject, title: 'Token with inline options', properties: { ...tokenFields,
     contentId: { ...tokenFields.contentId, description: contentIdDescription }, disposition: { ...tokenFields.disposition, description: dispositionDescription } } }] } };
-send.description = `At least one recipient across to/cc/bcc; combined maximum ${MAX_RECIPIENTS}. At least one nonempty text/html body; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes. Subject is one line. At most ${MAX_ATTACHMENTS} total attachments, including tokens and source-message attachments, together at most ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB; base64 attachments together at most ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / MIB} MiB, and a request body over ${MAX_SEND_REQUEST_BYTES / MIB} MiB is rejected with 413 before parsing. When external recipients are present and the encoded message would exceed about ${EXTERNAL_MESSAGE_MAX_BYTES / MIB} MiB, attachments are delivered as signed download links valid for 90 days, and cid: images point to those links. Inline images: give an attachment or token a contentId and reference it as cid:<contentId> in html. Sender identity: ordinary users must own the mailbox, whatever form from takes (GET /identities lists those with canSend). Administrators may use any claimed mailbox by mailboxId, or an explicit address on a configured system domain, a removed domain that still has claimed mailboxes, or a hosted domain. Any address on a hosted domain needs that domain’s sending to be ready (400 otherwise); system domains do not. Existing owned mailboxes remain usable when their domain is removed from the new-claim list. Shared mailboxes never grant send permission. A sender that is not allowed returns 403 forbidden with fix and docs. replyToMessageId only adds In-Reply-To/References: recipients, subject and body are not filled in, so use the original replyTo addresses (else fromAddress) from message detail. To reply to mail from outside this site, put its Message-ID into headers In-Reply-To/References instead; giving both returns 400. forwardAttachmentsFrom copies all original attachments and preserves inline CID images. Both source ids must be visible to the sender: mail at an address the sender claimed, or non-deleted inbound mail shared with the sender; administrators may also reference mail at unclaimed addresses. A missing or invisible source, or a forwarded attachment whose stored content is gone, returns 404 source_unavailable; drop replyToMessageId/forwardAttachmentsFrom to send it as a new message. A missing sender mailboxId stays 404 not_found. API keys need mail.read in addition to mail.send when either field is present.`;
+send.description = `At least one recipient across to/cc/bcc; combined maximum ${MAX_RECIPIENTS}. At least one nonempty text/html body; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes. Subject is one line. At most ${MAX_ATTACHMENTS} total attachments, including tokens and source-message attachments, together at most ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB; base64 attachments together at most ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / MIB} MiB, and a request body over ${MAX_SEND_REQUEST_BYTES / MIB} MiB is rejected with 413 before parsing. When external recipients are present and the encoded message would exceed about ${EXTERNAL_MESSAGE_MAX_BYTES / MIB} MiB, attachments are delivered as signed download links valid for 90 days, and cid: images point to those links. Inline images: give an attachment or token a contentId and reference it as cid:<contentId> in html. Sender identity: ordinary users must own the mailbox, whatever form from takes (GET /identities lists those with canSend); the owner of a hosted domain whose sending is ready may also use any unclaimed local part on it (GET /identities domains kind=hosted), and that address is claimed for the owner when sending, without counting toward the per-user claim limit (an address claimed by someone else, such as a member, stays 403). Administrators may use any claimed mailbox by mailboxId, or an explicit address on a configured system domain, a removed domain that still has claimed mailboxes, or a hosted domain. Any address on a hosted domain needs that domain’s sending to be ready (400 otherwise); system domains do not. Existing owned mailboxes remain usable when their domain is removed from the new-claim list. Shared mailboxes never grant send permission. A sender that is not allowed returns 403 forbidden with fix and docs. replyToMessageId only adds In-Reply-To/References: recipients, subject and body are not filled in, so use the original replyTo addresses (else fromAddress) from message detail. API keys can instead call POST /messages/{id}/reply or /forward, which fill them in on the server. To reply to mail from outside this site, put its Message-ID into headers In-Reply-To/References instead; giving both returns 400. forwardAttachmentsFrom copies all original attachments and preserves inline CID images. Both source ids must be visible to the sender: mail at an address the sender claimed, or non-deleted inbound mail shared with the sender; administrators may also reference mail at unclaimed addresses. A missing or invisible source, or a forwarded attachment whose stored content is gone, returns 404 source_unavailable; drop replyToMessageId/forwardAttachmentsFrom to send it as a new message. A missing sender mailboxId stays 404 not_found. API keys need mail.read in addition to mail.send when either field is present.`;
 send.anyOf = [{ required: ['text'], properties: { text: { minLength: 1 } } }, { required: ['html'], properties: { html: { minLength: 1 } } }];
 send['x-max-body-utf8-bytes'] = MAX_BODY_BYTES;
 send['x-max-total-recipients'] = MAX_RECIPIENTS;
@@ -113,6 +113,33 @@ send['x-max-total-attachments'] = MAX_ATTACHMENTS;
 send['x-max-attachment-bytes'] = MAX_ATTACHMENT_TOTAL_BYTES;
 send['x-max-inline-attachment-bytes'] = MAX_INLINE_ATTACHMENT_TOTAL_BYTES;
 send['x-max-request-bytes'] = MAX_SEND_REQUEST_BYTES;
+const composeFrom = { ...sendProperties.from,
+  description: 'Optional, same four forms as POST /messages. Defaults to the address the source message was received at (for your own sent mail, the address it was sent from). When that address is not one you can send from, typically mail in a mailbox shared with you, the request fails with 400 from_required: pick an address from GET /identities.' };
+const replyRequest: Schema = {
+  type: 'object', additionalProperties: false,
+  description: `Recipients, subject (Re: prefix) and the In-Reply-To/References thread headers are computed from the source message; unknown fields such as to or subject return 400 validation_failed (use POST /messages with replyToMessageId to customize them). At least one nonempty text/html; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes including the quote, which is truncated with a note when the original is too long. Attachments follow POST /messages.`,
+  properties: {
+    replyAll: { ...bool, default: false, description: 'false: reply to the source Reply-To addresses, else its sender (for your own sent mail, its To recipients). true: also Cc the other To/Cc recipients, excluding your own addresses; the original Bcc is never included.' },
+    text: sendProperties.text, html: sendProperties.html,
+    quote: { ...bool, default: true, description: 'Append the original below your text: a header (sender, time in UTC, subject) and the original quoted with "> " in text; in html, the original HTML body inside a blockquote (only when you give html).' },
+    from: composeFrom,
+    attachments: sendProperties.attachments, attachmentTokens: sendProperties.attachmentTokens,
+    headers: { ...sendProperties.headers, description: 'Custom headers with the same rules as POST /messages, except In-Reply-To and References, which the server generates (400 validation_failed if given).' },
+  },
+  anyOf: [{ required: ['text'], properties: { text: { minLength: 1 } } }, { required: ['html'], properties: { html: { minLength: 1 } } }],
+};
+const forwardRequest: Schema = {
+  type: 'object', additionalProperties: false, required: ['to'],
+  description: `Subject gets a Fwd: prefix; the note comes first, then (includeOriginal) a forwarded-message header and the original text and HTML. All attachments of the source, including inline CID images, are always attached (same rules as forwardAttachmentsFrom: at most ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB, a lost attachment returns 404 source_unavailable). Unknown fields return 400 validation_failed; use POST /messages with forwardAttachmentsFrom for full control.`,
+  properties: {
+    to: { ...array(ref('MailAddress')), description: `to+cc+bcc hold 1–${MAX_RECIPIENTS} addresses in total.` },
+    cc: { ...array(ref('MailAddress')), default: [] },
+    bcc: { ...array(ref('MailAddress')), default: [], description: 'Never disclosed to other recipients.' },
+    note: { type: 'string', description: 'Your plain-text message above the forwarded content. Required when includeOriginal is false.' },
+    includeOriginal: { ...bool, default: true, description: 'Include the forwarded-message header and the original body.' },
+    from: composeFrom,
+  },
+};
 const domains = fromZod(SETTING_SCHEMAS.domains, 'output');
 const domainEntry = ((domains.properties as Record<string, Schema>).list!.items) as Schema;
 (domainEntry.properties as Record<string, Schema>).domain = domainName;
@@ -207,8 +234,10 @@ export const schemas: Record<string, Schema> = {
       canSend: { ...bool, description: 'Use as from (mailboxId or address) only when true.' },
       reason: { ...nullable(sendIdentityReason), description: 'Why canSend is false; null when it can send.' },
     })), description: 'Caller-owned mailboxes first, then mailboxes shared with the caller, each sorted by address. Administrators may still send from any mailbox by mailboxId; those are not listed.' },
-    domains: { ...array(object({ domain: str, kind: { type: 'string', const: 'system' }, anyLocalPart: { type: 'boolean', const: true } })),
-      description: 'Domains where any local part may be used as from (localPart+domain or "Name <any@domain>"). Only administrators get entries: every configured system domain. Empty for ordinary users.' },
+    domains: { ...array(object({ domain: str,
+      kind: { type: 'string', enum: ['system', 'hosted'], description: 'system: a configured system domain (administrators only); hosted: a hosted domain the caller owns whose sending is ready.' },
+      anyLocalPart: { type: 'boolean', const: true } })),
+      description: 'Domains where any local part may be used as from (localPart+domain or "Name <any@domain>"): every configured system domain for administrators, then hosted domains the caller owns with sending ready. On a hosted domain an unclaimed address is claimed for the owner when sending; an address already claimed by someone else (for example a member) cannot be used. Members of a hosted domain and shared mailboxes get no entries.' },
   }),
   ApiKeySelf: object({
     key: object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: array({ type: 'string', enum: API_SCOPES }),
@@ -346,7 +375,7 @@ export const schemas: Record<string, Schema> = {
     return schema;
   })(),
   AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),
-  SendMailRequest: send, MailAddress: mailAddress,
+  SendMailRequest: send, MailAddress: mailAddress, ReplyMessageRequest: replyRequest, ForwardMessageRequest: forwardRequest,
   ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
   MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
@@ -412,7 +441,7 @@ export function sendMailOperation(scope?: string): Operation {
   const keyScopes = scope
     ? ` API keys need ${scope}; replyToMessageId or forwardAttachmentsFrom additionally require mail.read (403 without it).` : '';
   const base = operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope, status: 201, parameters: [idempotencyHeader],
-    description: `HTTP 201 means at least one recipient succeeded: status is sent or delivered (or unknown when replaying an interrupted send). Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient was attempted and rejected the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. There is no separate reply or forward endpoint (POST /messages/{id} does not exist): set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
+    description: `HTTP 201 means at least one recipient succeeded: status is sent or delivered (or unknown when replaying an interrupted send). Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient was attempted and rejected the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. ${scope ? 'To let the server fill in recipients, subject and quote, use POST /messages/{id}/reply or /forward instead. Here' : 'There is no separate reply or forward endpoint (POST /messages/{id} does not exist):'} set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
   const error = (description: string) => ({ description, content: { 'application/json': { schema: ref('Error') } } });
   return { ...base,
     responses: { ...(base.responses as Record<string, unknown>),
@@ -424,6 +453,23 @@ export function sendMailOperation(scope?: string): Operation {
       500: error('internal: the server failed before every recipient was attempted. Retry the identical request with the same Idempotency-Key to fetch the result: it may be 201, or 422 delivery_failed whose recipientOutcomes show recipients that were never attempted.'),
     },
     ...(scope ? { 'x-conditional-scopes': [{ scope: 'mail.read', when: 'replyToMessageId or forwardAttachmentsFrom is present' }] } : {}) };
+}
+/** POST /v1/messages/{id}/reply 与 /forward：结果、幂等与错误同发信，另有 from_required */
+export function composeOperation(op: 'reply' | 'forward'): Operation {
+  const send = sendMailOperation('mail.send');
+  const base = operation(op === 'reply' ? 'Reply to a message' : 'Forward a message with its attachments', ref('MessageSummary'), {
+    request: op === 'reply' ? 'ReplyMessageRequest' : 'ForwardMessageRequest', status: 201, parameters: [idempotencyHeader],
+    description: `${op === 'reply'
+      ? 'Replies to the visible message {id}: the server picks the recipients, adds Re: to the subject, sets In-Reply-To/References and by default quotes the original below your text.'
+      : 'Forwards the visible message {id}: subject gets Fwd:, your note comes first, the original header and body follow (includeOriginal), and every original attachment is attached.'} The source must be visible to the key owner like GET /messages/{id} (claimed addresses, non-deleted inbound mail shared with you, and for administrators unclaimed addresses); otherwise 404 source_unavailable. from defaults to the address the source was received at; mail in a mailbox shared with you needs an explicit from (400 from_required otherwise). Results, partial failure, 422 delivery_failed and the Idempotency-Key behave exactly like POST /messages; a replay returns the original result even if the source was deleted since. Needs both mail.send and mail.read.` });
+  const error = (description: string) => ({ description, content: { 'application/json': { schema: ref('Error') } } });
+  return { ...base, 'x-required-scopes': ['mail.send', 'mail.read'],
+    responses: { ...(send.responses as Record<string, unknown>),
+      201: (base.responses as Record<string, unknown>)[201],
+      400: error('validation_failed (unknown fields, empty body, invalid recipients, In-Reply-To/References in reply headers, or no recipient left to reply to), header_not_allowed, or from_required: the default sender (the address the source was received at) is not one you can send from, so give from.'),
+      403: error('forbidden: the API key lacks mail.send or mail.read, or the explicit from is not allowed (fix points to GET /identities).'),
+      404: error('source_unavailable: the source message does not exist or is not visible to you, or (forward) one of its attachments is gone.'),
+    } };
 }
 export function describePaths(paths: Paths, namespace = ''): Paths {
   return Object.fromEntries(Object.entries(paths).map(([path, methods]) => [path, {
@@ -464,7 +510,7 @@ export function usedSchemas(paths: Paths): Record<string, Schema> {
   visit(paths);
   return Object.fromEntries([...names].sort().map(name => [name, schemas[name]! ]));
 }
-export const identitiesDescription = 'Which addresses the caller can send from. identities lists caller-owned mailboxes (kind=owned) with canSend and reason, then mailboxes shared with the caller (kind=shared, always canSend=false, reason=shared_readonly). Use a canSend=true entry as from (mailboxId or address). domains lists system domains where any local part may be used; only administrators get entries. Administrators may still send from any claimed mailbox by mailboxId; those are not listed.';
+export const identitiesDescription = 'Which addresses the caller can send from. identities lists caller-owned mailboxes (kind=owned) with canSend and reason, then mailboxes shared with the caller (kind=shared, always canSend=false, reason=shared_readonly). Use a canSend=true entry as from (mailboxId or address). domains lists domains where any local part may be used: system domains for administrators (kind=system) and hosted domains the caller owns with sending ready (kind=hosted, the address is claimed for the owner when sending). Administrators may still send from any claimed mailbox by mailboxId; those are not listed.';
 /** 批量认领、批量可用性与随机后缀方案：会话与 API Key 两套接口同形，API Key 另需 scope */
 export function mailboxBatchPaths(scopes?: { read: string; write: string }): Paths {
   return {

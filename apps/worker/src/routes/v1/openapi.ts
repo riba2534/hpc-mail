@@ -1,6 +1,6 @@
 import { MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, identitiesDescription, int, listQuery,
+  array, bool, changed, claimStrategy, clientRequestIdRule, composeOperation, describePaths, domainName, identitiesDescription, int, listQuery,
   mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths,
   usedSchemas, type Paths,
 } from '../openapi-common.js';
@@ -40,6 +40,8 @@ export function buildOpenApiSpec(origin: string) {
         description: 'Descending cursor pagination. Use nextCursor exactly as returned; null ends the page stream. Shared inboxes only add non-trash inbound visibility. afterId supports incremental polling, but process all relevant results before advancing. unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt.' }),
       post: sendMailOperation('mail.send'),
     },
+    '/messages/{id}/reply': { post: composeOperation('reply') },
+    '/messages/{id}/forward': { post: composeOperation('forward') },
     '/messages/wait': { get: operation('Wait for the earliest new incoming message matching optional filters', object({
       message: { anyOf: [ref('MessageSummary'), ref('MessageDetail'), { type: 'null' }],
         description: 'The matching message: a MessageSummary, or with include=body a MessageDetail (same as GET /messages/{id}); null on timeout.' },

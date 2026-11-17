@@ -69,6 +69,8 @@ export const ERROR_CODES = [
   'header_not_allowed',
   /** 全部收件人被明确拒收，没有任何一份投递成功：422，details 带发件行 id 与逐收件人结果；同 Key 重放返回同样的错误 */
   'delivery_failed',
+  /** 回复/转发没给 from，而原信的收件地址不是调用者可用的发件身份（如共享给你的邮箱）：400，在 from 指定自己的地址 */
+  'from_required',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -94,5 +96,6 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   source_unavailable: 404,
   header_not_allowed: 400,
   delivery_failed: 422,
+  from_required: 400,
   internal: 500,
 };

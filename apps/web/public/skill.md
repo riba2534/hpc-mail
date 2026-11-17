@@ -65,18 +65,16 @@ hpc '/messages' -X POST -H 'Content-Type: application/json' -H "Idempotency-Key:
 
 ### ③ 回复与转发
 ```bash
-# 没有单独的回复端点（POST /messages/:id 是 404）：读原信，自己填收件人和主题，再按配方②换新 Key 发送
-hpc "/messages/$MSG_ID" > "$WORK/orig.json"
-jq --arg from "$FROM" --arg text '回复正文' '.data as $m | {from:$from,
-  to:(if ($m.replyTo | length) > 0 then $m.replyTo else [$m.fromAddress] end),
-  subject:(if ($m.subject | test("^re:"; "i")) then $m.subject else "Re: " + $m.subject end),
-  text:$text, replyToMessageId:$m.id}' "$WORK/orig.json" > "$WORK/send.json"
+# 服务器按原信填收件人、Re:/Fwd: 主题、线程头与原文引用；需要 mail.send 与 mail.read，Idempotency-Key 同配方②
+hpc "/messages/$MSG_ID/reply" -X POST -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY" \
+  --data "$(jq -n --arg text '回复正文' '{text:$text, replyAll:false}')" | jq '.data | {id,status,recipientOutcomes}'
+hpc "/messages/$MSG_ID/forward" -X POST -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY2" \
+  --data "$(jq -n '{to:["bob@example.net"], note:"请看下面这封"}')" | jq '.data | {id,status,recipientOutcomes}'
 ```
 
-- `replyToMessageId` 只写入线程头。回复全部时从原信 `recipients.to/cc` 重新计算收件人，去掉自己的地址，不要带上原 Bcc。
-- 回复外部邮件（原信不在本站，只知道对方的 Message-ID）：不写 `replyToMessageId`，改写 `headers:{"In-Reply-To":"<id@example.net>","References":"<root@example.net> <id@example.net>"}`。两者同时给返回 400。
-- 转发：自己写新的 `to`、`Fwd: ` 主题和正文（需要原文就自己引用 `bodyText/bodyHtml`），加 `forwardAttachmentsFrom: <原邮件 id>` 复制原附件和内嵌图。
-- 带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时 Key 还需要 `mail.read`。来源可以是自己地址的邮件或共享给你的未删除来信；不存在、看不到或原附件已丢失返回 404 `source_unavailable`，去掉该字段即可作为新邮件发送。发件人仍须是自己的地址。
+- 回复默认回给原信 `replyTo`（没有时回发件人）；`replyAll:true` 另抄送原 To/Cc 里的其他人，去掉你自己，从不带原 Bcc；`quote` 默认附原文引用，`text`/`html` 至少一个。转发时 `note` 在前，`includeOriginal` 默认附原文，原附件总会带上。
+- `from` 缺省用原信的收件地址；原信在共享给你的邮箱里时返回 400 `from_required`，在 `from` 写自己的地址即可。来源看不到或原附件已丢失返回 404 `source_unavailable`。
+- 要自己定收件人、主题或正文时用配方②，带 `replyToMessageId`（只写线程头）或 `forwardAttachmentsFrom`（复制原附件和内嵌图），同样需要 `mail.read`。回复站外邮件（只知道对方 Message-ID）：不写 `replyToMessageId`，改写 `headers:{"In-Reply-To":"<id@example.net>","References":"<root@example.net> <id@example.net>"}`，两者同时给返回 400。
 
 ### ④ 附件与内联图片
 ```bash
@@ -124,9 +122,9 @@ SINCE=$MAX   # 所有页处理完才推进基线
 ## 身份与权限模型
 
 1. 登录用户名不是邮箱地址。一个账户可以认领多个 `localPart@domain`，邮件按完整地址归属；认领即可看到该地址的全部历史，包括认领之前收到的。
-2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
+2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。自己拥有的托管域名发信就绪后可用任意前缀（`/identities` 的 `domains` 里 `kind:"hosted"`），发出时自动认领。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
 3. 共享给你的地址（`kind=shared`，`reason=shared_readonly`）只读：可读来信、设个人星标、作为回复或转发的来源；不能发信、删除、标记已读或释放。已读状态属于所有者，未读数与 `unread=1` 只统计自己认领的地址。
-4. 管理员可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 列出可用任意前缀发信的系统域名；不能推断任意外部域名可用。
+4. 管理员可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 另列出可用任意前缀发信的系统域名（`kind:"system"`）；不能推断任意外部域名可用。
 5. scope：`mail.read` 读邮件、等待、下载附件；`mail.write` 标记已读、星标、删除与恢复；`mail.send` 发信与上传附件；`mailbox.read` 查看邮箱、可用性与随机后缀；`mailbox.write` 认领（含批量）、改显示名、释放。`/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
 6. 管理员的列表默认也只看自己的邮箱：未认领地址用 `scope=unclaimed`，只读审阅某个用户用 `scope=user&userId=`。
 7. Key 不能用于 `/api`，也不能管理 Key、改密码、配置通知或托管域名。用户改密码时默认吊销本人全部 Key，管理员重置密码时一律吊销；之后这些 Key 返回 401。
@@ -141,7 +139,8 @@ SINCE=$MAX   # 所有页处理完才推进基线
 | 等新邮件、验证码、验证链接 | `GET /messages/wait` | `mail.read` | [mail](references/mail.md#等待本次验证码) |
 | 详情、线程、原始 .eml、未读数、联系人 | `GET /messages/:id`、`GET /messages/:id/thread`、`GET /messages/:id/raw`、`GET /messages/unread-count`、`GET /messages/contacts` | `mail.read` | [mail](references/mail.md) |
 | 已读、全部已读、星标、删除、恢复、永久删除 | `POST /messages/read\|read-all\|star\|delete\|restore\|purge` | `mail.write` | [mail](references/mail.md#维护状态与回收站) |
-| 发信、回复、转发、补发 | `POST /messages` | `mail.send`（回复、转发另需 `mail.read`） | [mail](references/mail.md#发送) |
+| 发信、补发（可带回复/转发字段） | `POST /messages` | `mail.send`（带回复、转发字段另需 `mail.read`） | [mail](references/mail.md#发送) |
+| 回复、转发（服务器填收件人、主题与引用） | `POST /messages/:id/reply`、`POST /messages/:id/forward` | `mail.send` + `mail.read` | [mail](references/mail.md#回复和转发) |
 | 下载附件 | `GET /messages/:id/attachments/:attId` | `mail.read` | [attachments](references/attachments.md) |
 | 上传附件、分片、取消 | `POST /uploads`、`POST /uploads/multipart`、`DELETE /uploads/:token` | `mail.send` | [attachments](references/attachments.md) |
 | 我的邮箱、共享给我的、可用性、随机后缀 | `GET /mailboxes`、`GET /mailboxes/shared`、`GET /mailboxes/availability`、`POST /mailboxes/availability/batch`、`GET /mailboxes/random-plan` | `mailbox.read` | [mailboxes](references/mailboxes-and-domains.md) |

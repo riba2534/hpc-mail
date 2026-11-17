@@ -49,7 +49,11 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 ## source_unavailable
 
-`replyToMessageId` 或 `forwardAttachmentsFrom` 引用的原邮件不存在、不可见，或附件已丢失（HTTP 404）。去掉这个字段后可以作为新邮件发送，丢失的附件需要重新附上。回复站外邮件不用 `replyToMessageId`，改在 `headers` 里写 `In-Reply-To`/`References`。
+`replyToMessageId` 或 `forwardAttachmentsFrom` 引用的原邮件、或回复/转发接口路径里的原邮件不存在、不可见，或附件已丢失（HTTP 404）。去掉这个字段（或改用普通发送）后可以作为新邮件发送，丢失的附件需要重新附上。回复站外邮件不用 `replyToMessageId`，改在 `headers` 里写 `In-Reply-To`/`References`。
+
+## from_required
+
+回复或转发没给 `from`，而缺省的发件地址——原信的收件地址——不是你能用的发件身份（HTTP 400 `from_required`），典型情况是原信在别人共享给你的邮箱里。在请求的 `from` 写自己的地址（写法同普通发送），先调 `GET /v1/identities` 从 `canSend=true` 的项里选。显式给了 `from` 但无权使用时是 403 `forbidden`，见 [forbidden-sender](#forbidden-sender)。
 
 ## delivery_failed
 
