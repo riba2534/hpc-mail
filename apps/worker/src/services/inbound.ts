@@ -261,7 +261,7 @@ async function receiveInbound(
   if (settings.code_extract.enabled) {
     code = extractCodeByRegex(subject, body.plain);
     if (!code) {
-      codeBody = codeScanBody(text, html, body.plain);
+      codeBody = codeScanBody(text, html, body);
       if (codeBody !== body.plain) code = extractCodeByRegex(subject, codeBody);
     }
     verificationLink = extractVerificationLink({ subject, text, html, fromAddress });
