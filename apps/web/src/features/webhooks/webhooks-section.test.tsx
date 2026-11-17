@@ -16,7 +16,8 @@ const mocks = vi.hoisted(() => ({
   update: vi.fn(),
   toast: vi.fn(),
 }));
-vi.mock('@/api/resources', () => ({
+vi.mock('./webhooks-api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./webhooks-api')>()),
   webhookApi: { list: mocks.list, create: mocks.create, test: mocks.test, update: mocks.update, remove: vi.fn(), rotateSecret: vi.fn(),
     deliveries: vi.fn(async () => ({ items: [], nextCursor: null })), retry: vi.fn() },
 }));

@@ -321,7 +321,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
   const queryClient = useQueryClient();
   const isAdmin = user.role === 'admin';
   const { data: visibleDomains } = useDomains();
-  const { data: mailboxes } = useMailboxesQuery(false);
+  const { data: mailboxes } = useMailboxesQuery();
   const hostedDomains = useHostedSendDomains();
   // 可用任意前缀的域名：管理员是系统域名加自己的托管域名，普通用户只有自己的托管域名
   const customDomains = useMemo(

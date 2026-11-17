@@ -86,7 +86,7 @@ export function DraftsPage() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const statusFilter = parseFilter(params.get('status'));
-  const { data: mailboxes } = useMailboxesQuery(false);
+  const { data: mailboxes } = useMailboxesQuery();
   const { data, isLoading, isError, error, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
     queryKey: draftKeys.list(statusFilter),
     queryFn: ({ pageParam, signal }) =>

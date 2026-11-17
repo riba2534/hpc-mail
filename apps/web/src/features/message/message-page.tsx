@@ -156,7 +156,7 @@ export function MessagePage() {
     return () => controller.abort();
   }, []);
 
-  const { data: ownedMailboxes } = useMailboxesQuery(false);
+  const { data: ownedMailboxes } = useMailboxesQuery();
   const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
     ...messageDetailQueryOptions(messageId, view),
     enabled: Number.isInteger(messageId) && messageId > 0,

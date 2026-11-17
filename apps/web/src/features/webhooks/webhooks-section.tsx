@@ -10,8 +10,6 @@ import {
   type WebhookEventType,
 } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
-import { webhookApi } from '@/api/resources';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -25,6 +23,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
+import { webhookApi, webhookKeys } from './webhooks-api';
 
 export const EVENT_LABELS: Record<WebhookEventType, string> = {
   'mail.received': '收到新邮件',
@@ -54,7 +53,7 @@ function CreateEndpointDialog({ open, onOpenChange }: { open: boolean; onOpenCha
     mutationFn: webhookApi.create,
     onSuccess: (data) => {
       setCreated(data);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.root });
+      void queryClient.invalidateQueries({ queryKey: webhookKeys.list });
     },
     onError: (err) => setError(errorText(err, '创建失败，请重试')),
   });
@@ -148,12 +147,13 @@ function CreateEndpointDialog({ open, onOpenChange }: { open: boolean; onOpenCha
 /** 最近投递：失败的可以手动重试一次 */
 function Deliveries({ endpoint }: { endpoint: WebhookEndpoint }) {
   const queryClient = useQueryClient();
-  const deliveries = useQuery({ queryKey: queryKeys.webhooks.deliveries(endpoint.id), queryFn: () => webhookApi.deliveries(endpoint.id) });
+  const deliveries = useQuery({ queryKey: webhookKeys.deliveries(endpoint.id), queryFn: () => webhookApi.deliveries(endpoint.id) });
   const retry = useMutation({
     mutationFn: (deliveryId: number) => webhookApi.retry(endpoint.id, deliveryId),
     onSuccess: () => {
       toast({ title: '已重新投递', variant: 'success' });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.root });
+      void queryClient.invalidateQueries({ queryKey: webhookKeys.deliveries(endpoint.id) });
+      void queryClient.invalidateQueries({ queryKey: webhookKeys.list });
     },
     onError: (err) => toast({ title: errorText(err, '重试失败'), variant: 'error' }),
   });
@@ -185,7 +185,8 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
   const [showDeliveries, setShowDeliveries] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
-  const refresh = () => queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.root });
+  // 启停、轮换、删除只改端点本身：重拉端点列表，其他端点已展开的投递记录不受影响
+  const refresh = () => queryClient.invalidateQueries({ queryKey: webhookKeys.list });
 
   const toggle = useMutation({
     mutationFn: () => webhookApi.update(endpoint.id, { enabled: endpoint.status !== 'active' }),
@@ -270,7 +271,7 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
 /** 个人设置里的 Webhook v2 端点管理 */
 export function WebhooksSection({ id }: { id: string }) {
   const [createOpen, setCreateOpen] = useState(false);
-  const endpoints = useQuery({ queryKey: queryKeys.webhooks.list, queryFn: webhookApi.list });
+  const endpoints = useQuery({ queryKey: webhookKeys.list, queryFn: webhookApi.list });
 
   return (
     <section id={id} tabIndex={-1} className="flex scroll-mt-20 flex-col gap-4 rounded-lg border border-line bg-surface p-5 focus:outline-none">

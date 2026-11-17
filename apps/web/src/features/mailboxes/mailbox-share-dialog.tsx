@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { Mailbox, MailboxShareGrant } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
@@ -11,6 +11,7 @@ import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@
 import { Input } from '@/components/ui/input';
 import { toast } from '@/components/ui/toast';
 import { compareText } from '@/lib/sort';
+import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 function errorText(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.message : fallback;
@@ -39,11 +40,7 @@ export function MailboxShareDialog({
     [grants],
   );
   const normalized = userQuery.trim().toLowerCase();
-  const [debounced, setDebounced] = useState('');
-  useEffect(() => {
-    const timer = globalThis.setTimeout(() => setDebounced(normalized), 250);
-    return () => globalThis.clearTimeout(timer);
-  }, [normalized]);
+  const debounced = useDebouncedValue(normalized, 250);
   const matches = useQuery({
     queryKey: queryKeys.mailboxes.shareUsers(debounced, current?.ownerUserId),
     queryFn: ({ signal }) => mailboxApi.searchShareUsers(debounced, current?.ownerUserId, signal),

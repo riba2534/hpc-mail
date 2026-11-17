@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { MoreHorizontal, Network, Search } from 'lucide-react';
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import { type ReactNode, useCallback, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import type { HostedDomain, HostedDomainsHealth, HostedDomainStatus } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -32,6 +32,7 @@ import {
 import { adminHostedDomainApi } from '@/features/hosted-domains/hosted-domains-api';
 import { storeHostedDomain } from '@/features/hosted-domains/use-hosted-domains';
 import { LoadMoreFooter } from '../load-more-footer';
+import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 const ALL_STATUSES = 'all';
 /** 每页条数（服务端上限 200） */
@@ -146,12 +147,8 @@ export function AdminHostedDomainsPage() {
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<HostedDomainStatus | typeof ALL_STATUSES>(ALL_STATUSES);
   const [search, setSearch] = useState('');
-  const [debounced, setDebounced] = useState('');
+  const debounced = useDebouncedValue(search.trim().toLowerCase(), 250);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
-  useEffect(() => {
-    const timer = globalThis.setTimeout(() => setDebounced(search.trim().toLowerCase()), 250);
-    return () => globalThis.clearTimeout(timer);
-  }, [search]);
 
   const filters = { status: status === ALL_STATUSES ? undefined : status, q: debounced || undefined };
   const {
