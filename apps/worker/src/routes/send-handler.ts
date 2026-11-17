@@ -26,14 +26,14 @@ export async function handleSend(
   c: Context<AppContext>,
   actor: IdempotencyActor,
   sender: Sender,
-  authorize?: (req: InternalSendMailRequest) => void,
+  authorize?: (req: InternalSendMailRequest) => void | Promise<void>,
 ): Promise<Response> {
   // 解析前拦下超大请求体：JSON 解析、幂等哈希、base64 解码会同时持有好几份内容
   if (Number(c.req.header('Content-Length')) > MAX_SEND_REQUEST_BYTES) {
     throw new AppError('payload_too_large', `发信请求体超过 ${MAX_SEND_REQUEST_BYTES / 1024 / 1024}MB 上限`);
   }
   const req = await parseBody(c, internalSendMailSchema);
-  authorize?.(req);
+  await authorize?.(req);
   const idem = await beginIdempotentSend(c.env, actor, c.req.header('Idempotency-Key'), sendRequestFingerprint(req));
   if (idem.kind === 'replay') {
     // 全部收件人失败的结果重放时与首次一样是 422；部分失败、unknown 等仍是 201

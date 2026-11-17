@@ -3,6 +3,7 @@ import { createApiKeyRequestSchema, updateApiKeyRequestSchema } from '@hpc-mail/
 import { Hono } from 'hono';
 import { ok, parseBody, parseId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
+import { verifyReauthPassword } from '../services/reauth.js';
 import {
   createApiKey,
   getApiKey,
@@ -24,9 +25,11 @@ app.get('/', async (c) => {
 
 app.post('/', async (c) => {
   const user = c.get('user')!;
-  const req = await parseBody(c, createApiKeyRequestSchema);
+  const { password, ...req } = await parseBody(c, createApiKeyRequestSchema);
+  // 先重新验证密码：拿到会话令牌的人不能静默创建一把改密前就存在、之后也收不回的 Key
+  await verifyReauthPassword(c.env, user.id, password);
   // 带上令牌的鉴权版本：改密后仍在途的旧令牌请求不能再插入新 Key
-  return ok(c, await createApiKey(c.env, user.id, req, c.get('authEpoch')), 201);
+  return ok(c, await createApiKey(c.env, user.id, req, c.get('authEpoch'), user.role), 201);
 });
 
 app.get('/:id', async (c) => {
@@ -52,7 +55,7 @@ app.put('/:id', async (c) => {
   const user = c.get('user')!;
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, updateApiKeyRequestSchema);
-  return ok(c, await updateApiKey(c.env, id, req, user.id));
+  return ok(c, await updateApiKey(c.env, id, req, user.id, user.role));
 });
 
 app.delete('/:id', async (c) => {

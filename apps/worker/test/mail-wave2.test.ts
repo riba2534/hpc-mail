@@ -1,5 +1,5 @@
 import {
-  API_SCOPES, DEFAULT_SETTINGS, type CreatedApiKey, type ListMessagesQuery, type MessageDetail, type MessageSummary, type Settings,
+  DEFAULT_SETTINGS, type CreatedApiKey, type ListMessagesQuery, type MessageDetail, type MessageSummary, type Settings,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq, inArray, sql } from 'drizzle-orm';
@@ -15,6 +15,7 @@ import { enqueueMailNotifications, processNotificationJobs } from '../src/servic
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { createSession } from '../src/services/session.js';
 import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 
 const app = createApp();
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -51,10 +52,12 @@ async function baseSettings(patch: Partial<Settings> = {}) {
 async function account(prefix: string, role: 'admin' | 'user' = 'user') {
   const username = `${prefix}-${rand()}`;
   const [user] = await createDb(env).insert(users)
-    .values({ username, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+    .values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`, scopes: [...API_SCOPES], rateLimit: 120 })), 201);
+  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`, scopes: USER_SCOPES, rateLimit: 120, password: TEST_PASSWORD })), 201);
+  // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope）
+  if (role === 'admin') await grantLegacyAdminScope(env, key.id);
   return { id: user!.id, jwt, key: key.key };
 }
 

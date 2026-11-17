@@ -141,11 +141,12 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/api-keys': {
       get: operation('List own API keys without plaintext secrets', array(ref('ApiKeySummary'))),
       post: operation('Create an API key', ref('CreatedApiKey'), { request: 'CreateApiKeyRequest', status: 201,
-        description: 'The full key is returned only once. Scopes limit /v1 operations, never grant administrator/JWT-only permissions, and are additionally bounded by the owner role and mailbox visibility.' }),
+        description: 'Requires the current password (password); missing returns 403 reauth_required, wrong returns 403 reauth_failed. The full key is returned only once. Scopes limit /v1 operations and never grant JWT-only functions (account settings, mail forwarding targets, 2FA, key management, administration). allowedMailboxIds/allowedDomains restrict the key to those mailboxes or domains; ids must be mailboxes the caller owns. The admin scope can only be granted by administrators and requires allowedIps plus an expiresAt at most 90 days ahead (400 otherwise; 403 for non-administrators); only with it does an administrator key act as administrator.' }),
     },
     '/api-keys/{id}': {
       get: operation('Read own API key metadata', ref('ApiKeySummary')),
-      put: operation('Update own API key limits/scopes/status', ref('ApiKeySummary'), { request: 'UpdateApiKeyRequest' }),
+      put: operation('Update own API key limits/scopes/status', ref('ApiKeySummary'), { request: 'UpdateApiKeyRequest',
+        description: 'Only supplied fields change; allowedMailboxIds/allowedDomains replace the whole list. When scopes, allowedIps or expiresAt change, the resulting key is validated against the admin scope rules (allowlist and at most 90 days); renaming or disabling an existing key is not.' }),
       delete: operation('Revoke own API key', success),
     },
     '/api-keys/{id}/logs': { get: operation('Read own API key audit logs', page(ref('ApiRequestLog')), { parameters: pageQuery,

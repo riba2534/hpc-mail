@@ -4,7 +4,7 @@
 
 - [请求约定](#请求约定)：成功与错误信封（`fix`、`docs`、`details`）、分页、请求头、CORS
 - [登录与 bootstrap](#登录与-bootstrap)：JWT 登录、两步验证、账户接口
-- [Key-only 与长期自动化](#key-only-与长期自动化)：scopes、`/v1/me` 自查、创建与管理 API Key
+- [Key-only 与长期自动化](#key-only-与长期自动化)：scopes、限定邮箱或域名、admin scope、`/v1/me` 自查、创建与管理 API Key
 - [错误与限流](#错误与限流)：常见错误码的处理与各级限流；逐个错误码的改正方法见[错误码说明](errors.md)
 
 ## 请求约定
@@ -69,7 +69,7 @@ hpc '/auth/me'
 
 ## Key-only 与长期自动化
 
-已有 `hpcm_` Key 可直接访问 `/v1`，无需 bootstrap 登录。Key 的所属用户当前角色、状态、邮箱归属/共享仍决定访问权；scopes 不是管理员权限。系统关闭开放 API、Key 被禁用/吊销/过期、来源 IP 不匹配均会拒绝；已吊销的 Key 与不存在的 Key 一样返回 401 `unauthorized`。用户改密码（默认）或管理员重置该用户密码时，其全部 Key 被吊销，需要重新创建。Key 不能创建 Key、改密码、配置个人通知或管理用户/域名/共享。
+已有 `hpcm_` Key 可直接访问 `/v1`，无需 bootstrap 登录。Key 的所属用户当前状态、邮箱归属/共享仍决定访问权。系统关闭开放 API、Key 被禁用/吊销/过期、来源 IP 不匹配均会拒绝；已吊销的 Key 与不存在的 Key 一样返回 401 `unauthorized`。用户改密码（默认）或管理员重置该用户密码时，其全部 Key 被吊销，需要重新创建。Key 不能创建 Key、改密码、开关两步验证、修改邮箱转发目标或管理用户与系统设置。
 
 | Scope | 能力 |
 |---|---|
@@ -78,6 +78,15 @@ hpc '/auth/me'
 | `mail.send` | 发信及独立附件上传/取消上传；发件身份 `GET /v1/identities` |
 | `mailbox.read` | 自有/共享邮箱列表、地址可用性（含批量）、随机后缀方案；发件身份 `GET /v1/identities` |
 | `mailbox.write` | 认领（含批量）、邮箱显示名、释放及可选清除历史 |
+| `mailbox.share` | 管理自己邮箱的共享（只按 userId，不提供用户搜索） |
+| `webhook.write` | 管理 Webhook v2 端点、测试发送、查看与重试投递，见 [Webhook](webhooks.md) |
+| `notify.read` | 读取个人通知配置（飞书、PushDeer、通用 Webhook；转发目标只读）与投递健康 |
+| `notify.write` | 修改飞书、PushDeer、通用 Webhook 并发送测试；邮箱转发目标只能网页会话修改 |
+| `admin` | 管理员能力开关，见下文 |
+
+**管理员能力要显式授予。** 只有所属用户是管理员、且 Key 带 `admin` scope 时，这把 Key 才按管理员执行（`scope=unclaimed/user`、`all=1`、用任意 `mailboxId` 或系统域名任意前缀发信、不受外发配额）；没有它的管理员 Key 与普通用户完全一样。`admin` 只有管理员能授予，且必须同时设置 `allowedIps` 与不超过 90 天的 `expiresAt`（否则 400；普通用户授予 403）。升级前已存在的管理员 Key 已自动带上 `admin`，照常可用；之后修改它的 scopes、白名单或有效期时按新规则校验。`GET /v1/me` 的 `key.effectiveRole` 是这把 Key 实际的执行角色。
+
+**限定邮箱或域名。** `allowedMailboxIds`（认领行 id，来自 `GET /api/mailboxes`）与 `allowedDomains` 都为空表示不限；否则地址的域名在 `allowedDomains` 中，或该地址当前认领行的 id 在 `allowedMailboxIds` 中，才在范围内。范围外的邮件在列表、等待、未读数、联系人里不出现，按 id 读取返回 404，批量标记、删除静默跳过；请求里显式给出范围外的 `address`、`domain`、发件地址、回复或转发来源、邮箱 id 返回 403 `forbidden`（文档锚点 [key-restricted](errors.md#key-restricted)）。只限定了邮箱的 Key 不能认领新地址，`GET /v1/domains` 为空；限定了域名的 Key 只能在这些域名认领，新地址立即可用。释放后重新认领同一地址会得到新 id，旧 Key 不再覆盖它。限定了范围的 Key 不能修改通知配置；Webhook 端点必须带落在范围内的地址或域名过滤；共享只能管理范围内的邮箱；随机后缀方案不可用。只给某个 Agent 一个地址时，用限定邮箱的 Key。
 
 `GET /v1/identities` 有 `mail.send` 或 `mailbox.read` 其中之一即可，返回能用哪些地址发信，见[发件身份](mailboxes-and-domains.md#发件身份)。
 
@@ -86,24 +95,26 @@ hpc '/auth/me'
 ```bash
 hpc '/me' | jq '.data'
 # {"key":{"id":7,"name":"agent","keyPrefix":"hpcm_1a2b","keySuffix":"9f0e","scopes":["mail.read","mail.send"],"rateLimit":120,
-#   "allowedIps":[],"expiresAt":null,"createdAt":"…"},"user":{"id":3,"username":"alice","role":"user"},
+#   "allowedIps":[],"expiresAt":null,"createdAt":"…","allowedMailboxIds":[42],"allowedDomains":[],"effectiveRole":"user"},
+#  "user":{"id":3,"username":"alice","role":"user"},
 #  "limits":{"userRequestsPerMinute":1200,"waitPollsPerMinute":120},
 #  "outbound":{"sent":4,"recipients":9,"dailyLimit":50,"dailyRecipientLimit":200,"exempt":false,"resetsAt":"2026-11-18T00:00:00.000Z"}}
 ```
 
-- `key`：当前 Key 的元数据（不含明文），`rateLimit` 是这把 Key 每分钟请求上限；`id` 也是幂等记录的隔离单位。
+- `key`：当前 Key 的元数据（不含明文），`rateLimit` 是这把 Key 每分钟请求上限；`id` 也是幂等记录的隔离单位；`allowedMailboxIds/allowedDomains` 是限定范围，`effectiveRole` 是执行角色（`user.role` 是账户角色）。
 - `limits`：同一用户所有 Key 合计每分钟请求上限、`/v1/messages/wait` 每用户每分钟轮询次数上限。
-- `outbound`：所属用户今天（UTC 自然日）的外发用量，网页与所有 Key 合计。每次发信 `sent` 加 1、`recipients` 加去重后的收件人数；全部收件人失败的那次会退还。上限为 0 表示不限，两个上限都为 0 时不计数；管理员不受外发配额约束，`exempt:true` 且上限按 0 返回。`resetsAt` 是下一个 UTC 零点。超出时发信返回 429 `rate_limited`。
+- `outbound`：所属用户今天（UTC 自然日）的外发用量，网页与所有 Key 合计。每次发信 `sent` 加 1、`recipients` 加去重后的收件人数；全部收件人失败的那次会退还。上限为 0 表示不限，两个上限都为 0 时不计数；按管理员执行的 Key（`effectiveRole=admin`）不受外发配额约束，`exempt:true` 且上限按 0 返回。`resetsAt` 是下一个 UTC 零点。超出时发信返回 429 `rate_limited`。
 
-`GET /v1/status` 返回 `{status:"operational",userId,role,scopes}`；`GET /v1/domains` 返回 `{domains:[...]}`，是当前可认领的域名；均只需任一有效 Key，无独立 scope。域名范围：普通用户默认是公开的系统域名，管理员为其设置了专属邮箱权限时改为专属名单中的系统域名（可含非公开域名）；管理员看到配置中的全部系统域名。系统域名之后附上已生效的托管域名：普通用户为自己拥有或作为成员的，管理员为全部。已从列表移除、但仍有存量邮箱的旧域名不在其中，需从邮箱列表发现。
+`GET /v1/status` 返回 `{status:"operational",userId,role,scopes}`（`role` 是执行角色）；`GET /v1/domains` 返回 `{domains:[...]}`，是当前可认领的域名（限定了范围的 Key 只返回 `allowedDomains` 里的）；均只需任一有效 Key，无独立 scope。域名范围：普通用户默认是公开的系统域名，管理员为其设置了专属邮箱权限时改为专属名单中的系统域名（可含非公开域名）；管理员看到配置中的全部系统域名。系统域名之后附上已生效的托管域名：普通用户为自己拥有或作为成员的，管理员为全部。已从列表移除、但仍有存量邮箱的旧域名不在其中，需从邮箱列表发现。
 
-要创建 Key，先用 JWT 登录且完成必要 2FA，再经 `/api/api-keys` 操作。只按任务授予最小 scopes，用户仅要查验证码时通常选 `mail.read`；若还要认领可加 `mailbox.read/mailbox.write`，无需自动加 `mail.send`。新建和长期保留 Key 应符合用户对自动化的授权。
+要创建 Key，先用 JWT 登录且完成必要 2FA，再经 `/api/api-keys` 操作，请求体必须带当前登录密码 `password`（缺少 403 `reauth_required`，错误 403 `reauth_failed`，15 分钟内错 5 次后 429）。只按任务授予最小 scopes，用户仅要查验证码时通常选 `mail.read`；若还要认领可加 `mailbox.read/mailbox.write`，无需自动加 `mail.send`；只服务一个地址的 Agent 再加 `allowedMailboxIds`。新建和长期保留 Key 应符合用户对自动化的授权。
 
 ```bash
-# 当前 API="$BASE/api"、AUTH 为 JWT；完整 key 仅在创建成功时返回一次
-# 将响应留在受保护的运行状态，不把明文 key 输出到公开报告
-KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
-  --data-binary '{"name":"验证码读取","scopes":["mail.read"],"rateLimit":60,"allowedIps":[]}')
+# 当前 API="$BASE/api"、AUTH 为 JWT；HPC_PASSWORD 由用户提供，HPC_MAILBOX_ID 来自 GET /mailboxes
+# 完整 key 仅在创建成功时返回一次；将响应留在受保护的运行状态，不把明文 key 与密码输出到公开报告
+KEY_RESPONSE=$(jq -n --arg password "$HPC_PASSWORD" --argjson box "$HPC_MAILBOX_ID" \
+  '{name:"验证码读取",scopes:["mail.read"],rateLimit:60,allowedIps:[],allowedMailboxIds:[$box],password:$password}' \
+  | hpc '/api-keys' -X POST -H 'Content-Type: application/json' --data-binary @-)
 ```
 
 创建的 `{data}` 为元数据加 `key` 明文；受保护地保存 `.data.key`。列表和后续读取只能获得 `keyPrefix/keySuffix`，无法找回明文。
@@ -111,13 +122,13 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 | 方法与 `/api` 路径 | 契约 |
 |---|---|
 | `GET /api-keys` | 当前用户未吊销 Key 数组 |
-| `POST /api-keys` | `{name,scopes,rateLimit?,allowedIps?,expiresAt?}` → 201 新 Key |
+| `POST /api-keys` | `{name,scopes,password,rateLimit?,allowedIps?,expiresAt?,allowedMailboxIds?,allowedDomains?}` → 201 新 Key |
 | `GET /api-keys/:id` | 自己的 Key 元数据 |
-| `PUT /api-keys/:id` | 至少一个 `name/scopes/rateLimit/allowedIps/status/expiresAt`；`status:active\|disabled`；返回元数据 |
+| `PUT /api-keys/:id` | 至少一个 `name/scopes/rateLimit/allowedIps/status/expiresAt/allowedMailboxIds/allowedDomains`；`status:active\|disabled`；两个限定列表整体替换；返回元数据 |
 | `DELETE /api-keys/:id` | 吊销，不能通过重新启用恢复；`{success:true}` |
 | `GET /api-keys/:id/logs?cursor=…&limit=30` | 自己 Key 的调用审计分页 |
 
-`name` 1–64 字符；`scopes` 非空且只接受上表五个；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；`path` 是归一化后的路由（数字 ID 段写成 `:id`，最长 256 字符）。被拒绝的请求（Key 禁用或过期、IP 不在白名单、用户停用、超出限流）同一 Key 每分钟最多记一条，其余只计数；已吊销的 Key 不再记录。保留约 90 天。
+`name` 1–64 字符；`scopes` 非空且只接受上表列出的；`allowedMailboxIds` 最多 100 个且必须是自己当前认领的邮箱（否则 400），`allowedDomains` 最多 20 个；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；`path` 是归一化后的路由（数字 ID 段写成 `:id`，最长 256 字符）。被拒绝的请求（Key 禁用或过期、IP 不在白名单、用户停用、超出限流）同一 Key 每分钟最多记一条，其余只计数；已吊销的 Key 不再记录。保留约 90 天。
 
 ## 错误与限流
 
@@ -131,6 +142,7 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 | 401 `unauthorized` | JWT 会话无效，或 Key 无效/过期/禁用；依原鉴权方式处理 |
 | 403 `forbidden`、`user_disabled`、`registration_closed` | 权限/策略/状态阻止；不换身份绕过。Key 缺 scope 或发件地址无权时 `fix` 说明该怎么做 |
 | 403 `totp_setup_required` | 见 API 绑定流程 |
+| 403 `reauth_required`、`reauth_failed` | 创建 Key、新增或启用转发目标、开关两步验证要在请求体带当前密码 `password`；缺少或错误分别返回这两个码，不会让会话失效 |
 | 404 `not_found` | 资源不存在或不在可见范围；核对 ID/作用域 |
 | 404 `source_unavailable` | 回复或转发引用的原邮件不存在、不可见，或原附件已丢失；去掉 `replyToMessageId`/`forwardAttachmentsFrom` 后可作为新邮件发送 |
 | 409 `address_taken` | 地址被占用；可用性检查只是提示，最终以认领结果为准 |

@@ -1,4 +1,4 @@
-import { MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
+import { API_SCOPES, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
   array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, identitiesDescription, int, listQuery,
   mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths,
@@ -12,7 +12,8 @@ export function buildOpenApiSpec(origin: string) {
   const paths: Paths = {
     '/openapi.json': { get: specificationOperation() },
     '/status': { get: operation('Check API key access', object({ status: { type: 'string', const: 'operational' }, userId: positiveId,
-      role: { type: 'string', enum: ['admin', 'user'] }, scopes: array({ type: 'string', enum: ['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'] }) }),
+      role: { type: 'string', enum: ['admin', 'user'], description: 'The role this key acts with (admin only with the admin scope on an administrator account).' },
+      scopes: array({ type: 'string', enum: API_SCOPES }) }),
       { description: 'Requires an active API key and enabled API. No additional scope. This confirms access, not end-to-end mail delivery. userId identifies the key owner; GET /identities lists the addresses this key can send from, and GET /me adds key details, rate limits and today’s outbound usage. Revoked keys, including those revoked by a password change or administrator password reset, return 401 like unknown keys.' }) },
     '/me': { get: operation('Describe this API key, its owner, limits and today’s outbound usage', ref('ApiKeySelf'), {
       description: 'Requires an active API key and enabled API. No additional scope. Read-only self-inspection: key metadata (never the key itself), owner, per-key and per-user request limits, the wait poll limit, and today’s (UTC) outbound quota usage with resetsAt. Administrators are exempt from the outbound quota (exempt=true, limits 0).' }) },
@@ -84,7 +85,7 @@ export function buildOpenApiSpec(origin: string) {
     ...webhookPaths('v1'),
   };
   return {
-    openapi: '3.1.0', info: specInfo('HPC Mail Open API', `API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; requests already over a key or user limit do not count toward the instance limit. 429 rate_limited messages tell the scopes apart: API 调用频率超限 is this key, API 调用频率超限（账户级） is all keys of the same user combined, and API 总调用频率超限 is the whole site. Users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API. Every response carries X-Request-ID; ${clientRequestIdRule}.`),
+    openapi: '3.1.0', info: specInfo('HPC Mail Open API', `API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; requests already over a key or user limit do not count toward the instance limit. A key may be restricted to mailboxes or domains (GET /me key.allowedMailboxIds/allowedDomains): lists, wait and counts only include mail in range, a message outside the range is 404 like an invisible one, and an explicit address/domain/mailbox/sender outside it returns 403 forbidden (docs #key-restricted). Restricted keys cannot change account-wide notification settings. An administrator key acts as administrator only with the admin scope (GET /me key.effectiveRole). 429 rate_limited messages tell the scopes apart: API 调用频率超限 is this key, API 调用频率超限（账户级） is all keys of the same user combined, and API 总调用频率超限 is the whole site. Users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API. Every response carries X-Request-ID; ${clientRequestIdRule}.`),
     servers: [{ url: `${origin}/v1` }], security: [{ apiKey: [] }],
     externalDocs: { description: 'Agent usage guide and authentication workflows', url: `${origin}/skill.md` },
     'x-relatedApis': [{ url: `${origin}/api/openapi.json`, description: 'JWT session and administration API' }],

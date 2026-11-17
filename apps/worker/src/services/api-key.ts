@@ -1,4 +1,5 @@
 import {
+  adminKeyIssues,
   API_KEY_PREFIX,
   MAX_API_KEYS_PER_USER,
   MAX_API_USER_REQUESTS_PER_MINUTE,
@@ -10,6 +11,7 @@ import {
   type CreateApiKeyRequest,
   type CreatedApiKey,
   type Page,
+  type Role,
   type UpdateApiKeyRequest,
 } from '@hpc-mail/shared';
 import { and, desc, eq, lt, ne, sql } from 'drizzle-orm';
@@ -55,6 +57,30 @@ function serialize(row: ApiKeyRow, ownerUsername?: string): ApiKeySummary {
   };
 }
 
+/**
+ * 授予与修改 admin scope 的规则：只有管理员能让 Key 带 admin；结果状态带 admin 时必须有 IP 白名单
+ * 与不超过 90 天的有效期（shared 的 adminKeyIssues，与前端表单同一份校验）。
+ */
+function assertAdminScopeRules(
+  role: Role,
+  key: { scopes: readonly string[]; allowedIps: readonly string[]; expiresAt: Date | null },
+  granting: boolean,
+): void {
+  if (granting && role !== 'admin') throw new AppError('forbidden', '只有管理员可以授予 admin scope');
+  const [issue] = adminKeyIssues({ ...key, expiresAt: key.expiresAt?.toISOString() ?? null });
+  if (issue) throw new AppError('validation_failed', issue.message);
+}
+
+/** 限定的邮箱必须是该用户当前认领的：一次查询数命中个数 */
+async function assertOwnedMailboxes(env: Env, userId: number, ids: readonly number[]): Promise<void> {
+  if (!ids.length) return;
+  const row = await env.db.prepare(`SELECT COUNT(*) AS n FROM mailboxes
+    WHERE user_id = ? AND id IN (SELECT value FROM json_each(?))`).bind(userId, JSON.stringify(ids)).first<{ n: number }>();
+  if (Number(row?.n ?? 0) !== ids.length) {
+    throw new AppError('validation_failed', 'allowedMailboxIds 只能包含你当前认领的邮箱 id（GET /api/mailboxes 的 id）');
+  }
+}
+
 function normalizeExpiry(value: string | undefined): Date | null {
   if (!value) return null;
   const date = new Date(value);
@@ -77,17 +103,25 @@ export async function createApiKey(
   userId: number,
   req: CreateApiKeyParams,
   authEpoch?: number,
+  role?: Role,
 ): Promise<CreatedApiKey> {
   const db = createDb(env);
   const { key, keyPrefix, keySuffix } = generateKey();
   const keyHash = await hashApiKey(key);
   const expiresAt = normalizeExpiry(req.expiresAt);
+  const allowedMailboxIds = req.allowedMailboxIds ?? [];
+  const allowedDomains = req.allowedDomains ?? [];
+  // role 由路由传入（会话用户的角色）；服务层直调（脚本、测试）时读库
+  const ownerRole = role ?? (await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).get())?.role ?? 'user';
+  assertAdminScopeRules(ownerRole, { scopes: req.scopes, allowedIps: req.allowedIps, expiresAt }, req.scopes.includes('admin'));
+  await assertOwnedMailboxes(env, userId, allowedMailboxIds);
   const epochGuard = authEpoch === undefined ? '' : 'AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_version = ?)';
   const inserted = await env.db
     .prepare(
       `INSERT INTO api_keys
-        (name, key_prefix, key_suffix, key_hash, user_id, scopes, allowed_ips, rate_limit, status, expires_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?
+        (name, key_prefix, key_suffix, key_hash, user_id, scopes, allowed_ips, allowed_mailbox_ids, allowed_domains,
+         rate_limit, status, expires_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?
        WHERE (SELECT COUNT(*) FROM api_keys WHERE user_id = ? AND status <> 'revoked') < ? ${epochGuard}
        RETURNING id`,
     )
@@ -99,6 +133,8 @@ export async function createApiKey(
       userId,
       JSON.stringify(req.scopes),
       JSON.stringify(req.allowedIps),
+      JSON.stringify(allowedMailboxIds),
+      JSON.stringify(allowedDomains),
       req.rateLimit,
       expiresAt?.getTime() ?? null,
       userId,
@@ -166,14 +202,16 @@ export async function getApiKeySelf(env: Env, keyId: number, userId: number, now
   const [user] = userRows;
   // 鉴权之后、读取之前被吊销或删除：按无效 Key 处理
   if (!key || key.status === 'revoked' || !user) throw new AppError('unauthorized', 'API Key 无效');
-  const exempt = user.role === 'admin';
+  const effectiveRole: Role = user.role === 'admin' && (key.scopes as ApiScope[]).includes('admin') ? 'admin' : 'user';
+  // 外发配额按 Key 的执行角色：没有 admin scope 的管理员 Key 与普通用户一样受配额约束
+  const exempt = effectiveRole === 'admin';
   return {
     key: {
       id: key.id, name: key.name, keyPrefix: key.keyPrefix, keySuffix: key.keySuffix, scopes: key.scopes as ApiScope[],
       rateLimit: key.rateLimit, allowedIps: key.allowedIps,
       expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null, createdAt: key.createdAt.toISOString(),
       allowedMailboxIds: key.allowedMailboxIds, allowedDomains: key.allowedDomains,
-      effectiveRole: user.role === 'admin' && (key.scopes as ApiScope[]).includes('admin') ? 'admin' : 'user',
+      effectiveRole,
     },
     user,
     limits: { userRequestsPerMinute: MAX_API_USER_REQUESTS_PER_MINUTE, waitPollsPerMinute: MAX_WAIT_POLLS_PER_USER_PER_MINUTE },
@@ -194,20 +232,35 @@ export async function getApiKey(env: Env, id: number, userId?: number): Promise<
   return serialize(row);
 }
 
+/**
+ * 修改 Key。改到 scopes / allowedIps / expiresAt 时按修改后的结果校验 admin scope 规则（只改名、状态等不校验，
+ * 迁移时自动加上 admin scope 的旧管理员 Key 因此照常可用）；新授予 admin 需要管理员。
+ */
 export async function updateApiKey(
   env: Env,
   id: number,
   req: UpdateApiKeyRequest,
   userId?: number,
+  role?: Role,
 ): Promise<ApiKeySummary> {
   const db = createDb(env);
-  await requireKey(db, id, userId);
+  const current = await requireKey(db, id, userId);
+  if (req.scopes !== undefined || req.allowedIps !== undefined || req.expiresAt !== undefined) {
+    const scopes = req.scopes ?? current.scopes;
+    const expiresAt = req.expiresAt === undefined ? current.expiresAt : req.expiresAt === null ? null : new Date(req.expiresAt);
+    const ownerRole = role ?? (await db.select({ role: users.role }).from(users).where(eq(users.id, current.userId)).get())?.role ?? 'user';
+    assertAdminScopeRules(ownerRole, { scopes, allowedIps: req.allowedIps ?? current.allowedIps, expiresAt },
+      scopes.includes('admin') && !current.scopes.includes('admin'));
+  }
+  if (req.allowedMailboxIds) await assertOwnedMailboxes(env, current.userId, req.allowedMailboxIds);
   const patch: Partial<ApiKeyRow> = {};
   if (req.name !== undefined) patch.name = req.name;
   if (req.scopes !== undefined) patch.scopes = req.scopes;
   if (req.rateLimit !== undefined) patch.rateLimit = req.rateLimit;
   if (req.allowedIps !== undefined) patch.allowedIps = req.allowedIps;
   if (req.status !== undefined) patch.status = req.status;
+  if (req.allowedMailboxIds !== undefined) patch.allowedMailboxIds = req.allowedMailboxIds;
+  if (req.allowedDomains !== undefined) patch.allowedDomains = req.allowedDomains;
   // 续期：null 改为永久，字符串按新过期时间；undefined 不动
   if (req.expiresAt !== undefined) {
     patch.expiresAt = req.expiresAt === null ? null : normalizeExpiry(req.expiresAt);

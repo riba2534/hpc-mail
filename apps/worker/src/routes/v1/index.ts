@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { AppError } from '../../lib/errors.js';
 import { ok } from '../../lib/http.js';
-import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
+import { apiKeyAuth, keyRestriction, requireScope, restrictionAllowsMailbox } from '../../middleware/api-key-auth.js';
 import { getApiKeySelf } from '../../services/api-key.js';
 import { getVisibleDomains } from '../../services/domain.js';
 import { listSendIdentities } from '../../services/identities.js';
@@ -48,13 +48,23 @@ app.get('/identities', apiKeyAuth, async (c) => {
       docs: '/references/errors.md#forbidden-scope',
     });
   }
-  return ok(c, await listSendIdentities(c.env, { userId: key.userId, role: key.role }));
+  const result = await listSendIdentities(c.env, { userId: key.userId, role: key.role });
+  const restriction = keyRestriction(c);
+  if (!restriction) return ok(c, result);
+  // 限定了范围的 Key 只列范围内的身份；任意前缀的系统域名只保留 allowedDomains 里的
+  return ok(c, {
+    identities: result.identities.filter((item) => restrictionAllowsMailbox(restriction, { id: item.mailboxId, domain: item.domain })),
+    domains: result.domains.filter((item) => restriction.domains.includes(item.domain)),
+  });
 });
 
 // 与网页及认领校验共用用户的公共/专属规则。
 app.get('/domains', apiKeyAuth, async (c) => {
   const key = c.get('apiKey')!;
-  return ok(c, { domains: await getVisibleDomains(c.env, key.userId) });
+  const domains = await getVisibleDomains(c.env, key.userId);
+  const restriction = keyRestriction(c);
+  // 只能在 allowedDomains 里认领；只限定了邮箱的 Key 没有可认领的域名
+  return ok(c, { domains: restriction ? domains.filter((domain) => restriction.domains.includes(domain)) : domains });
 });
 
 /** OpenAPI 描述（公开，无需 key） */

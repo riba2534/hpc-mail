@@ -1,4 +1,4 @@
-import { API_SCOPES, OUTBOUND_DELIVERY_CONCURRENCY, OUTBOUND_PENDING_STALE_MS, type CreatedApiKey,
+import { OUTBOUND_DELIVERY_CONCURRENCY, OUTBOUND_PENDING_STALE_MS, type CreatedApiKey,
   type MessageSummary, type SingleUploadResult } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
@@ -18,6 +18,7 @@ import { updateSettings } from '../src/services/setting.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
 import { consumeDraftAttachments, draftKey } from '../src/services/upload.js';
 import type { Env } from '../src/types.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -73,11 +74,13 @@ async function account(name: string, role: 'admin' | 'user' = 'user', quota = { 
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username: name, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username: name, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   await db.insert(mailboxes).values({ address: `${name}@hpc.email`, domain: 'hpc.email', userId: user!.id });
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await call(env, '/api/api-keys', json(jwt, { name: `${name}-key`, scopes: [...API_SCOPES], rateLimit: 600 })));
+  const key = await data<CreatedApiKey>(await call(env, '/api/api-keys', json(jwt, { name: `${name}-key`, scopes: USER_SCOPES, rateLimit: 600, password: TEST_PASSWORD })));
+  // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope）
+  if (role === 'admin') await grantLegacyAdminScope(env, key.id);
   return { id: user!.id, jwt, key: key.key, address: `${name}@hpc.email`, sender: { userId: user!.id, role } };
 }
 

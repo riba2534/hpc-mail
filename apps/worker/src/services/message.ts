@@ -50,6 +50,14 @@ export interface Viewer {
   scope?: 'mine' | 'unclaimed' | 'user';
   /** admin + scope=user 时的目标用户 */
   targetUserId?: number;
+  /** API Key 限定的邮箱认领行 id 与域名（见 keyRestriction）；不限时不传 */
+  restrict?: AddressRestriction;
+}
+
+/** 地址可用 ⇔ 域名在 domains 中，或该地址当前认领行的 id 在 mailboxIds 中（未认领地址只看域名） */
+export interface AddressRestriction {
+  mailboxIds: number[];
+  domains: string[];
 }
 
 type MessageRow = typeof messages.$inferSelect;
@@ -206,6 +214,33 @@ function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess): SQL {
   if (scope === 'unclaimed' || access === 'owned') return scopeCondition(db, scope, access);
   const owned = db.select({ address: mailboxes.address }).from(mailboxes).where(eq(mailboxes.userId, scope.ownerId));
   return inArray(messages.address, union(owned, sharedAddressQuery(db, scope.ownerId)));
+}
+
+/**
+ * Key 限定范围的附加条件，叠加在可见范围之外；不限时返回 undefined，生成的 SQL 与原来完全相同。
+ * 两个列表各以一个 JSON 数组绑定（json_each），列表再长也只占两个参数，不受 D1 的 100 参数上限影响。
+ */
+function restrictCondition(restrict: AddressRestriction | undefined): SQL | undefined {
+  if (!restrict) return undefined;
+  const parts: SQL[] = [];
+  if (restrict.domains.length) {
+    parts.push(sql`${messages.domain} IN (SELECT value FROM json_each(${JSON.stringify(restrict.domains)}))`);
+  }
+  if (restrict.mailboxIds.length) {
+    parts.push(sql`${messages.address} IN (SELECT ${mailboxes.address} FROM ${mailboxes}
+      WHERE ${mailboxes.id} IN (SELECT value FROM json_each(${JSON.stringify(restrict.mailboxIds)})))`);
+  }
+  // 两者都为空表示不限，调用方不会传进来；保险起见按「什么都不可见」处理
+  return parts.length ? or(...parts) : sql`0`;
+}
+
+/** 单封邮件的限定范围判定：域名命中不查库，否则查该地址当前的认领行 */
+async function withinRestriction(db: Db, restrict: AddressRestriction | undefined, address: string): Promise<boolean> {
+  if (!restrict) return true;
+  if (restrict.domains.includes(address.slice(address.lastIndexOf('@') + 1).toLowerCase())) return true;
+  if (!restrict.mailboxIds.length) return false;
+  const row = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, address)).get();
+  return row !== undefined && restrict.mailboxIds.includes(row.id);
 }
 
 /**
@@ -374,6 +409,7 @@ function messagePageQuery(db: Db, viewer: Viewer, query: ListMessagesQuery) {
   const cursorId = decodeCursor(query.cursor);
   if (cursorId) conds.push(lt(messages.id, cursorId));
   if (query.afterId) conds.push(gt(messages.id, query.afterId));
+  conds.push(restrictCondition(viewer.restrict));
   conds.push(...source.prefix);
 
   const where = and(...conds.filter((x): x is SQL => x !== undefined));
@@ -417,7 +453,7 @@ export async function syncMessages(env: Env, viewer: Viewer, query: ListMessages
   const db = createDb(env);
   const firstPage: ListMessagesQuery = { ...query, cursor: undefined, afterId: undefined };
   const [unread, rows] = await db.batch([
-    unreadCountQuery(db, viewer.userId, viewer.role, UNREAD_COUNT_CAP),
+    unreadCountQuery(db, viewer.userId, viewer.role, UNREAD_COUNT_CAP, viewer.restrict),
     messagePageQuery(db, viewer, firstPage),
   ]);
   const page = await toPage(db, viewer, firstPage, rows);
@@ -467,6 +503,8 @@ export async function findNextMessage(
   ];
   if (input.address) conditions.push(inArray(messages.address, input.address));
   if (input.domain) conditions.push(domainCondition(scope, input.domain));
+  const restricted = restrictCondition(viewer.restrict);
+  if (restricted) conditions.push(restricted);
   const filtered = Boolean(input.from || input.subjectContains || input.hasCode);
   // 指定地址时逐个地址按 id 取：多地址的 IN 会让规划器为省排序改沿 idx_messages_live 扫全站 afterId 之后的邮件，
   // 没有新信的轮询（最常见）每次都要读完这段；逐地址读取量只随这几个地址的新信增长
@@ -527,18 +565,19 @@ export { UNREAD_COUNT_CAP };
  * admin 也按 scope=mine 只数自己认领地址（个人角标，非全站）。
  * cap 给定时最多数到 cap 封即停（/api 角标），不给则精确计数（/v1 对外契约）。
  */
-export async function countUnread(env: Env, userId: number, role: Role, cap?: number): Promise<number> {
-  const row = await unreadCountQuery(createDb(env), userId, role, cap).get();
+export async function countUnread(env: Env, userId: number, role: Role, cap?: number, restrict?: AddressRestriction): Promise<number> {
+  const row = await unreadCountQuery(createDb(env), userId, role, cap, restrict).get();
   return row?.value ?? 0;
 }
 
-function unreadCountQuery(db: Db, userId: number, role: Role, cap?: number) {
+function unreadCountQuery(db: Db, userId: number, role: Role, cap?: number, restrict?: AddressRestriction) {
   const scope = resolveScope({ userId, role, scope: 'mine' });
   const where = and(
     scopeCondition(db, scope),
     eq(messages.direction, 'inbound'),
     eq(messages.isRead, false),
     isNull(messages.deletedAt),
+    restrictCondition(restrict),
   );
   if (cap === undefined) return db.select({ value: count() }).from(messages).where(where);
   const capped = db.select({ one: sql`1`.as('one') }).from(messages).where(where).limit(cap).as('capped');
@@ -558,7 +597,7 @@ export async function getRecentContacts(env: Env, viewer: Viewer, limit = 100): 
       fromAddress: messages.fromAddress,
     }))
     .from(ownerId === null ? MESSAGES : MESSAGES_BY_ADDRESS)
-    .where(and(scopeCondition(db, scope), isNull(messages.deletedAt)))
+    .where(and(scopeCondition(db, scope), isNull(messages.deletedAt), restrictCondition(viewer.restrict)))
     .orderBy(desc(messages.id))
     .limit(400)
     .all();
@@ -629,6 +668,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
             inArray(messages.id, candidates),
             isNull(messages.deletedAt),
             scopeCondition(db, scope, access),
+            restrictCondition(viewer.restrict),
           ),
         )
         .orderBy(asc(messages.id))
@@ -660,6 +700,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
       and(
         scopeCondition(db, scope, access),
         isNull(messages.deletedAt),
+        restrictCondition(viewer.restrict),
         eq(messages.address, target.address),
         gte(messages.createdAt, new Date(target.createdAt.getTime() - windowMs)),
         lte(messages.createdAt, new Date(target.createdAt.getTime() + windowMs)),
@@ -702,6 +743,8 @@ async function isAddressClaimed(db: Db, address: string): Promise<boolean> {
  */
 async function assertVisible(db: Db, viewer: Viewer, row: VisibilityRow): Promise<void> {
   const scope = resolveScope(viewer);
+  // Key 限定范围外的邮件与不可见一致
+  if (!(await withinRestriction(db, viewer.restrict, row.address))) throw new AppError('not_found', '邮件不存在');
   if (scope === 'unclaimed') {
     if (await isAddressClaimed(db, row.address)) throw new AppError('not_found', '邮件不存在');
     return;
@@ -955,7 +998,7 @@ export async function markMessages(
   // ids 分批：D1 单条查询最多 100 个绑定参数，schema 允许一次传 500 个 id
   let changed = 0;
   for (const batch of chunk(ids)) {
-    const cond = and(inArray(messages.id, batch), scopeCondition(db, scope));
+    const cond = and(inArray(messages.id, batch), scopeCondition(db, scope), restrictCondition(viewer.restrict));
     const result = await db.update(messages).set({ isRead }).where(cond).run();
     changed += result.meta.changes ?? 0;
   }
@@ -979,6 +1022,7 @@ export async function markAllRead(
     eq(messages.direction, 'inbound'),
     eq(messages.isRead, false),
     isNull(messages.deletedAt),
+    restrictCondition(viewer.restrict),
   ];
   if (filters.domain) conds.push(domainCondition(scope, filters.domain));
   if (filters.address) conds.push(eq(messages.address, filters.address));
@@ -1006,7 +1050,7 @@ export async function starMessages(
     const rows = await db
       .select({ id: messages.id })
       .from(messages)
-      .where(and(inArray(messages.id, batch), scopeCondition(db, scope, shareAccess(viewer, scope))))
+      .where(and(inArray(messages.id, batch), scopeCondition(db, scope, shareAccess(viewer, scope)), restrictCondition(viewer.restrict)))
       .all();
     visibleIds.push(...rows.map((v) => v.id));
   }
@@ -1031,8 +1075,8 @@ export async function starMessages(
   return changed;
 }
 
-function scopedIdsCondition(db: Db, scope: Scope, ids: number[]): SQL {
-  return and(inArray(messages.id, ids), scopeCondition(db, scope)) as SQL;
+function scopedIdsCondition(db: Db, scope: Scope, ids: number[], restrict?: AddressRestriction): SQL {
+  return and(inArray(messages.id, ids), scopeCondition(db, scope), restrictCondition(restrict)) as SQL;
 }
 
 /** 批量软删除（移入回收站）：仅置 deletedAt，7 天后由 scheduled 硬删 */
@@ -1042,7 +1086,7 @@ export async function deleteMessages(env: Env, viewer: Viewer, ids: number[]): P
   const deletedAt = new Date();
   let changed = 0;
   for (const batch of chunk(ids)) {
-    const cond = and(scopedIdsCondition(db, scope, batch), isNull(messages.deletedAt)) as SQL;
+    const cond = and(scopedIdsCondition(db, scope, batch, viewer.restrict), isNull(messages.deletedAt)) as SQL;
     const result = await db.update(messages).set({ deletedAt }).where(cond).run();
     changed += result.meta.changes ?? 0;
   }
@@ -1055,7 +1099,7 @@ export async function restoreMessages(env: Env, viewer: Viewer, ids: number[]): 
   const scope = resolveMutationScope(viewer);
   let changed = 0;
   for (const batch of chunk(ids)) {
-    const cond = and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt), isNull(messages.purgeToken)) as SQL;
+    const cond = and(scopedIdsCondition(db, scope, batch, viewer.restrict), isNotNull(messages.deletedAt), isNull(messages.purgeToken)) as SQL;
     const result = await db.update(messages).set({ deletedAt: null }).where(cond).run();
     changed += result.meta.changes ?? 0;
   }
@@ -1068,7 +1112,7 @@ export async function purgeMessages(env: Env, viewer: Viewer, ids: number[], ctx
   const scope = resolveMutationScope(viewer);
   let changed = 0;
   for (const batch of chunk(ids)) {
-    changed += await purgeMatchingMessages(env, and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt))!, batch.length, ctx);
+    changed += await purgeMatchingMessages(env, and(scopedIdsCondition(db, scope, batch, viewer.restrict), isNotNull(messages.deletedAt))!, batch.length, ctx);
   }
   return changed;
 }
