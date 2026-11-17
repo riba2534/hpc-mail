@@ -1,5 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
+import { eq } from 'drizzle-orm';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createDb } from '../src/db/client.js';
+import { messages } from '../src/db/schema.js';
 import { codeScanBody, extractCodeByRegex, wantsAiCode } from '../src/services/code-extract.js';
+import { handleInbound } from '../src/services/inbound.js';
+import { updateSettings } from '../src/services/setting.js';
+
+afterEach(() => { vi.restoreAllMocks(); });
 
 /** 仿造样本，结构仿照常见的误判来源，不含真实邮件内容 */
 describe('正则提码不把邮编、年份、编号当成验证码（R08）', () => {
@@ -56,5 +64,23 @@ describe('纯文本段是占位文案时提码看 HTML（R08）', () => {
     const real = 'Your verification code is 731904. It expires in ten minutes.';
     expect(codeScanBody(real, html, real)).toBe(real);
     expect(codeScanBody('', html, 'converted')).toBe('converted');
+  });
+
+  it('收件链路：text 段占位、码只在 HTML 里时照样落库', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await updateSettings(env, { code_extract: { enabled: true, aiEnabled: false } });
+    const to = 'precision-html@precision.test';
+    const raw = [
+      'From: Example <no-reply@example.net>', `To: ${to}`, 'Subject: Sign-in request', 'Message-ID: <precision-html@example.net>',
+      'MIME-Version: 1.0', 'Content-Type: multipart/alternative; boundary="alt"', '',
+      '--alt', 'Content-Type: text/plain; charset=utf-8', '', placeholder,
+      '--alt', 'Content-Type: text/html; charset=utf-8', '', html,
+      '--alt--', ''].join('\r\n');
+    const ctx = createExecutionContext();
+    await handleInbound({ raw: new Response(raw).body!, headers: new Headers(), to, from: 'no-reply@example.net', forward: vi.fn(),
+      setReject: vi.fn() } as unknown as ForwardableEmailMessage, env, ctx);
+    await waitOnExecutionContext(ctx);
+    const row = await createDb(env).select().from(messages).where(eq(messages.address, to)).get();
+    expect(row?.verificationCode).toBe('482913');
   });
 });
