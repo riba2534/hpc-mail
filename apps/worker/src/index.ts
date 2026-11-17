@@ -118,8 +118,8 @@ export default {
     await handleInbound(message, env, ctx);
   },
 
-  async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
-    await runScheduled(env, _event.cron === '0 16 * * *');
+  async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await runScheduled(env, event.cron === '0 16 * * *', event.cron);
   },
 
   /** 外发投递回执：Cloudflare Email Sending 事件订阅经 Queue 投递过来（wrangler.toml 的 queues.consumers） */

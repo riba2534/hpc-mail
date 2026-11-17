@@ -854,8 +854,6 @@ describe('托管域名的 Cloudflare 调用序列基准', () => {
         `GET ${z}`, `GET ${z}/email/routing`, `POST ${z}/email/routing/dns`,
         `GET ${z}/email/routing/rules/catch_all`,
         `GET ${z}/email/sending/subdomains/sub-${zoneId}/dns/status`, `POST ${z}/email/sending/subdomains/sub-${zoneId}/dns`,
-        // 发信就绪后订阅投递回执：先找投递回执 Queue（本假 API 没有 Queue，订阅记为失败，不影响开通）
-        `GET /accounts/${ACCOUNT}/queues`,
       ],
       // 删除先撤发信接入，再删 zone
       afterDelete: [`DELETE ${z}/email/sending/subdomains/sub-${zoneId}`, `DELETE ${z}`],

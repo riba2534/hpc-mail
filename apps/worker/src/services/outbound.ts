@@ -11,14 +11,22 @@ import {
 } from '@hpc-mail/shared';
 import { and, eq, notInArray, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
-import { d1Statement } from '../lib/d1.js';
-import { attachments as attachmentsTable, deliveryObjectLeases, mailboxes, messages, storageCleanupJobs } from '../db/schema.js';
+import {
+  attachments as attachmentsTable,
+  deliveryObjectLeases,
+  draftAttachments,
+  mailboxes,
+  messages,
+  storageCleanupJobs,
+} from '../db/schema.js';
 import {
   assertNoHeaderInjection,
   getEmailDomain,
   normalizeEmail,
 } from '../lib/email-address.js';
 import { AppError, type AppErrorHints } from '../lib/errors.js';
+import { runLimited } from '../lib/concurrency.js';
+import { countsAsAttachment } from '../lib/attachment-rule.js';
 import {
   base64ToBytes,
   bytesToBase64,
@@ -47,9 +55,9 @@ import { assertSendBodySize, bodyBytes, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail, type ForwardAttachment } from './forwarding.js';
 import { enqueueMailNotifications, processNotificationJobs } from './notification-jobs.js';
 import { retainExternalAttachments } from './external-attachment.js';
-import { bindIdempotentSend, type IdempotencyHandle } from './idempotency.js';
+import { bindIdempotentSend, completeIdempotentStatement, type IdempotencyHandle } from './idempotency.js';
 import { injectAttachmentLinks, stripAttachmentLinks, type AttachmentLink } from './attachment-links.js';
-import { deliveryRefStatements } from './delivery-events.js';
+import { deliveryEventsQueue, deliveryRefInserts } from './delivery-refs.js';
 import { lookupSuppressions, recipientSuppressedError, suppressedFor, suppressionMessage } from './suppression.js';
 export { injectAttachmentLinks } from './attachment-links.js';
 
@@ -98,11 +106,68 @@ export function attachmentDisposition(ref: { contentId?: string; disposition?: s
   return ref.disposition ?? (ref.contentId ? 'inline' : 'attachment');
 }
 
+const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
 /** D1 写入结果不明时也只登记清理；任务执行前检查活引用，不能直接擦除可能已提交的对象。 */
 async function queueObjectCleanup(env: Env, keys: string[]): Promise<void> {
   if (!keys.length) return;
   try { await createDb(env).insert(storageCleanupJobs).values(keys.map(r2Key => ({ r2Key }))).onConflictDoNothing(); }
   catch (error) { console.error('发件对象清理登记失败:', error); }
+}
+
+/** 发送中引用对象的租约时长：清理任务不删有效租约下的对象，投递结束时释放；进程中断时到期后由 cron 回收 */
+const DELIVERY_LEASE_MS = 3600_000;
+
+/**
+ * 为被引用对象（草稿、转发的原附件）登记租约的 INSERT … SELECT 列：只为此刻仍存在的引用行登记，与读取引用行同一个 batch。
+ * 清理任务只删「没有租约且没有引用」的对象，所以登记成功后对象一直保留到投递结束，解析与投递之间被删也不影响。
+ */
+export function leaseColumns(r2Key: typeof attachmentsTable.r2Key | typeof draftAttachments.r2Key, leaseToken: string) {
+  return {
+    r2Key,
+    token: sql<string>`${leaseToken}`.as('token'),
+    expiresAt: sql<Date>`${Date.now() + DELIVERY_LEASE_MS}`.as('expires_at'),
+  };
+}
+
+/** 发送在投递前失败时释放本次请求登记的租约；失败只记日志，租约到期后由 cron 回收 */
+export async function releaseDeliveryLeases(env: Env, leaseToken: string): Promise<void> {
+  try { await createDb(env).delete(deliveryObjectLeases).where(eq(deliveryObjectLeases.token, leaseToken)); }
+  catch (error) { console.error('发送租约释放延迟:', error); }
+}
+
+/**
+ * Cloudflare send_email 明确表示没有接受这封信的错误码（官方错误码表）：请求校验、发信域或收件人受限、账户暂停、
+ * 内容与头部超限、频率与日配额，以及收件服务器拒收（E_DELIVERY_FAILED）。E_INTERNAL_SERVER_ERROR 与表外的码
+ * 不算：服务端可能已经接受。
+ */
+const REJECTED_SEND_CODES = new Set([
+  'E_VALIDATION_ERROR', 'E_FIELD_MISSING', 'E_TOO_MANY_RECIPIENTS', 'E_TOO_MANY_ATTACHMENTS',
+  'E_SENDER_NOT_VERIFIED', 'E_RECIPIENT_NOT_ALLOWED', 'E_RECIPIENT_SUPPRESSED', 'E_ACCOUNT_SUSPENDED',
+  'E_SENDER_DOMAIN_NOT_AVAILABLE', 'E_CONTENT_TOO_LARGE', 'E_DELIVERY_FAILED', 'E_RATE_LIMIT_EXCEEDED',
+  'E_DAILY_LIMIT_EXCEEDED', 'E_HEADER_NOT_ALLOWED', 'E_HEADER_USE_API_FIELD', 'E_HEADER_VALUE_INVALID',
+  'E_HEADER_VALUE_TOO_LONG', 'E_HEADER_NAME_INVALID', 'E_HEADERS_TOO_LARGE', 'E_HEADERS_TOO_MANY',
+]);
+
+/** 没有错误码的报错（旧版 EmailMessage 路径）按文案识别明确拒收：目标或发信域未验证、地址非法、发信域未开通、超出频率或配额 */
+const REJECTED_SEND_MESSAGES = [
+  /\bnot (?:a )?verified\b/i,
+  /\binvalid (?:e-?mail |sender |recipient |destination |from |to )?address\b/i,
+  /\bdomain (?:is )?not (?:available|enabled|onboarded)\b/i,
+  /\brecipient (?:is )?(?:not in (?:the )?allowed|suppressed)\b/i,
+  /\b(?:rate|daily|sending) limit exceeded\b/i,
+  /\bquota (?:exceeded|reached)\b/i,
+];
+
+/**
+ * send_email 抛错时邮件是否确定没有被接受。只有能确定的拒收才记 failed（可修正后换 Key 重发）；超时、断连、
+ * 内部错误等结果不明的一律 unknown，宁可让调用方先核对，也不诱导重复投递。
+ */
+export function isDefiniteSendRejection(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string') return REJECTED_SEND_CODES.has(code);
+  const message = errorText(error).slice(0, 500);
+  return REJECTED_SEND_MESSAGES.some((pattern) => pattern.test(message));
 }
 
 /** 地址写法：路由传入已解析的 MailAddress；服务内部与测试也可直接传地址字符串 */
@@ -232,19 +297,20 @@ const FORBIDDEN_SENDER: AppErrorHints = {
   docs: '/references/errors.md#forbidden-sender',
 };
 
-async function resolveFrom(
-  env: Env,
-  sender: Sender,
-  req: SendMailInput,
-  domains: string[],
-): Promise<ResolvedFrom> {
-  const db = createDb(env);
+type FromMailbox = Pick<typeof mailboxes.$inferSelect, 'address' | 'domain' | 'userId' | 'displayName'>;
+
+/** 发件邮箱行：mailboxId 写法按 id，地址写法按地址。与可路由域名查询并行发出，不多一次串行往返 */
+function lookupFromMailbox(db: Db, from: SendFrom): Promise<FromMailbox | undefined> {
+  return db
+    .select({ address: mailboxes.address, domain: mailboxes.domain, userId: mailboxes.userId, displayName: mailboxes.displayName })
+    .from(mailboxes)
+    .where(from.mailboxId !== undefined ? eq(mailboxes.id, from.mailboxId) : eq(mailboxes.address, `${from.localPart}@${from.domain}`))
+    .get();
+}
+
+/** 显示名：请求显式给出的优先，其次邮箱配置的 displayName，最后用地址前缀（含管理员用没有邮箱行的任意前缀） */
+function resolveFrom(sender: Sender, req: SendMailInput, domains: string[], box: FromMailbox | undefined): ResolvedFrom {
   if (req.from.mailboxId !== undefined) {
-    const box = await db
-      .select()
-      .from(mailboxes)
-      .where(eq(mailboxes.id, req.from.mailboxId))
-      .get();
     if (!box) throw new AppError('not_found', '发件邮箱不存在');
     if (sender.role !== 'admin' && box.userId !== sender.userId) {
       throw new AppError('forbidden', '无权使用该发件地址', FORBIDDEN_SENDER);
@@ -259,22 +325,18 @@ async function resolveFrom(
   if (!domains.includes(domain)) {
     throw new AppError('validation_failed', '发件域名不在系统域名列表内');
   }
-  if (sender.role !== 'admin') {
-    const owned = await db
-      .select({ id: mailboxes.id })
-      .from(mailboxes)
-      .where(and(eq(mailboxes.address, address), eq(mailboxes.userId, sender.userId)))
-      .get();
-    if (!owned) throw new AppError('forbidden', '只能使用自己认领的地址发件', FORBIDDEN_SENDER);
+  if (sender.role !== 'admin' && box?.userId !== sender.userId) {
+    throw new AppError('forbidden', '只能使用自己认领的地址发件', FORBIDDEN_SENDER);
   }
-  const displayName = (req.from.displayName || req.from.localPart!).trim();
+  const displayName = (req.from.displayName || box?.displayName || req.from.localPart!).trim();
   assertNoHeaderInjection(displayName);
   return { address, domain, displayName };
 }
 
 /**
- * 转发时把原邮件的附件带入本次发送：校验可见性（同详情）后直接引用原对象，不复制也不读内容，
- * 只用 HEAD 确认对象还在；来源或附件不可用为 source_unavailable
+ * 转发时把原邮件的附件带入本次发送：校验可见性（同详情）后直接引用原对象，不复制也不读内容。
+ * 读附件行与登记租约在同一个 batch 里，之后才用 HEAD 确认对象还在：此后原邮件被永久删除也要等投递结束才回收对象。
+ * 来源或附件不可用为 source_unavailable
  */
 async function loadForwardedAttachments(
   env: Env,
@@ -283,13 +345,20 @@ async function loadForwardedAttachments(
   sourceMessageId: number,
   alreadyCount: number,
   alreadyBytes: number,
+  leaseToken: string,
 ): Promise<StoredAttachment[]> {
-  await loadSourceMessage(env, sender, sourceMessageId, '转发的原邮件不存在或不可见');
-  const rows = await db
-    .select()
-    .from(attachmentsTable)
-    .where(eq(attachmentsTable.messageId, sourceMessageId))
-    .all();
+  const unavailable = '转发的原邮件不存在或不可见';
+  await loadSourceMessage(env, sender, sourceMessageId, unavailable);
+  const ofSource = eq(attachmentsTable.messageId, sourceMessageId);
+  const [, rows, source] = await db.batch([
+    db.insert(deliveryObjectLeases)
+      .select(db.select(leaseColumns(attachmentsTable.r2Key, leaseToken)).from(attachmentsTable).where(ofSource))
+      .onConflictDoNothing(),
+    db.select().from(attachmentsTable).where(ofSource),
+    // 与读附件行同一事务复核原邮件仍在：永久删除时附件行与邮件同批删除，不会只带走一半附件
+    db.select({ id: messages.id }).from(messages).where(eq(messages.id, sourceMessageId)),
+  ]);
+  if (!source.length) throw new AppError('source_unavailable', unavailable);
   if (alreadyCount + rows.length > MAX_ATTACHMENTS) {
     throw new AppError('validation_failed', `原邮件附件与新增附件合计最多 ${MAX_ATTACHMENTS} 个，请先移除部分附件`);
   }
@@ -341,10 +410,14 @@ async function persistAttachments(
       contentId: att.contentId,
       disposition: att.disposition,
     })));
-    // 先为全部对象登记发送中的独立引用。发件记录被 purge/release 删除时，清理仍须等待投递结束。
-    await db.insert(deliveryObjectLeases).values([...new Set(rows.map(row => row.r2Key))].map(r2Key => ({
-      r2Key, token: leaseToken, expiresAt: new Date(Date.now() + 3600_000),
-    })));
+    // 新写的对象先登记租约再上传：发件记录被 purge/release 删除时，清理仍须等待投递结束。
+    // 引用的已有对象在解析时已经登记（resolveDraftAttachments、loadForwardedAttachments）
+    const created = [...new Set(rows.filter((_, index) => 'bytes' in atts[index]!).map(row => row.r2Key))];
+    if (created.length) {
+      await db.insert(deliveryObjectLeases).values(created.map(r2Key => ({
+        r2Key, token: leaseToken, expiresAt: new Date(Date.now() + DELIVERY_LEASE_MS),
+      }))).onConflictDoNothing();
+    }
     for (let index = 0; index < rows.length; index++) {
       const att = atts[index]!;
       if (!('bytes' in att)) continue;
@@ -443,21 +516,13 @@ async function prepareOutboundMime(
 }
 
 /**
- * Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文；并发投递前只 import 一次。
+ * Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文；并发投递前只 import 一次，部署金丝雀也直接复用。
  * 返回 send() 给出的 Cloudflare 消息 ID（投递回执按它关联），没有时为 null。
  */
-async function cloudflareSender(env: Env, fromAddress: string): Promise<(toAddr: string, raw: string) => Promise<string | null>> {
+export async function cloudflareSender(env: Env, fromAddress: string): Promise<(toAddr: string, raw: string) => Promise<string | null>> {
   // 动态 import：`cloudflare:email` 在 vitest workerd 里静态加载会崩
   const { EmailMessage } = await import('cloudflare:email');
   return async (toAddr, raw) => (await env.email.send(new EmailMessage(fromAddress, toAddr, raw)))?.messageId || null;
-}
-
-/** 有界并发：最多 limit 个任务同时进行 */
-async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) await task(items[next++]!);
-  }));
 }
 
 function summarize(
@@ -562,9 +627,48 @@ function outcomeWriter(db: Db, messageId: number, snapshot: () => RecipientOutco
   };
 }
 
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+/**
+ * 最终结果回填的退避间隔：请求内连写两次仍失败时，交给 waitUntil 按这些间隔继续重试（测试可调小）。
+ * 全部失败时发件行停在 pending，幂等记录也没完成，同 Key 重放 409，一小时后由 cron 标 unknown。
+ */
+export const finalWriteRetry = { delaysMs: [1_000, 3_000, 10_000] };
 
-/** 先持久化内容与幂等绑定，再投递；已确认投递的副作用不因状态回填故障重投。 */
+/** 没有确认送达、也没有被明确拒收的目标：可能已经收到 */
+const UNCONFIRMED_DETAIL = '投递结果未确认，可能已送达，补发前先向收件人核对';
+
+const describeOutcomes = (list: RecipientOutcome[]) => list.map((outcome) => `${outcome.address}: ${outcome.error ?? ''}`).join('; ');
+
+/**
+ * 整体状态：有目标送达即 sent/delivered（失败与未确认的目标写进 errorDetail）；没有送达但有结果不明的为 unknown；
+ * 全部被明确拒收或根本没尝试（投递前的服务端故障）才是 failed
+ */
+export function overallResult(outcomes: RecipientOutcome[]): { status: 'sent' | 'delivered' | 'unknown' | 'failed'; errorDetail: string } {
+  // 投递回执：退信算失败；投诉表示已送达
+  const failed = outcomes.filter(outcome => outcome.status === 'failed' || outcome.status === 'bounced');
+  const unconfirmed = outcomes.filter(outcome => outcome.status === 'unknown');
+  if (outcomes.some(outcome => outcome.status === 'sent' || outcome.status === 'delivered' || outcome.status === 'complained')) {
+    return {
+      status: outcomes.some(outcome => outcome.status === 'sent') ? 'sent' : 'delivered',
+      errorDetail: [
+        failed.length ? `部分收件人失败: ${describeOutcomes(failed)}` : '',
+        unconfirmed.length ? `部分收件人${UNCONFIRMED_DETAIL}: ${describeOutcomes(unconfirmed)}` : '',
+      ].filter(Boolean).join('；'),
+    };
+  }
+  if (unconfirmed.length) {
+    return {
+      status: 'unknown',
+      errorDetail: `${UNCONFIRMED_DETAIL}: ${describeOutcomes(unconfirmed)}` + (failed.length ? `；已失败: ${describeOutcomes(failed)}` : ''),
+    };
+  }
+  return { status: 'failed', errorDetail: `全部收件人投递失败: ${describeOutcomes(failed)}` };
+}
+
+/**
+ * 先持久化内容与幂等绑定，再投递；已确认投递的副作用不因状态回填故障重投。全部收件人被明确拒收时同样返回结果
+ * （status 为 failed），由路由转成 422。
+ * leaseToken 与 resolveDraftAttachments 登记草稿租约用的是同一个，投递结束时一并释放；投递前抛错时由调用方释放。
+ */
 export async function sendMail(
   env: Env,
   ctx: ExecCtx,
@@ -573,6 +677,7 @@ export async function sendMail(
   attachments: DecodedAttachment[],
   origin: string,
   handle?: IdempotencyHandle | null,
+  leaseToken: string = crypto.randomUUID(),
 ): Promise<MessageSummary> {
   assertNoHeaderInjection(req.subject);
   let text = req.text ?? '';
@@ -590,15 +695,17 @@ export async function sendMail(
     ...(req.from.domain ? [req.from.domain] : []),
     ...[...to, ...cc, ...bcc].map(item => getEmailDomain(item.address)),
   ];
-  const domains = await getRoutableDomains(env, settings, candidateDomains);
-  // 抑制名单只涉及站外收件人，与发件身份校验并行查询（查询失败按未抑制处理，不会拒绝）
-  const suppressionRows = lookupSuppressions(env, [...to, ...cc, ...bcc].map(item => item.address)
-    .filter(address => !domains.includes(getEmailDomain(address))));
-  const from = await resolveFrom(env, sender, req, domains);
+  // 投递回执启用时，抑制名单与域名、发件邮箱并行查询（查询失败按未抑制处理）；未启用时不查
+  const [domains, fromBox, suppressionRows] = await Promise.all([
+    getRoutableDomains(env, settings, candidateDomains),
+    lookupFromMailbox(db, req.from),
+    deliveryEventsQueue(env) ? lookupSuppressions(env, [...to, ...cc, ...bcc].map(item => item.address)) : [],
+  ]);
+  const from = resolveFrom(sender, req, domains, fromBox);
   await assertHostedSendable(env, settings, from.domain);
   if (req.forwardAttachmentsFrom) {
     const forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
-      attachments.length, attachments.reduce((sum, att) => sum + attachmentSize(att), 0));
+      attachments.length, attachments.reduce((sum, att) => sum + attachmentSize(att), 0), leaseToken);
     attachments = [...attachments, ...forwarded];
     const siteOrigin = env.site_origin ?? origin;
     // 补发/重发沿用的正文里有上次注入的下载区块：这些附件会重新带上，先去掉旧区块再判断是否重新注入，
@@ -647,8 +754,8 @@ export async function sendMail(
   // 只写站内收件副本；发件记录本身不是「收到的验证邮件」
   const verificationLink = settings.code_extract.enabled && internalTargets.length
     ? extractVerificationLink({ subject: req.subject, text, html, fromAddress: from.address }) : '';
-  // 抑制名单按发件域名生效；全部收件人都被抑制时不建发件行、不占配额
-  const suppressed = suppressedFor(await suppressionRows, from.domain);
+  // 抑制名单按发件域名生效，只拦站外收件人；全部收件人都被抑制时不建发件行、不占配额
+  const suppressed = suppressedFor(suppressionRows.filter(row => externalTargets.includes(row.address)), from.domain);
   if (suppressed.size && suppressed.size === uniqueTargets.length) throw recipientSuppressedError([...suppressed.values()]);
   await assertOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
 
@@ -699,12 +806,11 @@ export async function sendMail(
 
   /**
    * 投递阶段交给 waitUntil 托住：客户端断开或请求被取消时仍会投递完并回填结果；请求里照常等待最终结果。
-   * 中途出现服务端故障（附件持久化等）时，没尝试的目标记为失败并带上原因。
+   * 中途出现服务端故障（附件持久化等）时，没尝试的目标一定没收到，记为失败并带上原因。
    */
   const deliver = async () => {
     let processingError = '';
     let outboundAtts: Awaited<ReturnType<typeof persistAttachments>> = [];
-    const objectLeaseToken = crypto.randomUUID();
 
     const deliverExternal = async () => {
       for (const [target, blocked] of suppressed) {
@@ -730,13 +836,18 @@ export async function sendMail(
           messageId: outgoingMessageId,
         }, payload.atts);
         const send = await cloudflareSender(env, from.address);
-        await runPool(sendable, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
+        await runLimited(sendable, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
+          let handedOver = false;
           try {
-            const providerMessageId = await send(target, rawFor(target));
+            const raw = rawFor(target);
+            handedOver = true;
+            const providerMessageId = await send(target, raw);
             record({ address: target, status: 'sent' });
             sentRefs.push({ recipient: target, providerMessageId });
           } catch (error) {
-            record({ address: target, status: 'failed', error: errorText(error) });
+            // 交给 Cloudflare 之前出错一定没发出；之后的报错只有明确拒收才算失败，其余结果不明
+            const status = !handedOver || isDefiniteSendRejection(error) ? 'failed' : 'unknown';
+            record({ address: target, status, error: errorText(error) });
           }
         });
       } catch (error) {
@@ -792,7 +903,7 @@ export async function sendMail(
     // 引用的已有对象（草稿、转发的原附件）由原持有方管理回收：草稿行不算清理引用，投递后在这里登记会在草稿还能重发时删掉对象
     const borrowedKeys = [...new Set(attachments.flatMap(att => ('r2Key' in att ? [att.r2Key] : [])))];
     try {
-      outboundAtts = await persistAttachments(env, db, sent.id, attachments, objectLeaseToken);
+      outboundAtts = await persistAttachments(env, db, sent.id, attachments, leaseToken);
       await Promise.all([deliverExternal(), deliverInternal()]);
     } catch (error) {
       processingError = errorText(error);
@@ -803,11 +914,11 @@ export async function sendMail(
           await db.batch([
             db.insert(storageCleanupJobs).select(db.select({ r2Key: deliveryObjectLeases.r2Key,
               createdAt: sql<Date>`${Date.now()}`.as('created_at'), lastError: sql<string>`''`.as('last_error') })
-              .from(deliveryObjectLeases).where(and(eq(deliveryObjectLeases.token, objectLeaseToken),
+              .from(deliveryObjectLeases).where(and(eq(deliveryObjectLeases.token, leaseToken),
                 borrowedKeys.length ? notInArray(deliveryObjectLeases.r2Key, borrowedKeys) : undefined))).onConflictDoNothing(),
             db.delete(attachmentsTable).where(and(eq(attachmentsTable.messageId, sent.id),
               sql`not exists (select 1 from messages where id = ${sent.id})`)),
-            db.delete(deliveryObjectLeases).where(eq(deliveryObjectLeases.token, objectLeaseToken)),
+            db.delete(deliveryObjectLeases).where(eq(deliveryObjectLeases.token, leaseToken)),
           ]);
         } catch (error) {
           // 暂时保持引用，cron 在租约到期后恢复回收；投递已完成的邮件不能因此改报失败。
@@ -815,39 +926,50 @@ export async function sendMail(
         }
       }
     }
-    const untried = targets.filter(target => !results.has(target));
-    for (const target of untried) {
-      results.set(target, { address: target, status: 'failed', error: processingError || '投递未执行' });
+    for (const target of targets) {
+      if (!results.has(target)) results.set(target, { address: target, status: 'failed', error: processingError || '投递未执行' });
     }
     const outcomes = ordered();
-    const delivered = outcomes.filter(outcome => outcome.status !== 'failed');
-    const status = delivered.length ? (delivered.some(outcome => outcome.status === 'sent') ? 'sent' : 'delivered') : 'failed';
-    const errors = outcomes.filter(outcome => outcome.error).map(outcome => `${outcome.address}: ${outcome.error}`);
-    const errorDetail = !errors.length ? '' : delivered.length
-      ? `部分收件人失败: ${errors.join('; ')}` : `全部收件人投递失败: ${errors.join('; ')}`;
-    // 增量写入排空后再写最终结果；至少重试一次，两次皆失败时保留 pending 幂等占位，禁止再次外发（cron 稍后标 unknown）。
-    await writer.settled();
-    let saved = false;
-    for (let attempt = 0; attempt < 2 && !saved; attempt++) {
+    const { status, errorDetail } = overallResult(outcomes);
+    // 与列表口径一致：正文内联图不算「有附件」
+    const summary = summarize({ ...sent, ...storedBody!, status, errorDetail, recipientOutcomes: outcomes },
+      attachments.some(countsAsAttachment), false);
+    // 发件行最终结果与幂等记录的响应同一事务写入：重放拿到的就是这次返回的结果。增量写入排空后再写
+    const persistFinal = async () => {
       try {
-        const finalWrite = db.update(messages).set({ status, errorDetail, recipientOutcomes: outcomes })
-          .where(eq(messages.id, sent.id));
+        const updateRow = db.update(messages).set({ status, errorDetail, recipientOutcomes: outcomes }).where(eq(messages.id, sent.id));
         // 投递回执的对应关系与最终结果同一事务写入：回执查到对应关系时发件行一定已是终态
-        if (sentRefs.length) {
-          await env.db.batch([d1Statement(env, finalWrite), ...deliveryRefStatements(env, {
-            kind: 'message', messageId: sent.id, sender: from.address, rfcMessageId: outgoingMessageId, targets: sentRefs,
-          })]);
-        } else await finalWrite;
-        saved = true;
-      } catch (error) { console.error('投递结果回填失败:', error); }
+        const refs = sentRefs.length && deliveryEventsQueue(env) ? deliveryRefInserts(db, {
+          kind: 'message', messageId: sent.id, sender: from.address, rfcMessageId: outgoingMessageId, targets: sentRefs,
+        }) : [];
+        if (handle || refs.length) {
+          await db.batch([updateRow, ...(handle ? [completeIdempotentStatement(db, handle, summary)] : []), ...refs]);
+        } else await updateRow;
+        return true;
+      } catch (error) {
+        console.error('投递结果回填失败:', error);
+        return false;
+      }
+    };
+    await writer.settled();
+    if (!(await persistFinal()) && !(await persistFinal())) {
+      // 响应照常返回；回填交给 waitUntil 退避重试，期间重放 409。仍失败时 pending 占位禁止再次外发，cron 稍后标 unknown
+      ctx.waitUntil((async () => {
+        for (const delay of finalWriteRetry.delaysMs) {
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          if (await persistFinal()) return;
+        }
+        console.error(`发件 ${sent.id} 的最终结果回填放弃，留给 cron 标为 unknown`);
+      })());
     }
-    if (!delivered.length) {
+    if (status === 'failed') {
+      // 全部明确失败才退还配额；结果不明的可能已经发出
       try { await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length); }
       catch (error) { console.error('外发配额退还失败:', error); }
     } else if (internalDeliveries.length) {
       ctx.waitUntil(notifyInternalDeliveries());
     }
-    return { outcomes, status, errorDetail, allAttempted: untried.length === 0, delivered: delivered.length > 0 };
+    return summary;
   };
 
   // 站内收件与 SMTP 收件统一转发及通知；每次发送只启动一组有界通知处理器。
@@ -883,14 +1005,5 @@ export async function sendMail(
 
   const delivery = deliver();
   ctx.waitUntil(delivery.then(() => undefined, (error: unknown) => console.error('投递任务异常结束:', error)));
-  const result = await delivery;
-  if (!result.delivered) {
-    // 每个目标都尝试过才是确定的拒收；处理中途的服务端故障（有目标没尝试）仍是 500
-    if (result.allAttempted) throw deliveryFailedError(sent.id, result.outcomes, result.errorDetail);
-    throw new AppError('internal', result.errorDetail || '发送失败');
-  }
-  // 与列表口径一致：正文内联图不算「有附件」
-  const hasAttachments = attachments.some(att => !(att.disposition === 'inline' && att.contentId));
-  return summarize({ ...sent, ...storedBody!, status: result.status, errorDetail: result.errorDetail,
-    recipientOutcomes: result.outcomes }, hasAttachments, false);
+  return delivery;
 }

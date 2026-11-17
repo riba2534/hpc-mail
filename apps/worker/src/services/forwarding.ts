@@ -1,17 +1,17 @@
-import { EXTERNAL_MESSAGE_MAX_BYTES, type UserNotifyPrefs } from '@hpc-mail/shared';
-import { and, eq, inArray } from 'drizzle-orm';
+import { EXTERNAL_MESSAGE_MAX_BYTES, type Settings, type UserNotifyPrefs } from '@hpc-mail/shared';
+import { eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { attachments, users } from '../db/schema.js';
+import { attachments } from '../db/schema.js';
 import { hmacSha256Base64 } from '../lib/crypto.js';
 import { chunk } from '../lib/d1.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
 import { convertHtmlToText, type MailText } from '../lib/text.js';
 import type { Env } from '../types.js';
-import { dayWindow, reserveCounters } from './rate-counter.js';
+import { dayWindow, releaseCounters, reserveCounters, type CounterLimit } from './rate-counter.js';
 import { retainExternalAttachments } from './external-attachment.js';
 import { injectAttachmentLinks } from './attachment-links.js';
-import { saveDeliveryRefs } from './delivery-events.js';
+import { saveDeliveryRefs } from './delivery-refs.js';
 import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT, recordDeliveryResult, type ForwardMode } from './notification-jobs.js';
 import type { NotifyOwner } from './notify-prefs.js';
 import { getSettings } from './setting.js';
@@ -145,55 +145,79 @@ async function relayForward(env: Env, target: string, mail: ForwardMail): Promis
   return (await env.email.send(new EmailMessage(sender, target, foldMimeHeaders(replyHeader + raw))))?.messageId || null;
 }
 
-/** 中转转发的日计数：全站一格（subject `instance`）与按归属人（subject 为用户 id），按天窗口 */
+/** 中转转发的日计数：全站一格（subject `instance`），未认领地址的来信另共用一格（subject `unclaimed`），按天窗口 */
 export const FORWARD_RELAY_SCOPE = 'fwd-relay';
+/** 已认领地址的中转按归属人日计数（subject 为用户 id） */
 export const FORWARD_RELAY_USER_SCOPE = 'fwd-relay-user';
 
 /** 转发归属人：收件链路传已读出的状态与偏好；站内互投只传偏好（与 mail.ownerIds 按下标对应），状态在这里补读 */
 export type ForwardOwners = Map<number, NotifyOwner> | UserNotifyPrefs[];
 
-/**
- * 开启转发且仍启用的归属人。只给偏好时只为开启了转发的人查一次状态（在 waitUntil 里，不在收件 Ack 前）；
- * 已停用的归属人原生与中转都不转发。
- */
-async function activeForwarders(env: Env, ownerIds: number[], owners: ForwardOwners): Promise<{ userId: number; prefs: UserNotifyPrefs }[]> {
-  if (owners instanceof Map) {
-    return ownerIds.flatMap((userId) => {
-      const owner = owners.get(userId);
-      return owner?.active && owner.prefs.forward.enabled ? [{ userId, prefs: owner.prefs }] : [];
-    });
-  }
-  const enabled = ownerIds.flatMap((userId, index) =>
-    owners[index]?.forward.enabled ? [{ userId, prefs: owners[index]! }] : []);
-  if (!enabled.length) return [];
-  const active = new Set<number>();
-  for (const ids of chunk([...new Set(enabled.map((item) => item.userId))])) {
-    const rows = await createDb(env).select({ id: users.id }).from(users)
-      .where(and(inArray(users.id, ids), eq(users.status, 'active'))).all();
-    for (const row of rows) active.add(row.id);
-  }
-  return enabled.filter((item) => active.has(item.userId));
+interface Forwarders {
+  list: { userId: number; prefs: UserNotifyPrefs }[];
+  /** 来信时地址未被认领（归属人是全体管理员） */
+  unclaimed: boolean;
 }
 
 /**
- * 中转额度：全站与归属人两个日计数同时占一格。同一目标有多位归属人（未认领地址归全部管理员）时
- * 按顺序找第一位还有额度的人计入，全部用尽才跳过；全站额度用尽时不再逐人尝试。返回跳过原因，有额度时为空串。
+ * 开启转发且仍启用的归属人，以及来信时地址是否未认领。有人开启转发时才查库，一次 batch 读地址当前的认领人，
+ * 只给偏好时同批补读归属人状态（在 waitUntil 里，不在收件 Ack 前）。已停用的归属人原生与中转都不转发。
+ * 已认领地址的归属快照只有认领人一个；快照里有多人（全体管理员），或唯一那人不是当前认领人，按未认领计。
  */
-async function reserveRelay(env: Env, window: number, userIds: number[], quota: { relayDaily: number; relayPerUserDaily: number }): Promise<string> {
-  for (const userId of userIds) {
-    const [siteFull, userFull] = await reserveCounters(env, [
-      { scope: FORWARD_RELAY_SCOPE, subject: 'instance', window, limit: quota.relayDaily },
-      { scope: FORWARD_RELAY_USER_SCOPE, subject: String(userId), window, limit: quota.relayPerUserDaily },
-    ]);
-    if (siteFull) return '全站今日中转转发额度已用尽';
-    if (!userFull) return '';
+async function loadForwarders(env: Env, mail: ForwardMail, owners: ForwardOwners): Promise<Forwarders> {
+  const enabled = owners instanceof Map
+    ? mail.ownerIds.flatMap((userId) => {
+      const owner = owners.get(userId);
+      return owner?.active && owner.prefs.forward.enabled ? [{ userId, prefs: owner.prefs }] : [];
+    })
+    : mail.ownerIds.flatMap((userId, index) => owners[index]?.forward.enabled ? [{ userId, prefs: owners[index]! }] : []);
+  if (!enabled.length) return { list: [], unclaimed: false };
+  const unverified = owners instanceof Map ? [] : [...new Set(enabled.map((item) => item.userId))];
+  const [claim, ...statuses] = await env.db.batch<{ id: number }>([
+    env.db.prepare('SELECT user_id AS id FROM mailboxes WHERE address = ?1').bind(mail.toAddress),
+    ...chunk(unverified).map((ids) => env.db.prepare(`SELECT id FROM users WHERE status = 'active'
+      AND id IN (${ids.map(() => '?').join(', ')})`).bind(...ids)),
+  ]);
+  const claimant = claim?.results[0]?.id;
+  const unclaimed = !(mail.ownerIds.length === 1 && claimant !== undefined && Number(claimant) === mail.ownerIds[0]);
+  if (owners instanceof Map) return { list: enabled, unclaimed };
+  const active = new Set(statuses.flatMap((result) => result.results.map((row) => Number(row.id))));
+  return { list: enabled.filter((item) => active.has(item.userId)), unclaimed };
+}
+
+type RelayQuota = Pick<Settings['quota'], 'relayDaily' | 'relayPerUserDaily' | 'relayUnclaimedDaily'>;
+
+/**
+ * 中转额度：全站一格，再加来信地址那一格——已认领地址计在认领人名下；未认领地址（归全体管理员）共用
+ * `unclaimed` 一格：catch-all 谁都能灌信，不能按管理员人数叠加。返回跳过原因（有额度时为空串）
+ * 与占到的格子（中转失败时退还）。
+ */
+async function reserveRelay(
+  env: Env, window: number, forwarders: Forwarders, ownerId: number, quota: RelayQuota,
+): Promise<{ skipped: string; taken: CounterLimit[] }> {
+  const site: CounterLimit = { scope: FORWARD_RELAY_SCOPE, subject: 'instance', window, limit: quota.relayDaily };
+  const own: CounterLimit = forwarders.unclaimed
+    ? { scope: FORWARD_RELAY_SCOPE, subject: 'unclaimed', window, limit: quota.relayUnclaimedDaily }
+    : { scope: FORWARD_RELAY_USER_SCOPE, subject: String(ownerId), window, limit: quota.relayPerUserDaily };
+  const [siteFull, ownFull] = await reserveCounters(env, [site, own]);
+  if (siteFull) return { skipped: '全站今日中转转发额度已用尽', taken: [] };
+  if (ownFull) return { skipped: forwarders.unclaimed ? '未认领地址今日中转转发额度已用尽' : '今日中转转发额度已用尽', taken: [] };
+  return { skipped: '', taken: [site, own] };
+}
+
+/** 退还没用上的额度；退还失败只记日志，不改变这次转发的结果 */
+async function releaseQuota(env: Env, items: CounterLimit[]): Promise<void> {
+  try {
+    await releaseCounters(env, items);
+  } catch (error) {
+    console.error('转发额度退还失败:', error);
   }
-  return '今日中转转发额度已用尽';
 }
 
 /**
  * 原生收件与站内互投使用同一归属偏好、限额及环路保护。
  * 每个目标先占域名与目标两个日计数（已满不再累加），再试原生 forward()；原生失败才走中转并占中转额度。
+ * 中转因额度跳过时退还域名与目标计数（这次什么也没发出去）；中转抛错时退还中转额度。
  */
 export async function forwardReceivedMail(
   env: Env,
@@ -202,8 +226,9 @@ export async function forwardReceivedMail(
   native?: ForwardableEmailMessage,
 ): Promise<void> {
   if (native?.headers.get('x-hpc-mail-relay') === await relayMarker(env)) return;
+  const forwarders = await loadForwarders(env, mail, owners);
   const ownersByTarget = new Map<string, Set<number>>();
-  for (const { userId, prefs } of await activeForwarders(env, mail.ownerIds, owners)) {
+  for (const { userId, prefs } of forwarders.list) {
     for (const rawTarget of prefs.forward.addresses) {
       const target = normalizeEmail(rawTarget);
       if (!target || target === mail.toAddress) continue;
@@ -211,7 +236,7 @@ export async function forwardReceivedMail(
     }
   }
   const window = dayWindow();
-  let quota: Promise<{ relayDaily: number; relayPerUserDaily: number }> | undefined;
+  let quota: Promise<RelayQuota> | undefined;
   for (const [target, owned] of ownersByTarget) {
     const userIds = [...owned];
     let status: 'succeeded' | 'failed' | 'skipped' = 'succeeded';
@@ -219,10 +244,11 @@ export async function forwardReceivedMail(
     let forwardMode: ForwardMode = '';
     let providerMessageId: string | null = null;
     try {
-      const [domainFull, targetFull] = await reserveCounters(env, [
+      const limits: CounterLimit[] = [
         { scope: 'fwd-domain', subject: mail.domain, window, limit: FORWARD_DOMAIN_DAILY_LIMIT },
         { scope: 'fwd-target', subject: target, window, limit: FORWARD_TARGET_DAILY_LIMIT },
-      ]);
+      ];
+      const [domainFull, targetFull] = await reserveCounters(env, limits);
       if (domainFull || targetFull) {
         status = 'skipped';
         detail = '今日转发额度已用尽';
@@ -233,11 +259,19 @@ export async function forwardReceivedMail(
         }
         if (!forwardMode) {
           quota ??= getSettings(env).then((settings) => settings.quota);
-          detail = await reserveRelay(env, window, userIds, await quota);
-          if (detail) status = 'skipped';
-          else {
+          const relay = await reserveRelay(env, window, forwarders, userIds[0]!, await quota);
+          if (relay.skipped) {
+            status = 'skipped';
+            detail = relay.skipped;
+            await releaseQuota(env, limits);
+          } else {
             forwardMode = 'relay';
-            providerMessageId = await relayForward(env, target, mail);
+            try {
+              providerMessageId = await relayForward(env, target, mail);
+            } catch (error) {
+              await releaseQuota(env, relay.taken);
+              throw error;
+            }
           }
         }
       }

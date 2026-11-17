@@ -1,7 +1,11 @@
 import type { ApiScope, Role, UserStatus } from '@hpc-mail/shared';
+import type { RateLimitBindingName } from './services/rate-limit.js';
 
-/** Worker 运行时绑定与变量（对应 wrangler.toml） */
-export interface Env {
+/**
+ * Worker 运行时绑定与变量（对应 wrangler.toml）。
+ * Rate Limiting binding（rl_*）可缺省：缺失时 services/rate-limit.ts 退回进程内计数。
+ */
+export interface Env extends Partial<Record<RateLimitBindingName, RateLimit>> {
   db: D1Database;
   kv: KVNamespace;
   r2: R2Bucket;
@@ -19,6 +23,11 @@ export interface Env {
   cf_account_id?: string;
   /** 托管域名 catch-all 投递的目标脚本名，须与 wrangler.toml 的 name 一致 */
   worker_name?: string;
+  /**
+   * 投递回执 Queue 名：设置了 GitHub Variable DELIVERY_EVENTS_QUEUE 时 CI 注入（同时注入 Queue consumer）；
+   * 未设置即未启用投递回执
+   */
+  delivery_events_queue?: string;
 }
 
 /** 内部 API 鉴权后的用户上下文 */

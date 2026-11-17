@@ -7,12 +7,12 @@ import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, emailDeliveryRefs, emailSuppressions, mailboxes, messages, notificationJobs, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import {
-  handleDeliveryEventBatch, parseDeliveryEvent, processDeliveryEvent, summarizeOutcomes, type DeliveryUserEvent,
+  handleDeliveryEventBatch, parseDeliveryEvent, processDeliveryEvent, type DeliveryUserEvent,
 } from '../src/services/delivery-events.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { getNotificationHealth } from '../src/services/notification-jobs.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
-import { sendMail } from '../src/services/outbound.js';
+import { overallResult, sendMail } from '../src/services/outbound.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
@@ -24,6 +24,7 @@ vi.mock('cloudflare:email', () => ({
 }));
 
 const app = createApp();
+const QUEUE = 'hpc-mail-email-events';
 const db = createDb(env);
 let sequence = 0;
 
@@ -36,7 +37,7 @@ function mailEnv(opts: { withId?: boolean } = {}) {
     sent.push({ from: mail.from, to: mail.to });
     return opts.withId === false ? undefined : { messageId: `cf-${sent.length}-${mail.to}` };
   });
-  return { runtime: { ...env, email: { send } } as unknown as Env, sent, send };
+  return { runtime: { ...env, email: { send }, delivery_events_queue: QUEUE } as unknown as Env, sent, send };
 }
 
 async function fixture() {
@@ -102,12 +103,14 @@ describe('投递事件解析', () => {
     expect(parseDeliveryEvent('not json')).toBeNull();
   });
 
-  it('整体状态：还有 sent 为 sent；全部失败或退信为 failed；投诉算已送达', () => {
-    expect(summarizeOutcomes([{ address: 'a', status: 'delivered' }, { address: 'b', status: 'sent' }]).status).toBe('sent');
-    expect(summarizeOutcomes([{ address: 'a', status: 'complained' }, { address: 'b', status: 'bounced', error: 'x' }]))
+  it('整体状态（与发信同一口径）：还有 sent 为 sent；全部失败或退信为 failed；投诉算已送达；只剩结果不明为 unknown', () => {
+    expect(overallResult([{ address: 'a', status: 'delivered' }, { address: 'b', status: 'sent' }]).status).toBe('sent');
+    expect(overallResult([{ address: 'a', status: 'complained' }, { address: 'b', status: 'bounced', error: 'x' }]))
       .toEqual({ status: 'delivered', errorDetail: '部分收件人失败: b: x' });
-    expect(summarizeOutcomes([{ address: 'a', status: 'bounced', error: 'x' }, { address: 'b', status: 'failed', error: 'y' }]))
+    expect(overallResult([{ address: 'a', status: 'bounced', error: 'x' }, { address: 'b', status: 'failed', error: 'y' }]))
       .toEqual({ status: 'failed', errorDetail: '全部收件人投递失败: a: x; b: y' });
+    expect(overallResult([{ address: 'a', status: 'bounced', error: 'x' }, { address: 'b', status: 'unknown', error: 'timeout' }]).status)
+      .toBe('unknown');
   });
 });
 
@@ -195,6 +198,27 @@ describe('外发回执回写与抑制名单', () => {
     // 抑制只对这个发信域名生效
     await send(runtime, f.sender, `${f.prefix}-owner@another.test`, [blocked], `${f.prefix}-other-domain`);
     expect(sent.map((item) => item.to)).toEqual([other, blocked]);
+  });
+
+  it('部署未启用投递回执时：外发不查抑制名单、不登记对应关系', async () => {
+    const f = await fixture();
+    const target = f.ext('off');
+    await processDeliveryEvent(env, event('complained', { messageId: 'x', sender: 'a@hpc.email', recipient: target }));
+    const { runtime, sent } = mailEnv();
+    const disabled = { ...runtime, delivery_events_queue: undefined } as Env;
+    const summary = await send(disabled, f.sender, f.address, [target], `${f.prefix}-off`);
+    expect(sent.map((item) => item.to)).toEqual([target]);
+    expect(summary.recipientOutcomes).toEqual([{ address: target, status: 'sent' }]);
+    expect(await db.select().from(emailDeliveryRefs).where(eq(emailDeliveryRefs.messageId, summary.id)).all()).toEqual([]);
+    // 中转转发同样不登记
+    await updateUserNotifyPrefs(env, f.user.id, { forward: { enabled: true, addresses: [f.ext('off-fwd')] } });
+    const ctx = createExecutionContext();
+    await handleInbound({ to: f.address, from: 'sender@example.org', headers: new Headers(),
+      raw: new Response(`From: sender@example.org\r\nTo: ${f.address}\r\nSubject: ${f.prefix}-off-relay\r\n\r\nbody`).body!,
+      forward: vi.fn(async () => { throw new Error('destination not verified'); }), setReject: vi.fn() } as unknown as ForwardableEmailMessage, disabled, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(sent.map((item) => item.to)).toContain(f.ext('off-fwd'));
+    expect(await db.select().from(emailDeliveryRefs).where(eq(emailDeliveryRefs.recipient, f.ext('off-fwd'))).all()).toEqual([]);
   });
 
   it('API 返回 422 recipient_suppressed 错误信封并释放 Idempotency-Key，过期的抑制不再拦截', async () => {
@@ -355,10 +379,16 @@ describe('Queue consumer 与管理接口', () => {
     expect(await db.select().from(emailSuppressions).where(eq(emailSuppressions.address, target)).get()).toBeUndefined();
     expect(await db.select().from(adminAuditLogs).where(eq(adminAuditLogs.target, target)).get()).toMatchObject({ action: 'suppression.delete' });
 
+    // 部署没有注入 Queue 时 queue 为 null（投递回执未启用）
     const overview = await call('GET', '/admin/delivery-events', adminToken);
     expect((await overview.json() as { data: DeliveryEventsOverview }).data).toMatchObject({
-      enabled: true, credentials: false, queue: 'hpc-mail-email-events', subscriptions: expect.any(Array),
+      enabled: true, credentials: false, queue: null, subscriptions: expect.any(Array),
     });
+    const ctx = createExecutionContext();
+    const enabled = await app.request('/api/admin/delivery-events', { headers: { Authorization: `Bearer ${adminToken}` } },
+      { ...env, delivery_events_queue: QUEUE }, ctx);
+    await waitOnExecutionContext(ctx);
+    expect((await enabled.json() as { data: DeliveryEventsOverview }).data.queue).toBe(QUEUE);
   });
 
   it('发件摘要类型：201 响应里的逐收件人结果保持原有字段', async () => {

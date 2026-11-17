@@ -1,7 +1,8 @@
 import { DELIVERY_EVENT_TYPES, type DeliveryEventType, type RecipientOutcome } from '@hpc-mail/shared';
-import { chunk } from '../lib/d1.js';
 import { getEmailDomain } from '../lib/email-address.js';
 import type { Env, ExecCtx } from '../types.js';
+import { stripBrackets } from './delivery-refs.js';
+import { overallResult } from './outbound.js';
 import { bounceSuppression, upsertSuppressionStatement } from './suppression.js';
 
 /**
@@ -74,42 +75,6 @@ export function parseDeliveryEvent(body: unknown, now = Date.now()): DeliveryEve
 }
 
 // ---------------------------------------------------------------------------
-// 发送时登记对应关系
-
-export interface DeliveryRefInput {
-  kind: 'message' | 'forward';
-  messageId: number;
-  sender: string;
-  /** 本站写进原文的 Message-ID（可带尖括号）；中转转发没有 */
-  rfcMessageId: string | null;
-  /** forward：结果归属人 */
-  ownerIds?: number[];
-  targets: { recipient: string; providerMessageId: string | null }[];
-}
-
-const stripBrackets = (value: string): string => value.trim().replace(/^<|>$/g, '');
-
-/** 每个外部收件人一行；与发件结果写在同一个 batch 里，不多一次往返 */
-export function deliveryRefStatements(env: Env, input: DeliveryRefInput): D1PreparedStatement[] {
-  const now = Date.now();
-  const rfc = input.rfcMessageId ? stripBrackets(input.rfcMessageId) : null;
-  const owners = JSON.stringify(input.ownerIds ?? []);
-  // 每行 8 个绑定，10 行一条语句，不超过 D1 的 100 参数上限
-  return chunk(input.targets, 10).map((rows) => env.db.prepare(`INSERT OR IGNORE INTO email_delivery_refs
-      (provider_message_id, rfc_message_id, kind, message_id, sender, recipient, owner_ids, created_at)
-      VALUES ${rows.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`)
-    .bind(...rows.flatMap((row) => [row.providerMessageId || null, rfc, input.kind, input.messageId,
-      input.sender.toLowerCase(), row.recipient.toLowerCase(), owners, now])));
-}
-
-/** 中转转发成功后登记（在 waitUntil 里，失败只记日志） */
-export async function saveDeliveryRefs(env: Env, input: DeliveryRefInput): Promise<void> {
-  if (!input.targets.length) return;
-  try { await env.db.batch(deliveryRefStatements(env, input)); }
-  catch (error) { console.error('投递回执对应关系保存失败:', error); }
-}
-
-// ---------------------------------------------------------------------------
 // 消费事件
 
 interface RefRow {
@@ -145,18 +110,6 @@ const MAX_MATCH_ATTEMPTS = 4;
 const OUTCOME_FROM_EVENT: Record<DeliveryEventType, RecipientOutcome['status']> = {
   delivered: 'delivered', bounced: 'bounced', failed: 'failed', rejected: 'failed', complained: 'complained',
 };
-const SUCCEEDED = new Set<RecipientOutcome['status']>(['delivered', 'sent', 'complained', 'unknown']);
-
-/** 发件整体状态与 errorDetail：与 sendMail 写最终结果的口径一致 */
-export function summarizeOutcomes(outcomes: RecipientOutcome[]): { status: 'sent' | 'delivered' | 'failed'; errorDetail: string } {
-  const succeeded = outcomes.filter((outcome) => SUCCEEDED.has(outcome.status));
-  const status = !succeeded.length ? 'failed' : outcomes.some((outcome) => outcome.status === 'sent') ? 'sent' : 'delivered';
-  const errors = outcomes.filter((outcome) => outcome.error).map((outcome) => `${outcome.address}: ${outcome.error}`);
-  const errorDetail = !errors.length ? '' : succeeded.length
-    ? `部分收件人失败: ${errors.join('; ')}` : `全部收件人投递失败: ${errors.join('; ')}`;
-  return { status, errorDetail: errorDetail.slice(0, 2000) };
-}
-
 /** 把事件应用到一个收件人的结果；比已有回执旧或完全相同的事件不改动，返回 null */
 export function applyEventToOutcome(outcome: RecipientOutcome, event: DeliveryEvent): RecipientOutcome | null {
   // 站内收件人与本站拦下的收件人没有发往 Cloudflare，不会有真实回执
@@ -222,12 +175,12 @@ async function applyToMessage(env: Env, ref: RefRow, event: DeliveryEvent, attem
       return 'unchanged';
     }
     const nextOutcomes = outcomes.map((outcome, i) => (i === index ? updated : outcome));
-    // unknown 行保留原状态（其他收件人仍未确认），只更新这个收件人的结果
-    const summary = message.status === 'unknown' ? null : summarizeOutcomes(nextOutcomes);
+    // 整体状态与 errorDetail 按 sendMail 写最终结果的同一口径重算
+    const summary = overallResult(nextOutcomes);
     const [write] = await env.db.batch([
-      env.db.prepare(`UPDATE messages SET recipient_outcomes = ?, status = COALESCE(?, status), error_detail = COALESCE(?, error_detail)
+      env.db.prepare(`UPDATE messages SET recipient_outcomes = ?, status = ?, error_detail = ?
         WHERE id = ? AND recipient_outcomes = ? AND status = ?`)
-        .bind(JSON.stringify(nextOutcomes), summary?.status ?? null, summary?.errorDetail ?? null,
+        .bind(JSON.stringify(nextOutcomes), summary.status, summary.errorDetail,
           message.id, message.recipient_outcomes, message.status),
       resolveRef(env, ref.id, event.at),
     ]);

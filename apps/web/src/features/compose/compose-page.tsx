@@ -453,8 +453,21 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       sendPayloadHashRef.current = null;
       writeLastIdentity(user.id, currentIdentity());
       const failures = result.recipientOutcomes?.filter((outcome) => outcome.status === 'failed' || outcome.status === 'bounced') ?? [];
+      // 结果未确认的收件人可能已经收到：提示先核对，不引导直接重发
+      const unconfirmed = result.recipientOutcomes?.filter((outcome) => outcome.status === 'unknown') ?? [];
       const issue = failures.length > 0 || Boolean(result.errorDetail) || result.status === 'failed';
-      toast({ title: issue ? failures.length ? `${failures.length} 个收件人发送失败，请查看并重试失败目标` : '邮件发送有异常，请查看详情' : result.status === 'delivered' ? '站内邮件已送达' : '邮件已提交发送', variant: issue ? 'error' : 'success' });
+      if (unconfirmed.length > 0 || result.status === 'unknown') {
+        toast({
+          title: [
+            failures.length ? `${failures.length} 个收件人发送失败` : '',
+            unconfirmed.length ? `${unconfirmed.length} 个收件人的投递结果未确认` : '投递结果未确认',
+          ].filter(Boolean).join('，'),
+          description: '可能已经收到：请先向收件人核对，确认没收到再补发，避免重复投递',
+          variant: 'error',
+        });
+      } else {
+        toast({ title: issue ? failures.length ? `${failures.length} 个收件人发送失败，请查看并重试失败目标` : '邮件发送有异常，请查看详情' : result.status === 'delivered' ? '站内邮件已送达' : '邮件已提交发送', variant: issue ? 'error' : 'success' });
+      }
       clearDraft(draftKey);
       const owned = new Set((mailboxes ?? []).map((box) => box.address.toLowerCase()));
       syncSentMessage(queryClient, {
@@ -463,7 +476,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       });
       // 新收件人会进入往来联系人
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });
-      navigate(result.errorDetail || result.status === 'failed' || failures.length ? `/mail/${result.id}` : '/sent');
+      navigate(issue || unconfirmed.length > 0 || result.status === 'unknown' ? `/mail/${result.id}` : '/sent');
     },
     onError: (err, payload) => {
       // 网络/超时可能发生在服务端已经发送之后、服务端也可能仍在处理：保留同一个 key，再次发送只会查询/重放原结果。

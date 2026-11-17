@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
-  DEFAULT_RELAY_DAILY_LIMIT, DEFAULT_RELAY_PER_USER_DAILY_LIMIT, DEFAULT_RESERVED_LOCAL_PARTS, REGISTRATION_MODES,
+  DEFAULT_RELAY_DAILY_LIMIT, DEFAULT_RELAY_PER_USER_DAILY_LIMIT, DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT,
+  DEFAULT_RESERVED_LOCAL_PARTS, REGISTRATION_MODES,
 } from '../constants.js';
 import { emailAddressSchema } from './mail.js';
 import { domainSchema } from './mailbox.js';
@@ -105,6 +106,11 @@ export const quotaSettingSchema = z.object({
   relayDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_DAILY_LIMIT),
   /** 转发中转按归属人每日上限，含管理员（0=不限） */
   relayPerUserDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_PER_USER_DAILY_LIMIT),
+  /**
+   * 未认领地址（归管理员）的来信中转全站共用的每日上限（0=不限）。catch-all 地址谁都能灌信，
+   * 不按管理员人数叠加，免得外部来信把全站中转额度耗尽。
+   */
+  relayUnclaimedDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT),
 });
 
 /** 邮箱认领策略：保留前缀防身份冒充 + 每用户认领上限防囤积（admin 豁免） */
@@ -233,6 +239,7 @@ export const DEFAULT_SETTINGS: Settings = {
   quota: {
     dailyOutbound: 200, dailyRecipients: 500,
     relayDaily: DEFAULT_RELAY_DAILY_LIMIT, relayPerUserDaily: DEFAULT_RELAY_PER_USER_DAILY_LIMIT,
+    relayUnclaimedDaily: DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT,
   },
   mailbox_policy: {
     perUserLimit: 50,

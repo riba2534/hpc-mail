@@ -8,7 +8,10 @@ import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from '../constants.js';
 export const DELIVERY_EVENT_TYPES = ['delivered', 'bounced', 'failed', 'rejected', 'complained'] as const;
 export type DeliveryEventType = (typeof DELIVERY_EVENT_TYPES)[number];
 
-/** 投递事件所在的 Queue 名（不含账户信息，各部署相同；CI 部署前确保存在） */
+/**
+ * 投递事件 Queue 的建议名（不含账户信息）。投递回执显式启用：部署时把队列名设为 GitHub Variable
+ * DELIVERY_EVENTS_QUEUE，CI 才创建 Queue 并注入 consumer；没设置时整个功能不生效。
+ */
 export const DELIVERY_EVENTS_QUEUE = 'hpc-mail-email-events';
 
 /**
@@ -66,6 +69,7 @@ export interface DeliveryEventsOverview {
   enabled: boolean;
   /** Worker 是否配置了 Cloudflare 凭据（cf_api_token / cf_account_id）；没有时不会自动建立订阅 */
   credentials: boolean;
-  queue: string;
+  /** 部署注入的 Queue 名；null 表示部署未启用投递回执（没有设置 GitHub Variable DELIVERY_EVENTS_QUEUE），开关不生效 */
+  queue: string | null;
   subscriptions: DeliveryEventSubscriptionView[];
 }

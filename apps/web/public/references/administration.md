@@ -10,7 +10,7 @@
 - [投递回执与抑制名单](#投递回执与抑制名单)：回执订阅状态、抑制名单的查看与解除
 - [Key 与管理审计](#key-与管理审计)
 
-所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的五个 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
+所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
 
 ## 用户与邮件审阅
 
@@ -103,7 +103,7 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | `domains` | `{list:[{domain,public,perUserLimit,random?}],revision?}`；`random:false` 的域不参与随机后缀；更新必须顶层 `expectedDomainsRevision`，见域名参考 |
 | `mailbox_policy` | `{perUserLimit,reservedLocalParts}`；总认领上限 0–10000，0 不限；保留前缀最多 200 项，每项 ≤64 字符；普通用户生效，admin 豁免 |
 | `claim_random` | `{paidSuspendedLimit,pendingDays,suspendedPercent,dailyLimit}`；Claude 0 封号随机后缀规则。任意历史封号记录都排除，不受账号数或付费状态影响；paidSuspendedLimit（0–1000，默认 2）和 suspendedPercent（0–100，默认 50）已弃用，仅兼容解析与存储，设为 0 也不能放行封号域名；pendingDays（0–90，默认 7，0 不计）天内认领、还没收到 Claude 来信的邮箱计入后缀负载；近 24 小时新增达到 dailyLimit（0–1000，默认 3，0 不限）的后缀当天不再分配。更新时提交完整对象，缺省字段按默认值处理 |
-| `quota` | `{dailyOutbound,dailyRecipients,relayDaily,relayPerUserDaily}`；普通用户每日外发邮件数 0–100000、唯一收件地址数 0–1000000，跨 Key/JWT 共用，admin 豁免（用户可用 `/v1/me` 查看自己的用量）；`relayDaily`/`relayPerUserDaily`（0–100000，默认 300/50）是邮箱转发经 `no-reply@收件域名` 中转重发的全站与每位归属人每日上限，含管理员，原生转发不计入，超限的转发记为跳过。0 均为不限 |
+| `quota` | `{dailyOutbound,dailyRecipients,relayDaily,relayPerUserDaily,relayUnclaimedDaily}`；普通用户每日外发邮件数 0–100000、唯一收件地址数 0–1000000，跨 Key/JWT 共用，admin 豁免（用户可用 `/v1/me` 查看自己的用量）；`relayDaily`/`relayPerUserDaily`（0–100000，默认 300/50）是邮箱转发经 `no-reply@收件域名` 中转重发的全站与每位归属人每日上限，含管理员；`relayUnclaimedDaily`（默认 50）是未认领地址（归管理员）来信中转的全站合计上限，不按管理员人数叠加，免得外部灌信耗尽全站中转额度。原生转发不计入，超限的转发记为跳过，因额度跳过的不占域名与目标计数。0 均为不限 |
 | `retention` | `{unclaimedDays,allMessagesDays}`；0–3650 天，0 关闭该项定时清理 |
 | `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除；沿用已存 Key 时 baseUrl 的 origin 与路径必须与已保存的一致（协议、主机、端口或路径变化都算换了接口，末尾斜杠视为相同），否则仍提交 `******` 返回 400 `validation_failed`，需要重新填写 apiKey，防止已存的 Key 被发往新地址；清空 baseUrl 可沿用已存 Key |
 | `translation` | `{enabled,dailyCharsPerUser}`；AI 翻译开关与额度。enabled=true 要求 `ai_model` 已配置，同一请求同时提交两者时按合并后的结果校验（翻译开着时不能单独清空模型）；dailyCharsPerUser 0–10000000，每用户每 UTC 日发送给模型的字符数，0 不限，admin 不豁免 |
@@ -122,11 +122,11 @@ AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Wo
 
 ## 投递回执与抑制名单
 
-外发投递回执来自 Cloudflare Email Sending 的事件订阅：送达、退信、失败、拒绝、投诉事件按发信域名投递到 Queue `hpc-mail-email-events`，本站据此回写发件的逐收件人结果（见[投递回执](mail.md#投递回执)），退信与投诉的收件人进入抑制名单（见[抑制名单](mail.md#抑制名单)）。设置 `delivery_events.enabled` 开启（默认）且 Worker 有 Cloudflare 凭据时，定时任务每 5 分钟为还没有订阅的系统域名补建订阅、每日核对一次，托管域名开通发信时立即订阅。关闭后不再新建订阅，已有订阅的事件仍会回写。
+外发投递回执来自 Cloudflare Email Sending 的事件订阅：送达、退信、失败、拒绝、投诉事件按发信域名投递到部署时配置的 Queue，本站据此回写发件的逐收件人结果（见[投递回执](mail.md#投递回执)），退信与投诉的收件人进入抑制名单（见[抑制名单](mail.md#抑制名单)）。这个功能需要站长在部署时显式启用（GitHub Variable `DELIVERY_EVENTS_QUEUE`）；没启用时 `GET /admin/delivery-events` 的 `queue` 为 null，不建订阅、发信也不查抑制名单。启用后，设置 `delivery_events.enabled` 开启（默认）且 Worker 有 Cloudflare 凭据时，定时任务每 5 分钟为还没有订阅的系统域名补建订阅、每日核对一次，托管域名开通发信时立即订阅。关闭后不再新建订阅，已有订阅的事件仍会回写。
 
 | 方法与 `/api` 路径 | 契约 |
 |---|---|
-| `GET /admin/delivery-events` | `{enabled,credentials,queue,subscriptions:[{domain,kind,zoneId,subscriptionId,status,lastError,checkedAt}]}`；`kind` 为 `system\|hosted`，`status` 为 `active`（已订阅）或 `error`（建立失败，见 `lastError`，定时任务约 6 小时后重试）。只列定时任务处理过的域名 |
+| `GET /admin/delivery-events` | `{enabled,credentials,queue,subscriptions:[{domain,kind,zoneId,subscriptionId,status,lastError,checkedAt}]}`；`queue` 为部署配置的队列名，null 表示部署未启用；`kind` 为 `system\|hosted`，`status` 为 `active`（已订阅）或 `error`（建立失败，见 `lastError`，定时任务约 6 小时后重试）。只列定时任务处理过的域名 |
 | `GET /admin/suppressions?q=…&cursor=…&limit=30` | 有效（未过期）的抑制条目，按 id 倒序分页；`q` 按收件地址或发信域名包含匹配，不区分大小写；limit 1–100，默认 30 |
 | `DELETE /admin/suppressions/:id` | 解除一条，`{success:true}`；不存在返回 404 `not_found`；记管理审计 `suppression.delete`（target 为收件地址，detail 为「发信域名 <域名>」） |
 

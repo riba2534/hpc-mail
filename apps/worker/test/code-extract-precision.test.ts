@@ -3,6 +3,7 @@ import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../src/db/client.js';
 import { messages } from '../src/db/schema.js';
+import { mailText, type MailText } from '../src/lib/text.js';
 import { codeScanBody, extractCodeByRegex, wantsAiCode } from '../src/services/code-extract.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { updateSettings } from '../src/services/setting.js';
@@ -59,11 +60,27 @@ describe('纯文本段是占位文案时提码看 HTML（R08）', () => {
   const html = '<p>Hello,</p><p>Your verification code is <b>482913</b>.</p>';
 
   it('占位或很短的 text 段改看 HTML 转出的文本；正常 text 段原样使用', () => {
-    expect(codeScanBody(placeholder, html, placeholder)).toContain('482913');
-    expect(codeScanBody('Hi', html, 'Hi')).toContain('482913');
+    expect(codeScanBody(placeholder, html, mailText(placeholder, html))).toContain('482913');
+    expect(codeScanBody('Hi', html, mailText('Hi', html))).toContain('482913');
     const real = 'Your verification code is 731904. It expires in ten minutes.';
-    expect(codeScanBody(real, html, real)).toBe(real);
-    expect(codeScanBody('', html, 'converted')).toBe('converted');
+    expect(codeScanBody(real, html, mailText(real, html))).toBe(real);
+    expect(codeScanBody('', html, mailText('', html))).toContain('482913');
+  });
+
+  /** 多数来信的纯文本段本来就不含验证码说法，按这一条判占位时每封都要多转一次 HTML（C8） */
+  it('有实际内容的 text 段即使不含验证码说法也不转换 HTML，占位时复用正文视图的转换结果', () => {
+    let conversions = 0;
+    const view = (text: string): MailText => ({
+      plain: text,
+      plainTruncated: false,
+      get htmlText() { conversions++; return 'Your verification code is 482913'; },
+      preview: () => text,
+    });
+    const newsletter = 'Hi Alice, here is what happened in your workspace this week: three new members joined and two projects shipped.';
+    expect(codeScanBody(newsletter, html, view(newsletter))).toBe(newsletter);
+    expect(conversions).toBe(0);
+    expect(codeScanBody(placeholder, html, view(placeholder))).toBe('Your verification code is 482913');
+    expect(conversions).toBe(1);
   });
 
   it('收件链路：text 段占位、码只在 HTML 里时照样落库', async () => {

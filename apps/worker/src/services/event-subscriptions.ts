@@ -1,6 +1,5 @@
 import {
   DELIVERY_EVENT_TYPES,
-  DELIVERY_EVENTS_QUEUE,
   type DeliveryEventsOverview,
   type DeliveryEventSubscriptionView,
 } from '@hpc-mail/shared';
@@ -15,6 +14,7 @@ import {
   type CfEventSubscription,
   type CloudflareCredentials,
 } from './cloudflare.js';
+import { deliveryEventsQueue } from './delivery-refs.js';
 import { getSettings, getSettingsFresh } from './setting.js';
 
 /** 订阅的事件名（Queues 订阅接口使用不带 cf.email.sending 前缀的短名） */
@@ -59,9 +59,9 @@ async function saveRow(env: Env, target: Target, fields: { zoneId: string; subsc
 }
 
 /** 取 Queue 与它已有的 email.sending 订阅（按发信域名索引）；Queue 不存在时抛出带提示的错误 */
-async function loadQueueState(creds: CloudflareCredentials): Promise<{ queueId: string; byDomain: Map<string, CfEventSubscription> }> {
-  const queue = await findQueue(creds, DELIVERY_EVENTS_QUEUE);
-  if (!queue) throw new Error(`Queue ${DELIVERY_EVENTS_QUEUE} 不存在：部署流程会自动创建，或手动运行 wrangler queues create ${DELIVERY_EVENTS_QUEUE}`);
+async function loadQueueState(creds: CloudflareCredentials, name: string): Promise<{ queueId: string; byDomain: Map<string, CfEventSubscription> }> {
+  const queue = await findQueue(creds, name);
+  if (!queue) throw new Error(`Queue ${name} 不存在：部署流程会自动创建，或手动运行 wrangler queues create ${name}`);
   const subscriptions = await listQueueSubscriptions(creds, queue.queue_id);
   const byDomain = new Map<string, CfEventSubscription>();
   for (const item of subscriptions) {
@@ -113,11 +113,13 @@ async function loadTargets(env: Env, domains: string[]): Promise<{ targets: Targ
 /**
  * 定时维护（幂等）：每 5 分钟为还没有订阅、或失败超过 6 小时的域名建立订阅，每轮最多 limit 个；
  * verify=true（每日）时再核对一次 Cloudflare 上的订阅，被删掉的重建，不再需要的域名删掉本地记录。
- * 只在 Worker 有 Cloudflare 凭据且设置 delivery_events.enabled 开启时执行；没有待办时不调用 Cloudflare。
+ * 只在部署启用了投递回执（注入了 Queue）、Worker 有 Cloudflare 凭据且设置 delivery_events.enabled 开启时执行；
+ * 未启用时不读库也不调用 Cloudflare，没有待办时也不调用 Cloudflare。
  */
 export async function syncDeliveryEventSubscriptions(env: Env, options: { verify?: boolean; limit?: number } = {}): Promise<number> {
+  const queue = deliveryEventsQueue(env);
   const creds = cloudflareCredentials(env);
-  if (!creds) return 0;
+  if (!queue || !creds) return 0;
   const settings = await getSettings(env);
   if (!settings.delivery_events.enabled) return 0;
   const { targets, rows } = await loadTargets(env, settings.domains.list.map((item) => item.domain));
@@ -137,7 +139,7 @@ export async function syncDeliveryEventSubscriptions(env: Env, options: { verify
   if (!due.length) return 0;
   let state: Awaited<ReturnType<typeof loadQueueState>>;
   try {
-    state = await loadQueueState(creds);
+    state = await loadQueueState(creds, queue);
   } catch (error) {
     // Queue 不可用时整轮失败：只给还没有记录的域名写 error，已生效的订阅保持原状态
     const message = errorText(error);
@@ -162,6 +164,8 @@ export async function syncDeliveryEventSubscriptions(env: Env, options: { verify
  * 托管域名开通发信后立即订阅（开通流程里调用，失败只记录，不影响开通）；已订阅时只读一次本地记录。
  */
 export async function subscribeHostedDomainEvents(env: Env, creds: CloudflareCredentials, domain: string, zoneId: string): Promise<void> {
+  const queue = deliveryEventsQueue(env);
+  if (!queue) return;
   try {
     const settings = await getSettings(env);
     if (!settings.delivery_events.enabled) return;
@@ -172,7 +176,7 @@ export async function subscribeHostedDomainEvents(env: Env, creds: CloudflareCre
     const target: Target = { domain, kind: 'hosted', zoneId };
     let state: Awaited<ReturnType<typeof loadQueueState>>;
     try {
-      state = await loadQueueState(creds);
+      state = await loadQueueState(creds, queue);
     } catch (error) {
       await saveRow(env, target, { zoneId, subscriptionId: null, status: 'error', lastError: errorText(error) });
       return;
@@ -193,7 +197,7 @@ export async function deliveryEventsOverview(env: Env): Promise<DeliveryEventsOv
   return {
     enabled: settings.delivery_events.enabled,
     credentials: cloudflareCredentials(env) !== null,
-    queue: DELIVERY_EVENTS_QUEUE,
+    queue: deliveryEventsQueue(env),
     subscriptions: results.map((row) => ({
       domain: row.domain, kind: row.kind, zoneId: row.zone_id, subscriptionId: row.subscription_id,
       status: row.status, lastError: row.last_error,

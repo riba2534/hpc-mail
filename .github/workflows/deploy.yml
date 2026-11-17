@@ -12,11 +12,6 @@ on:
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
   workflow_dispatch:
-    inputs:
-      reset_database:
-        type: boolean
-        default: false
-        description: '危险：清空线上 D1 全部表与 KV 后从零迁移（仅首次上线）'
 
 concurrency:
   group: hpc-mail-production
@@ -25,45 +20,64 @@ concurrency:
 permissions:
   contents: read
 
+# 账户/资源 ID 与管理员用户名不放 job 级 env（每个步骤的日志头都会回显 env），
+# 由第一步屏蔽后写入 GITHUB_ENV，之后的日志里一律显示为 ***
 env:
-  CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-  KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
   D1_NAME: hpc-cloud-mail-db
 
 jobs:
   deploy:
     # 一键部署克隆出的仓库不配 Variables，自动跳过本工作流（不产生失败标记）
-    if: vars.CLOUDFLARE_ACCOUNT_ID != ''
+    if: vars.CLOUDFLARE_ACCOUNT_ID != '' || vars.CUSTOM_DOMAIN != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
-
-      - name: 校验部署参数
+      # 这些标识可以配成 Variable，也可以配成同名 Secret（Secret 优先）。
+      # 配成 Variable 时本步骤的 env 回显是明文（之后的日志里屏蔽）；配成 Secret 则全程不出现在公开日志里。
+      - name: 校验部署参数并屏蔽日志中的标识
         env:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-          ADMIN_USERNAME: ${{ vars.ADMIN_USERNAME }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
+          IN_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          IN_D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID || vars.D1_DATABASE_ID }}
+          IN_KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID || vars.KV_NAMESPACE_ID }}
+          IN_ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME || vars.ADMIN_USERNAME }}
           CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
         run: |
           set -euo pipefail
+          for name in IN_ACCOUNT_ID IN_D1_DATABASE_ID IN_KV_NAMESPACE_ID; do
+            [ -z "${!name}" ] || echo "::add-mask::${!name}"
+          done
+          # 太短的用户名（如 admin）一屏蔽，日志里所有同样的词都会变成 ***；只屏蔽 6 位及以上的
+          [ "${#IN_ADMIN_USERNAME}" -lt 6 ] || echo "::add-mask::$IN_ADMIN_USERNAME"
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo '::error::缺 CLOUDFLARE_API_TOKEN'; exit 1; }
-          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo '::error::缺 Variable CLOUDFLARE_ACCOUNT_ID'; exit 1; }
-          [ -n "$D1_DATABASE_ID" ] || { echo '::error::缺 Variable D1_DATABASE_ID'; exit 1; }
-          [ -n "$KV_NAMESPACE_ID" ] || { echo '::error::缺 Variable KV_NAMESPACE_ID'; exit 1; }
-          [ -n "$CUSTOM_DOMAIN" ] || { echo '::error::缺 Variable CUSTOM_DOMAIN'; exit 1; }
+          # ID 会写进 GITHUB_ENV 并被 sed 注入 wrangler.toml，只允许字母、数字与连字符
+          echo "$IN_ACCOUNT_ID" | grep -qE '^[A-Za-z0-9-]{8,64}$' || { echo '::error::缺少或非法的 CLOUDFLARE_ACCOUNT_ID'; exit 1; }
+          echo "$IN_D1_DATABASE_ID" | grep -qE '^[A-Za-z0-9-]{8,64}$' || { echo '::error::缺少或非法的 D1_DATABASE_ID'; exit 1; }
+          echo "$IN_KV_NAMESPACE_ID" | grep -qE '^[A-Za-z0-9-]{8,64}$' || { echo '::error::缺少或非法的 KV_NAMESPACE_ID'; exit 1; }
+          echo "$CUSTOM_DOMAIN" | grep -qE '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$' || { echo '::error::缺少或非法的 Variable CUSTOM_DOMAIN'; exit 1; }
           echo "$JWT_SECRET" | grep -qE '^[A-Za-z0-9_-]{43,}$' || { echo '::error::JWT_SECRET 需为 43+ 位 URL-safe 字符串'; exit 1; }
           plen=${#ADMIN_PASSWORD}
           [ "$plen" -ge 12 ] && [ "$plen" -le 128 ] || { echo '::error::ADMIN_PASSWORD 需 12-128 位'; exit 1; }
-          echo "$ADMIN_USERNAME" | grep -qE '^[a-z0-9][a-z0-9_-]{2,31}$' || { echo '::error::ADMIN_USERNAME 非法'; exit 1; }
+          echo "$IN_ADMIN_USERNAME" | grep -qE '^[a-z0-9][a-z0-9_-]{2,31}$' || { echo '::error::ADMIN_USERNAME 非法'; exit 1; }
+          # 与 packages/shared 的 RESERVED_USERNAMES 一致：ci-smoke 是部署冒烟专用的普通用户
+          [ "$IN_ADMIN_USERNAME" != "ci-smoke" ] || { echo '::error::ADMIN_USERNAME 不能使用系统保留用户名 ci-smoke（部署冒烟专用账号），请换一个管理员用户名'; exit 1; }
           echo "::add-mask::$JWT_SECRET"
           echo "::add-mask::$ADMIN_PASSWORD"
+          {
+            echo "CLOUDFLARE_ACCOUNT_ID=$IN_ACCOUNT_ID"
+            echo "D1_DATABASE_ID=$IN_D1_DATABASE_ID"
+            echo "KV_NAMESPACE_ID=$IN_KV_NAMESPACE_ID"
+            echo "ADMIN_USERNAME=$IN_ADMIN_USERNAME"
+          } >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@v4
+      # 第三方 Action 固定到完整 commit SHA，防止标签被改指后接触生产凭据
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -95,16 +109,19 @@ jobs:
           pnpm --filter @hpc-mail/worker test
           pnpm --filter @hpc-mail/worker typecheck
 
+      - name: 部署脚本自测（冒烟、金丝雀、心跳）
+        run: node scripts/check-deploy-scripts.mjs
+
       - name: 依赖安全审计
         run: pnpm audit --prod --audit-level high
 
       - name: 注入 Cloudflare 资源配置
         working-directory: apps/worker
         env:
-          D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
           CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
           PLACEMENT_REGION: ${{ vars.PLACEMENT_REGION }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
         run: |
           set -euo pipefail
           sed -i \
@@ -126,6 +143,8 @@ jobs:
           else
             echo '::notice::未设置 PLACEMENT_REGION，跳过 placement 注入'
           fi
+          # 可选的外发投递回执：设置了 Variable DELIVERY_EVENTS_QUEUE 才注入 Worker 变量与 Queue consumer，未设置时只在 Summary 记一行
+          node scripts/ensure-delivery-queue.mjs --inject wrangler.toml
           # 现存哈希资源由边缘直出、不绕到 placement 区域；缺失文件仍经 Worker 返回 404（build:assets 已在前面执行）
           node scripts/inject-asset-routes.mjs
           rules=$(grep -E '^run_worker_first' wrangler.toml | grep -o '"[^"]*"' | wc -l)
@@ -134,77 +153,67 @@ jobs:
           [ "$rules" -le 100 ] || { echo '::error::run_worker_first 超过 Cloudflare 100 条上限'; exit 1; }
           grep -E '^run_worker_first' wrangler.toml | grep -q '"/assets/\*"' || { echo '::error::run_worker_first 缺少 /assets/* 兜底规则'; exit 1; }
 
+      # 启用了投递回执时，在迁移与发布之前只读预检一次（按名称列 Queue）：Token 没有 Queues 权限就在这里失败，
+      # Job Summary 写明缺 Account → Queues:Edit。日志只有队列名与错误码，不含账户 id
+      - name: 投递回执权限预检
+        if: vars.DELIVERY_EVENTS_QUEUE != ''
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
+        run: node scripts/ensure-delivery-queue.mjs --check
+
       - name: 部署预演（dry-run）
         working-directory: apps/worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: npx wrangler deploy --dry-run
 
-      - name: 清空线上 D1 与 KV（仅 reset_database=true）
-        if: github.event_name == 'workflow_dispatch' && inputs.reset_database
+      # 回滚基线：迁移前的 D1 书签（只用于人工恢复数据）与当前承载流量的 Worker 版本（失败时自动回滚到它）
+      - name: 记录回滚基线
+        id: baseline
         working-directory: apps/worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
         run: |
           set -euo pipefail
-          echo '::warning::正在清空线上数据库与 KV'
-          npx wrangler d1 execute "$D1_NAME" --remote -y --file=scripts/drop-legacy.sql
-          npx wrangler kv key list --namespace-id "$KV_NAMESPACE_ID" > /tmp/kv-keys.json
-          count=$(jq 'length' /tmp/kv-keys.json)
-          if [ "$count" -gt 0 ]; then
-            jq -c '[.[].name]' /tmp/kv-keys.json > /tmp/kv-del.json
-            npx wrangler kv bulk delete /tmp/kv-del.json --namespace-id "$KV_NAMESPACE_ID" --force
-          fi
-          echo "已清空 D1 旧表与 $count 个 KV key"
-
-      - name: 记录 D1 回滚书签
-        if: github.event_name != 'workflow_dispatch' || !inputs.reset_database
-        working-directory: apps/worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          set -euo pipefail
-          npx wrangler d1 time-travel info "$D1_NAME" --json > /tmp/d1-time-travel.json
-          bookmark=$(jq -r '.. | .bookmark? // empty' /tmp/d1-time-travel.json | head -n 1)
+          npx wrangler d1 time-travel info "$D1_NAME" --json > "$RUNNER_TEMP/d1-time-travel.json"
+          bookmark=$(jq -r '.. | .bookmark? // empty' "$RUNNER_TEMP/d1-time-travel.json" | head -n 1)
           [ -n "$bookmark" ] || { echo '::error::未能取得 D1 Time Travel bookmark'; exit 1; }
-          echo "D1 rollback bookmark: $bookmark" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::D1 rollback bookmark 已写入 Job Summary"
+          # deployments status 返回最新一次部署：{ versions: [{ version_id, percentage }] }
+          if npx wrangler deployments status --json > "$RUNNER_TEMP/deployment.json" 2> "$RUNNER_TEMP/deployment.err"; then
+            version_id=$(jq -r '.versions | max_by(.percentage) | .version_id // empty' "$RUNNER_TEMP/deployment.json")
+            percentage=$(jq -r '.versions | max_by(.percentage) | .percentage // 0' "$RUNNER_TEMP/deployment.json")
+            echo "$version_id" | grep -qE '^[A-Za-z0-9-]+$' || { echo '::error::无法解析当前线上版本'; cat "$RUNNER_TEMP/deployment.json"; exit 1; }
+            [ "$percentage" = "100" ] || echo "::warning::当前是分流部署，最大流量版本 $version_id 占 $percentage%，失败时回滚到它"
+          elif grep -qiE '10007|does not exist|has no deployments' "$RUNNER_TEMP/deployment.err"; then
+            version_id=''
+            echo '::notice::Worker 尚未部署过（首次部署），失败时没有可回滚的版本'
+          else
+            cat "$RUNNER_TEMP/deployment.err" >&2
+            echo '::error::读取当前线上版本失败，无法保证失败时能回滚，终止部署'
+            exit 1
+          fi
+          build=$(curl -sS --max-time 10 -D - -o /dev/null "$BASE_URL/api/config" 2>/dev/null | tr -d '\r' |
+            awk -F': ' 'tolower($1) == "x-hpc-build" { print $2 }' | grep -E '^[A-Za-z0-9._-]+$' || true)
+          echo "version_id=$version_id" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          {
+            echo '## 回滚基线'
+            echo
+            echo "- D1 Time Travel 书签（本次迁移之前）：\`$bookmark\`"
+            echo "- 部署前线上 Worker 版本：\`${version_id:-无（首次部署）}\`"
+            echo "- 部署前线上 build：\`${build:-未知}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      # 迁移先于代码上线，且失败回滚时不回滚迁移：迁移只能做加法（apps/worker/scripts/check-migrations.mjs 已在测试中把关）
       - name: 应用数据库迁移
         working-directory: apps/worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: npx wrangler d1 migrations apply "$D1_NAME" --remote
-
-      # wrangler.toml 的投递回执 consumer 引用的 Queue 必须先存在，否则 wrangler deploy 直接失败
-      - name: 确保投递回执 Queue 存在
-        working-directory: apps/worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: node scripts/ensure-delivery-queue.mjs
-
-      - name: 部署 Worker
-        working-directory: apps/worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: npx wrangler deploy
-
-      - name: 同步 Worker secrets
-        working-directory: apps/worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          CF_HOSTED_DOMAINS_TOKEN: ${{ secrets.CF_HOSTED_DOMAINS_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "$JWT_SECRET" | npx wrangler secret put jwt_secret
-          # 可选：托管域名使用的站长 Cloudflare 凭据；未设置时功能保持隐藏
-          if [ -n "$CF_HOSTED_DOMAINS_TOKEN" ]; then
-            echo "$CF_HOSTED_DOMAINS_TOKEN" | npx wrangler secret put cf_api_token
-            echo "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler secret put cf_account_id
-          else
-            echo '::notice::未设置 CF_HOSTED_DOMAINS_TOKEN，托管域名功能保持关闭'
-          fi
 
       - name: 校验迁移完整性
         working-directory: apps/worker
@@ -218,21 +227,74 @@ jobs:
           echo "migrations: 代码 $expected / 线上 $applied"
           [ "$expected" = "$applied" ] || { echo '::error::线上迁移数与代码不一致'; exit 1; }
 
-      - name: 引导管理员账号（幂等）
+      # 账号引导只写 D1、与 Worker 代码无关，放在发布之前：失败时线上仍是旧版本，不需要回滚
+      - name: 引导管理员与冒烟账号（幂等）
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          ADMIN_USERNAME: ${{ vars.ADMIN_USERNAME }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-        run: node apps/worker/scripts/seed-admin.mjs
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          node apps/worker/scripts/seed-admin.mjs
+          node apps/worker/scripts/seed-smoke.mjs
 
+      # 冒烟账号密码与运维端点令牌都由 JWT_SECRET 派生（公式见 seed-smoke.mjs 与 services/ops-probe.ts），
+      # 只把屏蔽后的派生值交给后续步骤，验证步骤不再接触 JWT_SECRET
+      - name: 派生冒烟密码与探针令牌
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          derive() { printf '%s' "$1" | openssl dgst -sha256 -hmac "$JWT_SECRET" -hex | awk '{print $NF}'; }
+          smoke_password=$(derive ci-smoke-password-v1 | cut -c1-32)
+          canary_token=$(derive hpc-canary-v1)
+          echo "::add-mask::$smoke_password"
+          echo "::add-mask::$canary_token"
+          { echo "SMOKE_PASSWORD=$smoke_password"; echo "CANARY_TOKEN=$canary_token"; } >> "$GITHUB_ENV"
+
+      # 注入的 consumer 引用的 Queue 必须先存在，否则 wrangler deploy 直接失败。创建失败时在发布前中止（线上仍是旧版本，
+      # 不触发回滚），Job Summary 写明原因。日志只有队列名与错误码，不含账户 id
+      - name: 确保投递回执 Queue 存在
+        if: vars.DELIVERY_EVENTS_QUEUE != ''
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
+        run: node scripts/ensure-delivery-queue.mjs
+
+      # secrets 随代码进同一个版本：部署后逐个 secret put 会各自生成新版本，回滚目标随之失真
+      - name: 部署 Worker（代码与 secrets 同一版本）
+        id: deploy
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          CF_HOSTED_DOMAINS_TOKEN: ${{ secrets.CF_HOSTED_DOMAINS_TOKEN }}
+        run: |
+          set -euo pipefail
+          secrets_file="$RUNNER_TEMP/worker-secrets.json"
+          trap 'rm -f "$secrets_file"' EXIT
+          umask 077
+          # 可选：托管域名使用的站长 Cloudflare 凭据；未设置时功能保持隐藏（已有的线上 secret 不会被删除）
+          if [ -n "$CF_HOSTED_DOMAINS_TOKEN" ]; then
+            jq -n '{jwt_secret: env.JWT_SECRET, cf_api_token: env.CF_HOSTED_DOMAINS_TOKEN, cf_account_id: env.CLOUDFLARE_ACCOUNT_ID}' > "$secrets_file"
+          else
+            echo '::notice::未设置 CF_HOSTED_DOMAINS_TOKEN，托管域名功能保持关闭'
+            jq -n '{jwt_secret: env.JWT_SECRET}' > "$secrets_file"
+          fi
+          npx wrangler deploy --secrets-file "$secrets_file" --message "ci $GITHUB_SHA"
+
+      # 发布之后的步骤都设单步超时：挂住时以失败结束，自动回滚仍有时间执行
       - name: 等待新版本全球生效
+        id: propagate
+        timeout-minutes: 6
         env:
           BUILD_SHA: ${{ github.sha }}
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
         run: |
           set -euo pipefail
           for i in $(seq 1 24); do
-            if curl -sS -D /tmp/hpc-config.headers "$BASE_URL/api/config" | jq -e '.data.registrationMode' >/dev/null 2>&1 && tr -d '\r' < /tmp/hpc-config.headers | grep -qi "^x-hpc-build: $BUILD_SHA$"; then
+            if curl -sS --max-time 15 -D "$RUNNER_TEMP/hpc-config.headers" "$BASE_URL/api/config" | jq -e '.data.registrationMode' >/dev/null 2>&1 && tr -d '\r' < "$RUNNER_TEMP/hpc-config.headers" | grep -qi "^x-hpc-build: $BUILD_SHA$"; then
               echo "新版本已生效（第 $i 次探测）"
               exit 0
             fi
@@ -242,9 +304,95 @@ jobs:
           echo '::error::240s 内新版本未生效'
           exit 1
 
+      # 可选 Secret ADMIN_TOTP_SECRET（管理员 TOTP 种子）：管理员开了两步验证时用它登录，保住管理员检查
       - name: 线上冒烟
+        id: smoke
+        timeout-minutes: 10
         env:
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
-          ADMIN_USERNAME: ${{ vars.ADMIN_USERNAME }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          ADMIN_TOTP_SECRET: ${{ secrets.ADMIN_TOTP_SECRET }}
         run: bash scripts/smoke.sh
+
+      # 金丝雀信经 send_email 真实外发，走 MX → Email Routing → email handler。须显式启用：
+      # 设置 Variables CANARY_FROM_DOMAIN 与 CANARY_TO_DOMAIN（或 DEPLOY_CANARY=on），否则跳过并 notice
+      - name: 收件金丝雀
+        id: canary
+        timeout-minutes: 6
+        env:
+          BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
+          BUILD_SHA: ${{ github.sha }}
+          DEPLOY_CANARY: ${{ vars.DEPLOY_CANARY }}
+          CANARY_FROM_DOMAIN: ${{ vars.CANARY_FROM_DOMAIN }}
+          CANARY_TO_DOMAIN: ${{ vars.CANARY_TO_DOMAIN }}
+        run: bash scripts/deploy-probe.sh canary
+
+      # cron 每 5 分钟一次，新版本首次运行后写心跳；最多等 10 分钟
+      - name: 等待新版本的 cron 心跳
+        id: heartbeat
+        timeout-minutes: 12
+        env:
+          BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
+          BUILD_SHA: ${{ github.sha }}
+        run: HEARTBEAT_TIMEOUT=600 PROBE_POLL_INTERVAL=15 bash scripts/deploy-probe.sh heartbeat
+
+      # 发布步骤执行过（成功、失败或中途取消）之后，任一步骤失败或整个运行被取消：Worker 回到部署前版本；迁移不回滚
+      - name: 失败自动回滚 Worker
+        if: (failure() || cancelled()) && steps.deploy.outcome != 'skipped' && steps.deploy.outcome != ''
+        timeout-minutes: 10
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ROLLBACK_VERSION_ID: ${{ steps.baseline.outputs.version_id }}
+          PREVIOUS_BUILD: ${{ steps.baseline.outputs.build }}
+          BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
+          # outcome 只会是 success/failure/cancelled/skipped，直接展开进表格
+          summary '## 部署失败或被取消：自动回滚' '' '| 步骤 | 结果 |' '| --- | --- |' \
+            '| 部署 Worker | ${{ steps.deploy.outcome }} |' \
+            '| 等待新版本全球生效 | ${{ steps.propagate.outcome }} |' \
+            '| 线上冒烟 | ${{ steps.smoke.outcome }} |' \
+            '| 收件金丝雀 | ${{ steps.canary.outcome }} |' \
+            '| cron 心跳 | ${{ steps.heartbeat.outcome }} |' ''
+          if [ -z "$ROLLBACK_VERSION_ID" ]; then
+            summary '部署前没有线上版本（首次部署），无可回滚目标；新版本保持在线，请按上表排查。'
+            echo '::warning::首次部署失败，没有可回滚的版本'
+            exit 0
+          fi
+          # 读不到当前版本时照常回滚：多一次同版本部署无害，少一次回滚才是事故
+          current=$(npx wrangler deployments status --json 2>/dev/null | jq -r '.versions | max_by(.percentage) | .version_id // empty' || true)
+          if [ "$current" = "$ROLLBACK_VERSION_ID" ]; then
+            summary "线上仍是部署前的版本 \`$ROLLBACK_VERSION_ID\`（新版本没有生效），无需回滚。"
+            exit 0
+          fi
+          message="auto rollback: $RUN_URL"
+          [ "${#message}" -le 100 ] || message="auto rollback: run $GITHUB_RUN_ID"
+          if ! npx wrangler rollback "$ROLLBACK_VERSION_ID" -y --message "$message"; then
+            summary '**自动回滚失败**，请立即手动执行（见 docs/ROLLBACK.md）：' '' '```bash' \
+              "npx wrangler rollback $ROLLBACK_VERSION_ID --name hpc-cloud-mail -y --message 'manual rollback'" '```'
+            echo "::error::自动回滚失败，线上仍是本次发布的版本"
+            exit 1
+          fi
+          # 用 X-HPC-Build 确认线上已回到部署前的 build
+          restored=unverified
+          if [ -n "$PREVIOUS_BUILD" ]; then
+            for i in $(seq 1 18); do
+              # 响应头先读进变量再匹配，避免 pipefail 下 grep -q 提前退出导致上游 SIGPIPE 误判
+              config_headers=$(curl -sS --max-time 10 -D - -o /dev/null "$BASE_URL/api/config" | tr -d '\r' || true)
+              if grep -qi "^x-hpc-build: $PREVIOUS_BUILD$" <<<"$config_headers"; then
+                restored=yes
+                break
+              fi
+              echo "等待回滚生效…（$i/18）"
+              sleep 10
+            done
+            [ "$restored" = yes ] || restored=no
+          fi
+          summary "已回滚到部署前版本 \`$ROLLBACK_VERSION_ID\`（build \`${PREVIOUS_BUILD:-未知}\`，线上确认：$restored）。" '' \
+            '数据库迁移不随 Worker 回滚：迁移只做加法，旧版本代码可以在新 schema 上运行。' \
+            '需要恢复数据时见 docs/ROLLBACK.md，本次迁移前的 D1 Time Travel 书签在上方「回滚基线」。'
+          echo "::error::部署未通过验证，已自动回滚到 $ROLLBACK_VERSION_ID"
+          [ "$restored" != no ] || { echo '::error::回滚后 180s 内线上 build 仍未回到部署前版本'; exit 1; }

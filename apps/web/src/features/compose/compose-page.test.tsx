@@ -111,6 +111,25 @@ describe('ComposePage complete delivery',()=>{
     await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:expect.stringContaining('1 个收件人发送失败')})));
     client.clear();
   });
+  it('201 + status unknown：提示先向收件人核对再补发，进入详情页而不是报成功',async()=>{
+    mocks.send.mockResolvedValueOnce({id:23,status:'unknown',errorDetail:'投递结果未确认，可能已送达，补发前先向收件人核对: to@example.com: timeout',
+      recipientOutcomes:[{address:'to@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人的投递结果未确认',
+      description:expect.stringContaining('请先向收件人核对')})));
+    expect(mocks.toast).not.toHaveBeenCalledWith(expect.objectContaining({variant:'success'}));
+    expect(await screen.findByText('mail page')).toBeInTheDocument();
+    client.clear();
+  });
+  it('部分送达、部分失败、部分未确认：标题同时说明失败与未确认',async()=>{
+    mocks.send.mockResolvedValueOnce({id:24,status:'sent',errorDetail:'部分收件人失败',recipientOutcomes:[{address:'to@example.com',status:'sent'},
+      {address:'bad@example.com',status:'failed',error:'rejected'},{address:'slow@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com','bad@example.com','slow@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人发送失败，1 个收件人的投递结果未确认'})));
+    client.clear();
+  });
 });
 
 

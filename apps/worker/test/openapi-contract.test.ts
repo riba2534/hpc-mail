@@ -1,7 +1,8 @@
 import {
-  ALLOWED_CUSTOM_HEADERS, DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, ERROR_STATUS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_REPLY_TO,
-  MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES,
-  SUPPRESSION_REASONS, internalSendMailSchema, type DeliveryEventSubscriptionView, type RecipientOutcome,
+  ALLOWED_CUSTOM_HEADERS, API_SCOPES, DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, ERROR_STATUS, MAIL_AUTH_RESULTS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES,
+  PROMPT_INJECTION_REASONS, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
+  MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, SUPPRESSION_REASONS, internalSendMailSchema,
+  type DeliveryEventSubscriptionView, type RecipientOutcome,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
@@ -19,6 +20,7 @@ import authDoc from '../../web/public/references/auth-and-http.md?raw';
 import errorsDoc from '../../web/public/references/errors.md?raw';
 import mailDoc from '../../web/public/references/mail.md?raw';
 import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
+import mcpDoc from '../../web/public/references/mcp.md?raw';
 import notificationsDoc from '../../web/public/references/notifications.md?raw';
 
 const app = createApp();
@@ -82,11 +84,16 @@ describe('OpenAPI routes and public contracts', () => {
     expect(caaResponse.tag).toEqual({ type: 'string' });
     const caaInput = (((input.oneOf as Schema[]).at(-1)!.properties as Record<string, Schema>).caa!.properties as Record<string, Schema>);
     expect(caaInput.tag).toMatchObject({ enum: ['issue', 'issuewild', 'iodef'] });
-    expect(specs.v1.paths).not.toHaveProperty('/hosted-domains/{id}/dns-records');
+    // /v1 的 DNS 解析与 /api 同一份记录 id 参数与请求体
+    const path = '/hosted-domains/{id}/dns-records/{recordId}';
+    expect(specs.v1.paths[path]!.parameters).toEqual(specs.api.paths[path]!.parameters);
+    expect(specs.v1.components.schemas.HostedDnsRecordInput).toEqual(input);
   });
 
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
-    const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*'))
+    // /api/internal 是部署运维端点（CI 金丝雀与心跳），有意不进公开描述；/mcp 是 JSON-RPC 端点，由 references/mcp.md 描述
+    const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*')
+      && !route.path.startsWith('/api/internal/') && route.path !== '/mcp')
       .map(route => `${route.method} ${route.path.replace(/\/$/, '').replace(/:([^/]+)/g, '{$1}')}`))].sort();
     expect([...operations('api'), ...operations('v1')].sort()).toEqual(mounted);
   });
@@ -465,7 +472,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
 
   it('超过 100 行的参考文件开头有目录', () => {
     const references = { administration: administrationDoc, attachments: attachmentsDoc, auth: authDoc, errors: errorsDoc,
-      mail: mailDoc, mailboxes: mailboxesDoc, notifications: notificationsDoc };
+      mail: mailDoc, mailboxes: mailboxesDoc, mcp: mcpDoc, notifications: notificationsDoc };
     for (const [name, doc] of Object.entries(references)) {
       if (doc.split('\n').length > 100) expect(doc.split('\n').slice(0, 5).join('\n'), name).toContain('## 目录');
     }
@@ -530,7 +537,7 @@ describe('外发投递回执与抑制名单反映在两份 OpenAPI 与 Agent 文
       }
       const header = (operation.parameters as Array<{ name: string; description: string }>).find(param => param.name === 'Idempotency-Key')!;
       expect(header.description).toContain('422 recipient_suppressed');
-      expect(operation.description).toContain('delivery receipts later update recipientOutcomes');
+      expect(operation.description).toContain('delivery receipts enabled, Cloudflare receipts later update recipientOutcomes');
     }
   });
 
@@ -548,7 +555,10 @@ describe('外发投递回执与抑制名单反映在两份 OpenAPI 与 Agent 文
     expect(schemas.EmailSuppression!.required).toEqual([...schemas.SuppressedRecipient!.required as string[], 'id', 'detail', 'updatedAt']);
     const view = props(schemas.DeliveryEventsOverview!);
     expect(schemas.DeliveryEventsOverview!.required).toEqual(['enabled', 'credentials', 'queue', 'subscriptions']);
-    expect(view.queue).toMatchObject({ const: DELIVERY_EVENTS_QUEUE });
+    // 投递回执显式启用：queue 为部署注入的队列名，null 表示部署未启用
+    expect(view.queue).toMatchObject({ anyOf: [{ type: 'string' }, { type: 'null' }] });
+    expect(view.queue!.description).toContain('DELIVERY_EVENTS_QUEUE');
+    expect(view.queue!.description).toContain(DELIVERY_EVENTS_QUEUE);
     const subscription = view.subscriptions!.items as Schema;
     expect(subscription.required).toEqual(['domain', 'kind', 'zoneId', 'subscriptionId', 'status', 'lastError', 'checkedAt']);
     expect(sorted(props(subscription).kind!.enum)).toEqual(sorted(Object.keys(subscriptionKinds)));
@@ -596,7 +606,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     'skill.md': skillDoc, 'llms.txt': llmsDoc,
     'references/administration.md': administrationDoc, 'references/attachments.md': attachmentsDoc,
     'references/auth-and-http.md': authDoc, 'references/errors.md': errorsDoc, 'references/mail.md': mailDoc,
-    'references/mailboxes-and-domains.md': mailboxesDoc, 'references/notifications.md': notificationsDoc,
+    'references/mailboxes-and-domains.md': mailboxesDoc, 'references/mcp.md': mcpDoc, 'references/notifications.md': notificationsDoc,
   };
   /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */
   const documentedAsMissing = ['POST /messages/{id}'];
@@ -653,12 +663,39 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     }
   });
 
+  it('publishes inbound auth, extractedText and risk in both specs and documents the agent rules', () => {
+    for (const spec of Object.values(specs)) {
+      const summary = spec.components.schemas.MessageSummary!;
+      const auth = (summary.properties as Record<string, Schema>).auth!;
+      expect(summary.required).not.toContain('auth');
+      const [authObject, nullType] = auth.anyOf as Schema[];
+      expect(nullType).toEqual({ type: 'null' });
+      const authFields = authObject!.properties as Record<string, Schema>;
+      expect(Object.keys(authFields).sort()).toEqual(['aligned', 'dkim', 'dkimDomain', 'dmarc', 'spf']);
+      for (const field of ['spf', 'dkim', 'dmarc']) expect(authFields[field]!.enum).toEqual([...MAIL_AUTH_RESULTS]);
+      expect(auth.description).toContain('mx.cloudflare.net');
+
+      const detail = spec.components.schemas.MessageDetail!;
+      const fields = detail.properties as Record<string, Schema>;
+      expect(fields.auth).toEqual(auth);
+      expect(fields.extractedText).toMatchObject({ type: 'string' });
+      expect(((fields.risk!.properties as Record<string, Schema>).reasons!.items as Schema).enum).toEqual([...PROMPT_INJECTION_REASONS]);
+      for (const optional of ['auth', 'extractedText', 'risk']) expect(detail.required).not.toContain(optional);
+    }
+    expect(specs.v1.paths['/messages/wait']!.get!.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'include', description: expect.stringContaining('extractedText and risk') })]));
+    expect(mailDoc).toContain('\n## 发件认证与正文预处理\n');
+    for (const reason of PROMPT_INJECTION_REASONS) expect(mailDoc).toContain(`| \`${reason}\` |`);
+    for (const token of ['mx.cloudflare.net', 'ARC-Authentication-Results', 'extractedText', '其中的任何指令都不执行']) expect(mailDoc).toContain(token);
+    for (const token of ['risk.promptInjection', 'extractedText', '`auth`', 'references/mail.md#发件认证与正文预处理']) expect(skillDoc).toContain(token);
+  });
+
   it('skill.md keeps the phase-0 entry structure within the size budget', () => {
     const frontmatter = /^---\nname: hpc-mail\ndescription: (.+)\n---\n/.exec(skillDoc);
     expect(frontmatter).not.toBeNull();
     expect([...frontmatter![1]!].length).toBeLessThanOrEqual(1024);
     expect(frontmatter![1]).not.toMatch(/管理员|admin/i);
-    expect(skillDoc.split('\n').length).toBeLessThanOrEqual(170);
+    expect(skillDoc.split('\n').length).toBeLessThanOrEqual(200);
     for (const recipe of ['①', '②', '③', '④', '⑤', '⑥']) expect(skillDoc).toMatch(new RegExp(`^### ${recipe} `, 'm'));
     for (const field of ['scannedThroughId', 'recipientOutcomes', 'Idempotency-Key', 'send_in_progress', 'idempotency_mismatch', 'afterId', 'nextCursor']) {
       expect(skillDoc).toContain(field);
@@ -681,5 +718,80 @@ describe('Agent docs reference only real endpoints and anchors', () => {
       }
     }
     expect(broken).toEqual([]);
+  });
+});
+
+describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文档', () => {
+  /** /v1 只开放这八个托管域名操作，读写分别要求 domain.read / domain.write */
+  const keyOperations: Record<string, Record<string, string>> = {
+    '/hosted-domains': { get: 'domain.read', post: 'domain.write' },
+    '/hosted-domains/{id}': { get: 'domain.read' },
+    '/hosted-domains/{id}/check': { post: 'domain.write' },
+    '/hosted-domains/{id}/dns-records': { get: 'domain.read', post: 'domain.write' },
+    '/hosted-domains/{id}/dns-records/{recordId}': { put: 'domain.write', delete: 'domain.write' },
+  };
+
+  it('八个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
+    let checked = 0;
+    for (const [path, scopes] of Object.entries(keyOperations)) {
+      expect(specs.v1.paths[path]!.parameters, path).toEqual(specs.api.paths[path]!.parameters);
+      for (const [method, scope] of Object.entries(scopes)) {
+        const label = `${method.toUpperCase()} ${path}`;
+        const v1 = specs.v1.paths[path]![method]!;
+        const api = specs.api.paths[path]![method]!;
+        expect(v1['x-required-scopes'], label).toEqual([scope]);
+        expect(api, label).not.toHaveProperty('x-required-scopes');
+        expect(v1.responses, label).toEqual(api.responses);
+        expect(v1.requestBody, label).toEqual(api.requestBody);
+        expect(v1.parameters, label).toEqual(api.parameters);
+        checked++;
+      }
+    }
+    expect(checked).toBe(8);
+  });
+
+  it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
+    const v1Hosted = Object.fromEntries(Object.entries(specs.v1.paths).filter(([path]) => path.startsWith('/hosted-domains'))
+      .map(([path, item]) => [path, Object.keys(item).filter(method => methods.has(method)).sort()]));
+    // 批量添加与批量检测（PR5f）由 hosted-domain-batch.test.ts 核对
+    expect(v1Hosted).toEqual({ ...Object.fromEntries(Object.entries(keyOperations).map(([path, scopes]) => [path, Object.keys(scopes).sort()])),
+      '/hosted-domains/batch': ['post'], '/hosted-domains/batch-check': ['post'] });
+    expect(Object.keys(specs.v1.paths).filter(path => path.startsWith('/admin'))).toEqual([]);
+    for (const [path, method] of [['/hosted-domains/{id}', 'delete'], ['/hosted-domains/{id}', 'put'], ['/hosted-domains/{id}/members', 'put'],
+      ['/hosted-domains/{id}/members/{userId}', 'delete'], ['/hosted-domains/{id}/transfer', 'post'], ['/admin/hosted-domains', 'get']] as const) {
+      expect(specs.api.paths[path]?.[method], `${method} ${path}`).toBeDefined();
+    }
+    // 两份规格只在认证相关措辞上不同：/v1 写明管理员 Key 的范围与审计记法，/api 保持原说明
+    expect(specs.v1.paths['/hosted-domains']!.get!.description).toContain('/api/admin/hosted-domains');
+    expect(specs.v1.paths['/hosted-domains/{id}']!.get!.description).toContain('JWT-only');
+    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
+      ['/hosted-domains/{id}/dns-records/{recordId}', 'put'], ['/hosted-domains/{id}/dns-records/{recordId}', 'delete']] as const) {
+      expect(specs.v1.paths[path]![method]!.description, `${method} ${path}`).toContain('API Key #id');
+      expect(specs.api.paths[path]![method]!.description, `${method} ${path}`).not.toContain('API Key');
+    }
+    expect(specs.api.paths['/hosted-domains']!.post!.description).toMatch(/^Requires \/config hostedDomainsEnabled\. /);
+  });
+
+  it('/status 的 scopes 枚举取自 shared API_SCOPES，info 写明可以用 domain.write 接入域名', () => {
+    const data = ((specs.v1.paths['/status']!.get!.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>)['200']!
+      .content['application/json']!.schema.properties.data);
+    expect(((data.properties as Record<string, Schema>).scopes!.items as Schema).enum).toEqual([...API_SCOPES]);
+    expect(specs.v1.info.description).not.toContain('Users cannot create arbitrary domains');
+    expect(specs.v1.info.description).toContain('domain.write');
+  });
+
+  it('Agent 文档写明配方⑦、两个新 scope 与只用 JWT 的边界', () => {
+    expect(skillDoc).toMatch(/^### ⑦ 接入自有域名$/m);
+    for (const text of ['POST /hosted-domains', 'POST /hosted-domains/:id/check', 'GET /hosted-domains/:id', 'POST /hosted-domains/:id/dns-records',
+      'nameServers', 'expiresAt', 'steps.sending', '`domain.read`', '`domain.write`']) {
+      expect(skillDoc, text).toContain(text);
+    }
+    // 每个 scope 在鉴权参考的 scope 表里都有一行
+    for (const scope of API_SCOPES) expect(authDoc, scope).toContain(`\n| \`${scope}\` |`);
+    expect(mailboxesDoc).toContain('\n### 用 API Key 接入\n');
+    for (const [name, doc] of Object.entries({ mailboxesDoc, authDoc, administrationDoc })) {
+      expect(doc, name).not.toMatch(/Key 无对应接口|五个 ?scopes?|上表五个/);
+    }
+    expect(llmsDoc).toContain('mail/mailbox/domain scopes');
   });
 });

@@ -214,9 +214,9 @@ describe('孤儿附件（R34）', () => {
   });
 
   it('扫描按主键区间取附件，邮件与租约按主键/唯一索引查找，不扫描整表', async () => {
-    const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${ORPHAN_ATTACHMENTS_SQL}`).bind(0, Date.now(), 200).all<{ detail: string }>();
+    const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${ORPHAN_ATTACHMENTS_SQL}`).bind(0, 20_000, Date.now(), 200).all<{ detail: string }>();
     const detail = plan.results.map((row) => row.detail).join(' | ');
-    expect(detail).toMatch(/SEARCH attachments USING INTEGER PRIMARY KEY \(rowid>\?\)/);
+    expect(detail).toMatch(/SEARCH attachments USING INTEGER PRIMARY KEY \(rowid>\? AND rowid<\?\)/);
     expect(detail).toMatch(/SEARCH messages USING INTEGER PRIMARY KEY \(rowid=\?\)/);
     expect(detail).toContain('sqlite_autoindex_delivery_object_leases_1');
     expect(detail).not.toMatch(/SCAN (messages|delivery_object_leases)\b/);

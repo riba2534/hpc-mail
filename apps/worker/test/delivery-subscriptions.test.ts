@@ -11,7 +11,7 @@ import type { Env } from '../src/types.js';
 const ACCOUNT = 'acct-events';
 const QUEUE = 'hpc-mail-email-events';
 const db = createDb(env);
-const runtime: Env = { ...env, cf_api_token: 'events-token', cf_account_id: ACCOUNT, worker_name: 'hpc-cloud-mail' };
+const runtime: Env = { ...env, cf_api_token: 'events-token', cf_account_id: ACCOUNT, worker_name: 'hpc-cloud-mail', delivery_events_queue: QUEUE };
 
 interface FakeSubscription { id: string; name: string; source: { type: string; zone_id: string; domain: string }; events: string[]; destination: { type: string; queue_id: string } }
 
@@ -75,10 +75,14 @@ beforeEach(() => vi.useRealTimers());
 afterEach(() => vi.unstubAllGlobals());
 
 describe('投递回执订阅维护', () => {
-  it('没有凭据或开关关闭时不调用 Cloudflare', async () => {
+  it('部署未启用（没有注入 Queue）、没有凭据或开关关闭时不调用 Cloudflare', async () => {
     await reset(['plain.test']);
     const cf = fakeCloudflare({ zones: { 'plain.test': 'zone-plain' } });
-    expect(await syncDeliveryEventSubscriptions(env)).toBe(0);
+    const notEnabled = { ...runtime, delivery_events_queue: undefined } as Env;
+    expect(await syncDeliveryEventSubscriptions(notEnabled, { verify: true })).toBe(0);
+    await subscribeHostedDomainEvents(notEnabled, { token: 'events-token', accountId: ACCOUNT, workerName: 'hpc-cloud-mail' }, 'plain.test', 'zone-plain');
+    await runScheduled(notEnabled, false);
+    expect(await syncDeliveryEventSubscriptions({ ...env, delivery_events_queue: QUEUE } as Env)).toBe(0);
     await reset(['plain.test'], false);
     expect(await syncDeliveryEventSubscriptions(runtime, { verify: true })).toBe(0);
     expect(cf.calls).toEqual([]);

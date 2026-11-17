@@ -235,9 +235,11 @@ function DeliveryEventsSection({ enabled, onChange }: { enabled: boolean; onChan
       ) : data && (
         <div aria-label="投递事件订阅状态" className="text-sm text-ink-secondary">
           <p>
-            {data.credentials
-              ? `已订阅 ${data.subscriptions.length - failed.length} 个发信域名${failed.length ? `，${failed.length} 个失败（定时任务稍后重试）` : ''}。`
-              : 'Worker 未配置 Cloudflare 凭据（cf_api_token / cf_account_id），不会自动建立订阅。'}
+            {!data.queue
+              ? '本站部署未启用投递回执（未设置 GitHub Variable DELIVERY_EVENTS_QUEUE），这个开关暂不生效。'
+              : data.credentials
+                ? `Queue ${data.queue}：已订阅 ${data.subscriptions.length - failed.length} 个发信域名${failed.length ? `，${failed.length} 个失败（定时任务稍后重试）` : ''}。`
+                : 'Worker 未配置 Cloudflare 凭据（cf_api_token / cf_account_id），不会自动建立订阅。'}
           </p>
           {failed.length > 0 && (
             <ul className="mt-1 list-disc pl-4">
@@ -454,9 +456,17 @@ export function SettingsPage() {
           />
           <NumberRow
             label="转发中转每人每日上限"
-            description="按收件地址的归属人计，同一封信转给多个目标各计一次；原生转发不计入。"
+            description="已认领地址按认领人计，同一封信转给多个目标各计一次；原生转发不计入。"
             value={draft.quota.relayPerUserDaily}
             onChange={(v) => patch((s) => void (s.quota.relayPerUserDaily = v))}
+            max={100000}
+            suffix="封/天"
+          />
+          <NumberRow
+            label="未认领地址转发中转每日上限"
+            description="未认领地址的来信归全体管理员，任何人都能往这类地址灌信，全体管理员共用这一个额度，不按人数叠加；原生转发不计入。"
+            value={draft.quota.relayUnclaimedDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayUnclaimedDaily = v))}
             max={100000}
             suffix="封/天"
           />
