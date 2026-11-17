@@ -13,6 +13,8 @@ export const API_SCOPES = [
   'mail.send',
   'mailbox.read',
   'mailbox.write',
+  'domain.read',
+  'domain.write',
 ] as const;
 export type ApiScope = (typeof API_SCOPES)[number];
 
@@ -98,6 +100,11 @@ export const MAX_BATCH_SHARE_MAILBOXES = 100;
 export const MAX_MAILBOX_GRANTEES = 100;
 /** 每个托管域名最多共享给多少位成员 */
 export const MAX_HOSTED_DOMAIN_MEMBERS = 100;
+/**
+ * 批量添加 / 批量检测托管域名单次最多的项数。实际能处理的还受每人每分钟添加与检测次数、
+ * pending 上限和全站 Cloudflare 额度约束，额度不够的项明确失败且不计数，下一分钟可用剩余项重试。
+ */
+export const MAX_HOSTED_DOMAIN_BATCH = 20;
 export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */

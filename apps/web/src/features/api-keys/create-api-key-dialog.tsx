@@ -30,6 +30,8 @@ const SCOPE_LABELS: Record<ApiScope, string> = {
   'mail.send': '发送邮件',
   'mailbox.read': '读取邮箱',
   'mailbox.write': '管理邮箱',
+  'domain.read': '查看托管域名',
+  'domain.write': '接入域名与解析',
 };
 
 type ScopePreset = 'read' | 'send' | 'full' | 'custom';
