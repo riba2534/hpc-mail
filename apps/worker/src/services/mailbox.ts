@@ -785,14 +785,18 @@ export async function releaseTargets(
   }
   const deleted = new Map(((token ? results[2]?.results : undefined) as { address: string; n: number }[] | undefined ?? [])
     .map((row) => [row.address, Number(row.n)]));
-  const revoked = new Map<number, number>();
-  for (const row of (results[sharesIndex]?.results ?? []) as { mailbox_id: number }[]) {
-    revoked.set(Number(row.mailbox_id), (revoked.get(Number(row.mailbox_id)) ?? 0) + 1);
-  }
+  const revoked = countByMailbox(results[sharesIndex]?.results);
   if (token) await scheduleStorageCleanup(env, ctx, 100);
   return new Map(targets.map((target) => [target.id, {
     deletedMessages: deleted.get(target.address) ?? 0, revokedShares: revoked.get(target.id) ?? 0,
   }]));
+}
+
+/** 按 mailbox_id 计数 RETURNING mailbox_id 的结果行（撤销、新增了几条共享） */
+export function countByMailbox(rows: readonly unknown[] | undefined): Map<number, number> {
+  const counts = new Map<number, number>();
+  for (const row of (rows ?? []) as { mailbox_id: number }[]) counts.set(Number(row.mailbox_id), (counts.get(Number(row.mailbox_id)) ?? 0) + 1);
+  return counts;
 }
 
 /**

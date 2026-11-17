@@ -18,7 +18,7 @@ import { AppError } from '../lib/errors.js';
 import type { Env, ExecCtx } from '../types.js';
 import { ACTOR_NAME_SQL, auditSuffix, type AuditActor } from './audit.js';
 import {
-  batchGateStatement, claimMailboxes, claimSettingsFrom, evaluateClaimPolicy, isBatchGateError,
+  batchGateStatement, claimMailboxes, claimSettingsFrom, countByMailbox, evaluateClaimPolicy, isBatchGateError,
   ownedCountsFromResult, ownedCountsStatement, ownerLabel, releaseTargets,
 } from './mailbox.js';
 import { claimSettingsStatement } from './mailbox-policy.js';
@@ -69,10 +69,35 @@ function summarize(results: AdminMailboxBatchItemResult[]): AdminMailboxBatchRes
   return { results, done: count('done'), unchanged: count('unchanged'), failed: count('failed') };
 }
 
-function countBy(rows: readonly unknown[] | undefined): Map<number, number> {
-  const counts = new Map<number, number>();
-  for (const row of (rows ?? []) as { mailbox_id: number }[]) counts.set(Number(row.mailbox_id), (counts.get(Number(row.mailbox_id)) ?? 0) + 1);
-  return counts;
+interface Accepted {
+  index: number;
+  row: BatchMailboxRow;
+}
+
+/**
+ * 读取阶段逐项分拣：先过通用校验，再交给 decide（返回结果即为该项结果，返回 null 即接受，进入写入事务）。
+ * results 按请求顺序留空位，写入之后由 finish 补上接受项的结果。
+ */
+function partition<T extends { address: string; expectedOwnerId?: number }>(
+  items: readonly T[], rows: Map<string, BatchMailboxRow>,
+  decide: (item: T, row: BatchMailboxRow) => AdminMailboxBatchItemResult | null = () => null,
+): { results: AdminMailboxBatchItemResult[]; accepted: Accepted[] } {
+  const results: AdminMailboxBatchItemResult[] = [];
+  const accepted: Accepted[] = [];
+  items.forEach((item, index) => {
+    const row = rows.get(item.address);
+    const result = precheck(item, row) ?? decide(item, row!);
+    if (result) results[index] = result;
+    else accepted.push({ index, row: row! });
+  });
+  return { results, accepted };
+}
+
+/** 写入之后补上接受项的结果并汇总 */
+function finish(results: AdminMailboxBatchItemResult[], accepted: readonly Accepted[],
+  done: (row: BatchMailboxRow) => AdminMailboxBatchItemResult): AdminMailboxBatchResult {
+  for (const { index, row } of accepted) results[index] = done(row);
+  return summarize(results);
 }
 
 /** 闸门失败：读取之后有并发修改，本批什么都没写 */
@@ -145,23 +170,13 @@ export async function adminReleaseMailboxes(
   env: Env, actor: AuditActor, req: AdminBatchReleaseRequest, tag: string, ctx?: ExecCtx | null,
 ): Promise<AdminMailboxBatchResult> {
   const rows = rowsByAddress(await mailboxesByAddressStatement(env, req.items.map((item) => item.address)).all());
-  const results: AdminMailboxBatchItemResult[] = [];
-  const accepted: { index: number; row: BatchMailboxRow }[] = [];
-  req.items.forEach((item, index) => {
-    const row = rows.get(item.address);
-    const failed = precheck(item, row);
-    if (failed) results[index] = failed;
-    else accepted.push({ index, row: row! });
-  });
-  if (accepted.length) {
-    const outcomes = await releaseTargets(env,
-      accepted.map(({ row }) => ({ id: row.id, address: row.address, ...ownerOf(row) })),
-      req.deleteHistory, { actor, note: `；${tag}` }, ctx);
-    for (const { index, row } of accepted) {
-      results[index] = itemResult(row.address, row, 'done', { deletedMessages: 0, revokedShares: 0, ...outcomes.get(row.id) });
-    }
-  }
-  return summarize(results);
+  const { results, accepted } = partition(req.items, rows);
+  if (!accepted.length) return summarize(results);
+  const outcomes = await releaseTargets(env,
+    accepted.map(({ row }) => ({ id: row.id, address: row.address, ...ownerOf(row) })),
+    req.deleteHistory, { actor, note: `；${tag}` }, ctx);
+  return finish(results, accepted,
+    (row) => itemResult(row.address, row, 'done', { deletedMessages: 0, revokedShares: 0, ...outcomes.get(row.id) }));
 }
 
 /**
@@ -184,7 +199,8 @@ export async function adminTransferMailboxes(env: Env, actor: AuditActor, req: A
   const snapshot = ownedCountsFromResult(ownedResult);
   const checkedDomains = new Set<string>();
   const results: AdminMailboxBatchItemResult[] = [];
-  const accepted: { index: number; row: BatchMailboxRow }[] = [];
+  const accepted: Accepted[] = [];
+  // 不用 partition：已归目标用户的项先记为 unchanged，即使 expectedOwnerId 已过时
   req.items.forEach((item, index) => {
     const row = rows.get(item.address);
     if (row?.user_id === target.id) {
@@ -231,11 +247,8 @@ export async function adminTransferMailboxes(env: Env, actor: AuditActor, req: A
       FROM json_each(?4) j`).bind(actor.id, auditSuffix(actor), actor.ip, items),
     env.db.prepare(`UPDATE mailboxes SET user_id = ?2 WHERE id IN (${IDS_SQL})`).bind(items, target.id),
   ]);
-  const revoked = countBy(shares?.results);
-  for (const { index, row } of accepted) {
-    results[index] = itemResult(row.address, row, 'done', { revokedShares: revoked.get(row.id) ?? 0 });
-  }
-  return summarize(results);
+  const revoked = countByMailbox(shares?.results);
+  return finish(results, accepted, (row) => itemResult(row.address, row, 'done', { revokedShares: revoked.get(row.id) ?? 0 }));
 }
 
 /** 共享相关的读取：邮箱、被分享人状态与这些邮箱现有的成员 */
@@ -264,21 +277,14 @@ export async function adminShareMailboxes(env: Env, actor: AuditActor, req: Admi
   const { rows, grantees, members } = await loadShareContext(env, req.items.map((item) => item.address), userIds);
   if (grantees.length !== userIds.length) throw new AppError('validation_failed', '包含不存在的用户');
   if (grantees.some((grantee) => grantee.status !== 'active')) throw new AppError('validation_failed', '只能共享给启用中的用户');
-  const results: AdminMailboxBatchItemResult[] = [];
-  const accepted: { index: number; row: BatchMailboxRow }[] = [];
-  req.items.forEach((item, index) => {
-    const row = rows.get(item.address);
-    const failed = precheck(item, row);
-    if (failed) {
-      results[index] = failed;
-      return;
+  const { results, accepted } = partition(req.items, rows, (item, row) => {
+    const current = members.get(row.id) ?? new Set<number>();
+    const adding = userIds.filter((userId) => userId !== row.user_id && !current.has(userId));
+    if (!adding.length) return itemResult(item.address, row, 'unchanged', { addedShares: 0 });
+    if (current.size + adding.length > MAX_MAILBOX_GRANTEES) {
+      return failure(item.address, row, 'validation_failed', `每只邮箱最多共享给 ${MAX_MAILBOX_GRANTEES} 个用户`);
     }
-    const current = members.get(row!.id) ?? new Set<number>();
-    const adding = userIds.filter((userId) => userId !== row!.user_id && !current.has(userId));
-    if (!adding.length) results[index] = itemResult(item.address, row, 'unchanged', { addedShares: 0 });
-    else if (current.size + adding.length > MAX_MAILBOX_GRANTEES) {
-      results[index] = failure(item.address, row, 'validation_failed', `每只邮箱最多共享给 ${MAX_MAILBOX_GRANTEES} 个用户`);
-    } else accepted.push({ index, row: row! });
+    return null;
   });
   if (!accepted.length) return summarize(results);
 
@@ -304,28 +310,19 @@ export async function adminShareMailboxes(env: Env, actor: AuditActor, req: Admi
     batchGateStatement(env, `SELECT 1 FROM mailbox_shares WHERE mailbox_id IN (${IDS_SQL}) GROUP BY mailbox_id HAVING COUNT(*) > ?2`,
       items, MAX_MAILBOX_GRANTEES),
   ]);
-  const added = countBy(inserted?.results);
-  for (const { index, row } of accepted) {
+  const added = countByMailbox(inserted?.results);
+  return finish(results, accepted, (row) => {
     const count = added.get(row.id) ?? 0;
-    results[index] = itemResult(row.address, row, count ? 'done' : 'unchanged', { addedShares: count });
-  }
-  return summarize(results);
+    return itemResult(row.address, row, count ? 'done' : 'unchanged', { addedShares: count });
+  });
 }
 
 /** 批量取消共享：从每个邮箱的名单移除这批用户；都不在名单里的项为 unchanged。每项一行 mailbox.unshare。 */
 export async function adminUnshareMailboxes(env: Env, actor: AuditActor, req: AdminBatchShareRequest, tag: string): Promise<AdminMailboxBatchResult> {
   const userIds = [...new Set(req.userIds)];
   const { rows, members } = await loadShareContext(env, req.items.map((item) => item.address), userIds);
-  const results: AdminMailboxBatchItemResult[] = [];
-  const accepted: { index: number; row: BatchMailboxRow }[] = [];
-  req.items.forEach((item, index) => {
-    const row = rows.get(item.address);
-    const failed = precheck(item, row);
-    if (failed) results[index] = failed;
-    else if (!userIds.some((userId) => members.get(row!.id)?.has(userId))) {
-      results[index] = itemResult(item.address, row, 'unchanged', { revokedShares: 0 });
-    } else accepted.push({ index, row: row! });
-  });
+  const { results, accepted } = partition(req.items, rows, (item, row) =>
+    userIds.some((userId) => members.get(row.id)?.has(userId)) ? null : itemResult(item.address, row, 'unchanged', { revokedShares: 0 }));
   if (!accepted.length) return summarize(results);
 
   const items = JSON.stringify(accepted.map(({ row }) => ({ id: row.id, ownerId: row.user_id, address: row.address })));
@@ -342,10 +339,9 @@ export async function adminUnshareMailboxes(env: Env, actor: AuditActor, req: Ad
     env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id IN (${IDS_SQL}) AND user_id IN (SELECT value FROM json_each(?2))
       RETURNING mailbox_id`).bind(items, granteeJson),
   ]);
-  const counts = countBy(removed?.results);
-  for (const { index, row } of accepted) {
+  const counts = countByMailbox(removed?.results);
+  return finish(results, accepted, (row) => {
     const count = counts.get(row.id) ?? 0;
-    results[index] = itemResult(row.address, row, count ? 'done' : 'unchanged', { revokedShares: count });
-  }
-  return summarize(results);
+    return itemResult(row.address, row, count ? 'done' : 'unchanged', { revokedShares: count });
+  });
 }
