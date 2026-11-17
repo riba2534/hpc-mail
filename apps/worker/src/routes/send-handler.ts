@@ -1,6 +1,8 @@
 import {
+  MAX_ATTACHMENT_TOTAL_BYTES,
   MAX_SEND_REQUEST_BYTES,
   internalSendMailSchema,
+  isUrlAttachment,
   sendRequestFingerprint,
   type InternalSendMailRequest,
   type MessageSummary,
@@ -16,6 +18,7 @@ import {
 } from '../services/idempotency.js';
 import { decodeInlineAttachments, deliveryFailedError, sendMail, type Sender } from '../services/outbound.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
+import { fetchUrlAttachments } from '../services/url-attachment.js';
 import type { AppContext } from '../types.js';
 
 /**
@@ -46,10 +49,14 @@ export async function handleSend(
   let summary: MessageSummary;
   try {
     // 两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端与大文件），合并后送 sendMail
-    const attachments = [
-      ...decodeInlineAttachments(req.attachments),
-      ...await resolveDraftAttachments(c.env, sender.userId, req.attachmentTokens),
-    ];
+    const inline = decodeInlineAttachments(req.attachments.filter((item) => !isUrlAttachment(item)));
+    const tokens = await resolveDraftAttachments(c.env, sender.userId, req.attachmentTokens);
+    const used = [...inline, ...tokens].reduce((sum, att) => sum + ('bytes' in att ? att.bytes.byteLength : att.size), 0);
+    const fetched = await fetchUrlAttachments(c.env, sender.userId, req.attachments.filter(isUrlAttachment), {
+      selfHosts: [new URL(c.req.url).hostname, ...(c.env.site_origin ? [new URL(c.env.site_origin).hostname] : [])],
+      budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - used,
+    });
+    const attachments = [...inline, ...tokens, ...fetched];
     summary = await sendMail(c.env, c.executionCtx, sender, req, attachments, new URL(c.req.url).origin, idem.handle);
   } catch (error) {
     // 全部失败（422）时幂等键已绑定发件行，这里不会动它，重放由发件行推出同样的结果

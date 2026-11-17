@@ -141,3 +141,32 @@ export const DEFAULT_RELAY_PER_USER_DAILY_LIMIT = 50;
 export const MAX_TRANSLATE_SEGMENTS = 60;
 export const MAX_TRANSLATE_SEGMENT_CHARS = 2000;
 export const MAX_TRANSLATE_BATCH_CHARS = 6000;
+
+/**
+ * 服务端草稿与定时发送（/v1/drafts、/api/drafts）。
+ * draft 可编辑；scheduled 到 sendAt 由每分钟的定时任务发出；sending 发送中（不可修改）；
+ * sent 已执行发送，结果看 messageId 对应的发件记录（含部分失败与 unknown）；failed 没有任何收件人收到，可修改后重发。
+ */
+export const DRAFT_STATUSES = ['draft', 'scheduled', 'sending', 'sent', 'failed'] as const;
+export type DraftStatus = (typeof DRAFT_STATUSES)[number];
+/** 定时发送时间：最早 1 分钟后、最晚 30 天内（按服务器时间） */
+export const MIN_SEND_AT_DELAY_MS = 60 * 1000;
+export const MAX_SEND_AT_DELAY_MS = 30 * 24 * 60 * 60 * 1000;
+/** 每个用户未发送（sent 以外）的服务端草稿上限 */
+export const MAX_DRAFTS_PER_USER = 100;
+/** 已发送的草稿保留天数（之后由每日维护删除；发件记录本身不受影响） */
+export const SENT_DRAFT_RETENTION_DAYS = 7;
+
+/** 批量发送单次最多项数 */
+export const MAX_BATCH_SEND_ITEMS = 20;
+
+/** URL 附件：单次拉取总超时、最多跟随的重定向次数 */
+export const URL_ATTACHMENT_TIMEOUT_MS = 15 * 1000;
+export const URL_ATTACHMENT_MAX_REDIRECTS = 3;
+
+/** sendAt（Unix 毫秒）不在允许范围内时返回原因，否则 null */
+export function sendAtProblem(sendAt: number, now = Date.now()): string | null {
+  if (sendAt < now + MIN_SEND_AT_DELAY_MS) return '定时发送时间最早为 1 分钟后';
+  if (sendAt > now + MAX_SEND_AT_DELAY_MS) return '定时发送时间最晚为 30 天内';
+  return null;
+}

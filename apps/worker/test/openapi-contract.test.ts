@@ -158,7 +158,9 @@ describe('OpenAPI routes and public contracts', () => {
     expect(send.required).toEqual(expect.arrayContaining(['from', 'to', 'subject']));
     expect(fields.from!.oneOf).toHaveLength(4);
     expect(fields.from).not.toHaveProperty('anyOf');
-    expect(fields.attachments!.items).toMatchObject({ type: 'object', required: ['filename', 'contentType', 'content'] });
+    const [base64Item, urlItem] = (fields.attachments!.items as Schema).anyOf as Schema[];
+    expect(base64Item).toMatchObject({ type: 'object', required: ['filename', 'contentType', 'content'] });
+    expect(urlItem).toMatchObject({ type: 'object', required: ['url'] });
     expect(fields.attachmentTokens).toMatchObject({ type: 'array', maxItems: 10 });
     expect(send['x-max-body-utf8-bytes']).toBe(1048576);
     const update = specs.api.components.schemas.UpdateSettingsRequest!;
@@ -383,7 +385,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(spec.components.schemas.MailAddress!.oneOf).toHaveLength(2);
       expect(fields.headers).toMatchObject({ type: 'object', 'x-allowed-headers': ALLOWED_CUSTOM_HEADERS });
       for (const text of ['header_not_allowed', 'details.headers', 'replyToMessageId']) expect(fields.headers!.description).toContain(text);
-      const attachment = props(fields.attachments!.items as Schema);
+      const attachment = props(((fields.attachments!.items as Schema).anyOf as Schema[])[0]!);
       expect(attachment.contentId!.description).toContain('cid:');
       expect(attachment.disposition).toMatchObject({ enum: ['attachment', 'inline'] });
       const [token, tokenObject] = (fields.attachmentTokens!.items as Schema).oneOf as Schema[];

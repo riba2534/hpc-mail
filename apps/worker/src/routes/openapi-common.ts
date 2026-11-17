@@ -92,7 +92,12 @@ sendProperties.headers = {
 };
 const contentIdDescription = 'Content-ID without angle brackets (brackets are stripped); reference it in html as <img src="cid:<contentId>">. Unique within the request, case-insensitively.';
 const dispositionDescription = 'inline needs contentId and is embedded in the HTML body (multipart/related); omitted means inline when contentId is given, else attachment.';
-const attachmentFields = (sendProperties.attachments!.items as Schema).properties as Record<string, Schema>;
+// attachments[] 每项是 base64 内联或 {url}（anyOf 的两支），URL 那支的说明由 URL 附件一节补充
+const [base64Attachment, urlAttachment] = (sendProperties.attachments!.items as Schema).anyOf as Schema[];
+const attachmentFields = base64Attachment!.properties as Record<string, Schema>;
+const urlAttachmentFields = urlAttachment!.properties as Record<string, Schema>;
+urlAttachmentFields.contentId = { ...urlAttachmentFields.contentId, description: contentIdDescription };
+urlAttachmentFields.disposition = { ...urlAttachmentFields.disposition, description: dispositionDescription };
 attachmentFields.content = {
   type: 'string', minLength: 1, pattern: '^[A-Za-z0-9+/\\s]+(?:=\\s*){0,2}$',
   description: `Base64 without a data: prefix; whitespace and line breaks are removed before decoding. Base64 attachments together decode to at most ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / MIB} MiB (413 payload_too_large); upload larger files to /uploads and use attachmentTokens.`,

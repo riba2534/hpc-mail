@@ -1,6 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { MessageRecipients, RecipientOutcome, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
+import type { DraftStatus, MessageRecipients, RecipientOutcome, StoredDraftContent, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -147,7 +147,8 @@ export const sessions = sqliteTable(
 export const idempotencyRecords = sqliteTable(
   'idempotency_records',
   {
-    actorType: text('actor_type', { enum: ['user', 'api_key'] }).notNull(),
+    /** draft：服务端草稿的发送（actor_id 为草稿 id，key 为第几次发送），由草稿发送流程自己占用 */
+    actorType: text('actor_type', { enum: ['user', 'api_key', 'draft'] }).notNull(),
     actorId: integer('actor_id').notNull(),
     key: text('key').notNull(),
     requestHash: text('request_hash').notNull(),
@@ -201,10 +202,13 @@ export const draftAttachments = sqliteTable(
     /** 已上传分片 [{partNumber, etag}]（JSON，单片直传为 null） */
     parts: text('parts', { mode: 'json' }).$type<{ partNumber: number; etag: string }[]>(),
     status: text('status', { enum: ['uploading', 'ready'] }).notNull().default('uploading'),
+    /** 被哪个服务端草稿（drafts.id）引用：引用期间不按 24h 过期清理，也不能被其他草稿或直接发信消费 */
+    draftId: integer('draft_id'),
     createdAt: createdAtColumn(),
   },
   (t) => [
     index('idx_draft_user').on(t.userId),
+    index('idx_draft_attachments_draft').on(t.draftId).where(sql`${t.draftId} IS NOT NULL`),
     index('idx_draft_status').on(t.status, t.createdAt),
     // 发信直接引用草稿对象后，对象清理要按 r2_key 判断草稿是否仍在（未发送的草稿不能被回收）
     index('idx_draft_r2_key').on(t.r2Key),
@@ -490,3 +494,55 @@ export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
   token: text('token').notNull(),
   expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
 }, (t) => [primaryKey({ columns: [t.r2Key, t.token] }), index('idx_delivery_lease_expiry').on(t.expiresAt)]);
+
+/**
+ * 服务端草稿与定时发送（/v1/drafts、/api/drafts）。内容存解析后的发信字段（content JSON，只含附件 token），
+ * 正文单独两列，避免 JSON 转义把 1MiB 正文放大到超过 D1 单行上限。
+ * 状态见 shared DRAFT_STATUSES；发送时按 (actor_type='draft', actor_id=id, key=attempt) 占用幂等记录，
+ * 发件行在外发前绑定，进程中断后可据此判断是否已经外发，绝不自动重发。
+ */
+export const drafts = sqliteTable(
+  'drafts',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    userId: integer('user_id').notNull(),
+    status: text('status').$type<DraftStatus>().notNull().default('draft'),
+    version: integer('version').notNull().default(1),
+    content: text('content', { mode: 'json' }).notNull().$type<StoredDraftContent>(),
+    bodyText: text('body_text').notNull().default(''),
+    bodyHtml: text('body_html').notNull().default(''),
+    /** 列表摘要（同 messages.preview） */
+    preview: text('preview').notNull().default(''),
+    sendAt: integer('send_at', { mode: 'timestamp_ms' }),
+    /** web | api */
+    createdVia: text('created_via').$type<'web' | 'api'>().notNull(),
+    /** 创建草稿的 API Key（网页创建为 null） */
+    apiKeyId: integer('api_key_id'),
+    /** 最近一次安排定时发送的 API Key（网页安排为 null）：到点时该 Key 已失效则取消发送 */
+    scheduledByKeyId: integer('scheduled_by_key_id'),
+    /** 安排定时发送时所有者的 users.auth_version：到点时已变化（改密、重置、禁用）则取消发送 */
+    scheduledAuthVersion: integer('scheduled_auth_version'),
+    /** 创建或安排时请求的 origin；定时发送没有请求时用于附件下载链接（优先 env.site_origin） */
+    origin: text('origin').notNull().default(''),
+    /** 发送次数（每次发送占用一个新的幂等键 = 该值） */
+    attempt: integer('attempt').notNull().default(0),
+    /** sending 状态的开始时间（租约）；超时由定时任务按幂等记录判定结果 */
+    claimedAt: integer('claimed_at', { mode: 'timestamp_ms' }),
+    /** 发送后对应的发件行 */
+    messageId: integer('message_id'),
+    errorDetail: text('error_detail').notNull().default(''),
+    /** 创建请求的幂等键：`<actorType>:<actorId>:<Idempotency-Key>`；request_hash 为创建请求体的哈希 */
+    idempotencyKey: text('idempotency_key'),
+    requestHash: text('request_hash'),
+    createdAt: createdAtColumn(),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+    sentAt: integer('sent_at', { mode: 'timestamp_ms' }),
+  },
+  (t) => [
+    index('idx_drafts_user').on(t.userId, t.id),
+    index('idx_drafts_due').on(t.sendAt).where(sql`${t.status} = 'scheduled'`),
+    index('idx_drafts_sending').on(t.claimedAt).where(sql`${t.status} = 'sending'`),
+    index('idx_drafts_sent').on(t.sentAt).where(sql`${t.status} = 'sent'`),
+    uniqueIndex('idx_drafts_idempotency').on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
+  ],
+);

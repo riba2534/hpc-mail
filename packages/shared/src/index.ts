@@ -7,6 +7,7 @@ export * from './schemas/auth.js';
 export * from './schemas/mailbox.js';
 export * from './schemas/mailbox-policy.js';
 export * from './schemas/mail.js';
+export * from './schemas/draft.js';
 export * from './schemas/api-key.js';
 export * from './schemas/invite.js';
 export * from './schemas/admin-settings.js';
