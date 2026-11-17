@@ -43,8 +43,12 @@ export const SYSTEM_DOMAIN_COUNT_SQL = "COALESCE((SELECT json_array_length(value
 export const ACTIVE_ONBOARDING_COUNT_SQL = `(SELECT COUNT(*) FROM system_domain_onboarding WHERE state NOT IN ${ONBOARDING_TERMINAL_SQL})`;
 
 /**
- * 系统接入新建、尚未激活的 zone 数。与托管的 pending 域名一起计入 hosted_domains.maxPendingTotal：
- * 站长账户在 zone 超过 50 个且 pending 多于 active 时不能再新增 zone，两类功能共用这份额度。
+ * 站长账户里等待 NS 的 zone 数：托管的 pending 域名加上系统接入新建、尚未激活的 zone，合计不超过
+ * hosted_domains.maxPendingTotal。站长账户在 zone 超过 50 个且 pending 多于 active 时不能再新增 zone，两类功能共用这份额度。
  */
-export const SYSTEM_PENDING_ZONES_SQL = `(SELECT COUNT(*) FROM system_domain_onboarding
-  WHERE mode = 'new_zone' AND state IN ('creating_zone', 'awaiting_ns'))`;
+export const PENDING_ZONES_TOTAL_SQL = `((SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending')
+  + (SELECT COUNT(*) FROM system_domain_onboarding WHERE mode = 'new_zone' AND state IN ('creating_zone', 'awaiting_ns')))`;
+
+/** 设置里的 hosted_domains.maxPendingTotal；没有该设置行时取参数 `fallback`（绑定默认值） */
+export const maxPendingTotalSql = (fallback: string): string =>
+  `COALESCE((SELECT json_extract(value, '$.maxPendingTotal') FROM settings WHERE key = 'hosted_domains'), ${fallback})`;

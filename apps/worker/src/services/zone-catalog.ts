@@ -6,7 +6,7 @@
  */
 import {
   DEFAULT_SETTINGS, SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_ZONE_CATEGORIES, domainSchema,
-  type DnssecState, type SystemDomainAck, type SystemDomainCheck, type SystemDomainCheckKey, type SystemDomainCheckState,
+  type DnssecState, type SystemDomainAck, type SystemDomainCheck, type SystemDomainCheckKey,
   type SystemDomainHiddenZones, type SystemDomainOnboardingMode, type SystemDomainOnboardingSummary, type SystemDomainPrecheck,
   type SystemDomainRegistrar, type SystemDomainSeverity, type SystemDomainVerdict, type SystemDomainZone, type SystemDomainZoneCategory,
   type SystemDomainZoneOrigin, type SystemDomainZoneReadiness, type SystemDomainZonesQuery, type SystemDomainZonesView,
@@ -19,7 +19,7 @@ import {
   type OnboardingAcceptance, type OnboardingPreflightSnapshot,
 } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
-import { AppError } from '../lib/errors.js';
+import { AppError, errorText } from '../lib/errors.js';
 import type { AuthUser, Env } from '../types.js';
 import { logAdminAction } from './audit.js';
 import {
@@ -27,13 +27,14 @@ import {
   type CfPage, type CfZone, type CloudflareCredentials,
 } from './cloudflare.js';
 import {
-  ACTIVE_ONBOARDING_COUNT_SQL, hostedTakenSql, ONBOARDING_TERMINAL_SQL, SYSTEM_DOMAIN_COUNT_SQL, SYSTEM_PENDING_ZONES_SQL,
+  ACTIVE_ONBOARDING_COUNT_SQL, hostedTakenSql, ONBOARDING_TERMINAL_SQL, SYSTEM_DOMAIN_COUNT_SQL, maxPendingTotalSql, PENDING_ZONES_TOTAL_SQL,
   systemDomainListedSql,
 } from './domain-occupancy.js';
 import {
-  dnssecState, fingerprintOf, INSPECT_CF_CALLS, inspectMailConfig, lookupRegistrar, planMailChanges, type MailInspection, type MailPlan,
+  check, dnssecState, fingerprintOf, INSPECT_CF_CALLS, inspectionReads, inspectMailConfig, lookupRegistrar, planMailChanges,
+  type MailInspection, type MailPlan,
 } from './mail-provisioning.js';
-import { counterResult, counterStatement, minuteWindow, type CounterGuard } from './rate-counter.js';
+import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
 import { mergeSettingRows } from './setting.js';
 
 type OnboardingRow = typeof systemDomainOnboarding.$inferSelect;
@@ -42,7 +43,6 @@ type Actor = Pick<AuthUser, 'id' | 'username'>;
 /** 系统域名列表上限（与 shared domainsSettingSchema 一致）；进行中的接入任务也占名额 */
 export const MAX_SYSTEM_DOMAINS = 64;
 
-export const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** 系统域名接入只看 Worker 是否配了 Cloudflare 凭据，不受托管域名开关影响 */
 export function requireCredentials(env: Env): CloudflareCredentials {
@@ -70,11 +70,8 @@ export const cfWindow = (now = Date.now()): number => minuteWindow(SYSTEM_DOMAIN
 
 /** 守卫：本窗口已用 + calls 不超过上限，且不在 429 退避期内（匿名 ? 绑定，可直接作为 counterStatement 的 guard） */
 export function cfBudgetGuard(calls: number, now = Date.now(), ceiling = MAX_SYSTEM_DOMAIN_CF_CALLS): CounterGuard {
-  return {
-    sql: `COALESCE((SELECT count FROM rate_counters WHERE scope = ? AND subject = 'all' AND "window" = ?), 0) + ? <= ?
-      AND ${BACKOFF_UNTIL_SQL} <= ?`,
-    params: [SYSTEM_DOMAIN_CF_SCOPE, cfWindow(now), calls, ceiling, now],
-  };
+  return andGuards(counterWithinGuard(SYSTEM_DOMAIN_CF_SCOPE, 'all', cfWindow(now), ceiling - calls),
+    { sql: `${BACKOFF_UNTIL_SQL} <= ?`, params: [now] });
 }
 
 export const cfBusyError = (): AppError => new AppError('rate_limited', 'Cloudflare 接口繁忙，请稍后再试');
@@ -196,8 +193,7 @@ export async function occupancyFacts(env: Env, domain: string, excludeId = 0): P
       ${SYSTEM_DOMAIN_COUNT_SQL} AS listed_count,
       ${ACTIVE_ONBOARDING_COUNT_SQL} - EXISTS (SELECT 1 FROM system_domain_onboarding
         WHERE id = ?2 AND state NOT IN ${ONBOARDING_TERMINAL_SQL}) AS active_count,
-      (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL} AS pending_zones,
-      COALESCE((SELECT json_extract(value, '$.maxPendingTotal') FROM settings WHERE key = 'hosted_domains'), ?3) AS max_pending`)
+      ${PENDING_ZONES_TOTAL_SQL} AS pending_zones, ${maxPendingTotalSql('?3')} AS max_pending`)
     .bind(domain, excludeId, DEFAULT_SETTINGS.hosted_domains.maxPendingTotal)
     .first<Record<'listed' | 'hosted' | 'task_id' | 'listed_count' | 'active_count' | 'pending_zones' | 'max_pending', number | null>>();
   return {
@@ -214,8 +210,7 @@ export async function occupancyFacts(env: Env, domain: string, excludeId = 0): P
 export function makeCheck(
   key: SystemDomainCheckKey, severity: SystemDomainSeverity, title: string, extra: Partial<SystemDomainCheck> = {},
 ): SystemDomainCheck {
-  const state: SystemDomainCheckState = severity === 'blocker' ? 'conflict' : 'ok';
-  return { key, state, severity, ack: null, danger: false, title, current: null, proposed: null, impact: '', records: [], ...extra };
+  return { ...check(key, severity === 'blocker' ? 'conflict' : 'ok', severity, title), ...extra };
 }
 
 /** 三方占用与列表容量（new_zone 另看等待 NS 的 zone 配额，与托管共用 hosted_domains.maxPendingTotal） */
@@ -306,8 +301,7 @@ function assemble(parts: EvaluationParts, inspection: MailInspection | null, pla
 
 /** inspect 中读取失败的错误（用来发现 429） */
 function inspectionErrors(inspection: MailInspection): unknown[] {
-  return [inspection.routing, inspection.catchAll, inspection.rules, inspection.apex, inspection.dmarc, inspection.dkim,
-    inspection.bounce, inspection.sending].flatMap((read) => (read && !read.ok ? [read.error] : []));
+  return inspectionReads(inspection).flatMap((read) => (read && !read.ok ? [read.error] : []));
 }
 
 /**

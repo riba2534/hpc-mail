@@ -105,7 +105,7 @@ export default {
   },
 
   /** 外发投递回执：Cloudflare Email Sending 事件订阅经 Queue 投递过来（wrangler.toml 的 queues.consumers） */
-  async queue(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
-    await handleDeliveryEventBatch(batch, env, ctx);
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    await handleDeliveryEventBatch(batch, env);
   },
 };

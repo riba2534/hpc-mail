@@ -1,30 +1,8 @@
 import type { DomainOnboardingStatus } from '@hpc-mail/shared';
+import { dohAnswers, dohQuery, rdapDomain, RR } from '../lib/public-dns.js';
+import { CF_SPF_INCLUDE } from '../lib/spf.js';
 
-const DOH_ENDPOINT = 'https://cloudflare-dns.com/dns-query';
 const CF_MX_SUFFIX = '.mx.cloudflare.net';
-const CF_SPF_INCLUDE = '_spf.mx.cloudflare.net';
-
-interface DohAnswer {
-  name: string;
-  type: number;
-  data: string;
-}
-interface DohResponse {
-  Status: number;
-  Answer?: DohAnswer[];
-}
-
-/** DNS-over-HTTPS JSON 查询（Cloudflare 公共 resolver，纯边缘子请求，不需任何凭据） */
-async function dohQuery(name: string, type: 'MX' | 'TXT' | 'DS'): Promise<DohAnswer[]> {
-  const url = `${DOH_ENDPOINT}?name=${encodeURIComponent(name)}&type=${type}`;
-  const res = await fetch(url, {
-    headers: { accept: 'application/dns-json' },
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`DoH ${type} ${res.status}`);
-  const body = (await res.json()) as DohResponse;
-  return body.Answer ?? [];
-}
 
 /** MX 记录 data 形如 "10 route1.mx.cloudflare.net."，取末段 exchange 主机名（去优先级、去末尾点） */
 function parseMxHost(data: string): string {
@@ -55,18 +33,14 @@ export async function checkDomainOnboarding(
   let spfReady = false;
   let resolved = false;
   try {
-    const [mxAnswers, txtAnswers] = await Promise.all([
+    const [mx, txt] = await Promise.all([
       dohQuery(domain, 'MX'),
-      dohQuery(domain, 'TXT').catch(() => [] as DohAnswer[]),
+      dohQuery(domain, 'TXT').catch(() => ({})),
     ]);
     resolved = true;
-    mxRecords = mxAnswers
-      .filter((a) => a.type === 15)
-      .map((a) => parseMxHost(a.data))
-      .filter(Boolean);
-    spfReady = txtAnswers
-      .filter((a) => a.type === 16)
-      .map((a) => parseTxt(a.data))
+    mxRecords = dohAnswers(mx, RR.MX).map(parseMxHost).filter(Boolean);
+    spfReady = dohAnswers(txt, RR.TXT)
+      .map(parseTxt)
       .some((t) => t.includes('v=spf1') && t.includes(CF_SPF_INCLUDE));
   } catch {
     resolved = false;
@@ -77,7 +51,7 @@ export async function checkDomainOnboarding(
 
 /** 父域仍发布 DS 记录即 DNSSEC 已开启：此时切换 NS 会让解析校验失败，需先在注册商关闭 */
 export async function hasDnssec(domain: string): Promise<boolean> {
-  return (await dohQuery(domain, 'DS')).some((answer) => answer.type === 43);
+  return dohAnswers(await dohQuery(domain, 'DS'), RR.DS).length > 0;
 }
 
 const normalizeNs = (name: string) => name.trim().toLowerCase().replace(/\.$/, '');
@@ -89,28 +63,17 @@ const normalizeNs = (name: string) => name.trim().toLowerCase().replace(/\.$/, '
  */
 export async function lookupDelegation(domain: string): Promise<string[] | null> {
   try {
-    const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
-      headers: { accept: 'application/rdap+json' },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (res.ok) {
-      const body = (await res.json()) as { nameservers?: { ldhName?: string }[] };
-      if (Array.isArray(body.nameservers)) {
-        return body.nameservers.map((ns) => normalizeNs(ns.ldhName ?? '')).filter(Boolean);
-      }
+    const body = await rdapDomain<{ nameservers?: { ldhName?: string }[] }>('https://rdap.org', domain);
+    if (Array.isArray(body?.nameservers)) {
+      return body.nameservers.map((ns) => normalizeNs(ns.ldhName ?? '')).filter(Boolean);
     }
   } catch {
     // 回落到 DoH
   }
   try {
-    const res = await fetch(`${DOH_ENDPOINT}?name=${encodeURIComponent(domain)}&type=NS`, {
-      headers: { accept: 'application/dns-json' },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as DohResponse;
+    const body = await dohQuery(domain, 'NS');
     if (body.Status !== 0) return null;
-    return (body.Answer ?? []).filter((answer) => answer.type === 2).map((answer) => normalizeNs(answer.data)).filter(Boolean);
+    return dohAnswers(body, RR.NS).map(normalizeNs).filter(Boolean);
   } catch {
     return null;
   }

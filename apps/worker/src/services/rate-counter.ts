@@ -68,7 +68,13 @@ export function counterStatement(
     RETURNING count, units`).bind(scope, subject, window, delta, units, ...(guard?.params ?? []));
 }
 
-/** 读取 counterStatement 的批量结果；守卫未通过时返回 null */
+/** 只读当前计数的语句形态，供与其他语句合进同一个 `db.batch`；用 counterResult 读取，没有行时为 null */
+export function counterReadStatement(env: Env, scope: string, subject: string, window: number): D1PreparedStatement {
+  return env.db.prepare('SELECT count, units FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?')
+    .bind(scope, subject, window);
+}
+
+/** 读取 counterStatement / counterReadStatement 的批量结果；守卫未通过或没有行时返回 null */
 export function counterResult(result: D1Result | undefined): CounterValue | null {
   const row = (result?.results?.[0] ?? null) as { count?: number; units?: number } | null;
   if (!row) return null;

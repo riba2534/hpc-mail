@@ -18,17 +18,16 @@ type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 const app = new Hono<AppContext>();
 app.use('*', apiKeyAuth);
 
-/** Key 所属用户即查看者，管理员 Key 与管理员 JWT 同权；只读接口不写审计，不查用户名 */
+/** Key 所属用户即查看者，管理员 Key 与管理员 JWT 同权；只读接口不写审计 */
 function keyViewer(c: Context<AppContext>): Viewer {
   const key = c.get('apiKey')!;
   return { id: key.userId, role: key.role, username: `API Key #${key.id}` };
 }
 
-/** 写操作的管理审计记为「用户名（API Key #id）」，与网页操作区分 */
-async function keyActor(c: Context<AppContext>): Promise<Viewer> {
-  const viewer = keyViewer(c);
-  const username = await c.env.db.prepare('SELECT username FROM users WHERE id = ?').bind(viewer.id).first<string>('username');
-  return { ...viewer, username: `${username ?? `user#${viewer.id}`}（${viewer.username}）` };
+/** 写操作的管理审计记为「用户名（API Key #id）」，与网页操作区分；用户名由鉴权连表读出 */
+function keyActor(c: Context<AppContext>): Viewer {
+  const key = c.get('apiKey')!;
+  return { id: key.userId, role: key.role, username: `${key.username}（API Key #${key.id}）` };
 }
 
 /**
@@ -52,7 +51,7 @@ app.post('/', async (c) => {
   requireScope(c, 'domain.write');
   const req = await parseBody(c, createHostedDomainRequestSchema);
   assertKeyCanUseDomain(c, req.domain);
-  return ok(c, await createHostedDomain(c.env, await keyActor(c), req.domain, execCtx(c), clientIp(c)), 201);
+  return ok(c, await createHostedDomain(c.env, keyActor(c), req.domain, execCtx(c), clientIp(c)), 201);
 });
 
 /** 批量添加与批量立即检测：逐项独立结果，单项规则与单个接口相同 */
@@ -60,7 +59,7 @@ app.post('/batch', async (c) => {
   requireScope(c, 'domain.write');
   const req = await parseBody(c, batchCreateHostedDomainsRequestSchema);
   for (const domain of req.domains) assertKeyCanUseDomain(c, domain);
-  return ok(c, await createHostedDomains(c.env, await keyActor(c), req.domains, execCtx(c), clientIp(c)));
+  return ok(c, await createHostedDomains(c.env, keyActor(c), req.domains, execCtx(c), clientIp(c)));
 });
 
 app.post('/batch-check', async (c) => {
@@ -88,7 +87,7 @@ app.post('/:id/reconnect', async (c) => {
   requireScope(c, 'domain.write');
   const id = parseId(c.req.param('id'));
   await assertHostedInKey(c, [id]);
-  return ok(c, await reconnectHostedDomain(c.env, await keyActor(c), id, execCtx(c), clientIp(c)));
+  return ok(c, await reconnectHostedDomain(c.env, keyActor(c), id, execCtx(c), clientIp(c)));
 });
 
 app.get('/:id/dns-records', async (c) => {
@@ -103,7 +102,7 @@ app.post('/:id/dns-records', async (c) => {
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, hostedDnsRecordInputSchema);
   await assertHostedInKey(c, [id]);
-  return ok(c, await createHostedDnsRecord(c.env, await keyActor(c), id, req, clientIp(c)), 201);
+  return ok(c, await createHostedDnsRecord(c.env, keyActor(c), id, req, clientIp(c)), 201);
 });
 
 app.put('/:id/dns-records/:recordId', async (c) => {
@@ -112,7 +111,7 @@ app.put('/:id/dns-records/:recordId', async (c) => {
   const recordId = parseRecordId(c.req.param('recordId'));
   const req = await parseBody(c, hostedDnsRecordInputSchema);
   await assertHostedInKey(c, [id]);
-  return ok(c, await updateHostedDnsRecord(c.env, await keyActor(c), id, recordId, req, clientIp(c)));
+  return ok(c, await updateHostedDnsRecord(c.env, keyActor(c), id, recordId, req, clientIp(c)));
 });
 
 app.delete('/:id/dns-records/:recordId', async (c) => {
@@ -120,7 +119,7 @@ app.delete('/:id/dns-records/:recordId', async (c) => {
   const id = parseId(c.req.param('id'));
   const recordId = parseRecordId(c.req.param('recordId'));
   await assertHostedInKey(c, [id]);
-  await deleteHostedDnsRecord(c.env, await keyActor(c), id, recordId, clientIp(c));
+  await deleteHostedDnsRecord(c.env, keyActor(c), id, recordId, clientIp(c));
   return ok(c, { success: true });
 });
 

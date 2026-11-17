@@ -17,16 +17,17 @@ import {
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { systemDomainOnboarding, users, type OnboardingAcceptance, type OnboardingChangeEvent } from '../db/schema.js';
-import { AppError } from '../lib/errors.js';
+import { runDetached } from '../lib/background.js';
+import { AppError, errorText } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
 import {
   CloudflareApiError, cloudflareCredentials, createZone, deleteZone, findZone, getZone, isOutcomeUnknown, isTransientCloudflareError,
-  requestActivationCheck, type CfZone, type CloudflareCredentials,
+  requestActivationCheck, zoneCreatedSince, zoneCreateRejection, type CfZone, type CloudflareCredentials,
 } from './cloudflare.js';
 import {
   ACTIVE_ONBOARDING_COUNT_SQL, hostedTakenSql, onboardingActiveSql, ONBOARDING_TERMINAL_SQL, SYSTEM_DOMAIN_COUNT_SQL,
-  SYSTEM_PENDING_ZONES_SQL, systemDomainListedSql,
+  maxPendingTotalSql, PENDING_ZONES_TOTAL_SQL, systemDomainListedSql,
 } from './domain-occupancy.js';
 import {
   APPLY_CF_CALLS, applyMailPlan, dnssecState, gatePlan, INSPECT_CF_CALLS, type ApplyHooks, type MailStepSnapshot,
@@ -34,7 +35,7 @@ import {
 import { counterStatement } from './rate-counter.js';
 import { domainsCasSql, invalidateSettingsMemory } from './setting.js';
 import {
-  acksOf, backOffCloudflare, cfBudgetGuard, cfBusyError, cfWindow, errorText, evaluateNewZone, evaluateZone, MAX_SYSTEM_DOMAINS,
+  acksOf, backOffCloudflare, cfBudgetGuard, cfBusyError, cfWindow, evaluateNewZone, evaluateZone, MAX_SYSTEM_DOMAINS,
   noteThrottle, occupancyChecks, occupancyFacts, requireCfCalls, requireCredentials, reserveCfCalls, resolveAccountZone,
   SYSTEM_DOMAIN_CF_SCOPE, throttleSeconds, zonesView, type Evaluation,
 } from './zone-catalog.js';
@@ -79,13 +80,6 @@ const later = (ms: number) => new Date(Date.now() + ms);
 const ZONE_MISSING = 'Cloudflare 中的 zone 已不存在';
 const STALE_FINGERPRINT = 'Cloudflare 上的配置已变化，请重新核对后确认';
 const CANCEL_KEEPS = '如需停用请在系统域名列表中移除';
-
-/** 后台任务：有 ctx 放进 waitUntil，没有时（单测）同步等待 */
-async function runDetached(ctx: ExecCtx | null | undefined, task: () => Promise<unknown>): Promise<void> {
-  const guarded = task().catch((error) => console.error('系统域名接入后台处理失败:', error));
-  if (ctx) ctx.waitUntil(guarded);
-  else await guarded;
-}
 
 // ---------------------------------------------------------------------------
 // 视图
@@ -442,8 +436,7 @@ async function advance(run: Run): Promise<Step> {
   }
 }
 
-const adoptable = (zone: CfZone, row: OnboardingRow) =>
-  Boolean(zone.created_on && new Date(zone.created_on).getTime() >= row.createdAt.getTime() - MINUTE);
+const adoptable = (zone: CfZone, row: OnboardingRow) => zoneCreatedSince(zone, row.createdAt);
 
 /** 建 zone 的结果不明：占位 10 分钟后按名称找回。只采纳占位之后创建的 zone，来源保持 unknown（永不删除） */
 async function stepCreatingZone(run: Run): Promise<Step> {
@@ -808,8 +801,7 @@ async function reserve(env: Env, r: Reservation): Promise<OnboardingRow | null> 
     SELECT ${values.map((_, i) => `?${i + 1}`).join(', ')}
     WHERE NOT ${systemDomainListedSql('?1')} AND NOT ${hostedTakenSql('?1')} AND NOT ${onboardingActiveSql('?1')}
       AND ${SYSTEM_DOMAIN_COUNT_SQL} + ${ACTIVE_ONBOARDING_COUNT_SQL} < ${MAX_SYSTEM_DOMAINS}
-      AND (?2 <> 'new_zone' OR (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL}
-        < COALESCE((SELECT json_extract(value, '$.maxPendingTotal') FROM settings WHERE key = 'hosted_domains'), ?${n + 1}))
+      AND (?2 <> 'new_zone' OR ${PENDING_ZONES_TOTAL_SQL} < ${maxPendingTotalSql(`?${n + 1}`)})
     RETURNING *`).bind(...values.map(([, value]) => value), DEFAULT_SETTINGS.hosted_domains.maxPendingTotal);
   try {
     const raw = await statement.first<Record<string, unknown>>();
@@ -838,11 +830,8 @@ function zoneCreateError(error: unknown): AppError {
   if (!(error instanceof CloudflareApiError)) return new AppError('internal', `Cloudflare 创建 zone 失败：${errorText(error)}`);
   if (error.status === 429) return cfBusyError();
   if (error.has(1061)) return new AppError('conflict', '该域名已在 Cloudflare 账户中，请在可接入列表中接入');
-  if (error.has(1049)) return new AppError('validation_failed', '该域名尚未注册，请先在注册商完成注册');
-  if (error.has(1099, 1093, 1116)) return new AppError('validation_failed', '请填写已注册的根域名（例如 example.com，而不是 mail.example.com）');
-  if (error.has(1110)) return new AppError('validation_failed', '暂时查不到该域名的注册信息，请稍后重试');
-  if (error.has(1097)) return new AppError('validation_failed', 'Cloudflare 不允许添加该域名');
-  if (error.has(1105)) return new AppError('rate_limited', 'Cloudflare 提示该域名尝试次数过多，请 3 小时后再试');
+  const rejection = zoneCreateRejection(error);
+  if (rejection) return rejection;
   if (error.has(1118)) return new AppError('rate_limited', '站长的 Cloudflare 账户暂时不能添加更多域名，请稍后再试');
   return new AppError('internal', `Cloudflare 创建 zone 失败：${error.message}`);
 }
@@ -886,7 +875,7 @@ async function createExisting(
     `已有 zone ${zone.id}（${zone.status}）${accepted.length ? `；随创建一并确认：${ackLabels(accepted)}` : ''}`, ip);
   if (token) {
     // 刚做完的预检直接用于配置，不重复读取；被截断时租约过期后由定时任务接手
-    await runDetached(ctx, () => drive(newRun(env, creds, { row, token, pool: 0 }, { prepared: ev })));
+    await runDetached(ctx, '系统域名接入后台处理', () => drive(newRun(env, creds, { row, token, pool: 0 }, { prepared: ev })));
   }
   return { view: await getOnboarding(env, row.id), created: true };
 }
@@ -998,7 +987,7 @@ export async function confirmOnboarding(
   }
   run.prepared = ev;
   run.deadline = Date.now() + API_DEADLINE_MS;
-  await runDetached(ctx, () => drive(run));
+  await runDetached(ctx, '系统域名接入后台处理', () => drive(run));
   return getOnboarding(env, id);
 }
 

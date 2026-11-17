@@ -2,8 +2,6 @@
  * 系统域名接入的 Cloudflare 邮件配置：inspect（只读，不吞错）→ plan（纯函数，确认项与指纹）→ apply（带前置复核的写入）。
  * 与托管域名的 ensureMailConfig 完全独立：读取失败一律是 unknown 并停止相关写入，绝不推断为「不存在」；
  * 已有配置（第三方 MX、catch-all、SPF）只在管理员确认后才改；不调用 deleteZone、关闭 Routing 或删除发信子域。
- *
- * 【接口契约（PR5h 负责人定义，实现者不得改签名；需要改时先找负责人）】
  */
 import {
   SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_WRITE_STEPS, type DnssecState, type SystemDomainAck, type SystemDomainCheck, type SystemDomainCheckKey,
@@ -11,9 +9,12 @@ import {
   type SystemDomainVerdict, type SystemDomainWriteStep,
 } from '@hpc-mail/shared';
 import type { OnboardingAcceptance, OnboardingChangeEvent } from '../db/schema.js';
+import { sha256Hex } from '../lib/crypto.js';
+import { errorText } from '../lib/errors.js';
+import { dohAnswers, dohQuery, PUBLIC_LOOKUP_TIMEOUT_MS, rdapDomain, RR } from '../lib/public-dns.js';
 import { CF_SPF_INCLUDE, decodeTxtContent, isSpfContent, mergeCloudflareSpf } from '../lib/spf.js';
 import {
-  CloudflareApiError, createSendingSubdomain, deleteDnsRecord, enableRouting, getCatchAll, getDnsRecord, getRouting, getSendingDnsStatus,
+  catchAllTargetsWorker, CloudflareApiError, createSendingSubdomain, deleteDnsRecord, enableRouting, getCatchAll, getDnsRecord, getRouting, getSendingDnsStatus,
   isOutcomeUnknown, listRoutingRules, listSendingSubdomains, putCatchAllWorker, queryDnsRecords, repairSendingDns, updateDnsRecord,
   type CfCatchAll, type CfDnsRecord, type CfPage, type CfRouting, type CfRoutingRule, type CfSendingDnsStatus, type CfSendingSubdomain,
   type CfZone, type CloudflareCredentials,
@@ -84,7 +85,6 @@ const SENDING_SUBDOMAIN_LIMIT = 30;
 const read = <T>(promise: Promise<T>): Promise<CfRead<T>> =>
   promise.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
 
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const normHost = (value: string) => value.trim().toLowerCase().replace(/\.$/, '');
 const sameName = (a: string, b: string) => normHost(a) === normHost(b);
 
@@ -103,11 +103,6 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
-async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
 const brief = (record: CfDnsRecord): SystemDomainRecordBrief => ({
   type: record.type, name: record.name, content: record.content, priority: record.priority ?? null, ttl: record.ttl ?? null,
 });
@@ -122,11 +117,6 @@ function catchAllTarget(rule: CfCatchAll | undefined): { action: 'worker' | 'for
   const action = rule?.actions?.[0];
   const type = action?.type;
   return { action: type === 'worker' || type === 'forward' || type === 'drop' ? type : 'other', targets: action?.value ?? [] };
-}
-
-function targetsWorker(rule: CfCatchAll | undefined, workerName: string): boolean {
-  const action = rule?.actions?.[0];
-  return rule?.enabled === true && action?.type === 'worker' && action.value?.[0] === workerName;
 }
 
 function describeAction(action: { type: string; value?: string[] } | undefined): string {
@@ -154,11 +144,17 @@ function readFailure(key: SystemDomainCheckKey, label: string, error: unknown): 
   return check(key, 'unknown', 'blocker', title, { current: errorText(error), impact });
 }
 
-function check(
+export function check(
   key: SystemDomainCheckKey, state: SystemDomainCheckState, severity: SystemDomainSeverity, title: string,
   extra: Partial<Omit<SystemDomainCheck, 'key' | 'state' | 'severity' | 'title'>> = {},
 ): SystemDomainCheck {
   return { key, state, severity, ack: null, danger: false, title, current: null, proposed: null, impact: '', records: [], ...extra };
+}
+
+/** inspect 的全部 Cloudflare 读取（zone 未激活时跳过的为 null） */
+export function inspectionReads(inspection: MailInspection): (CfRead<unknown> | null)[] {
+  return [inspection.routing, inspection.catchAll, inspection.rules, inspection.apex, inspection.dmarc, inspection.dkim,
+    inspection.bounce, inspection.sending];
 }
 
 /** 分页读取：失败或未取全都按读取失败处理 */
@@ -287,8 +283,7 @@ export async function planMailChanges(inspection: MailInspection, policy: Provis
   }
 
   // token：任一读取 401 说明凭据失效
-  const reads = [inspection.routing, inspection.catchAll, inspection.rules, inspection.apex, inspection.dmarc, inspection.dkim, inspection.bounce, inspection.sending];
-  const unauthorized = reads.find((r) => r && !r.ok && apiError(r.error)?.status === 401);
+  const unauthorized = inspectionReads(inspection).find((r) => r && !r.ok && apiError(r.error)?.status === 401);
   checks.push(unauthorized && !unauthorized.ok
     ? check('token', 'conflict', 'blocker', '本站 Cloudflare 凭据已失效', { current: errorText(unauthorized.error), impact: '站长需要更新 Worker 的 Cloudflare 凭据（CF_HOSTED_DOMAINS_TOKEN）后重新检测' })
     : check('token', 'ok', 'none', 'Cloudflare 凭据可用'));
@@ -371,7 +366,7 @@ export async function planMailChanges(inspection: MailInspection, policy: Provis
   else {
     const rule = inspection.catchAll.value;
     const target = catchAllTarget(rule);
-    if (targetsWorker(rule, workerName)) {
+    if (catchAllTargetsWorker(rule, workerName)) {
       catchAllState = 'ready';
       checks.push(check('catchAll', 'ok', 'none', `catch-all 已投递到本站（Worker ${workerName}）`));
     } else if (rule.source === 'wrangler') {
@@ -734,7 +729,7 @@ export async function applyMailPlan(
     exec: () => putCatchAllWorker(creds, zoneId, workerName),
     verify: async () => {
       const now = await getCatchAll(creds, zoneId);
-      if (targetsWorker(now, workerName)) return 'target';
+      if (catchAllTargetsWorker(now, workerName)) return 'target';
       const before = facts.catchAllBefore;
       return stableStringify({ enabled: now.enabled ?? null, actions: now.actions ?? [] })
         === stableStringify({ enabled: before?.enabled ?? null, actions: before?.actions ?? [] }) ? 'original' : 'other';
@@ -866,7 +861,7 @@ async function readSnapshot(
         : sendingValue.dnsStatus?.status === 'misconfigured' ? 'conflict' : 'missing';
   return {
     routing: { state: routingState, status: routing.ok ? routing.value.status ?? '' : previous.routing.status },
-    catchAll: { state: !catchAll.ok ? 'unknown' : targetsWorker(catchAll.value, workerName) ? 'ready' : 'missing' },
+    catchAll: { state: !catchAll.ok ? 'unknown' : catchAllTargetsWorker(catchAll.value, workerName) ? 'ready' : 'missing' },
     sending: {
       state: sendingState,
       status: sendingValue?.dnsStatus?.status ?? (sending.ok ? '' : previous.sending.status),
@@ -879,13 +874,12 @@ async function readSnapshot(
 // RDAP 与 DNSSEC（只作提示，失败一律是「未知」）
 
 const RDAP_BOOTSTRAP = 'https://data.iana.org/rdap/dns.json';
-const RDAP_TIMEOUT_MS = 5000;
 const RDAP_BOOTSTRAP_TTL_MS = 24 * 60 * 60 * 1000;
 let rdapBootstrap: { services: [string[], string[]][]; expiresAt: number } | null = null;
 
 async function rdapBaseFor(tld: string): Promise<string | null> {
   if (!rdapBootstrap || rdapBootstrap.expiresAt <= Date.now()) {
-    const res = await fetch(RDAP_BOOTSTRAP, { signal: AbortSignal.timeout(RDAP_TIMEOUT_MS) });
+    const res = await fetch(RDAP_BOOTSTRAP, { signal: AbortSignal.timeout(PUBLIC_LOOKUP_TIMEOUT_MS) });
     if (!res.ok) return null;
     const body = await res.json() as { services?: [string[], string[]][] };
     rdapBootstrap = { services: body.services ?? [], expiresAt: Date.now() + RDAP_BOOTSTRAP_TTL_MS };
@@ -903,12 +897,8 @@ export async function lookupRegistrar(domain: string): Promise<SystemDomainRegis
     const tld = domain.toLowerCase().split('.').pop() ?? '';
     const base = await rdapBaseFor(tld);
     if (!base) return unknown;
-    const res = await fetch(`${base.replace(/\/?$/, '/')}domain/${encodeURIComponent(domain)}`, {
-      headers: { accept: 'application/rdap+json' }, signal: AbortSignal.timeout(RDAP_TIMEOUT_MS),
-    });
-    if (!res.ok) return unknown;
-    const body = await res.json() as { entities?: RdapEntity[] };
-    const registrar = body.entities?.find((entity) => entity.roles?.includes('registrar'));
+    const body = await rdapDomain<{ entities?: RdapEntity[] }>(base, domain);
+    const registrar = body?.entities?.find((entity) => entity.roles?.includes('registrar'));
     const fn = registrar?.vcardArray?.[1]?.find((field) => field[0] === 'fn')?.[3];
     if (typeof fn !== 'string' || !fn.trim()) return unknown;
     return { name: fn.trim(), cloudflare: /cloudflare/i.test(fn) };
@@ -920,12 +910,8 @@ export async function lookupRegistrar(domain: string): Promise<SystemDomainRegis
 /** DNSSEC 三态：DoH 查询 DS，NOERROR / NXDOMAIN 为确定结果，其余（SERVFAIL、HTTP 失败、超时）为 unknown */
 export async function dnssecState(domain: string): Promise<DnssecState> {
   try {
-    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=DS`, {
-      headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return 'unknown';
-    const body = await res.json() as { Status?: number; Answer?: { type: number }[] };
-    if (body.Status === 0) return body.Answer?.some((answer) => answer.type === 43) ? 'on' : 'off';
+    const body = await dohQuery(domain, 'DS');
+    if (body.Status === 0) return dohAnswers(body, RR.DS).length ? 'on' : 'off';
     if (body.Status === 3) return 'off';
     return 'unknown';
   } catch {

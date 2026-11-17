@@ -21,3 +21,6 @@ export class AppError extends Error {
     this.name = 'AppError';
   }
 }
+
+/** 任意抛出值的可读文本：Error 取 message，其余转字符串 */
+export const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));

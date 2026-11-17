@@ -6,8 +6,10 @@ import {
 import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
+import { runDetached } from '../lib/background.js';
+import { runLimited } from '../lib/concurrency.js';
 import { chunk, d1Statement } from '../lib/d1.js';
-import { AppError } from '../lib/errors.js';
+import { AppError, errorText } from '../lib/errors.js';
 import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
@@ -16,17 +18,19 @@ import {
   assertZonesVisible, CloudflareApiError, catchAllTargetsWorker, cloudflareCredentials, countZones, createSendingSubdomain, createZone, deleteSendingSubdomain,
   deleteZone, enableRouting, findZone, getCatchAll, getRouting, getSendingDnsStatus, getZone, isCloudflareNotFound,
   isTransientCloudflareError, listSendingSubdomains, putCatchAll, repairSendingDns, requestActivationCheck, verifyToken,
-  type CfZone, type CloudflareCredentials, type ZoneDeleteGuard,
+  zoneCreatedSince, zoneCreateRejection, type CfZone, type CloudflareCredentials, type ZoneDeleteGuard,
 } from './cloudflare.js';
 import { hasDnssec } from './domain-check.js';
 import { getSystemFromAddress } from './domain.js';
 import { delegationBlock, tombstoneStatement } from './hosted-tombstone.js';
-import { onboardingActiveSql, SYSTEM_PENDING_ZONES_SQL, systemDomainListedSql } from './domain-occupancy.js';
+import { onboardingActiveSql, PENDING_ZONES_TOTAL_SQL, systemDomainListedSql } from './domain-occupancy.js';
 import { sendFeishuNotification } from './feishu.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { sendPushDeerNotification } from './pushdeer.js';
-import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
+import {
+  andGuards, counterReadStatement, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard,
+} from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
 import { emitHostedDomainTransitions } from './webhooks.js';
 
@@ -88,17 +92,6 @@ function requireCredentials(env: Env, settings: Pick<Settings, 'hosted_domains'>
   const creds = cloudflareCredentials(env);
   if (!settings.hosted_domains.enabled || !creds) throw new AppError('forbidden', '本站未开启域名托管');
   return creds;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** 后台任务：有 ctx 放进 waitUntil，没有时（定时任务、单测）同步等待 */
-async function runDetached(ctx: ExecCtx | null | undefined, label: string, task: () => Promise<unknown>): Promise<void> {
-  const guarded = task().catch((error) => console.error(`${label}失败:`, error));
-  if (ctx) ctx.waitUntil(guarded);
-  else await guarded;
 }
 
 /** 删除 zone 前核对身份：不能是系统域名，创建时间不早于本站记录 */
@@ -302,11 +295,8 @@ function createZoneError(error: unknown): AppError {
   if (error instanceof AppError) return error;
   if (!(error instanceof CloudflareApiError)) return new AppError('internal', `Cloudflare 创建域名失败：${errorText(error)}`);
   if (error.has(1061)) return new AppError('conflict', '该域名已存在于 Cloudflare 账户中，不能托管');
-  if (error.has(1049)) return new AppError('validation_failed', '该域名尚未注册，请先在注册商完成注册');
-  if (error.has(1099, 1093, 1116)) return new AppError('validation_failed', '请填写已注册的根域名（例如 example.com，而不是 mail.example.com）');
-  if (error.has(1110)) return new AppError('validation_failed', '暂时查不到该域名的注册信息，请稍后重试');
-  if (error.has(1097)) return new AppError('validation_failed', 'Cloudflare 不允许添加该域名');
-  if (error.has(1105)) return new AppError('rate_limited', 'Cloudflare 提示该域名尝试次数过多，请 3 小时后再试');
+  const rejection = zoneCreateRejection(error);
+  if (rejection) return rejection;
   if (error.has(1118)) return new AppError('rate_limited', '站长的 Cloudflare 账户暂时不能添加更多域名，请稍后再试或联系管理员');
   return new AppError('internal', `Cloudflare 创建域名失败：${error.message}`);
 }
@@ -320,10 +310,9 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
       OR EXISTS (SELECT 1 FROM messages WHERE domain = ?1)) AS used`).bind(domain),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status <> 'deleting'").bind(viewer.id),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(viewer.id),
-    env.db.prepare(`SELECT (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL} AS n`),
+    env.db.prepare(`SELECT ${PENDING_ZONES_TOTAL_SQL} AS n`),
     env.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 'active'").bind(viewer.id),
-    env.db.prepare(`SELECT count AS n FROM rate_counters WHERE scope = ? AND subject = 'all' AND "window" = ?`)
-      .bind(HOSTED_DNS_SITE_RATE_SCOPE, window),
+    counterReadStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window),
   ]);
   const first = <T>(result: D1Result | undefined) => result?.results?.[0] as T | undefined;
   const holder = first<{ user_id: number }>(hosted);
@@ -346,7 +335,7 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
   if (Number(first<{ n: number }>(totalPending)?.n) >= cfg.maxPendingTotal) {
     return new AppError('rate_limited', '当前等待生效的域名较多，请稍后再试');
   }
-  if (Number(first<{ n: number }>(site)?.n ?? 0) + CREATE_CF_CALLS > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) {
+  if ((counterResult(site)?.count ?? 0) + CREATE_CF_CALLS > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) {
     return new AppError('rate_limited', SITE_BUSY);
   }
   return new AppError('conflict', '域名状态已改变，请刷新后重试');
@@ -386,7 +375,7 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
       AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?1)
       AND (?3 = 1 OR ?4 = 0 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status <> 'deleting') < ?4)
       AND (?3 = 1 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status = 'pending') < ?5)
-      AND (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL} < ?6
+      AND ${PENDING_ZONES_TOTAL_SQL} < ?6
       AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active')
     RETURNING id`)
       .bind(domain, viewer.id, viewer.role === 'admin' ? 1 : 0, cfg.maxPerUser, cfg.maxPendingPerUser, cfg.maxPendingTotal,
@@ -561,7 +550,7 @@ async function dropPending(env: Env, creds: CloudflareCredentials, row: HostedRo
 async function recoverReservation(env: Env, creds: CloudflareCredentials, row: HostedRow, lease: Date): Promise<boolean> {
   if (Date.now() - row.createdAt.getTime() < RESERVATION_STALE_MS) return false;
   const zone = await findZone(creds, row.domain);
-  if (zone && zone.created_on && new Date(zone.created_on).getTime() >= row.createdAt.getTime() - MINUTE) {
+  if (zone && zoneCreatedSince(zone, row.createdAt)) {
     const filled = await createDb(env).update(hostedDomains).set({
       zoneId: zone.id, nameServers: zone.name_servers ?? [], originalNameServers: zone.original_name_servers ?? [],
       originalRegistrar: zone.original_registrar ?? '', zoneStatus: zone.status, checkedAt: new Date(), updatedAt: new Date(),
@@ -596,8 +585,7 @@ async function teardown(env: Env, creds: CloudflareCredentials, row: HostedRow):
   try {
     // 中断的创建请求可能已在 Cloudflare 建好 zone：按名称找回本次创建的 zone 一并删除
     const orphan = row.zoneId ? null : await findZone(creds, row.domain);
-    const zoneId = row.zoneId ?? (orphan?.created_on && new Date(orphan.created_on).getTime() >= row.createdAt.getTime() - MINUTE
-      ? orphan.id : null);
+    const zoneId = row.zoneId ?? (orphan && zoneCreatedSince(orphan, row.createdAt) ? orphan.id : null);
     if (zoneId) {
       // 发信接入随 zone 删除，单独删除失败不阻塞
       if (row.sendingTag) await deleteSendingSubdomain(creds, zoneId, row.sendingTag).catch(() => undefined);
@@ -725,16 +713,11 @@ export async function notifyHostedDomainMoved(
     const info = {
       subject: `托管域名 ${row.domain} 已停止收发`, fromAddress, fromName: 'HPC Mail', toAddress: row.domain, code: '', body: lines.join('\n'),
     };
-    try {
-      await sendFeishuNotification(prefs.feishu, info);
-    } catch (error) {
-      console.error('托管域名迁走飞书提醒失败:', error);
-    }
-    try {
-      await sendPushDeerNotification(prefs.pushdeer, info);
-    } catch (error) {
-      console.error('托管域名迁走 PushDeer 提醒失败:', error);
-    }
+    const [feishu, pushdeer] = await Promise.allSettled([
+      sendFeishuNotification(prefs.feishu, info), sendPushDeerNotification(prefs.pushdeer, info),
+    ]);
+    if (feishu.status === 'rejected') console.error('托管域名迁走飞书提醒失败:', feishu.reason);
+    if (pushdeer.status === 'rejected') console.error('托管域名迁走 PushDeer 提醒失败:', pushdeer.reason);
   });
 }
 
@@ -858,23 +841,19 @@ export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number
     const batch = await claimDue(env, limit, seen);
     if (!batch.rows.length) break;
     seen.push(...batch.rows.map((row) => row.id));
-    const queue = [...batch.rows];
     const skipped: number[] = [];
-    const work = async () => {
-      for (let row = queue.shift(); row; row = queue.shift()) {
-        if (Date.now() >= deadline) {
-          skipped.push(row.id);
-          continue;
-        }
-        processed++;
-        try {
-          await runClaim(env, base, { row, lease: batch.lease, probes: batch.probes });
-        } catch (error) {
-          console.error(`托管域名 #${row.id} 核对失败:`, error);
-        }
+    await runLimited(batch.rows, SYNC_CONCURRENCY, async (row) => {
+      if (Date.now() >= deadline) {
+        skipped.push(row.id);
+        return;
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(SYNC_CONCURRENCY, queue.length) }, work));
+      processed++;
+      try {
+        await runClaim(env, base, { row, lease: batch.lease, probes: batch.probes });
+      } catch (error) {
+        console.error(`托管域名 #${row.id} 核对失败:`, error);
+      }
+    });
     if (skipped.length) await releaseLeases(env, skipped, batch.lease);
     if (batch.rows.length < limit) break;
   }
@@ -930,7 +909,7 @@ async function rebuildZone(
   } catch (error) {
     throw new AppError('internal', `查询 Cloudflare 失败，请稍后重试：${errorText(error)}`);
   }
-  if (zone && !(zone.created_on && new Date(zone.created_on).getTime() >= missingSince.getTime() - MINUTE)) {
+  if (zone && !zoneCreatedSince(zone, missingSince)) {
     throw new AppError('conflict', '站长账户中已有同名 zone，不能接管');
   }
   if (!zone) {
