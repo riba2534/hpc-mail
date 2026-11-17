@@ -190,9 +190,20 @@ function listAccess(viewer: Viewer, scope: Scope, query: { trash?: boolean; dire
  * 会把不在该域的地址下的邮件全部读一遍。未认领范围没有地址集合，仍在 messages 上按 domain 收窄。
  * userId 可以是 SQL：分流时写成 CASE WHEN … THEN userId END，条件不成立得 NULL，子查询为空。
  */
-function ownedAddressQuery(db: Db, userId: number | SQL, domain?: string) {
+function ownedAddressQuery(db: Db, userId: number | SQL, domain?: string, restrict?: AddressRestriction) {
   return db.select({ address: mailboxes.address }).from(mailboxes)
-    .where(and(eq(mailboxes.userId, userId), domain === undefined ? undefined : eq(mailboxes.domain, domain)));
+    .where(and(eq(mailboxes.userId, userId), domain === undefined ? undefined : eq(mailboxes.domain, domain), mailboxInRange(restrict)));
+}
+
+/**
+ * Key 限定范围在地址子查询里的写法：认领行 id 在 mailboxIds 中或域名在 domains 中，与 restrictCondition 等价
+ * （messages.domain 就是地址的域名，地址唯一对应一个认领行）。一元 + 不让 id/domain 参与选索引，
+ * 仍按 user_id 取调用者自己的邮箱行，不改从主键或 idx_mailboxes_domain 扫全站
+ */
+function mailboxInRange(restrict: AddressRestriction | undefined): SQL | undefined {
+  if (!restrict) return undefined;
+  return sql`(+"mailboxes"."id" IN (SELECT value FROM json_each(${JSON.stringify(restrict.mailboxIds)}))
+    OR +"mailboxes"."domain" IN (SELECT value FROM json_each(${JSON.stringify(restrict.domains)})))`;
 }
 
 /**
@@ -202,13 +213,13 @@ function ownedAddressQuery(db: Db, userId: number | SQL, domain?: string) {
 const mailboxOnDomain = (domain: string | undefined) => (domain ? sql`+${mailboxes.domain} = ${domain}` : undefined);
 
 /** 分享给 userId、且认领人仍启用的地址；给了 domain 时只取该域的。userId 可以是 SQL，见 ownedAddressQuery */
-function sharedAddressQuery(db: Db, userId: number | SQL, domain?: string) {
+function sharedAddressQuery(db: Db, userId: number | SQL, domain?: string, restrict?: AddressRestriction) {
   return db
     .select({ address: mailboxes.address })
     .from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
     .innerJoin(users, eq(users.id, mailboxes.userId))
-    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active'), mailboxOnDomain(domain)));
+    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active'), mailboxOnDomain(domain), mailboxInRange(restrict)));
 }
 
 /**
@@ -242,11 +253,11 @@ function scopeCondition(db: Db, scope: Scope, access: ScopeAccess = 'owned', dom
  * 邮箱不能共享给自己的所有者，两支不相交，不需要 UNION 去重的临时 B 树（每个地址省一行读取）。
  * domain 下推进地址子查询（见 ownedAddressQuery），gate 见 gatedOwner。
  */
-function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess, domain?: string, gate?: SQL): SQL {
+function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess, domain?: string, gate?: SQL, restrict?: AddressRestriction): SQL {
   if (scope === 'unclaimed') return scopeCondition(db, scope, access, domain);
   const owner = gatedOwner(scope.ownerId, gate);
-  if (access === 'owned') return inArray(messages.address, ownedAddressQuery(db, owner, domain));
-  return inArray(messages.address, unionAll(ownedAddressQuery(db, owner, domain), sharedAddressQuery(db, owner, domain)));
+  if (access === 'owned') return inArray(messages.address, ownedAddressQuery(db, owner, domain, restrict));
+  return inArray(messages.address, unionAll(ownedAddressQuery(db, owner, domain, restrict), sharedAddressQuery(db, owner, domain, restrict)));
 }
 
 /**
@@ -648,10 +659,11 @@ export async function findNextMessage(
     statements = [scan(MESSAGES, [...visible, after])];
   } else {
     const gate = newMailMoreThan(input.afterId, WAIT_SITE_SCAN_MAX);
-    // 两条分流语句都要带 Key 限定范围：gate 成立时只有逐地址那条有结果
+    // 两条分流语句都要带 Key 限定范围：gate 成立时只有逐地址那条有结果。范围推进地址子查询，
+    // 只探测范围内的地址（只作剩余过滤时每次轮询都要读完范围外地址的新信）；剩余过滤保留，语义与另一条一致
     statements = [
-      scan(MESSAGES_BY_VISIBLE, [inboxScopeCondition(db, scope, access, input.domain, gate), after, ...visiblePrefix({ direction: 'inbound' }),
-        restrictCondition(viewer.restrict)]),
+      scan(MESSAGES_BY_VISIBLE, [inboxScopeCondition(db, scope, access, input.domain, gate, viewer.restrict), after,
+        ...visiblePrefix({ direction: 'inbound' }), restrictCondition(viewer.restrict)]),
       scan(MESSAGES, [...visible, gt(messages.id, sql`(CASE WHEN ${gate} THEN ${Number.MAX_SAFE_INTEGER} ELSE ${input.afterId} END)`)]),
     ];
   }
