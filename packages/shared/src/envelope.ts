@@ -12,6 +12,8 @@ export interface ApiErrorDetails {
   /** delivery_failed：已记录的发件行 id（可在已发送里查看）与逐收件人结果 */
   messageId?: number;
   recipientOutcomes?: RecipientOutcome[];
+  /** source_unavailable：不可用的是哪一个引用（reply = replyToMessageId，forward = forwardAttachmentsFrom 或其附件） */
+  source?: 'reply' | 'forward';
 }
 
 export interface ApiErrorBody {

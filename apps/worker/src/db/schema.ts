@@ -383,11 +383,16 @@ export const apiRequestLogs = sqliteTable(
     statusCode: integer('status_code').notNull(),
     ip: text('ip').notNull().default(''),
     durationMs: integer('duration_ms').notNull().default(0),
+    /** 本行代表的请求数：成功的 GET 按分钟聚合时累加，逐条记录的恒为 1 */
+    requestCount: integer('request_count').notNull().default(1),
+    /** 聚合行的分钟号（epoch 分钟）；逐条记录的为 NULL，不进聚合唯一索引 */
+    minute: integer('minute'),
     createdAt: createdAtColumn(),
   },
   (t) => [
     index('idx_api_logs_key').on(t.apiKeyId, t.id),
     index('idx_api_logs_created').on(t.createdAt),
+    uniqueIndex('idx_api_logs_minute').on(t.apiKeyId, t.minute, t.method, t.path, t.statusCode).where(sql`${t.minute} IS NOT NULL`),
   ],
 );
 

@@ -260,6 +260,7 @@ export async function listApiKeyLogs(
       statusCode: r.statusCode,
       ip: r.ip,
       durationMs: r.durationMs,
+      count: r.requestCount,
       createdAt: r.createdAt.toISOString(),
     })),
     nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.id) : null,
