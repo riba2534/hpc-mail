@@ -1,7 +1,5 @@
-import {
-  API_KEY_PREFIX, ERROR_CODES, MAX_SEND_REQUEST_BYTES, MCP_PROTOCOL_VERSIONS, mcpToolInputSchemas,
-  type IssueErrorParams, type McpToolName,
-} from '@hpc-mail/shared';
+import { API_KEY_PREFIX, ERROR_CODES, MAX_SEND_REQUEST_BYTES, type IssueErrorParams } from '@hpc-mail/shared';
+import { MCP_PROTOCOL_VERSIONS, mcpToolInputSchemas, type McpToolName } from '@hpc-mail/shared/mcp';
 import { Hono, type Context, type ExecutionContext } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { AppError } from '../../lib/errors.js';

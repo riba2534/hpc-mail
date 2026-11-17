@@ -1,15 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_HOSTED_DOMAIN_BATCH,
-  MCP_TOOL_NAMES,
   batchCheckHostedDomainsRequestSchema,
   batchCreateHostedDomainsRequestSchema,
   listMessagesQuerySchema,
-  mcpSearchQuery,
-  mcpToolInputSchemas,
-  mcpWaitQuery,
   waitMessagesQuerySchema,
 } from '../src/index.js';
+import { MCP_TOOL_NAMES, mcpSearchQuery, mcpToolInputSchemas, mcpWaitQuery } from '../src/schemas/mcp.js';
 
 describe('MCP 工具参数', () => {
   it('工具清单固定为 10 个，参数都能生成 object 类型的 JSON Schema', () => {

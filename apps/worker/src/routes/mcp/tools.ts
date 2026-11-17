@@ -1,6 +1,7 @@
+import { mcpSearchQuery, mcpToolInputSchemas, mcpWaitQuery, type McpToolArgs, type McpToolName } from '@hpc-mail/shared/mcp';
 import {
-  mcpSearchQuery, mcpToolInputSchemas, mcpWaitQuery, parseMailAddress,
-  type ApiErrorBody, type ApiKeySelf, type Mailbox, type McpToolArgs, type McpToolName, type MessageDetail, type Page,
+  parseMailAddress,
+  type ApiErrorBody, type ApiKeySelf, type Mailbox, type MessageDetail, type Page,
   type MessageSummary, type SendIdentities, type WaitMessageResult,
 } from '@hpc-mail/shared';
 import { htmlToText } from '../../lib/text.js';

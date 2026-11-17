@@ -3,7 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  MAX_HOSTED_DOMAIN_BATCH, type HostedDomain, type HostedDomainBatchCheckItem, type HostedDomainBatchCreateItem, type HostedDomainBatchResult,
+  MAX_HOSTED_DOMAIN_BATCH, type ApiScope, type HostedDomain, type HostedDomainBatchCheckItem, type HostedDomainBatchCreateItem, type HostedDomainBatchResult,
 } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
@@ -240,8 +240,9 @@ describe('批量立即检测', () => {
 });
 
 describe('/v1 批量接口', () => {
-  async function keyFor(userId: number, scopes: Array<'domain.read' | 'domain.write' | 'mail.read'>) {
-    return (await createApiKey(env, userId, { name: `batch-${scopes.join('-')}`, scopes, rateLimit: 120, allowedIps: [] })).key;
+  // domain.* 由并行的 PR3b 加进 API_SCOPES；这里绕过请求 schema 直接建 Key
+  async function keyFor(userId: number, scopes: string[]) {
+    return (await createApiKey(env, userId, { name: `batch-${scopes.join('-')}`, scopes: scopes as ApiScope[], rateLimit: 120, allowedIps: [] })).key;
   }
 
   it('需要 domain.write；审计记为 API Key；每个请求只鉴权一次', async () => {
