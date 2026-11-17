@@ -28,6 +28,8 @@ import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotific
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 import { releaseDraftStatements } from './upload.js';
 import { markStaleOutbound } from './outbound-recovery.js';
+import { syncDueOnboarding } from './system-domain.js';
+import { SYSTEM_DOMAIN_CF_SCOPE, SYSTEM_DOMAIN_CF_WINDOW_MINUTES } from './zone-catalog.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -192,6 +194,8 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
+  // 系统域名接入由管理员发起、数量很少（每轮最多 3 条，墙钟 20 秒），先于托管同步，不被它占满 Cloudflare 额度
+  await step(report, 'system_domains.onboarding', () => syncDueOnboarding(env));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
 }
 
@@ -256,6 +260,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
     ], minuteWindow(1) - 120);
+    await purgeCounters(env, SYSTEM_DOMAIN_CF_SCOPE, minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES) - 24);
     await purgeCounters(env, ['login-fail', LOGIN_ACCOUNT_SCOPE], minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });
