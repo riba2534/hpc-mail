@@ -16,18 +16,16 @@ import { assertKeyCanUseAddress, assertKeyCanUseSender, keyRestriction, requireS
 import type { IdempotencyActor } from '../services/idempotency.js';
 import { loadSourceMessage } from '../services/message.js';
 import type { Sender } from '../services/outbound.js';
-import { composeForward, composeReply } from '../services/reply-forward.js';
+import { composeForward, composeReply, type ComposedSend } from '../services/reply-forward.js';
 import { deliverSend, planOf, settledResult, type SendEnvironment, type SendPlan } from '../services/send-flow.js';
 import type { AppContext } from '../types.js';
-
-export type { SendEnvironment } from '../services/send-flow.js';
 
 export function sendEnvironment(c: Context<AppContext>): SendEnvironment {
   return { env: c.env, ctx: c.executionCtx, origin: new URL(c.req.url).origin, selfHosts: selfHostsOf(c) };
 }
 
 /** 本站自身的主机名：请求主机与 env.site_origin 的主机 */
-export function selfHostsOf(c: Context<AppContext>): string[] {
+function selfHostsOf(c: Context<AppContext>): string[] {
   const hosts = [new URL(c.req.url).hostname];
   if (c.env.site_origin) {
     try { hosts.push(new URL(c.env.site_origin).hostname); } catch { /* 配置错误时只拦请求主机 */ }
@@ -121,27 +119,17 @@ export async function handleCompose(
   assertRequestSize(c);
   if (op === 'reply') {
     const req = await parseBody(c, replyMessageRequestSchema);
-    return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () => {
-      const composed = await composeReply(c.env, sender, sourceId, req);
-      // 限定了范围的 API Key：原信与发件地址都要在范围内（网页会话不受限）
-      await assertKeyCanUseAddress(c, composed.sourceAddress);
-      await assertKeyCanUseSender(c, composed.req.from);
-      return {
-        req: composed.req,
-        attachments: { items: req.attachments, tokens: req.attachmentTokens },
-        ...(composed.fromIsDefault ? { defaultFromAddress: composed.sourceAddress } : {}),
-      };
-    });
+    return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () =>
+      composedPlan(c, await composeReply(c.env, sender, sourceId, req), { items: req.attachments, tokens: req.attachmentTokens }));
   }
   const req = await parseBody(c, forwardMessageRequestSchema);
-  return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () => {
-    const composed = await composeForward(c.env, sender, sourceId, req);
-    await assertKeyCanUseAddress(c, composed.sourceAddress);
-    await assertKeyCanUseSender(c, composed.req.from);
-    return {
-      req: composed.req,
-      attachments: { items: [], tokens: [] },
-      ...(composed.fromIsDefault ? { defaultFromAddress: composed.sourceAddress } : {}),
-    };
-  });
+  return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () =>
+    composedPlan(c, await composeForward(c.env, sender, sourceId, req), { items: [], tokens: [] }));
+}
+
+/** 回复/转发算好的请求转成发送内容；限定了范围的 API Key，原信与发件地址都要在范围内（网页会话不受限） */
+async function composedPlan(c: Context<AppContext>, composed: ComposedSend, attachments: SendPlan['attachments']): Promise<SendPlan> {
+  await assertKeyCanUseAddress(c, composed.sourceAddress);
+  await assertKeyCanUseSender(c, composed.req.from);
+  return { req: composed.req, attachments, ...(composed.fromIsDefault ? { defaultFromAddress: composed.sourceAddress } : {}) };
 }
