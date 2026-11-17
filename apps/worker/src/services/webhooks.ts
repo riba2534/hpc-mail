@@ -8,6 +8,7 @@ import {
   type MessageRecipients,
   type Page,
   type RecipientOutcome,
+  type Role,
   type UpdateWebhookEndpointRequest,
   type WebhookDelivery,
   type WebhookDeliveryStatus,
@@ -63,6 +64,7 @@ interface EndpointRow {
   domains: string;
   include_body: number;
   status: 'active' | 'disabled';
+  access_role: Role;
   disabled_reason: string;
   consecutive_failures: number;
   last_success_at: number | null;
@@ -159,28 +161,40 @@ export async function getWebhookEndpoint(env: Env, userId: number, id: number): 
   return toEndpoint(await loadEndpoint(env, userId, id));
 }
 
-export async function createWebhookEndpoint(env: Env, userId: number, req: CreateWebhookEndpointRequest, requestOrigin?: string): Promise<CreatedWebhookEndpoint> {
-  const url = await validateWebhookEndpointUrl(env, req.url, requestOrigin);
+/** 写端点的凭据：requestOrigin 用来拦指向本站的地址；accessRole 是凭据的有效角色（存为端点的 access_role） */
+export interface EndpointWriter {
+  requestOrigin?: string;
+  accessRole: Role;
+}
+
+export async function createWebhookEndpoint(env: Env, userId: number, req: CreateWebhookEndpointRequest, writer: EndpointWriter): Promise<CreatedWebhookEndpoint> {
+  const url = await validateWebhookEndpointUrl(env, req.url, writer.requestOrigin);
   const secret = newSecret();
   const now = Date.now();
   const row = await env.db.prepare(`INSERT INTO webhook_endpoints
-      (user_id, url, description, secret, events, addresses, domains, include_body, status, created_at, updated_at)
-    SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?
+      (user_id, url, description, secret, events, addresses, domains, include_body, status, access_role, created_at, updated_at)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?
     WHERE (SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = ?) < ?
     RETURNING *`).bind(userId, url, req.description, secret, JSON.stringify(req.events), JSON.stringify(req.addresses),
-    JSON.stringify(req.domains), req.includeBody ? 1 : 0, now, now, userId, MAX_WEBHOOK_ENDPOINTS_PER_USER).first<EndpointRow>();
+    JSON.stringify(req.domains), req.includeBody ? 1 : 0, writer.accessRole, now, now, userId, MAX_WEBHOOK_ENDPOINTS_PER_USER).first<EndpointRow>();
   if (!row) throw new AppError('forbidden', `每个用户最多 ${MAX_WEBHOOK_ENDPOINTS_PER_USER} 个 Webhook 端点`);
   return { ...toEndpoint(row), secret };
 }
 
+/**
+ * 修改端点。check 拿到修改后的订阅与是否带正文，在写入前校验（如 Key 另需 mail.read），不多一次读取；
+ * access_role 记为这次写入的凭据的有效角色：端点能收到的邮件范围跟随最近一次写入它的凭据
+ */
 export async function updateWebhookEndpoint(
-  env: Env, userId: number, id: number, req: UpdateWebhookEndpointRequest, requestOrigin?: string,
+  env: Env, userId: number, id: number, req: UpdateWebhookEndpointRequest,
+  writer: EndpointWriter & { check?: (next: { events: WebhookEventType[]; includeBody: boolean }) => void },
 ): Promise<WebhookEndpoint> {
   const current = await loadEndpoint(env, userId, id);
+  writer.check?.({ events: req.events ?? JSON.parse(current.events) as WebhookEventType[], includeBody: req.includeBody ?? Boolean(current.include_body) });
   const sets: string[] = [];
   const values: unknown[] = [];
   const set = (column: string, value: unknown) => { sets.push(`${column} = ?`); values.push(value); };
-  if (req.url !== undefined) set('url', await validateWebhookEndpointUrl(env, req.url, requestOrigin));
+  if (req.url !== undefined) set('url', await validateWebhookEndpointUrl(env, req.url, writer.requestOrigin));
   if (req.description !== undefined) set('description', req.description);
   if (req.events !== undefined) set('events', JSON.stringify(req.events));
   if (req.addresses !== undefined) set('addresses', JSON.stringify(req.addresses));
@@ -191,6 +205,7 @@ export async function updateWebhookEndpoint(
   } else if (req.enabled === false) {
     set('status', 'disabled'); set('disabled_reason', '');
   }
+  set('access_role', writer.accessRole);
   set('updated_at', Date.now());
   const row = await env.db.prepare(`UPDATE webhook_endpoints SET ${sets.join(', ')} WHERE id = ? AND user_id = ? RETURNING *`)
     .bind(...values, current.id, userId).first<EndpointRow>();
@@ -296,6 +311,7 @@ const INSERT_COLUMNS = `INSERT INTO webhook_deliveries
 /**
  * mail.received 入队语句：给归属人们订阅了它、过滤命中的端点各插一条投递。载荷在首次投递时按端点是否要正文构造，
  * 这里只记邮件 id；去重键保证补录重复入队时不会多发。供收件通知入队时合进同一个 batch。
+ * 未认领地址的来信归全部管理员；access_role 为 user 的端点（由没有 admin scope 的管理员 Key 写入）只收所有者自己认领的地址
  */
 export function mailReceivedDeliveriesStatement(
   env: Env, ownerIds: readonly number[], message: { id: number; address: string }, now = Date.now(),
@@ -304,9 +320,11 @@ export function mailReceivedDeliveriesStatement(
   return env.db.prepare(`${INSERT_COLUMNS}
     SELECT id, user_id, ?, 'mail.received', ?, '', 'pending', 0, ?, ?, ?
     FROM webhook_endpoints WHERE user_id IN (SELECT value FROM json_each(?)) AND ${MATCH_SQL}
+      AND (access_role = 'admin' OR EXISTS (SELECT 1 FROM mailboxes AS hook_box
+        WHERE hook_box.address = ? AND hook_box.user_id = webhook_endpoints.user_id))
     ON CONFLICT(endpoint_id, event_key) DO NOTHING RETURNING id`)
     .bind(newEventId(), `mail.received:${message.id}`, now, now, now, JSON.stringify([...new Set(ownerIds)]),
-      'mail.received', address, getEmailDomain(address));
+      'mail.received', address, getEmailDomain(address), address);
 }
 
 /**

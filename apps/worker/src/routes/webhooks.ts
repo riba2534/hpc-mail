@@ -58,7 +58,18 @@ export function webhookRoutes(mode: 'session' | 'key') {
     });
   }
   const owner = (c: Context<AppContext>) => (mode === 'session' ? c.get('user')!.id : c.get('apiKey')!.userId);
-  const origin = (c: Context<AppContext>) => new URL(c.req.url).origin;
+  /** 写入端点的凭据：有效角色存为端点的 access_role，决定它能否收到未认领地址的来信 */
+  const writer = (c: Context<AppContext>) => ({
+    requestOrigin: new URL(c.req.url).origin,
+    accessRole: mode === 'session' ? c.get('user')!.role : c.get('apiKey')!.role,
+  });
+  /**
+   * 订阅 mail.received 或带正文的端点会收到来信的主题、验证码与正文：Key 创建或修改这样的端点另需 mail.read，
+   * 只有 webhook.write 不能借端点读信
+   */
+  const requireMailRead = (c: Context<AppContext>, endpoint: { events: readonly string[]; includeBody: boolean }) => {
+    if (mode === 'key' && (endpoint.events.includes('mail.received') || endpoint.includeBody)) requireScope(c, 'mail.read');
+  };
 
   /** 读端点并确认这把 Key 能管理它（会话请求不受限） */
   async function visible(c: Context<AppContext>, id: number): Promise<WebhookEndpoint> {
@@ -81,8 +92,9 @@ export function webhookRoutes(mode: 'session' | 'key') {
 
   app.post('/', async (c) => {
     const req = await parseBody(c, createWebhookEndpointRequestSchema);
+    requireMailRead(c, req);
     if (!(await filtersInKey(c, [req]))[0]) throw restrictedFilters();
-    return ok(c, await createWebhookEndpoint(c.env, owner(c), req, origin(c)), 201);
+    return ok(c, await createWebhookEndpoint(c.env, owner(c), req, writer(c)), 201);
   });
 
   app.get('/:id', async (c) => ok(c, await visible(c, parseId(c.req.param('id')))));
@@ -95,7 +107,7 @@ export function webhookRoutes(mode: 'session' | 'key') {
       const next = { addresses: req.addresses ?? current.addresses, domains: req.domains ?? current.domains };
       if (!(await filtersInKey(c, [next]))[0]) throw restrictedFilters();
     }
-    return ok(c, await updateWebhookEndpoint(c.env, owner(c), id, req, origin(c)));
+    return ok(c, await updateWebhookEndpoint(c.env, owner(c), id, req, { ...writer(c), check: (next) => requireMailRead(c, next) }));
   });
 
   app.delete('/:id', async (c) => {

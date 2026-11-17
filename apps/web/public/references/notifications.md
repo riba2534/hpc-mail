@@ -17,7 +17,7 @@ API Key 版本（路径相对 `/v1`，`AUTH` 为 Key）：
 | 方法与路径 | scope | 请求/结果 |
 |---|---|---|
 | `GET /notify-prefs` | `notify.read` | 与上面 GET 相同（掩码，`forward` 只读） |
-| `PUT /notify-prefs` | `notify.write` | 只能带 `feishu`/`pushdeer`/`webhook`；带 `forward` 返回 403 |
+| `PUT /notify-prefs` | `notify.write` + `mail.read` | 只能带 `feishu`/`pushdeer`/`webhook`；带 `forward` 返回 403。这些通道会推送来信主题、验证码与正文摘要，所以另需 `mail.read`；管理员的个人配置也作用于未认领地址的来信，管理员账户的 Key 还需带 `admin` scope，否则 403 |
 | `POST /notify-prefs/feishu-test`、`/pushdeer-test` | `notify.write` | 同上，用已保存配置真实发送 |
 | `GET /notify-prefs/health` | `notify.read` | 同上 |
 | `POST /notify-prefs/jobs/:id/retry` | `notify.write` | 同上 |

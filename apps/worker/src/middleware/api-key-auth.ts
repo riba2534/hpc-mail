@@ -106,6 +106,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
       username: record.username ?? '',
       // 管理员能力要 Key 显式带 admin scope；没有它的管理员 Key 按普通用户执行
       role: row.role === 'admin' && row.scopes.includes('admin') ? 'admin' : 'user',
+      accountRole: row.role === 'admin' ? 'admin' : 'user',
       scopes: row.scopes,
       allowedMailboxIds: row.allowedMailboxIds,
       allowedDomains: row.allowedDomains,

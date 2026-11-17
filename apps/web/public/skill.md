@@ -122,7 +122,7 @@ SINCE=$MAX   # 所有页处理完才推进基线
 
 - 摘要已含 `preview`、`verificationCode`、`verificationLink`。只有需要正文或附件时才读详情，每封读一次并按 id 缓存，不要定时重拉同一封详情。处理完可用 `POST /messages/read` 标记已读（需要 `mail.write`）。
 - 持续监听用不带过滤的 `wait` 循环：每次返回最早一封新来信，以 `scannedThroughId` 作为下一轮的 `afterId`，不要高频轮询列表。`cursor` 只用服务器返回的值。
-- 有可公网访问的 HTTPS 接收端时改用 [Webhook v2](references/webhooks.md)（`POST /webhooks`，需要 `webhook.write`）：收信、发信结果与托管域名状态主动推送，Svix 兼容签名，失败自动重试，按 `webhook-id` 去重。
+- 有可公网访问的 HTTPS 接收端时改用 [Webhook v2](references/webhooks.md)（`POST /webhooks`，需要 `webhook.write`，订阅收信另需 `mail.read`）：收信、发信结果与托管域名状态主动推送，Svix 兼容签名，失败自动重试，按 `webhook-id` 去重。
 
 ### ⑦ 接入自有域名
 ```bash
@@ -167,8 +167,8 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 | 托管域名列表与接入进度、DNS 记录 | `GET /hosted-domains`、`GET /hosted-domains/:id`、`GET /hosted-domains/:id/dns-records` | `domain.read` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
 | 接入自有域名（含批量）、立即检测（含批量）、重新接入、增改删 DNS 记录 | `POST /hosted-domains`、`POST /hosted-domains/batch\|batch-check`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/reconnect`、`POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
 | 共享自己的邮箱（按 userId） | `GET /mailboxes/shares`、`PUT /mailboxes/shares`、`POST /mailboxes/shares/batch`、`DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | `mailbox.share` | [mailboxes](references/mailboxes-and-domains.md#释放历史与共享边界) |
-| Webhook 端点、换密钥、测试、投递记录与重试 | `GET\|POST /webhooks`、`GET\|PUT\|DELETE /webhooks/:id`、`POST /webhooks/:id/rotate-secret\|test`、`GET /webhooks/:id/deliveries`、`POST /webhooks/:id/deliveries/:deliveryId/retry` | `webhook.write` | [webhooks](references/webhooks.md) |
-| 通知通道（飞书、PushDeer、通用 Webhook）、测试、投递健康与重试 | `GET /notify-prefs`、`PUT /notify-prefs`、`POST /notify-prefs/feishu-test\|pushdeer-test`、`GET /notify-prefs/health`、`POST /notify-prefs/jobs/:id/retry` | 读 `notify.read`，改、测试与重试 `notify.write` | [notifications](references/notifications.md) |
+| Webhook 端点、换密钥、测试、投递记录与重试 | `GET\|POST /webhooks`、`GET\|PUT\|DELETE /webhooks/:id`、`POST /webhooks/:id/rotate-secret\|test`、`GET /webhooks/:id/deliveries`、`POST /webhooks/:id/deliveries/:deliveryId/retry` | `webhook.write`（订阅 `mail.received` 或带正文另需 `mail.read`） | [webhooks](references/webhooks.md) |
+| 通知通道（飞书、PushDeer、通用 Webhook）、测试、投递健康与重试 | `GET /notify-prefs`、`PUT /notify-prefs`、`POST /notify-prefs/feishu-test\|pushdeer-test`、`GET /notify-prefs/health`、`POST /notify-prefs/jobs/:id/retry` | 读 `notify.read`，改、测试与重试 `notify.write`（改通道另需 `mail.read`，管理员账户还需 `admin`） | [notifications](references/notifications.md) |
 
 只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；托管域名的删除、成员上限、成员与过户、共享候选用户搜索见 [mailboxes](references/mailboxes-and-domains.md)；邮箱转发目标（新目标要邮件确认）见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
 

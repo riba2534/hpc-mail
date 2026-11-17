@@ -3,6 +3,7 @@ import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
+import { eq } from 'drizzle-orm';
 import { mailboxes, users } from '../src/db/schema.js';
 import { hmacSha256Base64 } from '../src/lib/crypto.js';
 import { signToken } from '../src/lib/jwt.js';
@@ -132,13 +133,48 @@ describe('Webhook v2 端点管理', () => {
   it('限定了范围的 Key 只能管理过滤条件落在范围内的端点', async () => {
     const user = await account('scoped');
     const open = await data<CreatedWebhookEndpoint>(await create(user.jwt, {}), 201);
-    const key = await user.key(['webhook.write'], { allowedMailboxIds: [user.box.id] });
+    const key = await user.key(['webhook.write', 'mail.read'], { allowedMailboxIds: [user.box.id] });
     expect((await create(key, {}, '/v1')).status).toBe(403);
     expect((await create(key, { domains: ['hpc.email'] }, '/v1')).status).toBe(403);
     const mine = await data<CreatedWebhookEndpoint>(await create(key, { addresses: [user.box.address] }, '/v1'), 201);
     expect((await data<WebhookEndpoint[]>(await request('/v1/webhooks', { headers: auth(key) }))).map((item) => item.id)).toEqual([mine.id]);
     expect((await request(`/v1/webhooks/${open.id}`, { headers: auth(key) })).status).toBe(404);
     expect((await request(`/v1/webhooks/${mine.id}`, json(key, { addresses: [] }, 'PUT'))).status).toBe(403);
+  });
+
+  it('Key 创建或修改订阅 mail.received、或带正文的端点另需 mail.read（A5）', async () => {
+    const user = await account('mail-read');
+    const hookOnly = await user.key(['webhook.write']);
+    expect((await create(hookOnly, {}, '/v1')).status).toBe(403);
+    expect((await create(hookOnly, { events: ['mail.sent'], includeBody: true }, '/v1')).status).toBe(403);
+    const sent = await data<CreatedWebhookEndpoint>(await create(hookOnly, { events: ['mail.sent', 'mail.failed'] }, '/v1'), 201);
+    expect((await request(`/v1/webhooks/${sent.id}`, json(hookOnly, { events: ['mail.received'] }, 'PUT'))).status).toBe(403);
+    // 网页会话建的 mail.received 端点：只有 webhook.write 的 Key 改它（如换 url）同样要 mail.read
+    const received = await data<CreatedWebhookEndpoint>(await create(user.jwt, {}), 201);
+    expect((await request(`/v1/webhooks/${received.id}`, json(hookOnly, { url: 'https://evil.example.com/x' }, 'PUT'))).status).toBe(403);
+    const kept = await data<WebhookEndpoint>(await request(`/api/webhooks/${received.id}`, { headers: auth(user.jwt) }));
+    expect(kept.url).toBe('https://hooks.example.com/hpc');
+    const reader = await user.key(['webhook.write', 'mail.read']);
+    await data(await create(reader, { url: 'https://reader.example.com/x' }, '/v1'), 201);
+    await data(await request(`/v1/webhooks/${sent.id}`, json(reader, { events: ['mail.received'] }, 'PUT')));
+  });
+
+  it('端点能收到的来信按写入它的凭据的有效角色：没有 admin scope 的管理员 Key 写的端点不收未认领地址（A27）', async () => {
+    const admin = await account('admin-role');
+    await db.update(users).set({ role: 'admin' }).where(eq(users.id, admin.id));
+    const plainKey = await admin.key(['webhook.write', 'mail.read']);
+    const viaKey = await data<CreatedWebhookEndpoint>(await create(plainKey, { url: 'https://key.example.com/x' }, '/v1'), 201);
+    const viaSession = await data<CreatedWebhookEndpoint>(await create(admin.jwt, { url: 'https://session.example.com/x' }), 201);
+    const moved = await data<CreatedWebhookEndpoint>(await create(admin.jwt, { url: 'https://moved.example.com/x' }), 201);
+    // 没有 admin scope 的 Key 改过的端点同样降为只收自己认领的地址
+    await data(await request(`/v1/webhooks/${moved.id}`, json(plainKey, { description: 'by key' }, 'PUT')));
+    const hits = receiver();
+    await receive(`wh-unclaimed-${seq}@hpc.email`, 'unclaimed mail');
+    expect(hits.map((hit) => new URL(hit.url).host)).toEqual(['session.example.com']);
+    hits.length = 0;
+    await receive(admin.box.address, 'own mail');
+    expect(hits.map((hit) => new URL(hit.url).host).sort()).toEqual(['key.example.com', 'moved.example.com', 'session.example.com']);
+    expect(viaKey.id).not.toBe(viaSession.id);
   });
 
   it('测试发送同步返回接收端结果，不写投递记录', async () => {

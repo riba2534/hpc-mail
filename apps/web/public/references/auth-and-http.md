@@ -72,9 +72,9 @@ hpc '/auth/me'
 | `domain.read` | 自己拥有或被共享的托管域名列表、接入进度，托管域名的 DNS 记录 |
 | `domain.write` | 接入（添加，含批量）托管域名、立即检测（含批量）、重新接入、增改删 DNS 记录；见[用 API Key 接入](mailboxes-and-domains.md#用-api-key-接入) |
 | `mailbox.share` | 管理自己邮箱的共享（只按 userId，不提供用户搜索） |
-| `webhook.write` | 管理 Webhook v2 端点、测试发送、查看与重试投递，见 [Webhook](webhooks.md) |
+| `webhook.write` | 管理 Webhook v2 端点、测试发送、查看与重试投递，见 [Webhook](webhooks.md)；创建或修改订阅 `mail.received`、或带正文的端点另需 `mail.read` |
 | `notify.read` | 读取个人通知配置（飞书、PushDeer、通用 Webhook；转发目标只读）与投递健康 |
-| `notify.write` | 修改飞书、PushDeer、通用 Webhook，发送测试，手动重试通知任务；邮箱转发目标只能网页会话修改 |
+| `notify.write` | 修改飞书、PushDeer、通用 Webhook（另需 `mail.read`；管理员账户另需 `admin` scope），发送测试，手动重试通知任务；邮箱转发目标只能网页会话修改 |
 | `admin` | 管理员能力开关，见下文 |
 
 **管理员能力要显式授予。** 只有所属用户是管理员、且 Key 带 `admin` scope 时，这把 Key 才按管理员执行（`scope=unclaimed/user`、`all=1`、用任意 `mailboxId` 或系统域名任意前缀发信、不受外发配额）；没有它的管理员 Key 与普通用户完全一样。`admin` 只有管理员能授予，且必须同时设置 `allowedIps` 与不超过 90 天的 `expiresAt`（否则 400；普通用户授予 403）。升级前已存在的管理员 Key 已自动带上 `admin`，照常可用；之后修改它的 scopes、白名单或有效期时按新规则校验。`GET /v1/me` 的 `key.effectiveRole` 是这把 Key 实际的执行角色。

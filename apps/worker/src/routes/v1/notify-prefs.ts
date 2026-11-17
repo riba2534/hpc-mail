@@ -32,9 +32,25 @@ app.get('/', async (c) => {
   return ok(c, { ...maskUserNotifyPrefs(prefs), forwardPending: pending } satisfies NotifyPrefsView);
 });
 
+/**
+ * 飞书、PushDeer、通用 Webhook 都会推送来信的主题、验证码与正文摘要：修改它们另需 mail.read。
+ * 管理员的个人配置同时作用于未认领地址的来信，没有 admin scope 的管理员 Key 不能修改
+ */
+function assertCanRouteMail(c: Context<AppContext>): void {
+  requireScope(c, 'mail.read');
+  const key = c.get('apiKey')!;
+  if (key.accountRole === 'admin' && key.role !== 'admin') {
+    throw new AppError('forbidden', '管理员的通知配置也推送未认领地址的来信，需要带 admin scope 的 API Key', {
+      fix: '改用带 admin scope 的 Key（需 IP 白名单、有效期不超过 90 天），或请用户在网页「个人设置 - 转发与通知」修改',
+      docs: '/references/notifications.md',
+    });
+  }
+}
+
 app.put('/', async (c) => {
   requireScope(c, 'notify.write');
   assertKeyUnrestricted(c, ACCOUNT_WIDE);
+  assertCanRouteMail(c);
   const { forward, password: _password, ...req } = await parseBody(c, updateNotifyPrefsRequestSchema);
   if (forward !== undefined) {
     throw new AppError('forbidden', '邮箱转发目标只能在网页会话里修改', {

@@ -13,7 +13,7 @@ import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import type { Env } from '../src/types.js';
-import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -68,11 +68,16 @@ describe('通知配置开放给 notify.read / notify.write', () => {
     const user = await account('notify');
     await updateUserNotifyPrefs(env, user.id, { webhook: { enabled: true, url: 'https://hooks.example.com/a', secret: 'shh' } });
     const reader = await user.key(['notify.read']);
-    const writer = await user.key(['notify.read', 'notify.write']);
+    const writer = await user.key(['notify.read', 'notify.write', 'mail.read']);
     const prefs = await data<NotifyPrefsView>(await request('/v1/notify-prefs', { headers: auth(reader) }));
     expect(prefs.webhook).toMatchObject({ enabled: true, secret: '******' });
     expect(prefs.forwardPending).toEqual([]);
     expect((await request('/v1/notify-prefs', json(reader, { feishu: { enabled: false, webhookUrl: '', secret: '' } }, 'PUT'))).status).toBe(403);
+    // 通道会推送来信主题、验证码与正文摘要：只有 notify.write 不够，另需 mail.read（A5）
+    const notifyOnly = await user.key(['notify.read', 'notify.write']);
+    const missing = await request('/v1/notify-prefs', json(notifyOnly, { pushdeer: { enabled: true, endpoint: '', pushkey: 'PDU_TEST' } }, 'PUT'));
+    expect(missing.status).toBe(403);
+    expect(((await missing.json()) as { error: { message: string } }).error.message).toContain('mail.read');
     const updated = await data<NotifyPrefsView>(await request('/v1/notify-prefs',
       json(writer, { pushdeer: { enabled: true, endpoint: '', pushkey: 'PDU_TEST' } }, 'PUT')));
     expect(updated.pushdeer).toMatchObject({ enabled: true, pushkey: '******' });
@@ -82,12 +87,26 @@ describe('通知配置开放给 notify.read / notify.write', () => {
     expect((await data<NotificationHealth>(await request('/v1/notify-prefs/health', { headers: auth(reader) }))).channels).toHaveLength(4);
 
     const box = await own(user.id, `nk-notify-box-${seq}@hpc.email`);
-    const scoped = await user.key(['notify.read', 'notify.write'], { allowedMailboxIds: [box.id] });
+    const scoped = await user.key(['notify.read', 'notify.write', 'mail.read'], { allowedMailboxIds: [box.id] });
     expect((await request('/v1/notify-prefs', { headers: auth(scoped) })).status).toBe(200);
     expect((await request('/v1/notify-prefs', json(scoped, { pushdeer: { enabled: false, endpoint: '', pushkey: '' } }, 'PUT'))).status).toBe(403);
     expect((await request('/v1/notify-prefs/health', { headers: auth(scoped) })).status).toBe(403);
     expect((await request('/v1/notify-prefs/feishu-test', { method: 'POST', headers: auth(scoped) })).status).toBe(403);
   });
+});
+
+it('没有 admin scope 的管理员 Key 不能改通知配置：管理员的配置也推送未认领地址的来信（A27）', async () => {
+  const admin = await account('notify-admin');
+  await db.update(users).set({ role: 'admin' }).where(eq(users.id, admin.id));
+  const body = { pushdeer: { enabled: true, endpoint: '', pushkey: 'PDU_TEST' } };
+  const plain = await admin.key(['notify.read', 'notify.write', 'mail.read']);
+  const denied = await request('/v1/notify-prefs', json(plain, body, 'PUT'));
+  expect(denied.status).toBe(403);
+  expect(((await denied.json()) as { error: { message: string } }).error.message).toContain('admin scope');
+  // 存量管理员 Key 的形态（迁移 0022 补上 admin scope）
+  const scoped = await createApiKey(env, admin.id, { name: `k-${++seq}`, scopes: ['notify.read', 'notify.write', 'mail.read'], rateLimit: 600, allowedIps: [] });
+  await grantLegacyAdminScope(env, scoped.id);
+  expect((await request('/v1/notify-prefs', json(scoped.key, body, 'PUT'))).status).toBe(200);
 });
 
 describe('共享管理开放给 mailbox.share', () => {

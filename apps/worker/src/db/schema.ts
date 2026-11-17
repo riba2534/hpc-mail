@@ -732,6 +732,11 @@ export const webhookEndpoints = sqliteTable('webhook_endpoints', {
   consecutiveFailures: integer('consecutive_failures').notNull().default(0),
   lastSuccessAt: integer('last_success_at', { mode: 'timestamp_ms' }),
   lastFailureAt: integer('last_failure_at', { mode: 'timestamp_ms' }),
+  /**
+   * 最近一次写入端点的凭据的有效角色（没有 admin scope 的管理员 Key 是 user）。实际角色取它与 users.role 中较低的：
+   * user 的端点只收所有者自己认领地址的来信，不收未认领地址（未认领地址的来信归管理员）
+   */
+  accessRole: text('access_role', { enum: ['admin', 'user'] }).notNull().default('admin'),
   createdAt: createdAtColumn(),
   updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
 }, (t) => [index('idx_webhook_endpoints_user').on(t.userId, t.status)]);
