@@ -112,9 +112,19 @@ export async function lookupAdminHostedDomains(env: Env, query: AdminHostedDomai
 
 // ---------- Claude 事实与收据（/v1/admin/claude） ----------
 
-/** 每个后缀的地址数、付费数与封号地址（按 domain 索引读 claude_address_facts）。?1 域名 JSON 数组 */
-export const CLAUDE_DOMAIN_COUNTS_SQL = `SELECT domain, COUNT(*) AS addresses, SUM(paid > 0) AS paid, SUM(suspended > 0) AS suspended
-  FROM claude_address_facts WHERE domain IN (SELECT value FROM json_each(?1)) GROUP BY domain`;
+/**
+ * 每个后缀的地址数、付费数与封号数，口径与地址视图一致：地址取 claude_address_facts 与 claude_receipts 的并集，
+ * 事实表标了付费或有收据即算付费；封号只看事实表。两张表都按 domain 索引读。?1 域名 JSON 数组
+ */
+export const CLAUDE_DOMAIN_COUNTS_SQL = `SELECT domain, COUNT(*) AS addresses, SUM(paid) AS paid, SUM(suspended) AS suspended
+  FROM (SELECT domain, address, MAX(paid) AS paid, MAX(suspended) AS suspended FROM (
+      SELECT domain, address, paid > 0 AS paid, suspended > 0 AS suspended FROM claude_address_facts
+        WHERE domain IN (SELECT value FROM json_each(?1))
+      UNION ALL
+      SELECT domain, address, 1, 0 FROM claude_receipts WHERE domain IN (SELECT value FROM json_each(?1)))
+    GROUP BY domain, address)
+  GROUP BY domain`;
+/** 封号地址（按 domain 索引读 claude_address_facts）。?1 域名 JSON 数组 */
 export const CLAUDE_DOMAIN_BANS_SQL = `SELECT domain, address, suspended_at FROM claude_address_facts
   WHERE domain IN (SELECT value FROM json_each(?1)) AND suspended > 0 ORDER BY suspended_at, address`;
 

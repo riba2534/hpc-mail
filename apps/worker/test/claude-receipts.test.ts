@@ -167,6 +167,49 @@ describe('收据采集', () => {
     expect((await progress()).cursor).toBeGreaterThanOrEqual(recent.id);
   });
 
+  it('回填追上后只读到窗口内的第一行就停：不重扫最近 1 小时，也不越过它先处理 id 更大的旧行', async () => {
+    const domain = domainOf();
+    const old = (days: number) => ({ createdAt: new Date(Date.now() - days * DAY) });
+    const first = await receive(`o1@${domain}`, old(3));
+    const recent = await receive(`w@${domain}`);
+    // id 更大、时间却更早的行（时钟偏差或补写）：游标停在窗口内的行之前，不能先越过去，否则窗口内的行再也回填不到
+    const later = await receive(`o2@${domain}`, old(2));
+    for (let i = 0; i < 30; i++) await receive(`n${i}@${domain}`, { subject: 'Welcome to Claude' });
+    await setProgress({ cursor: first.id - 1 });
+
+    const statements: { sql: string; params: unknown[] }[] = [];
+    const traced = new Proxy(env.db, { get(target, property) {
+      if (property === 'prepare') return (query: string) => {
+        const statement = target.prepare(query);
+        return new Proxy(statement, { get(stmt, key) {
+          if (key === 'bind') return (...params: unknown[]) => { statements.push({ sql: query, params }); return stmt.bind(...params); };
+          const value = Reflect.get(stmt, key);
+          return typeof value === 'function' ? value.bind(stmt) : value;
+        } });
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const tracedEnv = { ...env, db: traced } as typeof env;
+
+    expect(await backfillClaudeReceipts(tracedEnv)).toBe(1);
+    expect(await progress()).toMatchObject({ cursor: first.id, caughtUp: true });
+    expect([...(await receiptsOf([first.id, recent.id, later.id])).keys()]).toEqual([first.id]);
+
+    // 追上后再跑一轮：扫描只读到窗口内的第一行，不把最近 1 小时的 30 多行再读一遍
+    statements.length = 0;
+    expect(await backfillClaudeReceipts(tracedEnv)).toBe(0);
+    const scan = statements.find((statement) => statement.sql === RECEIPT_BACKFILL_SCAN_SQL)!;
+    const replay = await env.db.prepare(scan.sql).bind(...scan.params).all();
+    expect(replay.results).toEqual([]);
+    expect(replay.meta.rows_read).toBeLessThan(10);
+    expect(await progress()).toMatchObject({ cursor: first.id, caughtUp: true });
+
+    // 两小时后窗口内的行与 id 更大的旧行一并补上
+    await backfillClaudeReceipts(env, Date.now() + 2 * HOUR);
+    expect([...(await receiptsOf([first.id, recent.id, later.id])).keys()].sort((a, b) => a - b)).toEqual([first.id, recent.id, later.id]);
+  });
+
   it('D1 正文里找不到金额且全文在 R2 时读全文；只有 HTML 时用转换出的文本', async () => {
     const domain = domainOf();
     await env.r2.put('body/receipt-text.json', JSON.stringify({ text: SAMPLE, html: '' }));
@@ -242,8 +285,10 @@ describe('收据采集', () => {
     const window = await planOf(RECEIPT_WINDOW_SQL, 0, 50);
     expect(window).toMatch(/idx_messages_created_id/);
     expect(window).not.toMatch(/SCAN messages\b/);
-    const scan = await planOf(RECEIPT_BACKFILL_SCAN_SQL, 0, 1000);
-    expect(scan).toMatch(/SEARCH messages USING INTEGER PRIMARY KEY \(rowid>\?\)/);
+    const scan = await planOf(RECEIPT_BACKFILL_SCAN_SQL, 0, 1000, Date.now() - HOUR);
+    // 主扫描按主键限定在游标与窗口内第一行之间；找那一行的子查询是协程，读到即停
+    expect(scan).toMatch(/SEARCH messages USING INTEGER PRIMARY KEY \(rowid>\? AND rowid<\?\)/);
+    expect(scan).toMatch(/CO-ROUTINE stop \| CO-ROUTINE \(subquery-\d+\) \| SEARCH messages USING INTEGER PRIMARY KEY \(rowid>\?\)/);
     // 只有收据按主键回表取正文
     expect(scan).toMatch(/SEARCH m USING INTEGER PRIMARY KEY \(rowid=\?\) LEFT-JOIN/);
     expect(scan).not.toMatch(/SCAN messages\b/);
@@ -352,6 +397,29 @@ describe('/v1/admin/claude 查询', () => {
     expect(after!.receipts).toEqual([{ ...live!.receipts[0], messageId: null }]);
   });
 
+  it('domains 与 addresses 的 paid 同一口径：事实表没标付费、甚至没有事实但有收据的地址也计入', async () => {
+    const key = await adminKey();
+    const domain = domainOf();
+    await fact(`x@${domain}`, { paid: true });
+    await fact(`y@${domain}`, { suspended: true, suspendedAt: new Date(Date.UTC(2026, 10, 3)) });
+    await fact(`plain@${domain}`);
+    const receipt = (address: string, offset: number) => db.insert(claudeReceipts).values({ messageId: 800_000_000 + sequence * 10 + offset,
+      address, domain, receivedAt: new Date(Date.now() - offset * DAY), subject: 'Your receipt from Anthropic', amountCents: 10_000 });
+    // y 两张收据只算一个地址；z 只有收据、没有事实
+    await receipt(`y@${domain}`, 1);
+    await receipt(`y@${domain}`, 2);
+    await receipt(`z@${domain}`, 3);
+
+    const [summary] = await get<ClaudeDomainFacts[]>(key, `/v1/admin/claude/domains?domains=${domain}`);
+    expect(summary).toMatchObject({ addresses: 4, paid: 3, suspended: 1 });
+    const views = await get<ClaudeAddressFacts[]>(key,
+      `/v1/admin/claude/addresses?addresses=x@${domain},y@${domain},z@${domain},plain@${domain}`);
+    expect(views.map((view) => [view.address.split('@')[0], view.known, view.paid]))
+      .toEqual([['x', true, true], ['y', true, true], ['z', true, true], ['plain', true, false]]);
+    expect(views.filter((view) => view.paid)).toHaveLength(summary!.paid);
+    expect(views.filter((view) => view.suspended)).toHaveLength(summary!.suspended);
+  });
+
   it('两个查询各一次 D1 batch，按索引读取，不全表扫描', async () => {
     // 每条预备的语句都进了同一次 batch：另发的单条查询会多出 prepare
     const calls = { prepared: 0, batches: [] as number[] };
@@ -379,6 +447,10 @@ describe('/v1/admin/claude 查询', () => {
       expect(plan).toMatch(/idx_claude_facts_domain \(domain=\?\)/);
       expect(plan).not.toMatch(/SCAN claude_address_facts\b/);
     }
+    // 付费数并入收据：claude_receipts 同样按 domain 索引读
+    const counts = await planOf(CLAUDE_DOMAIN_COUNTS_SQL, JSON.stringify(['a.test']));
+    expect(counts).toMatch(/idx_claude_receipts_domain \(domain=\?\)/);
+    expect(counts).not.toMatch(/SCAN claude_receipts\b/);
     // 管理员 Key 之外的调用者由 admin/index.ts 统一拦下（这里只确认路由挂在其后）
     const ctx = createExecutionContext();
     const response = await app.request('/v1/admin/claude/domains?domains=a.test', {}, env, ctx);

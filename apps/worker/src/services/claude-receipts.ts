@@ -161,11 +161,18 @@ export async function harvestRecentClaudeReceipts(env: Env, now = Date.now()): P
 }
 
 /**
- * 游标之后按主键取一批（导出供 EXPLAIN 回归）：先按主键判定每行是不是待记录的收据（只物化 id、时间与判定结果），
- * 只有收据再按主键取回正文等列，其余行这些列为 null。?1 游标 id、?2 批量
+ * 游标之后按主键取一批（导出供 EXPLAIN 回归）。?1 游标 id、?2 批量、?3 窗口起点（now - RECEIPT_WINDOW_MS）
+ * - stop：游标之后（同一批范围内）第一条落在窗口内的行。外层 LIMIT 1 让按主键顺序的子查询读到它就停，
+ *   追上进度后每轮只读这一行，不把最近 1 小时的行重扫一遍；
+ * - 只取 stop 之前的行：游标不越过窗口内的行，id 更大但时间更早的行（时钟偏差）留到它之后按顺序处理，不会漏；
+ * - 先按主键判定每行是不是待记录的收据（只物化 id、时间与判定结果），只有收据再按主键取回正文等列。
  */
-export const RECEIPT_BACKFILL_SCAN_SQL = `WITH scanned AS MATERIALIZED (
-    SELECT id, created_at, (${RECEIPT_SQL} AND ${NOT_RECORDED}) AS receipt FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2)
+export const RECEIPT_BACKFILL_SCAN_SQL = `WITH stop AS (
+    SELECT id FROM (SELECT id, created_at FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2) WHERE created_at >= ?3 LIMIT 1),
+  scanned AS MATERIALIZED (
+    SELECT id, created_at, (${RECEIPT_SQL} AND ${NOT_RECORDED}) AS receipt FROM messages
+    WHERE id > ?1 AND id < coalesce((SELECT id FROM stop), 9223372036854775807) AND created_at < ?3
+    ORDER BY id LIMIT ?2)
   SELECT s.id, s.created_at, s.receipt, m.address, m.domain, m.subject, m.body_text, m.body_r2_key
   FROM scanned s LEFT JOIN messages m ON s.receipt AND m.id = s.id
   ORDER BY s.id`;
@@ -191,18 +198,15 @@ export async function backfillClaudeReceipts(env: Env, now = Date.now(), scanRow
   const stored = await env.db.prepare('SELECT value FROM settings WHERE key = ?1')
     .bind(RECEIPT_BACKFILL_PROGRESS_KEY).first<{ value: string }>();
   const progress = parseProgress(stored?.value);
-  const { results } = await env.db.prepare(RECEIPT_BACKFILL_SCAN_SQL).bind(progress.cursor, scanRows)
+  const { results } = await env.db.prepare(RECEIPT_BACKFILL_SCAN_SQL).bind(progress.cursor, scanRows, now - RECEIPT_WINDOW_MS)
     .all<ReceiptRow & { receipt: number }>();
 
   const budget = newBudget();
   const records: ReceiptRecord[] = [];
   let cursor = progress.cursor;
+  // 取不满一批：游标之后要么已到最新一行，要么下一行就在窗口内
   let caughtUp = results.length < scanRows;
   for (const row of results) {
-    if (row.created_at >= now - RECEIPT_WINDOW_MS) {
-      caughtUp = true;
-      break;
-    }
     if (row.receipt) {
       // 收据数或 R2 额度到上限：游标停在这一行之前，下一轮接着处理
       if (records.length >= BACKFILL_MAX_RECEIPTS) {
