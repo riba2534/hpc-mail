@@ -6,6 +6,7 @@ import PostalMime, { type Address } from 'postal-mime';
 import { and, eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { attachments as attachmentsTable, messages } from '../db/schema.js';
+import { inboundAuth, type AuthSource } from '../lib/auth-results.js';
 import { d1Statement } from '../lib/d1.js';
 import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-address.js';
 import { sha256Hex } from '../lib/crypto.js';
@@ -141,6 +142,8 @@ interface InboundTrace {
   rawR2: boolean;
   bodyR2: boolean;
   messageId: number | null;
+  /** 发件认证结果的来源（不含结果本身）：上线后据此确认 Cloudflare 确实附带了认证头 */
+  auth: AuthSource;
   ms: Partial<Record<'parse' | 'lookup' | 'store' | 'db' | 'attachments' | 'total', number>>;
 }
 
@@ -155,7 +158,8 @@ export async function handleInbound(
   const started = Date.now();
   const trace: InboundTrace = {
     stage: 'parse', domain: getEmailDomain(normalizeEmail(message.to)), rawSize: 0, bodySize: 0,
-    attachments: 0, attachmentBytes: 0, attachmentsDropped: false, rawR2: false, bodyR2: false, messageId: null, ms: {},
+    attachments: 0, attachmentBytes: 0, attachmentsDropped: false, rawR2: false, bodyR2: false, messageId: null,
+    auth: 'missing', ms: {},
   };
   let result: InboundResult | 'error' = 'error';
   let errorClass: string | undefined;
@@ -225,6 +229,9 @@ async function receiveInbound(
   const domain = getEmailDomain(toAddress);
   const fromAddress = normalizeEmail(email.from?.address);
   const fromName = (email.from?.name || getNameFromEmail(fromAddress)).trim().slice(0, 512);
+  // 只采信 Cloudflare 加在最上方的 Authentication-Results，纯字符串解析，不增加往返
+  const { auth, source: authSource } = inboundAuth(email.headers ?? [], fromAddress);
+  trace.auth = authSource;
 
   const mapAddrs = (list: Address[] | undefined): string[] =>
     [...new Set((list ?? []).flatMap(item => item.group ?? [item])
@@ -363,6 +370,7 @@ async function receiveInbound(
       ingestKey,
       verificationCode: code,
       verificationLink,
+      auth,
       messageId: sourceMessageId || null,
       inReplyTo: (email.inReplyTo || '').slice(0, 998) || null,
       references: sourceReferences,

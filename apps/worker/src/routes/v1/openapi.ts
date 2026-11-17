@@ -50,7 +50,7 @@ export function buildOpenApiSpec(origin: string) {
         query('address', { type: 'string', maxLength: 300 * MAX_WAIT_ADDRESSES },
           `Only wait for mail to these recipient addresses: comma-separated, or repeat the parameter (?address=a&address=b). At most ${MAX_WAIT_ADDRESSES} distinct addresses; more returns 400 validation_failed.`),
         query('domain', domainName, 'Only wait for mail to recipient addresses on this domain.'),
-        query('include', { type: 'string', enum: ['body'] }, 'body: return the matching message as MessageDetail (bodies, recipients, attachments with signed URLs that expire after 5 minutes), saving a GET /messages/{id}.'),
+        query('include', { type: 'string', enum: ['body'] }, 'body: return the matching message as MessageDetail (bodies, recipients, attachments with signed URLs that expire after 5 minutes, plus extractedText and risk), saving a GET /messages/{id}.'),
         query('afterId', { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }), query('timeout', { type: 'integer', minimum: 1, maximum: 50, default: 25 }),
         query('from', { type: 'string', maxLength: 254 }, 'Sender filter, case-insensitive: a full address for an exact match, or @domain to match that exact domain suffix (subdomains are not included).'),
         query('subjectContains', { type: 'string', minLength: 1, maxLength: 200 }, 'Case-insensitive subject substring.'),
