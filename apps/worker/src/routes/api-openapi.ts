@@ -170,6 +170,13 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'Rejects incoming mail, blocks sending and new claims. Addresses and history are kept.' }) },
     '/admin/hosted-domains/{id}/resume': { post: operation('Resume a suspended hosted domain', ref('HostedDomain'), { ...admin,
       description: 'Re-checks Cloudflare immediately and returns to the matching state.' }) },
+    '/admin/delivery-events': { get: operation('Read outbound delivery receipt subscriptions', ref('DeliveryEventsOverview'), { ...admin,
+      description: 'The delivery_events switch, whether the Worker has Cloudflare credentials, the Queue name and the Cloudflare Email Sending event subscription of each sending domain. Creating subscriptions needs a Cloudflare token with Account Queues:Edit, and for system domains read access to the zone; failures appear in lastError. A subscription created by hand in Cloudflare for the same domain and Queue is detected and marked active on the next retry or daily check.' }) },
+    '/admin/suppressions': { get: operation('List active outbound suppressions', page(ref('EmailSuppression')), { ...admin,
+      parameters: [query('q', { type: 'string', maxLength: 254 }, 'Case-insensitive substring of the recipient address or sending domain.'), ...pageQuery],
+      description: 'Unexpired entries only, newest id first. Bounced and complained delivery receipts add entries per recipient address and sending domain; sends from that domain to the address fail with recipient_suppressed until the entry expires or is removed.' }) },
+    '/admin/suppressions/{id}': { delete: operation('Remove a suppression entry', success, { ...admin,
+      description: 'Removes the entry from this site’s list only, so the next send to the address is attempted again; confirm the address works first. Cloudflare keeps its own suppression list, which must be cleared separately in Cloudflare or sends are still rejected there. 404 not_found when the entry does not exist. Recorded in the administrator audit log as suppression.delete.' }) },
     '/admin/mailbox-shares': {
       get: operation('List grants on all claimed mailboxes', array(ref('MailboxShareGrant')), { ...admin,
         parameters: [query('mailboxId', { type: 'integer', minimum: 1 }, 'Only this mailbox (at most one item).')] }),

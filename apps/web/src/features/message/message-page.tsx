@@ -349,8 +349,10 @@ export function MessagePage() {
   const deliveryPending = outbound && message.status === 'pending';
   const deliveryUnknown = outbound && message.status === 'unknown';
   const sendIssue = outbound && !deliveryPending && (deliveryUnknown || message.errorDetail || message.status === 'failed');
-  const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
+  // 投递回执的退信与发送时被拒一样列为失败；投诉表示已送达但被标记为垃圾邮件
+  const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed' || outcome.status === 'bounced') ?? [];
   const unknownRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'unknown') ?? [];
+  const complainedRecipients = outbound ? message.recipientOutcomes?.filter((outcome) => outcome.status === 'complained') ?? [] : [];
   // 正文里已经就地显示的内联图不再在附件区重复列出
   const listedAttachments = message.attachments.filter((attachment) => !attachment.inline);
   const canMarkUnread = readStateWritable && !outbound;
@@ -532,6 +534,11 @@ export function MessagePage() {
               </button>
               )}
             </div>
+          )}
+          {complainedRecipients.length > 0 && (
+            <p className="rounded-md border border-caution/40 bg-caution-soft px-3 py-2.5 text-sm text-ink-secondary">
+              已送达，但这些收件人把邮件标记为垃圾邮件，之后从同一发信域名发给他们会被拦截：{complainedRecipients.map((outcome) => outcome.address).join('、')}
+            </p>
           )}
           {!outbound && (message.status === 'degraded' || message.errorDetail) && <div role="alert" className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
             <p className="font-medium text-caution">邮件内容可能不完整</p>

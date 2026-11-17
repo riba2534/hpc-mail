@@ -492,3 +492,64 @@ export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
   token: text('token').notNull(),
   expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
 }, (t) => [primaryKey({ columns: [t.r2Key, t.token] }), index('idx_delivery_lease_expiry').on(t.expiresAt)]);
+
+/**
+ * 外发与 Cloudflare 投递事件的对应：每个外部收件人一次 send() 一行。事件到达时依次按 send() 返回的
+ * Cloudflare 消息 ID、本站 Message-ID（同收件人）、同一发件人与收件人唯一一条未回执的记录查找。
+ * 保留 30 天，由每日维护清理。
+ */
+export const emailDeliveryRefs = sqliteTable('email_delivery_refs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  /** send() 返回的 Cloudflare 消息 ID；没有返回时为 null */
+  providerMessageId: text('provider_message_id'),
+  /** 本站写进原文的 Message-ID（不含尖括号）；中转转发为 null */
+  rfcMessageId: text('rfc_message_id'),
+  /** message：发件行（messages.id）；forward：中转转发，messageId 为被转发的收件行 */
+  kind: text('kind', { enum: ['message', 'forward'] }).notNull(),
+  messageId: integer('message_id').notNull(),
+  sender: text('sender').notNull(),
+  recipient: text('recipient').notNull(),
+  /** forward：该目标的转发结果归属人（notification_jobs.user_id） */
+  ownerIds: text('owner_ids', { mode: 'json' }).notNull().$type<number[]>().default(sql`'[]'`),
+  /** 收到终态事件的时间；null 表示还没有回执 */
+  resolvedAt: integer('resolved_at', { mode: 'timestamp_ms' }),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('idx_delivery_refs_provider').on(t.providerMessageId).where(sql`${t.providerMessageId} IS NOT NULL`),
+  index('idx_delivery_refs_rfc').on(t.rfcMessageId).where(sql`${t.rfcMessageId} IS NOT NULL`),
+  // 兜底匹配只看还没有回执的记录
+  index('idx_delivery_refs_pending_pair').on(t.recipient, t.sender, t.id).where(sql`${t.resolvedAt} IS NULL`),
+  index('idx_delivery_refs_created').on(t.createdAt),
+]);
+
+/**
+ * 外发抑制名单：退信与投诉后，同一发信域名再发给该地址直接失败（范围与 Cloudflare 的 sending_domain 一致）。
+ * expires_at 为 null 长期有效，由管理员解除；到期的行由每日维护清理。
+ */
+export const emailSuppressions = sqliteTable('email_suppressions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  address: text('address').notNull(),
+  sendingDomain: text('sending_domain').notNull(),
+  reason: text('reason', { enum: ['hard_bounce', 'soft_bounce', 'complaint'] }).notNull(),
+  detail: text('detail').notNull().default(''),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
+  /** 最近一次写入该条目的 Cloudflare 事件 ID */
+  eventId: text('event_id').notNull().default(''),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('idx_suppressions_address_domain').on(t.address, t.sendingDomain),
+  index('idx_suppressions_expires').on(t.expiresAt).where(sql`${t.expiresAt} IS NOT NULL`),
+]);
+
+/** 发信域名的 Cloudflare 事件订阅（系统域名与托管域名共用） */
+export const emailEventSubscriptions = sqliteTable('email_event_subscriptions', {
+  domain: text('domain').primaryKey(),
+  kind: text('kind', { enum: ['system', 'hosted'] }).notNull(),
+  zoneId: text('zone_id').notNull().default(''),
+  subscriptionId: text('subscription_id'),
+  status: text('status', { enum: ['active', 'error'] }).notNull(),
+  lastError: text('last_error').notNull().default(''),
+  checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+  createdAt: createdAtColumn(),
+});

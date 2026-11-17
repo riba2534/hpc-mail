@@ -280,16 +280,45 @@ hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,addre
 | `status` | 含义 | 在哪里出现 |
 |---|---|---|
 | `sent` | 至少一个外部收件人被发信服务商接受；不代表已进对方收件箱 | 201 响应、列表、详情 |
-| `delivered` | 收件人都在本站，副本已落库 | 201 响应、列表、详情 |
+| `delivered` | 收件人都在本站且副本已落库；或外部收件人的投递回执都已回来、没有仍在 `sent` 的（见[投递回执](#投递回执)） | 201 响应、列表、详情 |
 | `pending` | 仍在投递，逐收件人结果边投递边回填 | 列表、详情；同 Key 重试返回 409 `send_in_progress` |
 | `unknown` | 没有收件人确认成功，但至少一个结果不明（发信服务超时、网络错误等，可能已送达）；或创建超过 1 小时仍是 `pending`（投递中断），已回填的结果保留、其余收件人记为 `unknown` | 201 响应、列表、详情；同 Key 重试返回 201 与这个状态 |
 | `failed` | 全部收件人明确失败 | 列表、详情；发信接口不以 201 返回它，而是 422 `delivery_failed` |
 
-`recipientOutcomes` 每个去重后的收件人一项：`delivered`（站内已投递）、`sent`（外部已接受）、`failed`（`error` 为原因）、`unknown`（结果不明，`error` 为原因，例如发信服务超时或「投递中断，结果未确认」，可能已经送达）。只有发信服务明确拒收（目标未验证、发信域未就绪、地址非法、超出限额等）才记 `failed`；无法判断的错误一律记 `unknown`，避免诱导重复投递。外部收件人最多 4 路并发投递，每完成一个就回填，所以 `pending` 的邮件可能已有部分结果。
+`recipientOutcomes` 每个去重后的收件人一项：`delivered`（站内已投递，或外部收件服务器已接收）、`sent`（外部已接受）、`failed`（`error` 为原因）、`bounced`（退信）、`complained`（已送达但被标为垃圾邮件）、`unknown`（结果不明，`error` 为原因，例如发信服务超时或「投递中断，结果未确认」，可能已经送达）。只有发信服务明确拒收（目标未验证、发信域未就绪、地址非法、超出限额等）才记 `failed`；无法判断的错误一律记 `unknown`，避免诱导重复投递。`bounced`、`complained` 与外部的 `delivered` 来自[投递回执](#投递回执)。外部收件人最多 4 路并发投递，每完成一个就回填，所以 `pending` 的邮件可能已有部分结果。
 
 - **201**：至少一个收件人成功，或没有成功但有结果不明的收件人（`status:"unknown"`）。`errorDetail` 为空即全部成功；部分失败时为「部分收件人失败: 地址: 原因; …」，有结果不明的收件人时为「…投递结果未确认，可能已送达，补发前先向收件人核对: …」。按[部分失败补发](#部分失败补发)处理：只补发 `failed`，`unknown` 先核对。
 - **422 `delivery_failed`**：每个收件人都明确失败，什么也没发出——发信服务逐个拒收，或服务端在开始投递前就出错（例如附件保存失败，此时每个收件人的 `error` 写明原因）。message 为「全部收件人投递失败: …」，`error.details` 为 `{messageId,recipientOutcomes}`，`messageId` 是已记录的发件行（`direction=outbound` 列表里可见）。这次不占当日外发配额，上传的草稿附件保留，可以再次引用。同 Key 重试返回同一个 422；修正后用新 Key 重发。
 - 首次响应与同 Key 重放一致（状态码、`status`、`recipientOutcomes`）。极少数情况下结果写库多次失败，同 Key 重试会一直返回 409 `send_in_progress`，直到 1 小时后被标为 `unknown`；这期间到已发送列表核对，不要换 Key 重发。
+
+#### 投递回执
+
+外部收件人的 `sent` 只表示 Cloudflare 已接受。发信域名订阅了 Cloudflare 投递事件时，收件服务器的最终结果会回写到 `recipientOutcomes`，通常在发送后几秒到几分钟；临时失败在重试期间不回写，重试耗尽记为 `bounced`。各状态：
+
+| `status` | 含义 |
+|---|---|
+| `sent` | Cloudflare 已接受，还没有回执；不代表已进收件箱 |
+| `delivered` | 站内收件人已落库，或外部收件服务器已接收（`event:"delivered"`） |
+| `bounced` | 收件服务器退信（`event:"bounced"`）；`error` 为 SMTP 应答或退信原因，`smtpStatus` 如 `550 5.1.1` |
+| `failed` | 明确失败：发送时被拒（`error` 为原因）；命中本站抑制名单（`code:"recipient_suppressed"`，没有发出，见[抑制名单](#抑制名单)）；或回执为 failed、rejected（`error` 为「Cloudflare 投递失败（原因）」或「Cloudflare 拒绝投递（原因：说明）」） |
+| `complained` | 已送达，但收件人把邮件标为垃圾邮件（`event:"complained"`）；不算失败，没有 `error` |
+| `unknown` | 投递中断，结果未回填，见上文 |
+
+回写过的收件人还带 `event`（最近一次回执：`delivered`、`bounced`、`failed`、`rejected`、`complained`）、`eventAt`（事件时间，ISO 8601）和 `smtpStatus`（事件带应答码时才有）。只采用比已有 `eventAt` 更新的事件，乱序或重复的回执不会把结果改回去。
+
+整封的 `status` 与 `errorDetail` 随回执按发信时的同一口径重算：还有收件人是 `sent` 时仍为 `sent`；有收件人 `delivered` 或 `complained` 时为 `delivered`；没有送达、只剩结果不明的为 `unknown`；全部退信或失败时变为 `failed`。`errorDetail` 按失败与结果不明的收件人重写（「部分收件人失败: …」「全部收件人投递失败: …」等）。所以发送时 201 `sent` 的邮件之后可能变成 `failed`；同一 Idempotency-Key 重放仍返回首次的结果，要看最新状态就重读 `GET /messages/:id` 或 `direction=outbound` 列表，隔几分钟读一次即可，不要高频轮询。
+
+投递回执需要站长在部署时启用；没启用、管理员关闭了 `delivery_events`、Worker 没有配置 Cloudflare 凭据，或该域名的订阅建立失败（管理员可在 `GET /api/admin/delivery-events` 查看）时收不到回执，结果一直停在 `sent`，发信也不会被抑制名单拦下。所以 `sent` 长时间不变不代表失败。
+
+#### 抑制名单
+
+`bounced` 与 `complained` 的收件人会进入本站抑制名单，范围与 Cloudflare 一致：按「收件地址 + 发信域名」记录，只拦从同一发信域名发给该地址的信。期限：投诉长期；硬退信 7 天，地址或域名不存在（增强码 `5.1.1`、`5.1.2`、`5.1.10`）时长期；软退信（临时失败、重试耗尽）24 小时。长期条目只能由管理员解除，见[管理员参考](administration.md#投递回执与抑制名单)。
+
+- **全部收件人都在名单里**：422 `recipient_suppressed`，没有发出，没有创建发件记录，不占当日配额，`Idempotency-Key` 已释放、可以复用。`error.details.suppressed` 每项为 `{address,reason,sendingDomain,since,expiresAt}`，`reason` 为 `hard_bounce|soft_bounce|complaint`，`expiresAt` 为 null 表示需管理员解除。见[错误码](errors.md#recipient_suppressed)。
+- **部分在名单里**：其余收件人照常发送并返回 201，被抑制的收件人为 `{"status":"failed","code":"recipient_suppressed","error":"收件人在 <域名> 的抑制名单中：<原因>，<时间> 自动解除"}`（长期条目结尾为「需管理员解除」）。其余收件人也全部失败时返回 422 `delivery_failed`，`details.recipientOutcomes` 包含被抑制的收件人。
+- [部分失败补发](#部分失败补发)时去掉带 `code:"recipient_suppressed"` 的收件人，再发仍会失败。也不要为绕过名单改用其他发信域名：地址不存在会再次退信，投诉过的人不应再收到这类邮件。
+
+Cloudflare 自己也维护抑制名单：被它抑制的站外收件人在发送时被拒（`failed`，`error` 带原因）或回执为 rejected。本站名单只是提前、逐个收件人地给出明确原因；管理员解除本站条目不会解除 Cloudflare 侧的条目。
 
 ### 幂等与重试
 
@@ -378,7 +407,7 @@ jq -n --slurpfile original message.json --arg from "$HPC_FROM" \
 
 ### 部分失败补发
 
-获取完整原详情，以 `recipientOutcomes.status=failed` 筛原 `recipients.to/cc/bcc` 各数组，新的请求只保留失败地址，`to` 可为空，保持原分组；原 HTML/text 与 `replyToMessageId` 上下文按需要保留，附件通过 `forwardAttachmentsFrom=原 outbound ID` 复制，不引用已消费的旧 Tokens。这是新的发送，使用新持久化 Key。原邮件的附件曾被转成下载链接时，沿用原正文即可：服务器会先去掉正文里本站注入的「附件下载」区块，再按本次大小决定是否重新生成，不会出现两段。
+获取完整原详情，以 `recipientOutcomes.status=failed`（带 `code:"recipient_suppressed"` 的除外；`bounced` 的地址已进抑制名单，对方恢复前不补发，见[抑制名单](#抑制名单)）筛原 `recipients.to/cc/bcc` 各数组，新的请求只保留失败地址，`to` 可为空，保持原分组；原 HTML/text 与 `replyToMessageId` 上下文按需要保留，附件通过 `forwardAttachmentsFrom=原 outbound ID` 复制，不引用已消费的旧 Tokens。这是新的发送，使用新持久化 Key。原邮件的附件曾被转成下载链接时，沿用原正文即可：服务器会先去掉正文里本站注入的「附件下载」区块，再按本次大小决定是否重新生成，不会出现两段。
 
 - `status=unknown` 或某个收件人为 `unknown`：投递中断，结果未确认，对方可能已经收到。先向用户或收件人确认，确认没收到的再按上面的方法补发，不要把 `unknown` 当成 `failed` 直接重发。
 - 仍是 `pending`、没有逐收件人结果时先等待并核实，不全体重发。
