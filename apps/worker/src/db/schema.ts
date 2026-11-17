@@ -101,6 +101,8 @@ export const messages = sqliteTable(
     errorDetail: text('error_detail').notNull().default(''),
     isRead: integer('is_read', { mode: 'boolean' }).notNull().default(false),
     size: integer('size').notNull().default(0),
+    /** 入站 pending 自愈（定时任务用 R2 原文重走收件）已失败的次数；达到上限标为 degraded */
+    inboundRepairAttempts: integer('inbound_repair_attempts').notNull().default(0),
     createdAt: createdAtColumn(),
   },
   (t) => [
@@ -127,6 +129,8 @@ export const messages = sqliteTable(
     index('idx_messages_raw_r2').on(t.rawR2Key).where(sql`${t.rawR2Key} IS NOT NULL`),
     // 外发 pending 恢复：定时任务找出超过 1 小时仍未回填结果的发件行，正常时只有正在投递的少数几行
     index('idx_messages_outbound_pending').on(t.createdAt).where(sql`${t.direction} = 'outbound' AND ${t.status} = 'pending'`),
+    // 入站 pending 自愈：附件等未保存完整的收件行，正常时为 0 行
+    index('idx_messages_inbound_pending').on(t.createdAt).where(sql`${t.direction} = 'inbound' AND ${t.status} = 'pending'`),
   ],
 );
 

@@ -155,6 +155,13 @@
       "when": 1794913645111,
       "tag": "0021_agent_send_reliability",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1794917071368,
+      "tag": "0030_maintenance",
+      "breakpoints": true
     }
   ]
 }
