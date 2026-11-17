@@ -2,7 +2,7 @@ import type { CreateInviteRequest, Invite } from '@hpc-mail/shared';
 import { desc, eq, isNotNull } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { invites, users } from '../db/schema.js';
-import { chunk } from '../lib/d1.js';
+import { chunk, D1_MAX_BOUND_PARAMS } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 
@@ -60,8 +60,8 @@ export async function createInvites(
     status: 'active' as const,
     createdBy,
   }));
-  // 每行绑定 7 个参数，一次最多 50 行会超过 D1 的 100 个上限：每批 14 行，放进同一个 batch（一次往返、同一事务）
-  const [first, ...rest] = chunk(values, 14).map((part) => db.insert(invites).values(part).returning());
+  // 每行绑定 7 个参数，一次最多 50 行会超过 D1 的绑定参数上限：按上限分批，放进同一个 batch（一次往返、同一事务）
+  const [first, ...rest] = chunk(values, Math.floor(D1_MAX_BOUND_PARAMS / 7)).map((part) => db.insert(invites).values(part).returning());
   const rows = (await db.batch([first!, ...rest])).flat();
   return rows.map((row) => serialize(row));
 }

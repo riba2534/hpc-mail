@@ -655,7 +655,7 @@ export async function transferMailbox(
 ): Promise<MailboxTransferResult> {
   if (actor.role !== 'admin') throw new AppError('forbidden', '需要管理员权限');
   const db = createDb(env);
-  const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  const row = await mailboxWithOwner(env, id);
   if (!row) throw new AppError('not_found', '邮箱不存在');
   const target = await db.select().from(users).where(eq(users.id, req.userId)).get();
   if (!target) throw new AppError('not_found', '目标用户不存在');
@@ -676,8 +676,7 @@ export async function transferMailbox(
   if (policy?.blocked) throw policy.blocked.error;
   const totalLimit = policy?.perUserLimit ?? 0;
   const domainLimit = policy?.perDomainLimit ?? 0;
-  const previous = await db.select({ username: users.username }).from(users).where(eq(users.id, row.userId)).get();
-  const detail = `${previous?.username ?? `user#${row.userId}`} (#${row.userId}) → ${target.username} (#${target.id})；保留全部历史并撤销旧共享`;
+  const detail = `${ownerLabel(row)} → ${target.username} (#${target.id})；保留全部历史并撤销旧共享`;
   const results = await env.db.batch([
     env.db.prepare(`UPDATE mailboxes SET user_id = ? WHERE id = ? AND user_id = ? AND user_id <> ?
       AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ? AND mailbox_policy_revision = ?)
