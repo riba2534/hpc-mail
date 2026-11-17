@@ -12,7 +12,7 @@ import { countRemoteImages } from '@/features/message/count-remote-images';
 import { EmailHtml } from '@/lib/email-html';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
-import { draftKeys, draftsApi } from './drafts-api';
+import { draftDetailQueryOptions } from './draft-cache';
 import { DRAFT_STATUS_META, draftFromLabel, draftSourceLabel, draftStatusLabel, formatAddressList, isDraftEditable } from './draft-format';
 
 export interface DraftActionHandlers {
@@ -142,8 +142,7 @@ export function DraftReviewDialog({
   ...actions
 }: DraftActionHandlers & { draftId: number | null; mailboxes: Mailbox[] | undefined; busy: boolean; onClose: () => void }) {
   const { data: draft, isLoading, isError, error, refetch } = useQuery({
-    queryKey: draftKeys.detail(draftId ?? 0),
-    queryFn: ({ signal }) => draftsApi.get(draftId!, signal),
+    ...draftDetailQueryOptions(draftId ?? 0),
     enabled: draftId !== null,
   });
   const editable = draft ? isDraftEditable(draft.status) : false;

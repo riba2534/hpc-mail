@@ -65,12 +65,12 @@ import { useCurrentUser } from '@/lib/use-session';
 import { QueryErrorState } from '@/components/query-error-state';
 import { ApiError } from '@/api/errors';
 
-/** 去重（不区分大小写，保留首次出现的写法） */
 /** 详情页 j/k 翻阅的方向 */
 type KeyboardStep = 'next' | 'prev';
 /** 列表行带来的上下文，加上详情页内 j/k 翻阅时记下的方向（决定预取哪一封） */
 type DetailLinkState = Partial<MailListLinkState> & { keyboard?: KeyboardStep };
 
+/** 去重（不区分大小写，保留首次出现的写法） */
 function uniqueAddresses(addresses: string[], exclude: ReadonlySet<string> = new Set()): string[] {
   const seen = new Set(exclude);
   return addresses.filter((address) => {

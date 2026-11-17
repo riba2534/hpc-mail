@@ -212,6 +212,20 @@ export function syncSentMessage(
   if (selfDelivered) refreshUnreadCount(client);
 }
 
+/** 自己认领的地址（小写），用来判断发信是否投递给了自己 */
+export function ownedAddressSet(mailboxes: readonly { address: string }[] | undefined): Set<string> {
+  return new Set((mailboxes ?? []).map((box) => box.address.toLowerCase()));
+}
+
+/** 发信成功后（写信页与草稿箱共用）：见 syncSentMessage；收件人里有自己认领的地址算站内投递，新收件人进入往来联系人 */
+export function syncAfterSend(
+  client: QueryClient,
+  { sourceIds, recipients, owned }: { sourceIds: readonly number[]; recipients: readonly { address: string }[]; owned: ReadonlySet<string> },
+): void {
+  syncSentMessage(client, { sourceIds, selfDelivered: recipients.some((recipient) => owned.has(recipient.address)) });
+  void client.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });
+}
+
 /** 删除前各列表里这批邮件的快照，撤销时据此放回原列表 */
 export type ListMembership = Array<{ queryKey: QueryKey; items: MessageSummary[] }>;
 

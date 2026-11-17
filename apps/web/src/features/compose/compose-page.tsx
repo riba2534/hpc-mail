@@ -47,11 +47,11 @@ import { formatBytes, formatDateTime, formatRelativeTime } from '@/lib/format';
 import { useDomains } from '@/lib/use-config';
 import { useCurrentUser } from '@/lib/use-session';
 import { getAuthToken } from '@/lib/auth-token';
-import { syncSentMessage } from '@/features/inbox/message-cache';
+import { ownedAddressSet, syncAfterSend, syncSentMessage } from '@/features/inbox/message-cache';
 import { rememberedFilterAddress } from '@/features/inbox/use-inbox-filters';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
-import { putDraftInLists, refreshDraft, storeDraft, toDraftSummary } from '@/features/drafts/draft-cache';
-import { draftKeys, draftsApi } from '@/features/drafts/drafts-api';
+import { draftDetailQueryOptions, markDraftSent, refreshDraft, storeDraft } from '@/features/drafts/draft-cache';
+import { draftsApi } from '@/features/drafts/drafts-api';
 import { draftFromAddress, draftSourceLabel } from '@/features/drafts/draft-format';
 import { PageLoader } from '@/app/page-loader';
 import { QueryErrorState } from '@/components/query-error-state';
@@ -190,8 +190,7 @@ function ComposeSession() {
 function ServerDraftSession({ id }: { id: number }) {
   const user = useCurrentUser();
   const { data: draft, error, isError, isFetchedAfterMount, refetch } = useQuery({
-    queryKey: draftKeys.detail(id),
-    queryFn: ({ signal }) => draftsApi.get(id, signal),
+    ...draftDetailQueryOptions(id),
     refetchOnMount: 'always',
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -630,15 +629,19 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
         : { ...(replyToMessageId ? { replyToMessageId } : {}), ...(forwardAttachmentsFrom ? { forwardAttachmentsFrom } : {}) }),
     };
   };
+  /** 打开写信页之后换了登录账户（其他标签页登出再登录）时不发出任何写请求 */
+  const assertSameSession = () => {
+    if (composeSessionTokenRef.current !== getAuthToken()) {
+      throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
+    }
+  };
   const patchServerDraft = (id: number, request: DraftRequestBody) =>
     draftsApi.update(id, { ...request, expectedVersion: savedServerDraftRef.current?.version });
 
   /** 存到草稿箱与定时发送：新建用 POST（带幂等键），编辑服务端草稿用 PATCH（带版本）；成功后清掉本机草稿、去草稿箱 */
   const saveMutation = useMutation({
     mutationFn: async ({ request }: { request: DraftRequestBody; scheduled: boolean; leave: boolean }) => {
-      if (composeSessionTokenRef.current !== getAuthToken()) {
-        throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
-      }
+      assertSameSession();
       if (serverDraft) return patchServerDraft(serverDraft.id, request);
       const json = JSON.stringify(request);
       if (createAttemptRef.current?.body !== json) createAttemptRef.current = { body: json, key: crypto.randomUUID() };
@@ -671,9 +674,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
    * 页面内容没再改过就直接查询原结果（已发送的重放，不会重复投递）。
    */
   const sendServerDraft = async (id: number, request: DraftRequestBody, snapshot: string, attemptKey: string) => {
-    if (composeSessionTokenRef.current !== getAuthToken()) {
-      throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
-    }
+    assertSameSession();
     let saved: Draft;
     try {
       saved = await patchServerDraft(id, request);
@@ -692,9 +693,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
     mutationFn: async ({ payload, serverRequest, snapshot, attemptKey }: SendVariables) => {
       if (serverDraft && serverRequest) return sendServerDraft(serverDraft.id, serverRequest, snapshot, attemptKey);
       const payloadHash = await hashSendPayload(payload);
-      if (composeSessionTokenRef.current !== getAuthToken()) {
-        throw new ApiError('登录账户已变化，请重新操作', { code: 'session_changed' });
-      }
+      assertSameSession();
       const savedAttempt = readSendAttempt(user.id);
       const currentKey = sendPayloadHashRef.current === payloadHash ? sendIdempotencyKeyRef.current : null;
       sendIdempotencyKeyRef.current = currentKey ?? (savedAttempt?.payloadHash === payloadHash ? savedAttempt.key : crypto.randomUUID());
@@ -714,25 +713,19 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
       sendPayloadHashRef.current = null;
       writeLastIdentity(user.id, currentIdentity());
       const needsReview = notifySendResult(result);
-      if (serverDraft) {
-        const saved = savedServerDraftRef.current ?? serverDraft;
-        putDraftInLists(queryClient, { ...toDraftSummary(saved), status: 'sent', messageId: result.id, errorDetail: '', sentAt: new Date().toISOString() });
-        void queryClient.invalidateQueries({ queryKey: draftKeys.detail(serverDraft.id) });
-      } else {
-        clearDraft(draftKey);
-      }
-      const owned = new Set((mailboxes ?? []).map((box) => box.address.toLowerCase()));
+      if (serverDraft) markDraftSent(queryClient, savedServerDraftRef.current ?? serverDraft, result.id);
+      else clearDraft(draftKey);
+      const owned = ownedAddressSet(mailboxes);
       // 普通用户用托管域名的新前缀发信时，服务端已把这个地址认领给自己
       const { localPart: sentLocalPart, domain: sentDomain } = payload.from;
       if (!isAdmin && sentLocalPart && sentDomain && !owned.has(`${sentLocalPart}@${sentDomain}`)) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.root });
       }
-      syncSentMessage(queryClient, {
+      syncAfterSend(queryClient, {
         sourceIds: [payload.replyToMessageId, payload.forwardAttachmentsFrom, initial.sourceMessageId].filter((id) => id !== undefined),
-        selfDelivered: [...payload.to, ...payload.cc, ...payload.bcc].some((recipient) => owned.has(recipient.address)),
+        recipients: [...payload.to, ...payload.cc, ...payload.bcc],
+        owned,
       });
-      // 新收件人会进入往来联系人
-      void queryClient.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });
       navigate(needsReview ? `/mail/${result.id}` : serverDraft ? '/drafts' : '/sent');
     },
     onError: (err, { payload }) => {
