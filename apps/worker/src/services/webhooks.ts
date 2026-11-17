@@ -217,10 +217,15 @@ export async function rotateWebhookSecret(env: Env, userId: number, id: number):
 export async function listWebhookDeliveries(
   env: Env, userId: number, id: number, cursor: string | undefined, limit: number,
 ): Promise<Page<WebhookDelivery>> {
-  await loadEndpoint(env, userId, id);
   const before = decodeCursor(cursor);
-  const { results } = await env.db.prepare(`SELECT * FROM webhook_deliveries WHERE endpoint_id = ? ${before ? 'AND id < ?' : ''}
-    ORDER BY id DESC LIMIT ?`).bind(id, ...(before ? [before] : []), limit + 1).all<DeliveryRow>();
+  // 归属检查与列表同一往返
+  const [owned, list] = await env.db.batch([
+    env.db.prepare('SELECT 1 FROM webhook_endpoints WHERE id = ? AND user_id = ?').bind(id, userId),
+    env.db.prepare(`SELECT * FROM webhook_deliveries WHERE endpoint_id = ? ${before ? 'AND id < ?' : ''}
+      ORDER BY id DESC LIMIT ?`).bind(id, ...(before ? [before] : []), limit + 1),
+  ]);
+  if (!owned?.results?.length) throw new AppError('not_found', 'Webhook 端点不存在');
+  const results = (list?.results ?? []) as DeliveryRow[];
   const page = toPage(results, limit, (row) => Number(row.id));
   return { items: page.items.map(toDelivery), nextCursor: page.nextCursor };
 }
@@ -463,11 +468,16 @@ export async function processWebhookDeliveries(env: Env, options: { ids?: number
 
 async function deliverOne(env: Env, id: number): Promise<'succeeded' | 'failed' | 'deferred' | null> {
   const startedAt = Date.now();
-  const claimed = await env.db.prepare(`UPDATE webhook_deliveries SET status = 'processing', attempts = attempts + 1,
-      last_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND next_attempt_at <= ? RETURNING *`)
-    .bind(startedAt, startedAt, id, startedAt).first<DeliveryRow>();
+  // 认领与读端点同一往返
+  const [claimResult, endpointResult] = await env.db.batch([
+    env.db.prepare(`UPDATE webhook_deliveries SET status = 'processing', attempts = attempts + 1,
+        last_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND next_attempt_at <= ? RETURNING *`)
+      .bind(startedAt, startedAt, id, startedAt),
+    env.db.prepare('SELECT * FROM webhook_endpoints WHERE id = (SELECT endpoint_id FROM webhook_deliveries WHERE id = ?)').bind(id),
+  ]);
+  const claimed = claimResult?.results?.[0] as DeliveryRow | undefined;
   if (!claimed) return null;
-  const endpoint = await env.db.prepare('SELECT * FROM webhook_endpoints WHERE id = ?').bind(claimed.endpoint_id).first<EndpointRow>();
+  const endpoint = endpointResult?.results?.[0] as EndpointRow | undefined;
   const finish = (status: WebhookDeliveryStatus, fields: { error?: string; httpStatus?: number | null; next?: number; payload?: string }) =>
     env.db.prepare(`UPDATE webhook_deliveries SET status = ?, last_error = ?, last_http_status = ?, next_attempt_at = ?, payload = ?, updated_at = ?
       WHERE id = ? AND status = 'processing' AND attempts = ?`)

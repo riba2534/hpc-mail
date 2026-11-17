@@ -81,6 +81,11 @@ export function webhookRoutes(mode: 'session' | 'key') {
     return endpoint;
   }
 
+  /** 限定范围的 Key 先确认端点在范围内；会话与不限范围的 Key 由服务层按所有者读端点（不存在 404），不重复读 */
+  async function assertVisible(c: Context<AppContext>, id: number): Promise<void> {
+    if (keyRestriction(c)) await visible(c, id);
+  }
+
   app.get('/', async (c) => {
     const endpoints = await listWebhookEndpoints(c.env, owner(c));
     const inKey = await filtersInKey(c, endpoints);
@@ -98,34 +103,36 @@ export function webhookRoutes(mode: 'session' | 'key') {
   app.put('/:id', async (c) => {
     const id = parseId(c.req.param('id'));
     const req = await parseBody(c, updateWebhookEndpointRequestSchema);
-    const current = await visible(c, id);
-    const next = { addresses: req.addresses ?? current.addresses, domains: req.domains ?? current.domains };
-    if (!(await filtersInKey(c, [next]))[0]) throw restrictedFilters();
+    if (keyRestriction(c)) {
+      const current = await visible(c, id);
+      const next = { addresses: req.addresses ?? current.addresses, domains: req.domains ?? current.domains };
+      if (!(await filtersInKey(c, [next]))[0]) throw restrictedFilters();
+    }
     return ok(c, await updateWebhookEndpoint(c.env, owner(c), id, req, origin(c)));
   });
 
   app.delete('/:id', async (c) => {
     const id = parseId(c.req.param('id'));
-    await visible(c, id);
+    await assertVisible(c, id);
     await deleteWebhookEndpoint(c.env, owner(c), id);
     return ok(c, { success: true });
   });
 
   app.post('/:id/rotate-secret', async (c) => {
     const id = parseId(c.req.param('id'));
-    await visible(c, id);
+    await assertVisible(c, id);
     return ok(c, await rotateWebhookSecret(c.env, owner(c), id));
   });
 
   app.post('/:id/test', async (c) => {
     const id = parseId(c.req.param('id'));
-    await visible(c, id);
+    await assertVisible(c, id);
     return ok(c, await testWebhookEndpoint(c.env, owner(c), id));
   });
 
   app.get('/:id/deliveries', async (c) => {
     const id = parseId(c.req.param('id'));
-    await visible(c, id);
+    await assertVisible(c, id);
     const limitRaw = Number(c.req.query('limit'));
     const limit = Number.isInteger(limitRaw) ? Math.min(MAX_PAGE_SIZE, Math.max(1, limitRaw)) : DEFAULT_PAGE_SIZE;
     return ok(c, await listWebhookDeliveries(c.env, owner(c), id, c.req.query('cursor'), limit));
@@ -133,7 +140,7 @@ export function webhookRoutes(mode: 'session' | 'key') {
 
   app.post('/:id/deliveries/:deliveryId/retry', async (c) => {
     const id = parseId(c.req.param('id'));
-    await visible(c, id);
+    await assertVisible(c, id);
     return ok(c, await retryWebhookDelivery(c.env, owner(c), id, parseId(c.req.param('deliveryId')), execCtx(c)));
   });
 

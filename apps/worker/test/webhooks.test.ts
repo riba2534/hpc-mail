@@ -106,6 +106,29 @@ describe('Webhook v2 端点管理', () => {
     expect((await request(`/api/webhooks/${created.id}`, { headers: auth(user.jwt) })).status).toBe(404);
   });
 
+  it('他人的端点对网页会话与不限范围的 Key 都是 404，且不被改动', async () => {
+    const owner = await account('owner');
+    const intruder = await account('intruder');
+    const endpoint = await data<CreatedWebhookEndpoint>(await create(owner.jwt, {}), 201);
+    const key = await intruder.key(['webhook.write']);
+    for (const [token, prefix] of [[intruder.jwt, '/api'], [key, '/v1']] as const) {
+      const base = `${prefix}/webhooks/${endpoint.id}`;
+      for (const [path, init] of [
+        [base, { headers: auth(token) }],
+        [base, json(token, { description: 'taken' }, 'PUT')],
+        [`${base}/rotate-secret`, { method: 'POST', headers: auth(token) }],
+        [`${base}/test`, { method: 'POST', headers: auth(token) }],
+        [`${base}/deliveries`, { headers: auth(token) }],
+        [`${base}/deliveries/1/retry`, { method: 'POST', headers: auth(token) }],
+        [base, { method: 'DELETE', headers: auth(token) }],
+      ] as const) {
+        expect((await request(path, init)).status, `${init.method ?? 'GET'} ${path}`).toBe(404);
+      }
+    }
+    const kept = await data<WebhookEndpoint>(await request(`/api/webhooks/${endpoint.id}`, { headers: auth(owner.jwt) }));
+    expect(kept).toMatchObject({ description: '', secretPrefix: endpoint.secretPrefix });
+  });
+
   it('限定了范围的 Key 只能管理过滤条件落在范围内的端点', async () => {
     const user = await account('scoped');
     const open = await data<CreatedWebhookEndpoint>(await create(user.jwt, {}), 201);

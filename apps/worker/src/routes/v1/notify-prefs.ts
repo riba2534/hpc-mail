@@ -44,8 +44,8 @@ app.put('/', async (c) => {
   }
   if (!req.feishu && !req.webhook && !req.pushdeer) throw new AppError('validation_failed', '至少提供一个待更新项');
   const userId = c.get('apiKey')!.userId;
-  const prefs = await updateUserNotifyPrefs(c.env, userId, req);
-  return ok(c, { ...maskUserNotifyPrefs(prefs), forwardPending: await listPendingForwards(c.env, userId) } satisfies NotifyPrefsView);
+  const [prefs, pending] = await Promise.all([updateUserNotifyPrefs(c.env, userId, req), listPendingForwards(c.env, userId)]);
+  return ok(c, { ...maskUserNotifyPrefs(prefs), forwardPending: pending } satisfies NotifyPrefsView);
 });
 
 app.get('/health', async (c) => {

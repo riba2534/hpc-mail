@@ -11,7 +11,7 @@ import { normalizeEmail } from '../lib/email-address.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 import { getUserNotifyPrefs, updateUserNotifyPrefs } from './notify-prefs.js';
-import { bumpCounter, dayWindow } from './rate-counter.js';
+import { counterResult, counterStatement, counterWithinGuard, dayWindow } from './rate-counter.js';
 import { verifyReauthPassword } from './reauth.js';
 import { sendSystemMail } from './system-mail.js';
 
@@ -54,7 +54,8 @@ export async function updatePrefsWithForwardConfirmation(
   origin: string,
 ): Promise<{ prefs: UserNotifyPrefs; pending: ForwardPendingTarget[] }> {
   if (!patch.forward) {
-    return { prefs: await updateUserNotifyPrefs(env, user.id, patch), pending: await listPendingForwards(env, user.id) };
+    const [prefs, pending] = await Promise.all([updateUserNotifyPrefs(env, user.id, patch), listPendingForwards(env, user.id)]);
+    return { prefs, pending };
   }
   const current = await getUserNotifyPrefs(env, user.id);
   const confirmed = new Set(current.forward.addresses.map(normalizeEmail));
@@ -72,10 +73,12 @@ export async function updatePrefsWithForwardConfirmation(
     await verifyReauthPassword(env, user.id, patch.password);
   }
   if (toSend.length) {
+    // 加上本次不超过每日上限才计数，超限的请求不推高计数
+    const subject = String(user.id);
     const window = dayWindow();
-    const counted = await bumpCounter(env, FORWARD_CONFIRM_SCOPE, String(user.id), window, toSend.length);
-    if (counted.count > MAX_FORWARD_CONFIRM_MAILS_PER_DAY) {
-      await bumpCounter(env, FORWARD_CONFIRM_SCOPE, String(user.id), window, -toSend.length);
+    const counted = await counterStatement(env, FORWARD_CONFIRM_SCOPE, subject, window, toSend.length, 0,
+      counterWithinGuard(FORWARD_CONFIRM_SCOPE, subject, window, MAX_FORWARD_CONFIRM_MAILS_PER_DAY - toSend.length)).all();
+    if (!counterResult(counted)) {
       throw new AppError('rate_limited', `每天最多发送 ${MAX_FORWARD_CONFIRM_MAILS_PER_DAY} 封转发确认邮件，请明天再试`);
     }
   }
@@ -104,9 +107,12 @@ export async function updatePrefsWithForwardConfirmation(
     await env.db.prepare(`DELETE FROM forward_confirmations WHERE user_id = ? AND address IN (SELECT value FROM json_each(?))`)
       .bind(user.id, JSON.stringify(dropped)).run();
   }
-  const prefs = await updateUserNotifyPrefs(env, user.id, { ...patch, forward: { enabled: patch.forward.enabled, addresses: keep } },
-    { allowEmptyForward: added.length > 0 });
-  return { prefs, pending: await listPendingForwards(env, user.id) };
+  const [prefs, pending] = await Promise.all([
+    updateUserNotifyPrefs(env, user.id, { ...patch, forward: { enabled: patch.forward.enabled, addresses: keep } },
+      { allowEmptyForward: added.length > 0 }),
+    listPendingForwards(env, user.id),
+  ]);
+  return { prefs, pending };
 }
 
 /**
