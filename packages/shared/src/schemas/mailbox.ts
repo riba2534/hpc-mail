@@ -112,10 +112,14 @@ export interface SendIdentity {
   reason: SendIdentityBlockReason | null;
 }
 
-/** 可用任意前缀发信的域名：目前只有管理员在系统域名上（from 写 localPart+domain 或 "Name <任意前缀@域名>"） */
+/**
+ * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"）：目前只对管理员列出，
+ * 与管理员发信的实际放行规则一致——system 系统域名；hosted 发信已就绪的托管域名；
+ * legacy 已从系统列表移除、但仍有存量邮箱的旧域名。
+ */
 export interface SendIdentityDomain {
   domain: string;
-  kind: 'system';
+  kind: 'system' | 'hosted' | 'legacy';
   anyLocalPart: true;
 }
 
