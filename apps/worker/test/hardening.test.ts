@@ -106,7 +106,7 @@ describe('一致性与资源治理', () => {
     const actual: number[] = [];
     let afterId = 0;
     for (;;) {
-      const { message: next, scannedThroughId } = await findNextMessage(env, { userId, role: 'user' }, { afterId, address });
+      const { message: next, scannedThroughId } = await findNextMessage(env, { userId, role: 'user' }, { afterId, address: [address] });
       if (!next) { expect(scannedThroughId).toBe(afterId); break; }
       expect(scannedThroughId).toBe(next.id);
       actual.push(next.id);

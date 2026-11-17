@@ -7,6 +7,7 @@ import type {
   MessageSyncResult,
   Page,
   Role,
+  WaitMessageResult,
 } from '@hpc-mail/shared';
 import { MESSAGE_DIRECTIONS, UNREAD_COUNT_CAP } from '@hpc-mail/shared';
 import {
@@ -299,6 +300,16 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
   };
 }
 
+/**
+ * hasAttachments 的口径：带 Content-ID 的 inline 部件是正文里的内嵌图（logo、签名图），不算附件，
+ * 否则带内嵌 logo 的通知邮件在列表里也显示回形针。SQL 与 JS 两种写法供列表与详情共用同一规则。
+ */
+const COUNTS_AS_ATTACHMENT = sql`NOT (${attachmentsTable.disposition} = 'inline' AND ${attachmentsTable.contentId} <> '')`;
+
+function countsAsAttachment(att: { disposition: string; contentId: string }): boolean {
+  return !(att.disposition === 'inline' && att.contentId !== '');
+}
+
 /** 给定邮件集合的附件标记与当前用户的星标标记，合成一次 batch 往返 */
 async function messageFlags(db: Db, userId: number, ids: number[]): Promise<{ attachments: Set<number>; starred: Set<number> }> {
   const attachments = new Set<number>();
@@ -307,7 +318,7 @@ async function messageFlags(db: Db, userId: number, ids: number[]): Promise<{ at
   const batches = chunk(ids);
   const statements = [
     ...batches.map((batch) => db.select({ messageId: attachmentsTable.messageId }).from(attachmentsTable)
-      .where(inArray(attachmentsTable.messageId, batch))),
+      .where(and(inArray(attachmentsTable.messageId, batch), COUNTS_AS_ATTACHMENT))),
     ...batches.map((batch) => db.select({ messageId: stars.messageId }).from(stars)
       .where(and(eq(stars.userId, userId), inArray(stars.messageId, batch)))),
   ];
@@ -422,6 +433,8 @@ export interface WaitFilters {
 
 /** 单次轮询最多检查的新邮件数；积压更多时由调用方用 scannedThroughId 继续推进 */
 const WAIT_SCAN_BATCH = 50;
+/** 指定地址时 FROM 带 INDEXED BY（写成 SQL），列也要用同名 SQL 列 */
+const waitColumns = asSqlColumns(summarySelection);
 /** AI 兜底提码在收件后异步写回；这段时间内无码的新邮件先不判为「不匹配」，避免被跳过 */
 const AI_CODE_GRACE_MS = 30_000;
 /**
@@ -435,12 +448,15 @@ const PENDING_ATTACHMENTS_GRACE_MS = 2 * 60_000;
  * scannedThroughId 是本次已确定检查过的最大 id（没有新邮件时等于 afterId）：其间不匹配的邮件被跳过，
  * 调用方超时后可从它继续。hasCode 与返回的 verificationCode 同一口径；AI 可能稍后补码的新邮件、
  * 附件尚未落库（pending）的新邮件都不计入已检查，下一次轮询再判定——游标推过去调用方就再也看不到它。
+ * address（多个地址）与 domain 在 SQL 里收窄，不参与「跳过」；include=body 时命中项返回与详情相同的结构，
+ * 可见性已由本查询的范围条件确定，整行与附件、星标合成一次 batch，不再走详情的可见性校验。
  */
 export async function findNextMessage(
   env: Env,
   viewer: Viewer,
-  input: { afterId: number; address?: string } & WaitFilters,
-): Promise<{ message: MessageSummary | null; scannedThroughId: number }> {
+  input: { afterId: number; address?: string[]; domain?: string; include?: 'body' } & WaitFilters,
+  attachmentTtlSeconds?: number,
+): Promise<WaitMessageResult> {
   const db = createDb(env);
   const scope = resolveScope(viewer);
   const conditions: SQL[] = [
@@ -449,11 +465,14 @@ export async function findNextMessage(
     isNull(messages.deletedAt),
     gt(messages.id, input.afterId),
   ];
-  if (input.address) conditions.push(eq(messages.address, input.address));
+  if (input.address) conditions.push(inArray(messages.address, input.address));
+  if (input.domain) conditions.push(domainCondition(scope, input.domain));
   const filtered = Boolean(input.from || input.subjectContains || input.hasCode);
+  // 指定地址时逐个地址按 id 取：多地址的 IN 会让规划器为省排序改沿 idx_messages_live 扫全站 afterId 之后的邮件，
+  // 没有新信的轮询（最常见）每次都要读完这段；逐地址读取量只随这几个地址的新信增长
   const rows = await db
-    .select(summarySelection)
-    .from(messages)
+    .select(waitColumns)
+    .from(input.address ? MESSAGES_BY_ADDRESS : MESSAGES)
     .where(and(...conditions))
     .orderBy(asc(messages.id))
     .limit(filtered ? WAIT_SCAN_BATCH : 1)
@@ -478,6 +497,14 @@ export async function findNextMessage(
       if (aiPending && Date.now() - row.createdAt.getTime() < AI_CODE_GRACE_MS) break;
       scannedThroughId = row.id;
       continue;
+    }
+    if (input.include === 'body') {
+      const [[full], attRows, starRows] = await db.batch([
+        db.select().from(messages).where(eq(messages.id, row.id)), ...detailExtras(db, viewer.userId, row.id),
+      ]);
+      // 两次读取之间被永久删除：等同不存在，继续往后找
+      if (!full) { scannedThroughId = row.id; continue; }
+      return { message: await buildDetail(env, full, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
     }
     const flags = await messageFlags(db, viewer.userId, [row.id]);
     return { message: { ...summary, hasAttachments: flags.attachments.has(row.id), isStarred: flags.starred.has(row.id) }, scannedThroughId: row.id };
@@ -761,17 +788,31 @@ async function threadScope(db: Db, viewer: Viewer, target: { address: string }):
   return scope;
 }
 
+/**
+ * 正文里的 cid: 引用一次扫描、解码后查表替换成签名 URL（与 attachment-links 同一写法）：
+ * 逐个附件按前缀替换时 cid:img1 会先改坏 cid:img10。Content-ID 比较沿用原先的不区分大小写，
+ * 重复的 Content-ID 取第一个附件。返回被引用并替换的附件 id，详情据此标 inline。
+ */
 function rewriteCidUrls(
   html: string,
-  atts: { contentId: string; url: string }[],
-): string {
-  let result = html;
+  atts: { id: number; contentId: string; url: string }[],
+): { html: string; inlined: Set<number> } {
+  const byCid = new Map<string, { id: number; url: string }>();
   for (const att of atts) {
-    if (!att.contentId) continue;
-    const escaped = att.contentId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    result = result.replace(new RegExp(`cid:${escaped}`, 'gi'), att.url);
+    const key = att.contentId.toLowerCase();
+    if (key && !byCid.has(key)) byCid.set(key, att);
   }
-  return result;
+  const inlined = new Set<number>();
+  if (byCid.size === 0) return { html, inlined };
+  const rewritten = html.replace(/cid:([^\s"'<>)]+)/gi, (original, cid: string) => {
+    let decoded = cid;
+    try { decoded = decodeURIComponent(cid); } catch { /* 保留原始 CID */ }
+    const att = byCid.get(decoded.toLowerCase());
+    if (!att) return original;
+    inlined.add(att.id);
+    return att.url;
+  });
+  return { html: rewritten, inlined };
 }
 
 /** 完整正文：超过 D1 上限的正文在 R2，D1 里只有截断预览 */
@@ -791,6 +832,51 @@ export async function getMessageContent(
   return { subject: row.subject, ...(await fullBody(env, row)) };
 }
 
+/** 详情所需的附件全行与当前用户星标，调用方放进同一次 batch */
+function detailExtras(db: Db, userId: number, id: number) {
+  return [
+    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)),
+    db.select({ messageId: stars.messageId }).from(stars).where(and(eq(stars.userId, userId), eq(stars.messageId, id))),
+  ] as const;
+}
+
+/** 由已确认可见的整行组装详情：完整正文、附件签名 URL、CID 内联图替换 */
+async function buildDetail(
+  env: Env,
+  row: MessageRow,
+  attRows: (typeof attachmentsTable.$inferSelect)[],
+  starred: boolean,
+  attachmentTtlSeconds?: number,
+): Promise<MessageDetail> {
+  const [body, signed] = await Promise.all([
+    fullBody(env, row),
+    Promise.all(attRows.map(async (a) => {
+      const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
+      return { ...a, url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}` };
+    })),
+  ]);
+  const { html, inlined } = rewriteCidUrls(body.bodyHtml, signed);
+  return {
+    // 验证码与列表、wait、线程同一口径（summarize）：已存值优先，详情不再按正文另算一份
+    ...summarize(row, attRows.some(countsAsAttachment), starred),
+    recipients: row.recipients as MessageRecipients,
+    replyTo: row.replyTo,
+    bodyText: body.bodyText,
+    bodyHtml: html,
+    attachments: signed.map((a) => ({
+      id: a.id,
+      filename: a.filename,
+      mimeType: a.mimeType,
+      size: a.size,
+      contentId: a.contentId,
+      disposition: a.disposition,
+      inline: inlined.has(a.id),
+      url: a.url,
+    })),
+    hasRaw: !!row.rawR2Key,
+  };
+}
+
 /**
  * 邮件详情。attachmentTtlSeconds 不传时附件与 CID 内联图的签名按整点对齐（站内页面，1–2 小时）；
  * /v1 传短 TTL，签名 URL 不能比 Key 本身的有效期拖得更久。
@@ -803,47 +889,8 @@ export async function getMessageDetail(
 ): Promise<MessageDetail> {
   const db = createDb(env);
   const row = await loadVisible(env, viewer, id);
-
-  const body = await fullBody(env, row);
-  const bodyText = body.bodyText;
-  let bodyHtml = body.bodyHtml;
-
-  // 附件全行与星标同一次 batch 往返
-  const [attRows, starRows] = await db.batch([
-    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)),
-    db.select({ messageId: stars.messageId }).from(stars).where(and(eq(stars.userId, viewer.userId), eq(stars.messageId, id))),
-  ]);
-
-  const attachmentMetas = await Promise.all(
-    attRows.map(async (a) => {
-      const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
-      return {
-        id: a.id,
-        filename: a.filename,
-        mimeType: a.mimeType,
-        size: a.size,
-        contentId: a.contentId,
-        disposition: a.disposition,
-        url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}`,
-      };
-    }),
-  );
-
-  bodyHtml = rewriteCidUrls(
-    bodyHtml,
-    attachmentMetas.map((a) => ({ contentId: a.contentId, url: a.url })),
-  );
-
-  return {
-    // 验证码与列表、wait、线程同一口径（summarize）：已存值优先，详情不再按正文另算一份
-    ...summarize(row, attRows.length > 0, starRows.length > 0),
-    recipients: row.recipients as MessageRecipients,
-    replyTo: row.replyTo,
-    bodyText,
-    bodyHtml,
-    attachments: attachmentMetas,
-    hasRaw: !!row.rawR2Key,
-  };
+  const [attRows, starRows] = await db.batch(detailExtras(db, viewer.userId, id));
+  return buildDetail(env, row, attRows, starRows.length > 0, attachmentTtlSeconds);
 }
 
 /** 取原始 .eml R2 对象（校验可见性）；无存档返回 null */

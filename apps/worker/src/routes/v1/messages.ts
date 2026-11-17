@@ -164,11 +164,16 @@ app.get('/unread-count', async (c) => {
  * 轮询配额在请求开始时按本次最多轮询次数一次性预占（1 次写），结束时退还未用部分，
  * 不再每 2 秒写一次计数；预占超限即拒绝，并发长轮询仍受同一上限约束。
  * from/subjectContains/hasCode 跳过不匹配的新邮件；scannedThroughId 让调用方超时后也能推进游标。
+ * address（最多 20 个）与 domain 收窄范围；include=body 命中时直接返回详情结构，省一次详情请求。
  */
 app.get('/wait', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
-  const query = parseQuery(c, waitMessagesQuerySchema);
+  // 重复的 address 参数（?address=a&address=b）先用逗号合并，与逗号分隔写法走同一校验
+  const addresses = c.req.queries('address');
+  const query = parseQuery(c, {
+    safeParse: (raw) => waitMessagesQuerySchema.safeParse({ ...(raw as Record<string, string>), address: addresses?.join(',') }),
+  });
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
   const signal = c.req.raw.signal;
@@ -190,10 +195,9 @@ app.get('/wait', async (c) => {
       if (signal.aborted) return empty();
       polls++;
       const found = await findNextMessage(c.env, viewer, {
-        // 过渡：多地址、domain 与 include=body 由 wait 增强接入
-        afterId: cursor, address: query.address?.[0],
+        afterId: cursor, address: query.address, domain: query.domain, include: query.include,
         from: query.from, subjectContains: query.subjectContains, hasCode: query.hasCode,
-      });
+      }, V1_ATTACHMENT_TTL_SECONDS);
       cursor = found.scannedThroughId;
       if (found.message) return ok(c, found);
       const remaining = deadline - Date.now();

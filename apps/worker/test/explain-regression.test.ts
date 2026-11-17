@@ -8,7 +8,7 @@ import { encodeCursor } from '../src/lib/pagination.js';
 import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
 import { purgeStatements } from '../src/services/message-lifecycle.js';
 import {
-  countUnread, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
+  countUnread, findNextMessage, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
 } from '../src/services/message.js';
 
 /**
@@ -176,10 +176,11 @@ describe('执行计划回归：默认视图按地址取数', () => {
     for (const p of bySubject) expectNoFullScan(p.plan, p.sql);
   });
 
-  it('mailboxes 列表的 messageCount 子查询按地址走索引', async () => {
+  it('mailboxes 列表的 messageCount 子查询按地址走索引，canSend 所需的托管域名按唯一索引逐行查', async () => {
     for (const opts of [{ userId: admin.userId }, { all: true }]) {
       const [list] = await capturePlans((e) => listMailboxes(e, opts));
       expect(list!.plan).toMatch(/CORRELATED SCALAR SUBQUERY \d+ \| SEARCH messages USING COVERING INDEX \w+ \(address=\?\)/);
+      expect(list!.plan).toMatch(/SEARCH hosted_domains USING INDEX \w+ \(domain=\?\)/);
       expectNoFullScan(list!.plan, JSON.stringify(opts));
     }
   });
@@ -220,6 +221,44 @@ describe('执行计划回归：主人邮件很多、匹配很少', () => {
       expect(statement!.plan, label).toContain(VISIBLE_FULL_PREFIX);
       expect(statement!.rowsRead, label).toBeLessThan(100);
     }
+  });
+});
+
+describe('执行计划回归：wait 的地址与域名过滤', () => {
+  it('指定地址（单个或多个）逐地址按 id 取：没有新信时读取量与全站新信数量无关；domain 按范围选索引', async () => {
+    const db = createDb(env);
+    const [user] = await db.insert(users).values({ username: 'wait-plan', passwordHash: 'x', role: 'user', authVersionMigrated: true })
+      .returning({ id: users.id });
+    await db.insert(mailboxes).values([
+      { address: 'w1@waitplan.test', domain: 'waitplan.test', userId: user!.id },
+      { address: 'w2@waitplan.test', domain: 'waitplan.test', userId: user!.id },
+    ]);
+    const head = await env.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM messages').first<{ id: number }>();
+    // afterId 之后全站来了 2000 封别人的新信：多地址的 IN 若改沿 idx_messages_live 按 id 扫，每次轮询都要读完它们
+    await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+      INSERT INTO messages (direction, address, domain, from_address, subject, preview, status)
+      SELECT 'inbound', 'noise@waitplan-noise.test', 'waitplan-noise.test', 'f@example.net', 's', 'p', 'received' FROM n`).run();
+    const owner: Viewer = { userId: user!.id, role: 'user' };
+    const unclaimed: Viewer = { ...admin, scope: 'unclaimed' };
+    const cases: [string, Viewer, string[]][] = [
+      ['单地址', owner, ['w1@waitplan.test']], ['多地址', owner, ['w1@waitplan.test', 'w2@waitplan.test']],
+      ['未认领多地址', unclaimed, ['quiet1@waitplan-noise.test', 'quiet2@waitplan-noise.test']],
+    ];
+    for (const [label, viewer, address] of cases) {
+      let found: Awaited<ReturnType<typeof findNextMessage>> | undefined;
+      const [scan] = onMessages(await capturePlans(async (e) => { found = await findNextMessage(e, viewer, { afterId: head!.id, address }); }));
+      expect(found, label).toEqual({ message: null, scannedThroughId: head!.id });
+      expect(scan!.plan, label).toContain(BY_ADDRESS);
+      expectNoFullScan(scan!.plan, label);
+      expect(scan!.rowsRead, label).toBeLessThan(50);
+    }
+
+    // 未认领范围没有地址集合可走，domain 交给规划器走 idx_messages_domain；自己的范围用一元 + 压掉它，不扫整个 catch-all 域
+    const [byDomain] = onMessages(await capturePlans((e) => findNextMessage(e, unclaimed, { afterId: head!.id, domain: 'waitplan-noise.test' })));
+    expect(byDomain!.plan).toContain('idx_messages_domain (domain=? AND id>?)');
+    const [ownDomain] = onMessages(await capturePlans((e) => findNextMessage(e, owner, { afterId: head!.id, domain: 'waitplan-noise.test' })));
+    expect(ownDomain!.sql).toContain('+"messages"."domain" = ?');
+    expect(ownDomain!.plan).not.toContain('idx_messages_domain');
   });
 });
 
