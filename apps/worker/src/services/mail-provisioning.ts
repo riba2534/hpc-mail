@@ -678,7 +678,8 @@ export async function applyMailPlan(
 
   const finish = async (outcome: MailApplyResult['outcome'], failedStep: SystemDomainWriteStep | null = null,
     errorCode = '', error = '', retryAfter?: number): Promise<MailApplyResult> => {
-    if (outcome !== 'stopped') snapshot = await readSnapshot(creds, zoneId, domain, workerName, snapshot);
+    // 中断或限流时不再复读，避免在 Cloudflare 繁忙时追加调用
+    if (outcome !== 'stopped' && outcome !== 'transient') snapshot = await readSnapshot(creds, zoneId, domain, workerName, snapshot);
     const ready = snapshot.routing.state === 'ready' && snapshot.catchAll.state === 'ready' && snapshot.sending.state === 'ready';
     if (outcome === 'progress' && ready) outcome = 'ready';
     if (outcome === 'ready' && !ready) outcome = 'progress';
