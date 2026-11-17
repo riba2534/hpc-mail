@@ -21,8 +21,8 @@ export function buildSessionOpenApiSpec(origin: string) {
       post: operation('Upload a base64 avatar', ref('SessionUser'), { request: 'UploadAvatarRequest' }),
       delete: operation('Delete the current user avatar', ref('SessionUser')),
     },
-    '/auth/password': { put: operation('Change password and replace the session', ref('LoginResponse'), { request: 'ChangePasswordRequest',
-      description: 'Supply the current password. Changes password and credential epoch atomically, invalidates previous user JWTs, and returns a replacement JWT. Use the new token for subsequent calls.' }) },
+    '/auth/password': { put: operation('Change password and replace the session', ref('ChangePasswordResponse'), { request: 'ChangePasswordRequest',
+      description: 'Supply the current password. Changes password and credential epoch atomically, invalidates previous user JWTs, and returns a replacement JWT. Use the new token for subsequent calls. revokeApiKeys defaults to true and revokes every unrevoked API key of the user in the same change; revokedApiKeys reports how many. Revoked keys then return 401 on /v1.' }) },
     '/auth/2fa/setup': { post: operation('Begin TOTP enrollment', object({ secret: str, otpauthUri: str }),
       { description: 'Returns a sensitive enrollment secret and QR-compatible otpauth URI; this does not enable TOTP until /auth/2fa/enable succeeds.' }) },
     '/auth/2fa/enable': { post: operation('Verify TOTP and enable two-factor authentication', object({ recoveryCodes: array(str) }), { request: 'EnableTwoFactorRequest', status: 201,
@@ -35,7 +35,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       get: operation('List hosted domains the caller owns or was granted', array(ref('HostedDomain')), {
         description: 'Users can host their own domains on this site. Each item has role owner or member; administrators also see only their own here and use /admin/hosted-domains for all.' }),
       post: operation('Host a domain', ref('HostedDomain'), { request: 'CreateHostedDomainRequest', status: 201,
-        description: 'Requires /config hostedDomainsEnabled. Enter a registered root domain (not a subdomain). The site creates a Cloudflare zone and returns status pending with the two nameServers to set at the registrar; existing DNS records at the old nameservers are not migrated automatically; recreate common records (website, verification and so on) with /hosted-domains/{id}/dns-records, preferably before changing the nameservers. Disable DNSSEC at the registrar first. After the nameservers take effect, receiving (Email Routing catch-all) and sending (Email Sending) are configured automatically; poll GET /hosted-domains/{id}. Mail to any unclaimed address on an active hosted domain is claimed for the owner on arrival. Ordinary users obey hosted_domains.maxPerUser and pending limits; domains already used on this site, system domains and zones already in the site account are rejected with 409.' }),
+        description: 'Requires /config hostedDomainsEnabled. Enter a registered root domain (not a subdomain). The site creates a Cloudflare zone and returns status pending with the two nameServers to set at the registrar; existing DNS records at the old nameservers are not migrated automatically; recreate common records (website, verification and so on) with /hosted-domains/{id}/dns-records, preferably before changing the nameservers. Disable DNSSEC at the registrar first. After the nameservers take effect, receiving (Email Routing catch-all) and sending (Email Sending) are configured automatically; poll GET /hosted-domains/{id}. Mail to any unclaimed address on an active hosted domain is claimed for the owner on arrival. Ordinary users obey hosted_domains.maxPerUser and pending limits; domains already used on this site, system domains and zones already in the site account are rejected with 409. Creation has a per-user per-minute limit and counts toward the site-wide Cloudflare call budget; exceeding either, or Cloudflare rate limiting, returns 429 rate_limited.' }),
     },
     '/hosted-domains/{id}': {
       get: operation('Read a hosted domain and its setup progress', ref('HostedDomain'), { description: 'Owner, member or administrator; otherwise 404.' }),
@@ -44,7 +44,7 @@ export function buildSessionOpenApiSpec(origin: string) {
         description: 'Owner or administrator. Irreversible: the domain enters deleting, rejects mail immediately, then every message on the domain is permanently deleted, all its addresses are released and the Cloudflare zone is removed. Restore the original nameservers at the registrar first or the domain stops resolving.' }),
     },
     '/hosted-domains/{id}/check': { post: operation('Check the nameservers and continue setup now', ref('HostedDomain'), {
-      description: 'Owner or administrator. Asks Cloudflare to re-check nameservers while pending, then advances setup. Calls within 15 seconds of the last check return the current state.' }) },
+      description: 'Owner or administrator. Asks Cloudflare to re-check nameservers while pending, then advances setup. Calls within 15 seconds of the last check return the current state. Checks have a per-user per-minute limit and count toward the site-wide Cloudflare call budget; exceeding either returns 429 rate_limited.' }) },
     '/hosted-domains/{id}/members': {
       get: operation('List members of a hosted domain', array(ref('HostedDomainMember')), { description: 'Owner or administrator.' }),
       put: operation('Replace the members of a hosted domain', array(ref('HostedDomainMember')), { request: 'ReplaceHostedDomainMembersRequest',
@@ -120,7 +120,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'Counts only addresses the caller claimed. Shared mail is excluded because its read state belongs to the owner. Counting stops at 1000 (1000 means at least 1000); /v1/messages/unread-count returns the exact value.' }) },
     '/messages/contacts': { get: operation('Read recent contact addresses', object({ contacts: array(str) }), { parameters: scopeQuery }) },
     '/messages/{id}': { get: operation('Read full message detail', ref('MessageDetail'), { parameters: scopeQuery,
-      description: 'replyTo supplies preferred reply targets; fall back to fromAddress. Attachment URLs are short-lived signed URLs. Degraded mail has errorDetail; hasRaw reports archive availability.' }) },
+      description: 'replyTo supplies preferred reply targets; fall back to fromAddress. Attachment URLs are signed URLs valid for at least one hour, aligned to the hour; inline cid images in bodyHtml use the same URLs, so repeated reads within an hour return identical HTML. GET /attachments/{id} with the session token does not expire. Degraded mail has errorDetail; hasRaw reports archive availability.' }) },
     '/messages/{id}/thread': { get: operation('Read a visible thread', object({ items: array(ref('MessageSummary')) }), { parameters: scopeQuery,
       description: 'Bounded thread view built from Message-ID/In-Reply-To/References. Without linking headers it falls back to the same address and normalized subject within 30 days, only when one side has a Re:/Fwd:/Fw:/回复:/转发: prefix and neither side carries a verification code.' }) },
     '/messages/{id}/translate': { post: operation('Translate text segments of a visible message to Simplified Chinese', ref('MessageTranslation'), { request: 'TranslateMessageRequest', parameters: scopeQuery,
@@ -128,9 +128,9 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/messages/{id}/raw': { get: operation('Download the original .eml', str, { binary: 'message/rfc822', parameters: scopeQuery,
       description: 'Binary response without a data envelope; 404 when the message has no original archive.' }) },
     '/attachments/{id}': { get: operation('Download an attachment by session or signed URL', str, { binary: 'application/octet-stream',
-      parameters: [query('exp', { type: 'integer' }, 'Signed expiry, required together with sig for anonymous downloads.'), query('sig', str, 'HMAC signature; obtain the complete URL from message detail or an external email.')],
+      parameters: [query('exp', { type: 'integer' }, 'Signed expiry, required together with sig for anonymous downloads.'), query('sig', str, 'HMAC signature; obtain the complete URL from message detail or an external email.'), ...scopeQuery],
       security: [{ sessionToken: [] }, { attachmentSignature: [], attachmentExpiry: [] }],
-      description: 'JWT mode enforces visibility. Signed mode requires both exp and sig and may serve retained external links after sent-mail deletion. Returns binary bytes with safe MIME/download headers.' }) },
+      description: 'JWT mode enforces the same visibility as message detail, including scope/userId: administrators reviewing another user pass scope=user&userId=, or scope=unclaimed for unclaimed addresses. Ordinary users get 403 for unclaimed/user and an invalid scope returns 400. Signed mode requires both exp and sig, ignores scope, and may serve retained external links after sent-mail deletion. Message detail URLs are signed for at least one hour and aligned to the hour, so repeated reads within an hour return the same URL. Returns binary bytes with safe MIME/download headers.' }) },
     ...uploadPaths(),
     '/me/notify-prefs': {
       get: operation('Read masked personal notification and forwarding preferences', ref('NotifyPrefs')),
@@ -153,7 +153,8 @@ export function buildSessionOpenApiSpec(origin: string) {
       put: operation('Update own API key limits/scopes/status', ref('ApiKeySummary'), { request: 'UpdateApiKeyRequest' }),
       delete: operation('Revoke own API key', success),
     },
-    '/api-keys/{id}/logs': { get: operation('Read own API key audit logs', page(ref('ApiRequestLog')), { parameters: pageQuery }) },
+    '/api-keys/{id}/logs': { get: operation('Read own API key audit logs', page(ref('ApiRequestLog')), { parameters: pageQuery,
+      description: 'Newest first. path is the normalized route. Rejected requests are recorded at most once per key per minute.' }) },
     '/admin/users': {
       get: operation('List users', array(ref('AdminUser')), admin),
       post: operation('Create a user', ref('AdminUser'), { ...admin, request: 'CreateUserRequest', status: 201 }),
@@ -166,7 +167,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     }) },
     '/admin/users/{id}': {
       put: operation('Change user role/status/password or mailbox policy', ref('AdminUser'), { ...admin, request: 'UpdateUserRequest',
-        description: 'At least one field. Cannot disable self or remove the last active administrator. Password reset/disable revokes prior JWT epochs. Role changes preserve mailbox shares. mailboxPolicy=null restores public rules; a dedicated policy contains perUserLimit and domains:[{domain,perUserLimit}], with 0 meaning unlimited and an empty domain list blocking new claims. Only configured system domains may be granted, including private ones. Changing mailboxPolicy requires expectedMailboxPolicyRevision from GET /admin/users; a stale revision returns 409. Existing mailboxes retain read/send access and count toward quotas. Administrators are exempt. Role changes also increment mailboxPolicyRevision.' }),
+        description: 'At least one field. Cannot disable self or remove the last active administrator. Password reset/disable revokes prior JWT epochs; a password reset also revokes every API key of the user and is audited. Role changes preserve mailbox shares. mailboxPolicy=null restores public rules; a dedicated policy contains perUserLimit and domains:[{domain,perUserLimit}], with 0 meaning unlimited and an empty domain list blocking new claims. Only configured system domains may be granted, including private ones. Changing mailboxPolicy requires expectedMailboxPolicyRevision from GET /admin/users; a stale revision returns 409. Existing mailboxes retain read/send access and count toward quotas. Administrators are exempt. Role changes also increment mailboxPolicyRevision.' }),
       delete: operation('Delete a user', success, { ...admin, description: 'Cannot delete self or last active administrator. Releases owned mailboxes and revokes keys/shares; message history remains address-owned and may be inherited by later claimants.' }),
     },
     '/admin/mailboxes/{id}': { get: operation('Read any claimed mailbox', ref('Mailbox'), { ...admin,
@@ -215,7 +216,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/admin/audit-logs': { get: operation('Read administrator audit logs', page(ref('AdminAuditLog')), { ...admin, parameters: pageQuery }) },
   };
   return { openapi: '3.1.0', info: specInfo('HPC Mail Session and Administration API',
-    'JWT session API for all web-client functions. Authorization: Bearer <JWT> from login/register. hpcm_ API keys cannot authenticate these routes; see the related /v1 specification. Administrator endpoints require an active admin role. If site policy requires 2FA, un-enrolled sessions receive 403 totp_setup_required; /auth/me, logout and /auth/2fa routes remain available to complete setup.'),
+    'JWT session API for all web-client functions. Authorization: Bearer <JWT> from login/register. hpcm_ API keys cannot authenticate these routes; see the related /v1 specification. Administrator endpoints require an active admin role. If site policy requires 2FA, un-enrolled sessions receive 403 totp_setup_required; /auth/me, logout and /auth/2fa routes remain available to complete setup. Requests already over the per-user limit do not count toward the instance limit. Every response carries X-Request-ID; a client-supplied X-Request-ID is used only when it matches ^[A-Za-z0-9._:-]{1,64}$.'),
     servers: [{ url: `${origin}/api` }], security: [{ sessionToken: [] }],
     externalDocs: { description: 'Agent usage guide and workflows', url: `${origin}/skill.md` },
     'x-relatedApis': [{ url: `${origin}/v1/openapi.json`, description: 'Scoped API-key mail/mailbox automation' }],
