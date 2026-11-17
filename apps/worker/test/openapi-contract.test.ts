@@ -80,7 +80,9 @@ describe('OpenAPI routes and public contracts', () => {
   });
 
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
-    const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*'))
+    // /api/internal 是部署运维端点（CI 金丝雀与心跳），有意不进公开描述
+    const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*')
+      && !route.path.startsWith('/api/internal/'))
       .map(route => `${route.method} ${route.path.replace(/\/$/, '').replace(/:([^/]+)/g, '{$1}')}`))].sort();
     expect([...operations('api'), ...operations('v1')].sort()).toEqual(mounted);
   });
