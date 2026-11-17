@@ -693,7 +693,11 @@ export const schemas: Record<string, Schema> = {
   MultipartInitResult: object({ token: str, uploadId: str, partBytes: positiveId, partCount: positiveId }),
   MultipartPartResult: object({ partNumber: positiveId, etag: str }), MultipartCompleteResult: object({ token: str, size: int }),
   DraftInput: draftInput, DraftSummary: draftSummary, Draft: draft, DraftPage: page(ref('DraftSummary')),
-  SendDraftRequest: object({ expectedVersion: { ...positiveId, description: 'Version the reviewer saw; a different current version returns 409 draft_state_conflict.' } }, ['expectedVersion']),
+  SendDraftRequest: {
+    ...object({ expectedVersion: { ...positiveId, description: 'Version the reviewer saw; a different current version returns 409 draft_state_conflict.' } }, ['expectedVersion']),
+    // 未知字段 400（sendAt 不能借此改成定时，version 不能代替 expectedVersion）
+    additionalProperties: false,
+  },
 };
 export const query = (name: string, schema: Schema, description?: string, required = false): Schema => ({ name, in: 'query', required, schema, ...(description ? { description } : {}) });
 export const scopeQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed', 'user'] }, 'Default mine. unclaimed/user are administrator-only; user requires userId. Shared inboxes add read-only inbound visibility.'),

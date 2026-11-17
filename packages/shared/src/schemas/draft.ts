@@ -34,13 +34,13 @@ import { emptyAsUndefined, pageQueryShape } from './query.js';
  * sendAt：ISO 8601（带时区），最早 1 分钟后、最晚 30 天内（sendAtProblem）；给出即安排定时发送（status=scheduled），
  * 此时草稿必须已是完整、合法的发信请求。null 取消定时（回到 draft）。expectedVersion 只用于修改：与当前 version 不同返回 409。
  */
-/** 常见的写错字段 → 正确字段（未知字段报错时提示） */
-const DRAFT_FIELD_ALIASES: Record<string, string> = {
+/** 常见的写错字段 → 正确字段（未知字段报错时提示）；用 Map，toString 这类与原型同名的键查不到东西 */
+const DRAFT_FIELD_ALIASES = new Map<string, string>(Object.entries({
   scheduledAt: 'sendAt', scheduleAt: 'sendAt', scheduled_at: 'sendAt', send_at: 'sendAt', sendTime: 'sendAt', sendDate: 'sendAt',
   deliverAt: 'sendAt', schedule: 'sendAt', body: 'text 或 html', content: 'text 或 html', bodyText: 'text', bodyHtml: 'html',
   attachmentToken: 'attachmentTokens', tokens: 'attachmentTokens', reply_to: 'replyTo', replyToId: 'replyToMessageId',
   inReplyTo: 'replyToMessageId', forwardFrom: 'forwardAttachmentsFrom', version: 'expectedVersion', recipients: 'to/cc/bcc',
-};
+}));
 
 const draftInputShape = {
   from: sendFromSchema.nullable().optional(),
@@ -63,22 +63,26 @@ const DRAFT_FIELDS = Object.keys(draftInputShape);
 
 /**
  * 未知字段报 400（与 /v1 回复、转发一致），不静默忽略：例如把 sendAt 写成 scheduledAt 时草稿会被当成普通草稿保存、
- * 永远不会发出。fix 里给出最可能的正确字段名与全部可用字段。
+ * 永远不会发出；立即发送时带 sendAt 则会被提前发出。fix 里给出最可能的正确写法与全部可用字段。
  */
-function rejectUnknownDraftFields(value: Record<string, unknown>, ctx: z.RefinementCtx): void {
-  const unknown = Object.keys(value).filter((key) => !DRAFT_FIELDS.includes(key));
-  if (!unknown.length) return;
-  const hints = unknown.flatMap((key) => (DRAFT_FIELD_ALIASES[key] ? [`${key} 应写成 ${DRAFT_FIELD_ALIASES[key]}`] : []));
-  const params: IssueErrorParams = {
-    fix: `${hints.length ? `${hints.join('；')}。` : ''}草稿可用的字段：${DRAFT_FIELDS.join(', ')}`,
-    docs: '/references/drafts.md#保存草稿',
+function rejectUnknownFields(allowed: readonly string[], label: string, hint: (key: string) => string | undefined, docs: string) {
+  return (value: Record<string, unknown>, ctx: z.RefinementCtx): void => {
+    const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+    if (!unknown.length) return;
+    const hints = unknown.flatMap((key) => hint(key) ?? []);
+    const params: IssueErrorParams = { fix: `${hints.length ? `${hints.join('；')}。` : ''}${label}可用的字段：${allowed.join(', ')}`, docs };
+    ctx.addIssue({ code: 'custom', message: `${label}不接受字段：${unknown.join(', ')}`, path: [unknown[0]!], params });
   };
-  ctx.addIssue({ code: 'custom', message: `草稿不接受字段：${unknown.join(', ')}`, path: [unknown[0]!], params });
 }
+
+const draftFieldHint = (key: string) => {
+  const field = DRAFT_FIELD_ALIASES.get(key);
+  return field === undefined ? undefined : `${key} 应写成 ${field}`;
+};
 
 export const draftInputSchema = z
   .looseObject(draftInputShape)
-  .superRefine((v, ctx) => rejectUnknownDraftFields(v, ctx))
+  .superRefine(rejectUnknownFields(DRAFT_FIELDS, '草稿', draftFieldHint, '/references/drafts.md#保存草稿'))
   .transform((v) => v as { [K in keyof typeof draftInputShape]: z.infer<(typeof draftInputShape)[K]> })
   .superRefine((v, ctx) => validateSendParts({
     to: v.to ?? [], cc: v.cc ?? [], bcc: v.bcc ?? [], text: v.text, html: v.html,
@@ -86,17 +90,32 @@ export const draftInputSchema = z
     attachments: v.attachments ?? [], attachmentTokens: v.attachmentTokens,
   }, ctx, false));
 export type DraftInput = z.infer<typeof draftInputSchema>;
-/** 请求体的输入形状（构造请求时用） */
-export type DraftRequestBody = z.input<typeof draftInputSchema>;
+/** 请求体的输入形状（构造请求时用）：按字段表推导，不带 looseObject 的索引签名，写错字段名编译期就报错 */
+export type DraftRequestBody = z.input<z.ZodObject<typeof draftInputShape>>;
 
 /**
  * 立即发送（POST /drafts/:id/send）的可选请求体。人审场景下带上审阅时看到的 version：
  * 草稿在审阅后被改过（如 Agent 又 PATCH 了收件人）时返回 409，不会发出没看过的内容。已发送的仍重放原结果。
  */
-export const sendDraftRequestSchema = z.object({
+const sendDraftShape = {
   expectedVersion: z.number().int().positive().optional(),
-});
-export type SendDraftRequest = z.infer<typeof sendDraftRequestSchema>;
+};
+const SEND_DRAFT_FIELDS = Object.keys(sendDraftShape);
+
+/** 立即发送误带的字段：定时时间、草稿内容要先 PATCH 进草稿；version 是 expectedVersion */
+function sendDraftFieldHint(key: string): string | undefined {
+  const field = key === 'sendAt' ? 'sendAt' : DRAFT_FIELD_ALIASES.get(key);
+  if (field === 'expectedVersion') return `${key} 应写成 expectedVersion`;
+  if (field === 'sendAt') return `这个接口立即发出；要定时发送，用 PATCH /drafts/:id 写 sendAt`;
+  if (field !== undefined || DRAFT_FIELDS.includes(key)) return `${key} 是草稿内容，先用 PATCH /drafts/:id 改好再发送`;
+  return undefined;
+}
+
+export const sendDraftRequestSchema = z
+  .looseObject(sendDraftShape)
+  .superRefine(rejectUnknownFields(SEND_DRAFT_FIELDS, '立即发送', sendDraftFieldHint, '/references/drafts.md#发送'))
+  .transform((v) => v as { expectedVersion?: number });
+export type SendDraftRequest = z.input<z.ZodObject<typeof sendDraftShape>>;
 
 export const listDraftsQuerySchema = z.object({
   status: emptyAsUndefined(z.enum(DRAFT_STATUSES)),

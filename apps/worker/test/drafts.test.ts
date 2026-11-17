@@ -523,6 +523,18 @@ describe('草稿接口的未知字段（E2）', () => {
     expect(patched.fix).toContain('body 应写成 text 或 html');
     expect(await row(draft.id)).toMatchObject({ version: 1 });
   });
+
+  it("E2'：立即发送带未知字段（想定时的 sendAt、写错的 version）返回 400，不会提前发出或跳过版本锁", async () => {
+    const me = await account('draft-strict-send');
+    const draft = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 's2@hpc.email'))), 201);
+    const early = await failure(await call(`/v1/drafts/${draft.id}/send`, req(me.key, 'POST', { sendAt: inMinutes(60) })), 400);
+    expect(early).toMatchObject({ code: 'validation_failed', message: '立即发送不接受字段：sendAt' });
+    expect(early.fix).toContain('PATCH /drafts/:id');
+    const typo = await failure(await call(`/api/drafts/${draft.id}/send`, req(me.jwt, 'POST', { version: draft.version + 5 })), 400);
+    expect(typo.fix).toContain('version 应写成 expectedVersion');
+    expect(await row(draft.id)).toMatchObject({ status: 'draft', version: draft.version, messageId: null });
+    expect(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.address, me.address), eq(messages.direction, 'outbound')))).toEqual([]);
+  });
 });
 
 describe('草稿里的 URL 附件（A12）', () => {
