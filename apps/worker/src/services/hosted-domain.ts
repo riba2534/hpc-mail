@@ -6,6 +6,8 @@ import {
 import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
+import { runDetached } from '../lib/background.js';
+import { runLimited } from '../lib/concurrency.js';
 import { chunk, d1Statement } from '../lib/d1.js';
 import { AppError, errorText } from '../lib/errors.js';
 import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
@@ -90,13 +92,6 @@ function requireCredentials(env: Env, settings: Pick<Settings, 'hosted_domains'>
   const creds = cloudflareCredentials(env);
   if (!settings.hosted_domains.enabled || !creds) throw new AppError('forbidden', '本站未开启域名托管');
   return creds;
-}
-
-/** 后台任务：有 ctx 放进 waitUntil，没有时（定时任务、单测）同步等待 */
-async function runDetached(ctx: ExecCtx | null | undefined, label: string, task: () => Promise<unknown>): Promise<void> {
-  const guarded = task().catch((error) => console.error(`${label}失败:`, error));
-  if (ctx) ctx.waitUntil(guarded);
-  else await guarded;
 }
 
 /** 删除 zone 前核对身份：不能是系统域名，创建时间不早于本站记录 */
@@ -718,16 +713,11 @@ export async function notifyHostedDomainMoved(
     const info = {
       subject: `托管域名 ${row.domain} 已停止收发`, fromAddress, fromName: 'HPC Mail', toAddress: row.domain, code: '', body: lines.join('\n'),
     };
-    try {
-      await sendFeishuNotification(prefs.feishu, info);
-    } catch (error) {
-      console.error('托管域名迁走飞书提醒失败:', error);
-    }
-    try {
-      await sendPushDeerNotification(prefs.pushdeer, info);
-    } catch (error) {
-      console.error('托管域名迁走 PushDeer 提醒失败:', error);
-    }
+    const [feishu, pushdeer] = await Promise.allSettled([
+      sendFeishuNotification(prefs.feishu, info), sendPushDeerNotification(prefs.pushdeer, info),
+    ]);
+    if (feishu.status === 'rejected') console.error('托管域名迁走飞书提醒失败:', feishu.reason);
+    if (pushdeer.status === 'rejected') console.error('托管域名迁走 PushDeer 提醒失败:', pushdeer.reason);
   });
 }
 
@@ -851,23 +841,19 @@ export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number
     const batch = await claimDue(env, limit, seen);
     if (!batch.rows.length) break;
     seen.push(...batch.rows.map((row) => row.id));
-    const queue = [...batch.rows];
     const skipped: number[] = [];
-    const work = async () => {
-      for (let row = queue.shift(); row; row = queue.shift()) {
-        if (Date.now() >= deadline) {
-          skipped.push(row.id);
-          continue;
-        }
-        processed++;
-        try {
-          await runClaim(env, base, { row, lease: batch.lease, probes: batch.probes });
-        } catch (error) {
-          console.error(`托管域名 #${row.id} 核对失败:`, error);
-        }
+    await runLimited(batch.rows, SYNC_CONCURRENCY, async (row) => {
+      if (Date.now() >= deadline) {
+        skipped.push(row.id);
+        return;
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(SYNC_CONCURRENCY, queue.length) }, work));
+      processed++;
+      try {
+        await runClaim(env, base, { row, lease: batch.lease, probes: batch.probes });
+      } catch (error) {
+        console.error(`托管域名 #${row.id} 核对失败:`, error);
+      }
+    });
     if (skipped.length) await releaseLeases(env, skipped, batch.lease);
     if (batch.rows.length < limit) break;
   }

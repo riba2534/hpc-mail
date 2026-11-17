@@ -17,6 +17,7 @@ import {
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { systemDomainOnboarding, users, type OnboardingAcceptance, type OnboardingChangeEvent } from '../db/schema.js';
+import { runDetached } from '../lib/background.js';
 import { AppError, errorText } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
@@ -79,13 +80,6 @@ const later = (ms: number) => new Date(Date.now() + ms);
 const ZONE_MISSING = 'Cloudflare 中的 zone 已不存在';
 const STALE_FINGERPRINT = 'Cloudflare 上的配置已变化，请重新核对后确认';
 const CANCEL_KEEPS = '如需停用请在系统域名列表中移除';
-
-/** 后台任务：有 ctx 放进 waitUntil，没有时（单测）同步等待 */
-async function runDetached(ctx: ExecCtx | null | undefined, task: () => Promise<unknown>): Promise<void> {
-  const guarded = task().catch((error) => console.error('系统域名接入后台处理失败:', error));
-  if (ctx) ctx.waitUntil(guarded);
-  else await guarded;
-}
 
 // ---------------------------------------------------------------------------
 // 视图
@@ -881,7 +875,7 @@ async function createExisting(
     `已有 zone ${zone.id}（${zone.status}）${accepted.length ? `；随创建一并确认：${ackLabels(accepted)}` : ''}`, ip);
   if (token) {
     // 刚做完的预检直接用于配置，不重复读取；被截断时租约过期后由定时任务接手
-    await runDetached(ctx, () => drive(newRun(env, creds, { row, token, pool: 0 }, { prepared: ev })));
+    await runDetached(ctx, '系统域名接入后台处理', () => drive(newRun(env, creds, { row, token, pool: 0 }, { prepared: ev })));
   }
   return { view: await getOnboarding(env, row.id), created: true };
 }
@@ -993,7 +987,7 @@ export async function confirmOnboarding(
   }
   run.prepared = ev;
   run.deadline = Date.now() + API_DEADLINE_MS;
-  await runDetached(ctx, () => drive(run));
+  await runDetached(ctx, '系统域名接入后台处理', () => drive(run));
   return getOnboarding(env, id);
 }
 

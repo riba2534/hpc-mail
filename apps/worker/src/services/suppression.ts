@@ -7,7 +7,7 @@ import type {
 } from '@hpc-mail/shared';
 import { chunk } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
-import { decodeCursor, encodeCursor } from '../lib/pagination.js';
+import { decodeCursor, toPage } from '../lib/pagination.js';
 import type { Env } from '../types.js';
 
 const HOUR = 3600_000;
@@ -139,11 +139,11 @@ export async function listSuppressions(env: Env, query: AdminSuppressionsQuery):
   const { results } = await env.db.prepare(`SELECT id, address, sending_domain, reason, detail, expires_at, created_at, updated_at
     FROM email_suppressions WHERE ${conditions.join(' AND ')} ORDER BY id DESC LIMIT ?`)
     .bind(...params, query.limit + 1).all<SuppressionListRow>();
-  const page = results.slice(0, query.limit);
+  const page = toPage(results, query.limit, (row) => Number(row.id));
   return {
-    items: page.map(row => ({ ...toSuppressed(row), id: Number(row.id), detail: row.detail,
+    items: page.items.map(row => ({ ...toSuppressed(row), id: Number(row.id), detail: row.detail,
       updatedAt: new Date(Number(row.updated_at)).toISOString() })),
-    nextCursor: results.length > query.limit ? encodeCursor(Number(page.at(-1)!.id)) : null,
+    nextCursor: page.nextCursor,
   };
 }
 
