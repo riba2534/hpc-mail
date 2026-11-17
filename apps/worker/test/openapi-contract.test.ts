@@ -874,7 +874,8 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     // 批量添加与批量检测（PR5f）由 hosted-domain-batch.test.ts 核对
     expect(v1Hosted).toEqual({ ...Object.fromEntries(Object.entries(keyOperations).map(([path, scopes]) => [path, Object.keys(scopes).sort()])),
       '/hosted-domains/batch': ['post'], '/hosted-domains/batch-check': ['post'] });
-    expect(Object.keys(specs.v1.paths).filter(path => path.startsWith('/admin'))).toEqual([]);
+    // /v1/admin 只有管理员 Key 的运维查询（Claude 事实等），没有托管域名的管理路径
+    expect(Object.keys(specs.v1.paths).filter(path => path.startsWith('/admin') && !path.startsWith('/admin/claude/'))).toEqual([]);
     for (const [path, method] of [['/hosted-domains/{id}', 'delete'], ['/hosted-domains/{id}', 'put'], ['/hosted-domains/{id}/members', 'put'],
       ['/hosted-domains/{id}/members/{userId}', 'delete'], ['/hosted-domains/{id}/transfer', 'post'], ['/admin/hosted-domains', 'get']] as const) {
       expect(specs.api.paths[path]?.[method], `${method} ${path}`).toBeDefined();

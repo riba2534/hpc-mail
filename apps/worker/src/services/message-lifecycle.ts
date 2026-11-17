@@ -3,11 +3,12 @@ import { createDb } from '../db/client.js';
 import { messages } from '../db/schema.js';
 import type { Env, ExecCtx } from '../types.js';
 import { harvestPurgeStatement } from './claude-facts.js';
+import { harvestReceiptsPurgeStatement } from './claude-receipts.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
 import { purgeWebhookDeliveriesStatement } from './webhooks.js';
 
 /** purgeStatements 里删除 messages 行那条语句的下标；调用方据此读取实际删除条数 */
-export const PURGE_MESSAGES_INDEX = 7;
+export const PURGE_MESSAGES_INDEX = 8;
 
 /** All metadata removal and garbage references commit together, before awaiting R2. */
 export function purgeStatements(env: Env, token: string): D1PreparedStatement[] {
@@ -15,6 +16,8 @@ export function purgeStatements(env: Env, token: string): D1PreparedStatement[] 
   return [
     // 先把要删的官方 Claude 来信归纳进地址事实，邮件删掉后后缀统计不丢
     harvestPurgeStatement(env, token),
+    // 官方收据同样先记进 claude_receipts，邮件删掉后收据仍可查
+    harvestReceiptsPurgeStatement(env, token),
     env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key)
       SELECT r2_key FROM attachments WHERE message_id IN (${selected})
       UNION SELECT body_r2_key FROM messages WHERE purge_token = ? AND body_r2_key IS NOT NULL
