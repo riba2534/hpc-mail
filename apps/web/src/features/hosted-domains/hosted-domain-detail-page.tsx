@@ -214,7 +214,8 @@ function ProgressSection({ domain, canManage }: { domain: HostedDomain; canManag
         {checkable && siteDisabled && <p>本站已关闭域名托管，暂不能手动检测，系统仍会定时核对。</p>}
         {domain.status === 'pending' && domain.expiresAt && (
           <p className="text-caution">
-            请在 {formatDateTime(domain.expiresAt)} 前完成名称服务器修改，逾期仍未生效会自动删除。
+            请在 {formatDateTime(domain.expiresAt)} 前完成名称服务器修改，
+            {domain.activatedAt ? '逾期仍未生效会撤回这次重新接入（地址与历史邮件保留，可再次重新接入）。' : '逾期仍未生效会自动删除。'}
           </p>
         )}
       </div>

@@ -523,7 +523,7 @@ describe('重新接入（R15）', () => {
     const view = await data<HostedDomain>(await call('POST', `/hosted-domains/${row.id}/reconnect`, owner.jwt));
     const zone = cf.byName(domain)!;
     expect(view).toMatchObject({
-      status: 'pending', nameServers: zone.nameServers, activatedAt: row.activatedAt!.toISOString(), expiresAt: null,
+      status: 'pending', nameServers: zone.nameServers, activatedAt: row.activatedAt!.toISOString(), expiresAt: expect.any(String),
       lastError: '', mailboxCount: 1, memberCount: 1,
     });
     expect(view.nameServers).not.toEqual(row.nameServers);
@@ -663,5 +663,69 @@ describe('建 zone 返回 2xx 但响应体无法解析（R46）', () => {
     await db.update(hostedDomains).set({ createdAt: new Date(Date.now() - 11 * MINUTE) }).where(eq(hostedDomains.id, reserved.id));
     await syncHostedDomain(runtime, reserved.id);
     expect(await rowOf(reserved.id)).toMatchObject({ zoneId: cf.byName(domain)!.id, syncLeaseUntil: null });
+  });
+});
+
+describe('修复轮 A19：重新接入占等待生效额度，并按 pendingDays 到期撤回', () => {
+  async function movedAway(cf: ReturnType<typeof fakeCloudflare>, userId: number, domain: string) {
+    return seed(cf, userId, domain, { status: 'moved', zoneStatus: 'missing', zoneMissingAt: new Date(Date.now() - 3 * DAY) }, { absent: true });
+  }
+  const pendingSettings = (patch: { maxPendingPerUser?: number; maxPendingTotal?: number }) => updateSettings(env, {
+    hosted_domains: { enabled: true, maxPerUser: 5, maxPendingPerUser: 3, maxPendingTotal: 20, pendingDays: 7, autoClaimLimit: 0, ...patch },
+  });
+
+  it('所有者的等待数已满时 403、全站等待数已满时 429，都不建 zone；管理员不受个人额度限制', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const admin = await f.actor('admin', 'admin');
+    cf.ready(f.domain('elsewhere'));
+    await pendingSettings({ maxPendingPerUser: 1 });
+    await db.insert(hostedDomains).values({ domain: f.domain('waiting'), userId: owner.id, status: 'pending', zoneId: 'zone-waiting' });
+    const first = await movedAway(cf, owner.id, f.domain('first'));
+    const second = await movedAway(cf, owner.id, f.domain('second'));
+    expect(await errorOf(await call('POST', `/hosted-domains/${first.id}/reconnect`, owner.jwt), 403))
+      .toMatchObject({ code: 'forbidden', message: expect.stringContaining('等待 NS 生效') });
+    expect(cf.calls.filter((entry) => entry === 'POST /zones')).toEqual([]);
+    expect((await rowOf(first.id)).status).toBe('moved');
+
+    // 管理员替所有者重新接入：不看所有者的个人额度，仍受全站额度约束
+    expect((await data<HostedDomain>(await call('POST', `/hosted-domains/${first.id}/reconnect`, admin.jwt))).status).toBe('pending');
+    await pendingSettings({ maxPendingPerUser: 5, maxPendingTotal: 2 });
+    expect(await errorOf(await call('POST', `/hosted-domains/${second.id}/reconnect`, admin.jwt), 429))
+      .toMatchObject({ code: 'rate_limited', message: expect.stringContaining('等待生效的域名较多') });
+    expect(cf.calls.filter((entry) => entry === 'POST /zones')).toHaveLength(1);
+    expect((await rowOf(second.id)).status).toBe('moved');
+  });
+
+  it('重建出的 pending 给出 expiresAt，按 pendingDays 到期后删除新 zone 回到 moved，地址与邮件保留', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const domain = f.domain();
+    cf.ready(f.domain('elsewhere'));
+    await pendingSettings({});
+    const row = await movedAway(cf, owner.id, domain);
+    await db.insert(mailboxes).values({ address: `keep@${domain}`, domain, userId: owner.id });
+    await db.insert(messages).values({ direction: 'inbound', address: `keep@${domain}`, domain, status: 'received', subject: 'history' });
+    const view = await data<HostedDomain>(await call('POST', `/hosted-domains/${row.id}/reconnect`, owner.jwt));
+    expect(view.status).toBe('pending');
+    expect(Date.parse(view.expiresAt!)).toBeGreaterThan(Date.now() + 6 * DAY);
+    const zone = cf.byName(domain)!;
+
+    // 7 天内照常等待
+    await syncHostedDomain(runtime, row.id);
+    expect((await rowOf(row.id)).status).toBe('pending');
+
+    // 到期：新 zone 也是 8 天前建的，撤回接入
+    const longAgo = new Date(Date.now() - 8 * DAY);
+    zone.createdOn = longAgo.toISOString();
+    await db.update(hostedDomains).set({ createdAt: longAgo, checkedAt: null }).where(eq(hostedDomains.id, row.id));
+    await syncHostedDomain(runtime, row.id);
+    expect(await rowOf(row.id)).toMatchObject({ status: 'moved', zoneStatus: 'missing', syncLeaseUntil: null });
+    expect(cf.calls).toContain(`DELETE /zones/${zone.id}`);
+    expect(cf.byName(domain)).toBeUndefined();
+    expect(await db.select().from(mailboxes).where(eq(mailboxes.domain, domain)).all()).toHaveLength(1);
+    expect(await db.select().from(messages).where(eq(messages.domain, domain)).all()).toHaveLength(1);
   });
 });
