@@ -8,6 +8,7 @@ import {
   checkAvailability, checkAvailabilityBatch, claimMailbox, claimMailboxes, listMailboxes, releaseMailbox, updateMailbox,
 } from '../../services/mailbox.js';
 import { listSharedMailboxes } from '../../services/mailbox-share.js';
+import { auditActorOf } from '../../services/audit.js';
 import type { AppContext } from '../../types.js';
 
 const app = new Hono<AppContext>();
@@ -63,13 +64,14 @@ app.put('/:id', async (c) => {
   requireScope(c, 'mailbox.write');
   const key = c.get('apiKey')!;
   const req = await parseBody(c, updateMailboxRequestSchema);
-  return ok(c, await updateMailbox(c.env, key.userId, parseId(c.req.param('id')), req.displayName, key.role === 'admin'));
+  return ok(c, await updateMailbox(c.env, key.userId, parseId(c.req.param('id')), req.displayName, key.role === 'admin', auditActorOf(c)));
 });
 
 app.delete('/:id', async (c) => {
   requireScope(c, 'mailbox.write');
   const key = c.get('apiKey')!;
-  const result = await releaseMailbox(c.env, key.userId, parseId(c.req.param('id')), key.role === 'admin', parseBooleanFlag(c.req.query('deleteHistory')), execCtx(c));
+  const result = await releaseMailbox(c.env, key.userId, parseId(c.req.param('id')), key.role === 'admin',
+    parseBooleanFlag(c.req.query('deleteHistory')), execCtx(c), auditActorOf(c));
   return ok(c, { success: true, ...result });
 });
 
