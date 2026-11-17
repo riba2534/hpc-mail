@@ -8,7 +8,7 @@ import { missingScopeHints } from '../lib/errors.js';
  * 两份 OpenAPI 的示例数据。成功示例按响应 schema 由这里的组件示例拼出（见 openapi-common 的 exampleOf），
  * 失败示例放进 components.examples，operation 用 $ref 引用；message 取自实现里真实抛出的文案。
  */
-const AT = '2026-11-17T08:30:00.000Z';
+export const AT = '2026-11-17T08:30:00.000Z';
 const LATER = '2026-11-17T08:31:12.000Z';
 const ATTACHMENT_URL = '/api/attachments/77?exp=1795251600&sig=9b1f0c7e4d2a6b8c3e5f7a9d1c3b5e7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b';
 
