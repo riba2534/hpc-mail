@@ -11,7 +11,9 @@ import { createDb } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { bumpCounter, minuteWindow, readCounter } from './rate-counter.js';
+import {
+  bumpCounter, counterStatement, minuteWindow, readCounter, releaseCounters, reserveCounters, type CounterLimit,
+} from './rate-counter.js';
 import { signToken } from '../lib/jwt.js';
 import { hashPassword, verifyPassword } from '../lib/password.js';
 import { hashRecoveryCode, verifyTotp } from '../lib/totp.js';
@@ -25,61 +27,99 @@ import { sendPushDeerNotification } from './pushdeer.js';
 import { getUserEpoch, mirrorUserEpoch, createSession, destroySession } from './session.js';
 import { getSettings } from './setting.js';
 
-const LOGIN_WINDOW_SECONDS = 15 * 60;
+const LOGIN_WINDOW_MINUTES = 15;
 const MAX_FAILURES = 5;
+/** 同一用户名 15 分钟内跨 IP 的失败上限：超过后只要求等到窗口结束，不永久锁定 */
+const MAX_ACCOUNT_FAILURES = 20;
 const REGISTER_WINDOW_SECONDS = 60 * 60;
 const MAX_REGISTER_PER_WINDOW = 10;
 
 const LOGIN_FAIL_SCOPE = 'login-fail';
+/** 账号级登录失败计数（只按用户名，跨 IP），15 分钟窗口 */
+export const LOGIN_ACCOUNT_SCOPE = 'login-acct';
 const REGISTER_SCOPE = 'reg';
 
 /**
- * 登录失败计数的两个维度。
- *
- * 关键改动：用户名维度的 key 里**掺入了 IP**。原先按纯用户名锁定，攻击者对任意已知
- * 用户名（seed 出来的 admin 用户名基本可猜）每 15 分钟发 5 次错误密码，就能让该账号
- * 持续无法登录，受害者换 IP 也没用——这是一条定向 DoS。掺 IP 后攻击者只能锁住自己，
- * 而防爆破仍由 IP 维度（同一 IP 对任意账号累计）兜住。
+ * 计数用的 IP：IPv6 按 /64 聚合（一户通常分到整段 /64，按单个地址计数换个地址就绕过），
+ * IPv4 映射地址按 IPv4，其余原样。
  */
-async function loginSubjects(username: string, ip: string): Promise<string[]> {
-  const [idHash, ipHash] = await Promise.all([
-    sha256Hex(`id:${username.toLowerCase()}|${ip.toLowerCase()}`),
-    sha256Hex(`ip:${ip.toLowerCase()}`),
+export function ipBucket(ip: string): string {
+  const value = ip.trim().toLowerCase();
+  if (!value.includes(':')) return value;
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(value);
+  if (mapped) return mapped[1]!;
+  const halves = value.split('::');
+  if (halves.length > 2) return value;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return value;
+  const groups = [...head, ...Array<string>(missing).fill('0'), ...tail];
+  if (!groups.every((group) => /^[0-9a-f]{1,4}$/.test(group))) return value;
+  return `${groups.slice(0, 4).map((group) => Number.parseInt(group, 16).toString(16)).join(':')}::/64`;
+}
+
+interface LoginCounters {
+  pair: CounterLimit;
+  ip: CounterLimit;
+  account: CounterLimit;
+}
+
+/**
+ * 登录失败计数的三个维度：(用户名|IP)、IP、用户名。
+ *
+ * (用户名|IP) 维度的 key 里**掺入了 IP**：按纯用户名硬锁时，攻击者对任意已知用户名
+ * （seed 出来的 admin 用户名基本可猜）每 15 分钟发 5 次错误密码，就能让该账号持续无法登录，
+ * 受害者换 IP 也没用。掺 IP 后攻击者只能锁住自己，防爆破由 IP 维度（同一 IP 对任意账号累计）兜住。
+ * 只按用户名的账号维度上限放宽到 MAX_ACCOUNT_FAILURES，挡住换 IP 对单个账号的猜测，
+ * 代价是攻击者能让该账号最多等一个窗口。
+ */
+async function loginCounters(username: string, ip: string): Promise<LoginCounters> {
+  const window = minuteWindow(LOGIN_WINDOW_MINUTES);
+  const name = username.toLowerCase();
+  const bucket = ipBucket(ip);
+  const [pairHash, ipHash, accountHash] = await Promise.all([
+    sha256Hex(`id:${name}|${bucket}`),
+    sha256Hex(`ip:${bucket}`),
+    sha256Hex(`acct:${name}`),
   ]);
-  return [`u:${idHash}`, `i:${ipHash}`];
+  return {
+    pair: { scope: LOGIN_FAIL_SCOPE, subject: `u:${pairHash}`, window, limit: MAX_FAILURES },
+    ip: { scope: LOGIN_FAIL_SCOPE, subject: `i:${ipHash}`, window, limit: MAX_FAILURES },
+    account: { scope: LOGIN_ACCOUNT_SCOPE, subject: accountHash, window, limit: MAX_ACCOUNT_FAILURES },
+  };
 }
 
-function loginWindow(): number {
-  return minuteWindow(LOGIN_WINDOW_SECONDS / 60);
+/** 登录限流按固定 15 分钟窗口计，到窗口结束还要等的秒数（Retry-After） */
+export function loginRetryAfterSeconds(nowMs = Date.now()): number {
+  const windowMs = LOGIN_WINDOW_MINUTES * 60_000;
+  return Math.max(1, Math.ceil(((minuteWindow(LOGIN_WINDOW_MINUTES, nowMs) + 1) * windowMs - nowMs) / 1000));
 }
 
-async function assertLoginAllowed(env: Env, username: string, ip: string): Promise<void> {
-  const window = loginWindow();
-  const subjects = await loginSubjects(username, ip);
-  const records = await Promise.all(
-    subjects.map((s) => readCounter(env, LOGIN_FAIL_SCOPE, s, window)),
-  );
-  if (records.some((r) => r.count >= MAX_FAILURES)) {
-    throw new AppError('rate_limited', '登录尝试过于频繁，请稍后再试');
-  }
+/**
+ * 先占一次失败名额再校验口令：三个维度各自守卫递增，任一已满就退回其他维度、直接拒绝。
+ * 先读后写时并发请求都读到同一个旧计数，单个 IP 并发即可远超上限。
+ */
+async function reserveLoginAttempt(env: Env, username: string, ip: string): Promise<LoginCounters> {
+  const counters = await loginCounters(username, ip);
+  const [pairFull, ipFull, accountFull] = await reserveCounters(env, [counters.pair, counters.ip, counters.account]);
+  if (pairFull || ipFull) throw new AppError('rate_limited', '登录尝试过于频繁，请稍后再试');
+  if (accountFull) throw new AppError('rate_limited', '该账号登录失败次数过多，请稍后再试');
+  return counters;
 }
 
-async function recordLoginFailure(env: Env, username: string, ip: string): Promise<void> {
-  const window = loginWindow();
-  const subjects = await loginSubjects(username, ip);
-  await Promise.all(subjects.map((s) => bumpCounter(env, LOGIN_FAIL_SCOPE, s, window)));
-}
-
-async function resetLoginFailures(env: Env, username: string, ip: string): Promise<void> {
-  const window = loginWindow();
-  const subjects = await loginSubjects(username, ip);
-  // 登录成功清零：置回 0 而不是删行（删行要额外一次查询，清理任务会按窗口回收）
-  await Promise.all(
-    subjects.map(async (s) => {
-      const cur = await readCounter(env, LOGIN_FAIL_SCOPE, s, window);
-      if (cur.count > 0) await bumpCounter(env, LOGIN_FAIL_SCOPE, s, window, -cur.count);
-    }),
-  );
+/**
+ * 登录成功：(用户名|IP) 维度清零，IP 与账号维度只退回本次占位——之前的失败照算，
+ * 否则用自己的账号登录一次就能清空 IP 维度，再对其他用户名继续猜。
+ */
+async function settleLoginSuccess(env: Env, counters: LoginCounters): Promise<void> {
+  const { pair } = counters;
+  await env.db.batch([
+    // 置回 0 而不是删行（清理任务会按窗口回收）
+    env.db.prepare('UPDATE rate_counters SET count = 0 WHERE scope = ? AND subject = ? AND "window" = ?')
+      .bind(pair.scope, pair.subject, pair.window),
+    ...[counters.ip, counters.account].map((item) => counterStatement(env, item.scope, item.subject, item.window, -1)),
+  ]);
 }
 
 /** 注册按 IP 限流：每 IP 每小时上限（含失败尝试），堵开放模式灌号与邀请码暴力猜测 */
@@ -151,7 +191,7 @@ export async function login(
   ip: string,
   ctx?: ExecCtx | null,
 ): Promise<LoginResponse> {
-  await assertLoginAllowed(env, req.username, ip);
+  const counters = await reserveLoginAttempt(env, req.username, ip);
   const db = createDb(env);
   let user = await db.select().from(users).where(eq(users.username, req.username)).get();
   if (user && !user.authVersionMigrated) {
@@ -159,24 +199,25 @@ export async function login(
     user = await db.select().from(users).where(eq(users.id, user.id)).get();
   }
   const valid = user ? await verifyPassword(req.password, user.passwordHash) : false;
-  if (!user || !valid) {
-    await recordLoginFailure(env, req.username, ip);
-    throw new AppError('bad_credentials', '用户名或密码错误');
+  // 口令或验证码错误时占位保留，记作一次失败
+  if (!user || !valid) throw new AppError('bad_credentials', '用户名或密码错误');
+  if (user.status !== 'active') {
+    await releaseCounters(env, [counters.pair, counters.ip, counters.account]);
+    throw new AppError('user_disabled', '账号已被禁用');
   }
-  if (user.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
 
   try {
     await verifyLoginTwoFactor(env, user, req.totp);
   } catch (e) {
-    // 验证码错误计入失败限流；仅「需要验证码」的提示不计
-    if (e instanceof AppError && e.code === 'bad_credentials') {
-      await recordLoginFailure(env, req.username, ip);
+    // 仅「需要验证码」的提示不计失败
+    if (e instanceof AppError && e.code === 'totp_required') {
+      await releaseCounters(env, [counters.pair, counters.ip, counters.account]);
     }
     throw e;
   }
 
   const token = await issueToken(env, user, ctx);
-  await resetLoginFailures(env, req.username, ip);
+  await settleLoginSuccess(env, counters);
   const previousIp = user.lastLoginIp;
   await db
     .update(users)
