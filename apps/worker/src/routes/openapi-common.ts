@@ -10,6 +10,9 @@ import {
   HOSTED_DOMAIN_STATUSES, createHostedDomainRequestSchema, updateHostedDomainRequestSchema, replaceHostedDomainMembersRequestSchema,
   transferHostedDomainRequestSchema, HOSTED_DNS_CAA_TAGS, HOSTED_DNS_TTL_AUTO, hostedDnsRecordInputSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
+  ALLOWED_CUSTOM_HEADERS, MAX_CUSTOM_HEADER_VALUE_BYTES, MAX_CUSTOM_NON_X_HEADERS, MAX_CUSTOM_HEADERS_TOTAL_BYTES,
+  MAX_ATTACHMENT_TOTAL_BYTES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_SEND_REQUEST_BYTES, MAX_REPLY_TO, MAX_DISPLAY_NAME_LENGTH,
+  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 
@@ -42,22 +45,74 @@ export const claimStrategy: Schema = { type: 'string', enum: ['uniform', 'claude
   description: 'Optional. Omitted or uniform uses ordinary claim rules. claude rejects any domain with a historical Claude suspension, including for administrators and hosted domains; writes recheck atomically and return 403 forbidden: 该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领. Historical observations do not guarantee future safety.' };
 const claimRequest = fromZod(claimMailboxRequestSchema);
 (claimRequest.properties as Record<string, Schema>).strategy = claimStrategy;
+const MIB = 1024 * 1024;
 const send = fromZod(internalSendMailSchema);
 const sendProperties = send.properties as Record<string, Schema>;
-sendProperties.from = { ...sendProperties.from, oneOf: [
-  { required: ['mailboxId'], not: { anyOf: [{ required: ['localPart'], properties: { localPart: str } }, { required: ['domain'], properties: { domain: str } }] } },
-  { required: ['localPart', 'domain'], not: { required: ['mailboxId'], properties: { mailboxId: positiveId } } },
-] };
-send.description = `At least one recipient across to/cc/bcc; combined maximum ${MAX_RECIPIENTS}. At least one nonempty text/html body; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes. At most ${MAX_ATTACHMENTS} total attachments, including tokens and source-message attachments. Base64 allows whitespace. Sender identity: ordinary users must own the mailbox, whether given as mailboxId or localPart+domain. Administrators may use any claimed mailbox by mailboxId, or an explicit localPart+domain on a configured system domain, a removed domain that still has claimed mailboxes, or a hosted domain. Any address on a hosted domain needs that domain’s sending to be ready (400 otherwise); system domains do not. Existing owned mailboxes remain usable when their domain is removed from the new-claim list. Shared mailboxes never grant send permission. replyToMessageId only adds In-Reply-To/References: recipients, subject and body are not filled in, so use the original replyTo addresses (else fromAddress) from message detail. forwardAttachmentsFrom copies all original attachments and preserves inline CID images. Both source ids must be visible to the sender: mail at an address the sender claimed, or non-deleted inbound mail shared with the sender; administrators may also reference mail at unclaimed addresses. A missing or invisible source, or a forwarded attachment whose stored content is gone, returns 404 source_unavailable; drop replyToMessageId/forwardAttachmentsFrom to send it as a new message. A missing sender mailboxId stays 404 not_found. API keys need mail.read in addition to mail.send when either field is present.`;
+const [fromString, fromAddressObject, fromMailbox] = sendProperties.from!.anyOf as Schema[];
+const fromFields = fromMailbox!.properties as Record<string, Schema>;
+const senderName = { ...fromFields.displayName,
+  description: `Sender display name, at most ${MAX_DISPLAY_NAME_LENGTH} characters. Defaults to the mailbox display name, else the local part.` };
+sendProperties.from = {
+  description: 'Sender identity in one of four forms; pick an address from GET /identities with canSend=true. The two address forms are parsed into localPart+domain and follow the same rules.',
+  oneOf: [
+    { title: 'Mailbox id', type: 'object', required: ['mailboxId'], properties: { mailboxId: positiveId, displayName: senderName },
+      not: { anyOf: [{ required: ['localPart'] }, { required: ['domain'] }] } },
+    { title: 'Local part and domain', type: 'object', required: ['localPart', 'domain'],
+      properties: { localPart: fromFields.localPart, domain: fromFields.domain, displayName: senderName }, not: { required: ['mailboxId'] } },
+    { ...fromString, title: 'Address string', minLength: 3, examples: ['Alice <alice@example.org>', 'alice@example.org'],
+      description: '"a@b" or "Name <a@b>"; the name may be double-quoted, with \\" for a literal quote. The address must be one this site can send from.' },
+    { ...fromAddressObject, title: 'Address object', description: '{address, name?}; name is the display name.',
+      properties: { address: { type: 'string', minLength: 3, maxLength: 254 }, name: { type: 'string', maxLength: MAX_DISPLAY_NAME_LENGTH } } },
+  ],
+};
+/** to/cc/bcc/replyTo 的一个地址：字符串或 {address, name}，服务端解析后严格校验 */
+const mailAddress: Schema = {
+  description: `One address: "a@b", "Name <a@b>" (the name may be double-quoted, with \\" escapes) or {address, name?}. Addresses are lowercased and validated strictly: a dot-atom local part, DNS labels and a letter or punycode top-level domain, at most 254 characters; quoted local parts, IP literals and malformed input such as alice<a@b.com return 400 validation_failed. Display names are at most ${MAX_DISPLAY_NAME_LENGTH} characters and cannot contain control characters or angle brackets.`,
+  oneOf: [
+    { type: 'string', minLength: 3, examples: ['bob@example.net', 'Bob <bob@example.net>'] },
+    { type: 'object', required: ['address'], properties: { address: { type: 'string', minLength: 3, maxLength: 254 },
+      name: { type: 'string', maxLength: MAX_DISPLAY_NAME_LENGTH } } },
+  ],
+};
+sendProperties.to = { ...array(ref('MailAddress')), description: `Required, may be empty when cc or bcc has an address. to+cc+bcc hold 1–${MAX_RECIPIENTS} addresses in total; duplicates are sent once.` };
+sendProperties.cc = { ...array(ref('MailAddress')), default: [] };
+sendProperties.bcc = { ...array(ref('MailAddress')), default: [], description: 'Never disclosed to other recipients.' };
+sendProperties.replyTo = { ...array(ref('MailAddress')), maxItems: MAX_REPLY_TO,
+  description: `Reply-To header: where recipients’ replies go, at most ${MAX_REPLY_TO} addresses. Defaults to the sender.` };
+sendProperties.replyToMessageId = { ...sendProperties.replyToMessageId,
+  description: 'Id of a message on this site being replied to; the server adds In-Reply-To/References from it. It does not fill recipients, subject or body. Cannot be combined with headers In-Reply-To/References (400 validation_failed).' };
+sendProperties.forwardAttachmentsFrom = { ...sendProperties.forwardAttachmentsFrom,
+  description: 'Id of a visible message whose attachments, including inline images, are attached again. It does not fill recipients, subject or body.' };
+sendProperties.headers = {
+  type: 'object', additionalProperties: { type: 'string', minLength: 1 },
+  description: `Custom headers. Names: X-* or one of ${ALLOWED_CUSTOM_HEADERS.join(', ')} (case-insensitive). From/To/Cc/Bcc/Subject/Reply-To must use the request fields, and platform headers (Message-ID, Date, MIME-Version, Content-Type, DKIM-Signature, Received and so on) cannot be set: any disallowed name returns 400 header_not_allowed listing every rejected name in error.details.headers. Values are single-line (no CR/LF) and at most ${MAX_CUSTOM_HEADER_VALUE_BYTES} UTF-8 bytes each, a name appears once, at most ${MAX_CUSTOM_NON_X_HEADERS} non-X headers, and names plus values total at most ${MAX_CUSTOM_HEADERS_TOTAL_BYTES} bytes. Structured headers take printable ASCII; X-*, Comments, Keywords, Organization and Thread-Topic also accept UTF-8 (RFC 2047 encoded when sent). Formats: In-Reply-To is one <message-id>; References is space-separated <message-id>s; List-Unsubscribe is comma-separated <https:…> or <mailto:…> URIs; List-Unsubscribe-Post is exactly List-Unsubscribe=One-Click and needs an https List-Unsubscribe; Precedence bulk|list|junk; Importance high|normal|low; Priority normal|non-urgent|urgent; Sensitivity personal|private|company-confidential. Value problems return 400 validation_failed, also with details.headers. Use In-Reply-To/References only to reply to mail from outside this site (you know its Message-ID); for a message on this site use replyToMessageId, never both.`,
+  'x-allowed-headers': ALLOWED_CUSTOM_HEADERS, 'x-max-value-utf8-bytes': MAX_CUSTOM_HEADER_VALUE_BYTES,
+  'x-max-non-x-headers': MAX_CUSTOM_NON_X_HEADERS, 'x-max-total-bytes': MAX_CUSTOM_HEADERS_TOTAL_BYTES,
+  examples: [{ 'X-Campaign': 'weekly-2026-11', 'List-Unsubscribe': '<https://example.org/unsubscribe?u=1>' }],
+};
+const contentIdDescription = 'Content-ID without angle brackets (brackets are stripped); reference it in html as <img src="cid:<contentId>">. Unique within the request, case-insensitively.';
+const dispositionDescription = 'inline needs contentId and is embedded in the HTML body (multipart/related); omitted means inline when contentId is given, else attachment.';
+const attachmentFields = (sendProperties.attachments!.items as Schema).properties as Record<string, Schema>;
+attachmentFields.content = {
+  type: 'string', minLength: 1, pattern: '^[A-Za-z0-9+/\\s]+(?:=\\s*){0,2}$',
+  description: `Base64 without a data: prefix; whitespace and line breaks are removed before decoding. Base64 attachments together decode to at most ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / MIB} MiB (413 payload_too_large); upload larger files to /uploads and use attachmentTokens.`,
+};
+attachmentFields.contentId = { ...attachmentFields.contentId, description: contentIdDescription };
+attachmentFields.disposition = { ...attachmentFields.disposition, description: dispositionDescription };
+const [tokenString, tokenObject] = (sendProperties.attachmentTokens!.items as Schema).anyOf as Schema[];
+const tokenFields = tokenObject!.properties as Record<string, Schema>;
+sendProperties.attachmentTokens = { ...sendProperties.attachmentTokens,
+  description: 'Completed upload tokens from /uploads: a token string, or {token, contentId?, disposition?} to embed it as an inline image. Tokens are consumed by a finished send.',
+  items: { oneOf: [{ ...tokenString, title: 'Token' }, { ...tokenObject, title: 'Token with inline options', properties: { ...tokenFields,
+    contentId: { ...tokenFields.contentId, description: contentIdDescription }, disposition: { ...tokenFields.disposition, description: dispositionDescription } } }] } };
+send.description = `At least one recipient across to/cc/bcc; combined maximum ${MAX_RECIPIENTS}. At least one nonempty text/html body; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes. Subject is one line. At most ${MAX_ATTACHMENTS} total attachments, including tokens and source-message attachments, together at most ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB; base64 attachments together at most ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / MIB} MiB, and a request body over ${MAX_SEND_REQUEST_BYTES / MIB} MiB is rejected with 413 before parsing. When external recipients are present and the encoded message would exceed about ${EXTERNAL_MESSAGE_MAX_BYTES / MIB} MiB, attachments are delivered as signed download links valid for 90 days, and cid: images point to those links. Inline images: give an attachment or token a contentId and reference it as cid:<contentId> in html. Sender identity: ordinary users must own the mailbox, whatever form from takes (GET /identities lists those with canSend). Administrators may use any claimed mailbox by mailboxId, or an explicit address on a configured system domain, a removed domain that still has claimed mailboxes, or a hosted domain. Any address on a hosted domain needs that domain’s sending to be ready (400 otherwise); system domains do not. Existing owned mailboxes remain usable when their domain is removed from the new-claim list. Shared mailboxes never grant send permission. A sender that is not allowed returns 403 forbidden with fix and docs. replyToMessageId only adds In-Reply-To/References: recipients, subject and body are not filled in, so use the original replyTo addresses (else fromAddress) from message detail. To reply to mail from outside this site, put its Message-ID into headers In-Reply-To/References instead; giving both returns 400. forwardAttachmentsFrom copies all original attachments and preserves inline CID images. Both source ids must be visible to the sender: mail at an address the sender claimed, or non-deleted inbound mail shared with the sender; administrators may also reference mail at unclaimed addresses. A missing or invisible source, or a forwarded attachment whose stored content is gone, returns 404 source_unavailable; drop replyToMessageId/forwardAttachmentsFrom to send it as a new message. A missing sender mailboxId stays 404 not_found. API keys need mail.read in addition to mail.send when either field is present.`;
 send.anyOf = [{ required: ['text'], properties: { text: { minLength: 1 } } }, { required: ['html'], properties: { html: { minLength: 1 } } }];
 send['x-max-body-utf8-bytes'] = MAX_BODY_BYTES;
 send['x-max-total-recipients'] = MAX_RECIPIENTS;
 send['x-max-total-attachments'] = MAX_ATTACHMENTS;
-send['x-max-attachment-bytes'] = 50 * 1024 * 1024;
-(((sendProperties.attachments!.items as Schema).properties as Record<string, Schema>).content) = {
-  type: 'string', minLength: 1, pattern: '^[A-Za-z0-9+/\\s]+(?:=\\s*){0,2}$',
-  description: 'Base64 content; whitespace is allowed and removed before decoding. Combined decoded attachments must be at most 50 MiB.',
-};
+send['x-max-attachment-bytes'] = MAX_ATTACHMENT_TOTAL_BYTES;
+send['x-max-inline-attachment-bytes'] = MAX_INLINE_ATTACHMENT_TOTAL_BYTES;
+send['x-max-request-bytes'] = MAX_SEND_REQUEST_BYTES;
 const domains = fromZod(SETTING_SCHEMAS.domains, 'output');
 const domainEntry = ((domains.properties as Record<string, Schema>).list!.items) as Schema;
 (domainEntry.properties as Record<string, Schema>).domain = domainName;
@@ -82,12 +137,18 @@ for (const schema of [settingsResponse, settingsUpdate]) {
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
 notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webhook.secret and pushdeer.pushkey are returned as ******; plaintext secrets are never returned. In updates ****** preserves the secret (for PushDeer only while the endpoint keeps the same origin and path, ignoring a trailing slash, with an empty endpoint meaning the official one; otherwise 400 validation_failed asks for the pushkey again) and an explicit empty string clears it. Enabled configurations must have valid complete endpoints/keys/forward addresses. These are mail-owner notifications; shared mailbox readers do not receive owner notifications.';
+/** 逐收件人结果：发件摘要与 delivery_failed 错误的 details 共用 */
+const recipientOutcome = { ...object({ address: str,
+  status: { type: 'string', enum: ['delivered', 'sent', 'failed', 'unknown'],
+    description: 'delivered: stored for a recipient on this site; sent: accepted by the provider for an external recipient (not proof of inbox arrival); failed: rejected, see error; unknown: delivery was interrupted and the result was never recorded, so the recipient may already have it: confirm before resending.' },
+  error: str }, ['error']), description: 'Result for one unique recipient address.' };
 const messageSummary = object({
   id: positiveId, direction: { type: 'string', enum: ['inbound', 'outbound'] }, address: str, domain: str,
   fromAddress: str, fromName: str, subject: str, preview: str, verificationCode: str,
   verificationLink: { type: 'string', maxLength: 2048, description: 'Inbound only: the most likely http/https verification, sign-in, activation or password-reset link detected at receipt; empty string when none qualified (and for mail received before detection existed). Advisory and attacker-controllable: check the link host matches the expected service before opening it.' },
-  status: { type: 'string', description: 'Inbound: pending, received or degraded. Outbound: pending, sent, delivered, failed or unknown. sent means the provider accepted at least one external delivery; it is not proof of arrival in the destination inbox. pending: delivery still in progress, results not yet recorded. unknown: delivery was interrupted and some recipients may already have received it; check recipientOutcomes before resending.' },
-  errorDetail: str, recipientOutcomes: array(object({ address: str, status: { type: 'string', enum: ['delivered', 'sent', 'failed', 'unknown'] }, error: str }, ['error'])),
+  status: { type: 'string', 'x-inbound-values': ['pending', 'received', 'degraded'], 'x-outbound-values': OUTBOUND_STATUSES,
+    description: `Inbound: pending (attachments still being stored), received or degraded (parsing or attachments partly failed; see errorDetail and hasRaw). Outbound: ${OUTBOUND_STATUSES.join(', ')}. pending: delivery in progress, per-recipient results are filled in as each finishes. sent: the provider accepted at least one external recipient; not proof of arrival in the destination inbox. delivered: every recipient is on this site and the copies are stored. failed: every recipient failed. unknown: still pending an hour after creation (delivery interrupted), recorded results are kept and the rest are unknown; some recipients may already have the mail, so confirm before resending. A send response is never failed (that is 422 delivery_failed); errorDetail describes partial failures. Very old rows may carry other values; treat them as unknown.` },
+  errorDetail: str, recipientOutcomes: { ...array(recipientOutcome), description: 'Outbound only: one entry per unique recipient across to/cc/bcc.' },
   recipientsTo: array(str), isRead: bool, isStarred: bool,
   hasAttachments: { ...bool, description: 'Whether the message has real attachments. Inline parts with a Content-ID (embedded images such as logos) are not counted.' },
   size: int, createdAt: date,
@@ -113,7 +174,16 @@ const delivery = object({ id: positiveId, messageId: nullable(positiveId), targe
 });
 export const schemas: Record<string, Schema> = {
   Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
-    description: 'Stable machine-readable code. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message.' }, message: str }),
+    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient was attempted and rejected, nothing was delivered; details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422.' },
+    message: { ...str, description: 'Human-readable Chinese explanation; wording may change.' },
+    fix: { ...str, description: 'Optional: one actionable correction, e.g. which scope to add or which endpoint to call first.' },
+    docs: { type: 'string', format: 'uri', description: 'Optional: absolute URL of the matching section in /references/errors.md on this site.' },
+    details: { ...object({
+      headers: { ...array(str), description: 'header_not_allowed and header value errors: offending header names as written in the request.' },
+      messageId: { ...positiveId, description: 'delivery_failed: id of the recorded outbound message (visible in direction=outbound lists).' },
+      recipientOutcomes: { ...array(recipientOutcome), description: 'delivery_failed: per-recipient results, all failed.' },
+    }, ['headers', 'messageId', 'recipientOutcomes']), description: 'Optional structured data, present only on the codes above.' },
+  }, ['fix', 'docs', 'details']),
     requestId: { ...str, description: `Same value as the X-Request-ID response header, which every response carries; ${clientRequestIdRule}, anything else is replaced by a server-generated UUID.` } }),
   MessageSummary: messageSummary,
   MessageDetail: object({ ...summaryProperties, replyTo: array(str), recipients: object({ to: array(str), cc: array(str), bcc: array(str) }),
@@ -276,7 +346,7 @@ export const schemas: Record<string, Schema> = {
     return schema;
   })(),
   AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),
-  SendMailRequest: send,
+  SendMailRequest: send, MailAddress: mailAddress,
   ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
   MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
@@ -313,7 +383,7 @@ export const listQuery = [query('direction', { type: 'string', enum: ['inbound',
   query('q', { type: 'string', maxLength: 256 }, 'Literal substring search in subject/from/body; Unicode is supported.'),
   ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'), ...pageQuery];
 export const idempotencyHeader = { name: 'Idempotency-Key', in: 'header', required: false,
-  description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed (201 with the original summary) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key. Completed keys are retained at least two days.',
+  description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed (201 with the original summary, or the same 422 delivery_failed when every recipient failed) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it. After 422 delivery_failed, correct the recipients and use a new key. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key; confirm unknown recipients before resending to them. Outbound mail still pending an hour after creation is marked unknown, after which the same key replays 201 with status unknown. Completed keys are retained at least two days.',
   schema: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$' } };
 export const success = object({ success: { const: true, type: 'boolean' } });
 export const changed = object({ changed: int });
@@ -337,6 +407,24 @@ export function operation(summary: string, data: Schema, options: {
         ...(options.binary === 'application/octet-stream' ? { '*/*': { schema: responseSchema } } : {}) } } },
   };
 }
+/** 发信：/api/messages/send 与 /v1/messages 同一份请求、结果与错误说明；/v1 另声明 scope */
+export function sendMailOperation(scope?: string): Operation {
+  const keyScopes = scope
+    ? ` API keys need ${scope}; replyToMessageId or forwardAttachmentsFrom additionally require mail.read (403 without it).` : '';
+  const base = operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope, status: 201, parameters: [idempotencyHeader],
+    description: `HTTP 201 means at least one recipient succeeded: status is sent or delivered (or unknown when replaying an interrupted send). Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient was attempted and rejected the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. There is no separate reply or forward endpoint (POST /messages/{id} does not exist): set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
+  const error = (description: string) => ({ description, content: { 'application/json': { schema: ref('Error') } } });
+  return { ...base,
+    responses: { ...(base.responses as Record<string, unknown>),
+      400: error('validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, or a hosted-domain sender whose sending is not ready.'),
+      403: error('forbidden: the API key lacks a scope (fix names it), or the sender identity is not allowed (fix points to GET /identities); shared mailboxes never send.'),
+      413: error(`payload_too_large: request body over ${MAX_SEND_REQUEST_BYTES / 1024 / 1024} MiB (rejected before parsing), base64 attachments over ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB combined, or all attachments over ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB. Upload large files and use attachmentTokens.`),
+      422: error('delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key.'),
+      429: error('rate_limited: request rate, or the daily outbound mail/recipient quota (GET /v1/me shows usage).'),
+      500: error('internal: the server failed before every recipient was attempted. Retry the identical request with the same Idempotency-Key to fetch the result: it may be 201, or 422 delivery_failed whose recipientOutcomes show recipients that were never attempted.'),
+    },
+    ...(scope ? { 'x-conditional-scopes': [{ scope: 'mail.read', when: 'replyToMessageId or forwardAttachmentsFrom is present' }] } : {}) };
+}
 export function describePaths(paths: Paths, namespace = ''): Paths {
   return Object.fromEntries(Object.entries(paths).map(([path, methods]) => [path, {
     ...methods,
@@ -350,7 +438,7 @@ export function describePaths(paths: Paths, namespace = ''): Paths {
   }])) as Paths;
 }
 export function specInfo(title: string, description: string) {
-  return { title, description, version: '1.5.0', license: { name: 'MIT', identifier: 'MIT' },
+  return { title, description, version: '1.6.0', license: { name: 'MIT', identifier: 'MIT' },
     contact: { name: 'HPC Mail', url: 'https://github.com/riba2534/hpc-mail' } };
 }
 export function specificationOperation(): Operation {

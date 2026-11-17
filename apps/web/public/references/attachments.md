@@ -1,12 +1,19 @@
 # 附件下载与上传
 
-按任务定位：[下载](#下载)、[发送附件的三种来源](#发送附件的三种来源)、[外发大附件与保留](#外发大附件与保留)。
+## 目录
+
+- [下载](#下载)：带凭证下载、签名 URL、`inline` 标记
+- [发送附件的三种来源](#发送附件的三种来源)：base64、上传 token、转发原附件
+- [内联图片](#内联图片)：`contentId`、`disposition` 与 `cid:` 引用
+- [大小与数量限制](#大小与数量限制)：10 MiB base64、50 MiB 合计、16 MiB 请求体
+- [上传协议](#上传协议)：单片与分片上传、取消
+- [外发大附件与保留](#外发大附件与保留)：超过约 4 MiB 改为下载链接
 
 shell 示例复用 [入口指南](../skill.md) 的请求函数。`/api` JWT 和 `/v1` Key 均支持相同上传协议，Key 上传/取消需 `mail.send`，下载需 `mail.read`。Token 属于用户，仅指向已准备好的附件，不是公开下载链接或新的登录凭证。
 
 ## 下载
 
-详情 `attachments` 每项含 `id,filename,mimeType,size,contentId,disposition,url`。`url` 是签名链接，可能为相对路径。`/api` 详情（站内页面用）的附件与内嵌图签名按整点对齐，有效 1–2 小时，同一小时内重复读取得到相同的 URL；`/v1` 详情的签名 URL 只有 5 分钟。按可信实例 origin 解析，过期后重新读详情获取，不自己伪造签名。Agent 应使用下面带凭证的下载端点（Key 用 `/v1/messages/:id/attachments/:attId`），不依赖签名链接的时效。
+详情 `attachments` 每项含 `id,filename,mimeType,size,contentId,disposition,inline,url`。`inline:true` 表示 `bodyHtml` 以 `cid:<contentId>` 引用了它并已替换成 `url`，即正文里的内联图片，展示时不必再列为附件；摘要的 `hasAttachments` 不计带 Content-ID 的内联部分。`url` 是签名链接，可能为相对路径。`/api` 详情（站内页面用）的附件与内嵌图签名按整点对齐，有效 1–2 小时，同一小时内重复读取得到相同的 URL；`/v1` 详情的签名 URL 只有 5 分钟。按可信实例 origin 解析，过期后重新读详情获取，不自己伪造签名。Agent 应使用下面带凭证的下载端点（Key 用 `/v1/messages/:id/attachments/:attId`），不依赖签名链接的时效。
 
 - Key 下载：`GET /v1/messages/:messageId/attachments/:attachmentId`，支持同邮件详情的只读 `scope/userId`；鉴权验证附件确实属于该邮件。
 - JWT 下载：`GET /api/attachments/:attachmentId`，可见性与详情相同；管理员审阅其他用户的邮件时带与详情相同的 `scope=user&userId=…`（未认领地址用 `scope=unclaimed`）。普通用户带 `scope=user` 或 `scope=unclaimed` 返回 403，非法 scope 返回 400。
@@ -21,11 +28,42 @@ hpc "/messages/$MESSAGE_ID/attachments/$ATTACHMENT_ID" --output "$HPC_DOWNLOAD_F
 
 ## 发送附件的三种来源
 
-1. 小附件可直接放发送请求的 `attachments:[{filename,contentType,content}]`；content 为无 `data:` 前缀的 base64，可含折行空白。`filename` 1–255 字符，不能有 `/`、`\` 或 `..`；`contentType` 3–128 字符。
-2. 独立上传后在发送请求放 `attachmentTokens:["…"]`，无需把文件重新 base64；上传成功后才能发送。JSON 的 MIME 字段名上传为 `mimeType`，内联为 `contentType`，不要混用。
+1. 小附件可直接放发送请求的 `attachments:[{filename,contentType,content,contentId?,disposition?}]`；content 为无 `data:` 前缀的 base64，可含折行空白。`filename` 1–255 字符，不能有 `/`、`\` 或 `..`；`contentType` 3–128 字符。全部 base64 附件解码后合计不超过 10 MiB，更大的走第 2 种。
+2. 独立上传后在发送请求放 `attachmentTokens`，无需把文件重新 base64；上传完成后才能发送，token 不存在、不属于自己或尚未完成返回 400。每项写 token 字符串，或写成 `{token,contentId?,disposition?}` 把它作为内联图片。JSON 的 MIME 字段名上传为 `mimeType`，base64 附件为 `contentType`，不要混用。
 3. 转发或已确认部分失败的补发，用 `forwardAttachmentsFrom=原邮件 ID` 复制原附件，保留 inline/CID；此时不重复引用原附件 Tokens/重复 base64 加入。来源须对发件人可见（自己认领地址上的邮件、共享给自己的未删除来信，管理员另含未认领地址），否则或原附件已丢失时返回 404 `source_unavailable`；Key 还需要 `mail.read`。
 
-三路合并后最多 10 个、每个及合计最多 50 MiB（`50*1024*1024` 字节）。正文另限合计 UTF-8 1 MiB。上传配额每用户最多 20 个待发送附件、声明大小合计最多 100 MiB，包括尚未完成上传；取消时及时删除，未消费草稿约 24 小时后定时清理。附件 Token 过期/上传失败时不能默默略掉附件发送。
+三种来源可以混用。附件 Token 过期/上传失败时不能默默略掉附件发送。
+
+## 内联图片
+
+正文里显示的图片（logo、图表）与普通附件用同一个数组，区别是带 `contentId`：
+
+- `contentId`：1–128 个字母、数字或 `. _ - @ + = $ % & ! # * / ? ^ { } | ~ '` 等符号，不带尖括号（带了会去掉）；在一次请求的 base64 附件与 token 之间唯一，不区分大小写，重复返回 400。
+- `disposition`：`inline` 或 `attachment`。只给 `contentId` 不给 `disposition` 按 `inline`；`inline` 必须带 `contentId`，否则 400。
+- HTML 用 `<img src="cid:<contentId>">` 引用。带内联部分的邮件按 `multipart/related` 生成，收件客户端在正文里显示图片。本站收件人的详情里，被引用的图片 `inline:true`，`bodyHtml` 中的 `cid:` 已换成签名 URL。
+
+```json
+{"from":"alice@example.org","to":["bob@example.net"],"subject":"周报",
+ "html":"<p>本周数据</p><img src=\"cid:chart\"><img src=\"cid:logo\" alt=\"logo\">",
+ "attachments":[{"filename":"logo.png","contentType":"image/png","content":"iVBORw0KGgo=","contentId":"logo"}],
+ "attachmentTokens":[{"token":"<上传返回的 token>","contentId":"chart","disposition":"inline"},"<另一个普通附件的 token>"]}
+```
+
+## 大小与数量限制
+
+| 限制 | 上限 | 超出时 |
+|---|---|---|
+| 附件个数（base64、token、转发原附件三路合计） | 10 个 | 400 `validation_failed` |
+| 全部附件合计（含 token 与转发原附件） | 50 MiB（`50*1024*1024` 字节），单个文件同样 | 413 `payload_too_large` |
+| 请求体内 base64 附件解码后合计 | 10 MiB | 413 `payload_too_large`，`fix` 指向上传接口 |
+| 整个发信请求体（Content-Length） | 16 MiB | 413 `payload_too_large`，在解析前直接拒绝 |
+| 正文 `text`+`html` | UTF-8 合计 1 MiB | 400 `validation_failed` |
+| 单次直传 `POST /uploads` | 10 MiB，更大的走分片 | 413 |
+| 每用户待发送草稿 | 20 个、声明大小合计 100 MiB（含未完成上传） | 429 `rate_limited` |
+
+未消费的草稿约 24 小时后定时清理；不再需要时用 `DELETE /uploads/:token` 及时取消。
+
+## 上传协议
 
 单片上传不超过 10 MiB，较大文件走分片：
 
@@ -131,4 +169,4 @@ except BaseException:
 
 ## 外发大附件与保留
 
-站内投递附件仍是正常附件，不受外发 MIME 上限限制。含站外收件人的请求，正文与附件编码后的估算负载超过约 4 MiB 时，服务器将附件改为签名下载链接注入正文；这是交付形式变化，外部收件人不一定收到 MIME 附件。链接约 90 天有效，独立保留引用可在原站内邮件删除后继续提供文件，过期后台回收；没有额外的用户撤销链接接口。涉及敏感附件时先按用户要求选择是否允许这种可持链接访问的形式，不承诺永久可下载或“删除邮件就撤销外部链接”。
+站内投递附件仍是正常附件，不受外发 MIME 上限限制。含站外收件人的请求，正文与附件编码后的估算负载超过约 4 MiB 时，服务器将附件改为签名下载链接注入正文（文本与 HTML 末尾各加一段「附件下载」），HTML 里的 `cid:` 内联图片也改指向对应链接；这是交付形式变化，外部收件人不一定收到 MIME 附件。用 `forwardAttachmentsFrom` 补发或转发这类邮件时沿用原正文即可，服务器会先去掉原正文里指向这些附件的下载区块，再按本次大小决定是否重新生成，不会出现两段。链接约 90 天有效，独立保留引用可在原站内邮件删除后继续提供文件，过期后台回收；没有额外的用户撤销链接接口。涉及敏感附件时先按用户要求选择是否允许这种可持链接访问的形式，不承诺永久可下载或“删除邮件就撤销外部链接”。
