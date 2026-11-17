@@ -14,6 +14,7 @@ import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
 import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
+import { beforeStatement } from './support/system-domains.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -45,8 +46,6 @@ async function errorOf(response: Response, status: number) {
   return { ...body.error, requestId: body.requestId };
 }
 
-const inDays = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString();
-
 async function fixture() {
   const prefix = `va-${++sequence}`;
   await updateSettings(env, {
@@ -67,8 +66,8 @@ async function fixture() {
   const owner = await actor('owner');
   const target = await actor('target');
   const member = await actor('member');
-  // 管理员 Key：管理员账户 + admin scope（新建带 admin 的 Key 需要 IP 白名单与有效期）
-  const adminKey = await keyFor(admin.jwt, { scopes: ['mailbox.read', 'admin'], allowedIps: [IP], expiresAt: inDays(30) });
+  // 管理员 Key：管理员账户 + admin scope
+  const adminKey = await keyFor(admin.jwt, { scopes: ['mailbox.read', 'admin'] });
   const address = (name: string, domain = DOMAIN) => `${prefix}-${name}@${domain}`;
   async function box(ownerId: number, name: string, domain = DOMAIN) {
     return (await db.insert(mailboxes).values({ address: address(name, domain), domain, userId: ownerId }).returning().get())!;
@@ -85,27 +84,6 @@ const membersOf = async (id: number) => (await db.select().from(mailboxShares).w
   .map((row) => row.userId).sort((a, b) => a - b);
 const ownerOf = async (id: number) => (await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get())?.userId;
 const sorted = (...ids: number[]) => [...ids].sort((a, b) => a - b);
-
-/** 截获 prepare：SQL 含 marker 的语句被准备后，下一次 batch 执行前运行一次 hook（模拟读取与提交之间的并发修改） */
-function beforeBatchWith(marker: string, hook: () => Promise<void>): Env {
-  let armed = false;
-  let done = false;
-  return { ...env, db: new Proxy(env.db, { get(target, property) {
-    if (property === 'prepare') return (query: string) => {
-      if (query.includes(marker)) armed = true;
-      return target.prepare(query);
-    };
-    if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
-      if (armed && !done) {
-        done = true;
-        await hook();
-      }
-      return target.batch(statements);
-    };
-    const value = Reflect.get(target, property);
-    return typeof value === 'function' ? value.bind(target) : value;
-  } }) };
-}
 
 describe('/v1/admin 鉴权', () => {
   it('无 Key 401（带 requestId）；普通用户 Key、不带 admin scope 的管理员 Key 都是 403；管理员 JWT 不能调用', async () => {
@@ -208,7 +186,7 @@ describe('POST /v1/admin/mailboxes/batch/claim', () => {
 
   it('认领提交后共享整体失败（被分享人在提交前被禁用）：认领保留，每个认领到的地址记为 failed 并带错误', async () => {
     const f = await fixture();
-    const racing = beforeBatchWith("'mailbox.share'", async () => {
+    const racing = beforeStatement(env, /'mailbox\.share'/, async () => {
       await db.update(users).set({ status: 'disabled' }).where(eq(users.id, f.member.id));
     });
     const result = await adminClaimAndShare(racing, { id: f.admin.id, ip: IP }, {
@@ -368,12 +346,12 @@ describe('PUT /v1/admin/mailboxes/shares', () => {
     await f.share(a.id, f.member.id);
     const actor = { id: f.admin.id, ip: IP };
     const req = { userIds: [m2.id], items: [{ address: a.address }, { address: b.address }] };
-    const transferRace = beforeBatchWith('DELETE FROM mailbox_shares', async () => {
+    const transferRace = beforeStatement(env, /DELETE FROM mailbox_shares/, async () => {
       await db.update(mailboxes).set({ userId: f.target.id }).where(eq(mailboxes.id, b.id));
     });
     await expect(adminReplaceShares(transferRace, actor, req, 'tag')).rejects.toMatchObject({ code: 'conflict' });
     await db.update(mailboxes).set({ userId: f.owner.id }).where(eq(mailboxes.id, b.id));
-    const disableRace = beforeBatchWith('DELETE FROM mailbox_shares', async () => {
+    const disableRace = beforeStatement(env, /DELETE FROM mailbox_shares/, async () => {
       await db.update(users).set({ status: 'disabled' }).where(eq(users.id, m2.id));
     });
     await expect(adminReplaceShares(disableRace, actor, req, 'tag')).rejects.toMatchObject({ code: 'conflict' });

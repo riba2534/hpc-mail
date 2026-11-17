@@ -1,6 +1,5 @@
 import { env } from 'cloudflare:test';
 import { eq, sql } from 'drizzle-orm';
-import type { MessageAuth } from '@hpc-mail/shared';
 import { describe, expect, it } from 'vitest';
 import { createDb } from '../src/db/client.js';
 import { claudeAddressFacts, mailboxes, messages, users } from '../src/db/schema.js';
@@ -8,6 +7,7 @@ import { harvestRecentClaudeFacts, harvestSql } from '../src/services/claude-fac
 import { releaseMailbox } from '../src/services/mailbox.js';
 import { purgeMatchingMessages } from '../src/services/message-lifecycle.js';
 import { runScheduled } from '../src/services/scheduled.js';
+import { receiveSigned as receive, signedBy } from './support/claude-mail.js';
 
 const db = createDb(env);
 const HOUR = 60 * 60 * 1000;
@@ -16,20 +16,6 @@ let sequence = 0;
 /** 同一文件内用例共享 D1：每个用例用独立域名 */
 function domainOf() {
   return `facts-${++sequence}.test`;
-}
-
-/** 收件时 Cloudflare 判定 DKIM 通过、签名域即发件域的认证结果（真实官方来信的样子） */
-function signedBy(fromAddress: string, overrides: Partial<MessageAuth> = {}): MessageAuth {
-  const domain = fromAddress.slice(fromAddress.lastIndexOf('@') + 1).toLowerCase();
-  return { spf: 'pass', dkim: 'pass', dkimDomain: domain, dmarc: 'pass', aligned: true, ...overrides };
-}
-
-/** 默认是通过认证、To 头即收件地址的来信；extra 可覆盖 auth 与 recipients */
-async function receive(address: string, fromAddress: string, subject: string, extra: Partial<typeof messages.$inferInsert> = {}) {
-  return (await db.insert(messages).values({
-    address, domain: address.split('@')[1]!, direction: 'inbound', status: 'received', fromAddress, subject,
-    auth: signedBy(fromAddress), recipients: { to: [address], cc: [], bcc: [] }, ...extra,
-  }).returning().get())!;
 }
 
 async function factsOf(domain: string) {

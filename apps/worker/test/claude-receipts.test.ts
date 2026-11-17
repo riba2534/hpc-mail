@@ -1,5 +1,5 @@
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
-import type { ClaudeAddressFacts, ClaudeDomainFacts, MessageAuth } from '@hpc-mail/shared';
+import type { ClaudeAddressFacts, ClaudeDomainFacts } from '@hpc-mail/shared';
 import { inArray, sql } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
@@ -17,7 +17,7 @@ import { releaseMailbox } from '../src/services/mailbox.js';
 import { purgeMatchingMessages } from '../src/services/message-lifecycle.js';
 import { runScheduled } from '../src/services/scheduled.js';
 import { updateSettings } from '../src/services/setting.js';
-import { grantLegacyAdminScope } from './key-helpers.js';
+import { receiveSigned, signedBy } from './support/claude-mail.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -41,20 +41,9 @@ function domainOf() {
   return `receipts-${++sequence}.test`;
 }
 
-function signedBy(fromAddress: string, overrides: Partial<MessageAuth> = {}): MessageAuth {
-  const domain = fromAddress.slice(fromAddress.lastIndexOf('@') + 1).toLowerCase();
-  return { spf: 'pass', dkim: 'pass', dkimDomain: domain, dmarc: 'pass', aligned: true, ...overrides };
-}
-
 /** 默认是通过认证、To 头即收件地址的官方收据 */
-async function receive(address: string, extra: Partial<typeof messages.$inferInsert> = {}) {
-  const fromAddress = extra.fromAddress ?? INVOICE;
-  return (await db.insert(messages).values({
-    address, domain: address.split('@')[1]!, direction: 'inbound', status: 'received', fromAddress,
-    subject: 'Your receipt from Anthropic, PBC #2002-6773-4161', bodyText: SAMPLE,
-    auth: signedBy(fromAddress), recipients: { to: [address], cc: [], bcc: [] }, ...extra,
-  }).returning().get())!;
-}
+const receive = (address: string, extra: Partial<typeof messages.$inferInsert> = {}) =>
+  receiveSigned(address, extra.fromAddress ?? INVOICE, 'Your receipt from Anthropic, PBC #2002-6773-4161', { bodyText: SAMPLE, ...extra });
 
 async function receiptsOf(messageIds: number[]) {
   const rows = await db.select().from(claudeReceipts).where(inArray(claudeReceipts.messageId, messageIds)).all();
@@ -269,9 +258,7 @@ describe('/v1/admin/claude 查询', () => {
     await updateSettings(env, { api: { enabled: true } });
     const admin = (await db.insert(users).values({ username: `receipts-admin-${++sequence}`, role: 'admin', passwordHash: 'x', authVersionMigrated: true })
       .returning().get())!;
-    const created = await createApiKey(env, admin.id, { name: 'ops', scopes: ['mail.read'], allowedIps: [], rateLimit: 600 });
-    await grantLegacyAdminScope(env, created.id);
-    return created.key;
+    return (await createApiKey(env, admin.id, { name: 'ops', scopes: ['mail.read', 'admin'], allowedIps: [], rateLimit: 600 })).key;
   }
 
   async function get<T>(key: string, path: string, status = 200): Promise<T> {
