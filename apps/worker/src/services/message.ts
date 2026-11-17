@@ -680,13 +680,14 @@ export async function findNextMessage(
     if (input.include === 'body') {
       // 两次读取之间被删除、移入回收站或失去可见性（共享撤销、释放、过户）的不再以详情返回：
       // 它已不在等待范围内，游标越过它继续往后找
-      const [[full], attRows, starRows] = await db.batch([
-        db.select().from(messages).where(and(eq(messages.id, row.id), eq(messages.direction, 'inbound'), isNull(messages.deletedAt), ...visible)),
-        ...detailExtras(db, viewer.userId, row.id),
+      const [[full], attRows] = await db.batch([
+        db.select({ ...messageColumns, isStarred: starredColumn(viewer.userId) }).from(messages)
+          .where(and(eq(messages.id, row.id), eq(messages.direction, 'inbound'), isNull(messages.deletedAt), ...visible)),
+        attachmentRowsQuery(db, row.id),
       ]);
       if (!full) { scannedThroughId = row.id; continue; }
       const body = await readMailBody(env, full);
-      return { message: await buildDetail(env, full, body, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
+      return { message: await buildDetail(env, full, body, attRows, full.isStarred, attachmentTtlSeconds), scannedThroughId: row.id };
     }
     return { message: summary, scannedThroughId: row.id };
   }
@@ -1055,12 +1056,9 @@ export async function getMessageContent(
   return { subject: row.subject, ...(await readMailBody(env, row)) };
 }
 
-/** 详情所需的附件全行与当前用户星标，调用方放进同一次 batch */
-function detailExtras(db: Db, userId: number, id: number) {
-  return [
-    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)),
-    db.select({ messageId: stars.messageId }).from(stars).where(and(eq(stars.userId, userId), eq(stars.messageId, id))),
-  ] as const;
+/** 详情所需的附件全行（按 id 有序），调用方与整行（星标随行取回）放进同一次 batch */
+function attachmentRowsQuery(db: Db, id: number) {
+  return db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).orderBy(asc(attachmentsTable.id));
 }
 
 /** 由已确认可见的整行与完整正文（readMailBody）组装详情：附件签名 URL、CID 内联图替换 */
@@ -1150,7 +1148,7 @@ export async function getMessageDetailConditional(
   const [[row], attRows] = await db.batch([
     db.select({ ...messageColumns, ...visibilityColumns(viewer, scope), isStarred: starredColumn(viewer.userId) })
       .from(messages).where(eq(messages.id, id)),
-    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).orderBy(asc(attachmentsTable.id)),
+    attachmentRowsQuery(db, id),
   ]);
   if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
   const etag = await detailEtag(env, viewer, row, attRows, row.isStarred, options.attachmentTtlSeconds);
