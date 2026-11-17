@@ -364,8 +364,8 @@ async function buildOutboundMime(
   return foldMimeHeaders(msg.asRaw());
 }
 
-/** Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文 */
-async function sendViaCloudflare(env: Env, fromAddress: string, toAddr: string, raw: string): Promise<void> {
+/** Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文；部署金丝雀也直接复用 */
+export async function sendViaCloudflare(env: Env, fromAddress: string, toAddr: string, raw: string): Promise<void> {
   // 动态 import：`cloudflare:email` 在 vitest workerd 里静态加载会崩
   const { EmailMessage } = await import('cloudflare:email');
   await env.email.send(new EmailMessage(fromAddress, toAddr, raw));

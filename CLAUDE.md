@@ -80,10 +80,14 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 ## 部署
 
-单 workflow `.github/workflows/deploy.yml`，**push 到 `main` 自动触发**（改 `apps/**`/`packages/**`/workflow）。流程：参数校验 → 全量 test+typecheck+audit → web 构建（禁 sourcemap）→ 拷进 worker → wrangler dry-run →（仅 workflow_dispatch 勾 `reset_database`）清库 → `d1 migrations apply` → deploy → `wrangler secret put` → 迁移完整性校验 → `seed-admin.mjs`（幂等引导 admin）→ 线上冒烟。
+单 workflow `.github/workflows/deploy.yml`，**push 到 `main` 自动触发**（改 `apps/**`/`packages/**`/workflow）。流程：参数校验并屏蔽日志里的账户/D1/KV id 与管理员用户名 → 全量 test+typecheck+audit 与部署脚本自测 → web 构建（禁 sourcemap）→ 拷进 worker → wrangler dry-run → **记录回滚基线**（D1 Time Travel 书签、当前线上版本 id 与 build）→ `d1 migrations apply` → 迁移完整性校验 → `seed-admin.mjs` 与 `seed-smoke.mjs`（幂等）→ `wrangler deploy --secrets-file`（代码与 secrets 同一个版本）→ 等 `X-HPC-Build` 生效 → 线上冒烟 → **收件金丝雀**（经真实 MX 投递并由新版 email handler 识别）→ **新版 cron 心跳**。部署之后任一步失败自动 `wrangler rollback` 到基线版本（迁移只增不改、不回滚），细节见 `docs/ROLLBACK.md`。生产流水线没有清库开关。
+
+- **冒烟账号 `ci-smoke`**：普通用户，密码由 `JWT_SECRET` 派生（不新增 secret），`RESERVED_USERNAMES` 禁止注册与管理员创建。管理员开启两步验证后冒烟自动跳过管理员步骤、只做用户级检查，所以管理员可以绑定 TOTP。
+- **金丝雀与心跳端点**：`/api/internal/canary`、`/api/internal/canary/:nonce`、`/api/internal/health`，令牌为 `HMAC-SHA256(jwt_secret, "hpc-canary-v1")`，错误或缺失令牌一律 404，不进 OpenAPI。金丝雀信带签名头 `X-HPC-Canary`，email handler 识别后只写 KV、不落库。金丝雀**显式启用**：只有设置了 Variable `CANARY_FROM_DOMAIN`/`CANARY_TO_DOMAIN`（或 `DEPLOY_CANARY=on`）才执行，否则跳过；cron 心跳检查始终执行。管理员开 2FA 或 CI 里的管理员密码与线上不一致时，冒烟只告警并跳过管理员检查；配置可选 Secret `ADMIN_TOTP_SECRET` 可保住管理员检查。
+- **迁移规约**（`check-migrations.mjs` 在 worker test 脚本里执行）：自动回滚只回滚 Worker、不回滚迁移，所以迁移必须向后兼容——禁止 DROP TABLE、DROP COLUMN、RENAME、任意表的 `__new_` 整表重建，以及 DROP 仍被 `INDEXED BY` 引用的索引。改索引先加新索引并切换代码，下个版本再删旧的。
 
 - **`seed-admin.mjs` 不写死域名**（保持「不假定域名」）。清库重建后需**运维层用 API 把现有域名写回 `settings.domains`**，否则站点无可用域名。
-- **Cloudflare 资源 ID 不入库**（开源要求）：`wrangler.toml` 用 `__D1_DATABASE_ID__`/`__KV_NAMESPACE_ID__`/`__CUSTOM_DOMAIN__` 占位符，CI 部署前从 GitHub Variables（另有 `CLOUDFLARE_ACCOUNT_ID` 走环境变量）注入真实值；`wrangler.test.toml` 用全零假 ID（miniflare 纯本地模拟）。secrets（jwt_secret 等）经 CI `wrangler secret put` 注入。别把真实 ID 写回任何被追踪文件。
+- **Cloudflare 资源 ID 不入库**（开源要求）：`wrangler.toml` 用 `__D1_DATABASE_ID__`/`__KV_NAMESPACE_ID__`/`__CUSTOM_DOMAIN__` 占位符，CI 部署前从 GitHub Variables（另有 `CLOUDFLARE_ACCOUNT_ID` 走环境变量）注入真实值；`wrangler.test.toml` 用全零假 ID（miniflare 纯本地模拟）。secrets（jwt_secret 等）由 CI 写入临时 secrets 文件、随 `wrangler deploy --secrets-file` 与代码同一版本发布。别把真实 ID 写回任何被追踪文件。
 - 部署验证优先用真实 API / 真实浏览器 / 真实邮件（`~/.claude/skills/send-email` 发外部信、agent-browser 驱动 UI），别只靠单测——交付标准是线上成品可用。
 
 ## AI Agent 操作指南 `/skill.md`

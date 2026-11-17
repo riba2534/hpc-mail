@@ -17,6 +17,7 @@ import avatar from './routes/avatar.js';
 import config from './routes/config.js';
 import domains from './routes/domains.js';
 import hostedDomains from './routes/hosted-domains.js';
+import internal from './routes/internal.js';
 import mailboxes from './routes/mailboxes.js';
 import messages from './routes/messages.js';
 import notifyPrefs from './routes/notify-prefs.js';
@@ -56,6 +57,7 @@ export function createApp() {
   api.route('/admin/invites', adminInvites);
   api.route('/admin/api-keys', adminApiKeys);
   api.route('/admin/audit-logs', adminAudit);
+  api.route('/internal', internal);
 
   app.route('/api', api);
   app.route('/v1', v1);

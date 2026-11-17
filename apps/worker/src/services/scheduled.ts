@@ -19,6 +19,7 @@ import {
   HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
 } from './hosted-domain.js';
 import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
+import { CANARY_RATE_SCOPE, writeCronHeartbeat } from './ops-probe.js';
 import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
@@ -159,13 +160,15 @@ async function step(report: StepReport[], name: string, task: () => Promise<numb
  * 每 5 分钟（maintenance=false）：通知补录与投递、清理台账；
  * 每日（maintenance=true）：审计日志 90 天 + 过期限流窗口 + 邮件保留策略。
  * 16:00 两个 cron 同时触发，每日那次只跑维护步骤，常规步骤由同时刻的 5 分钟 cron 负责，不重复执行。
+ * 每次结束检查 cron 心跳，build 变化才写（含失败步骤），供部署后确认 scheduled 已在新版本上运行。
  */
-export async function runScheduled(env: Env, maintenance = true): Promise<void> {
+export async function runScheduled(env: Env, maintenance = true, cron = maintenance ? 'maintenance' : 'regular'): Promise<void> {
   const started = Date.now();
   const report: StepReport[] = [];
   if (maintenance) await runMaintenance(env, report);
   else await runRegular(env, report);
   console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
+  await writeCronHeartbeat(env, cron, report.filter((item) => item.failed).map((item) => item.step));
 }
 
 async function runRegular(env: Env, report: StepReport[]): Promise<void> {
@@ -241,6 +244,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
+      CANARY_RATE_SCOPE,
     ], minuteWindow(1) - 120);
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);

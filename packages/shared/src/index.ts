@@ -12,3 +12,4 @@ export * from './schemas/notify-prefs.js';
 export * from './schemas/audit.js';
 export * from './schemas/hosted-domain.js';
 export * from './schemas/hosted-dns.js';
+export * from './schemas/ops.js';
