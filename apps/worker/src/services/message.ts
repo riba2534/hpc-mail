@@ -324,7 +324,7 @@ function addressCountAtMost(db: Db, ownerId: number, access: ScopeAccess, domain
     .where(and(eq(mailboxes.userId, ownerId), domain === undefined ? undefined : eq(mailboxes.domain, domain)));
   const set = access === 'owned' ? owned.limit(max + 1) : unionAll(owned, db.select({ one: sql`1` }).from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
-    .where(and(eq(mailboxShares.userId, ownerId), domain === undefined ? undefined : sql`+${mailboxes.domain} = ${domain}`)))
+    .where(and(eq(mailboxShares.userId, ownerId), mailboxOnDomain(domain))))
     .limit(max + 1);
   return sql`(SELECT count(*) FROM ${set}) <= ${max}`;
 }
@@ -406,11 +406,19 @@ export async function loadMessageSummary(env: Env, messageId: number): Promise<M
  */
 function flagColumns(userId: number) {
   return {
-    hasAttachments: sql<boolean>`EXISTS (SELECT 1 FROM attachments AS flag_att
-      WHERE flag_att.message_id = "messages"."id" AND NOT (flag_att.disposition = 'inline' AND flag_att.content_id <> ''))`
-      .mapWith(Boolean),
+    hasAttachments: sql<boolean>`${attachmentExists('flag_att')}`.mapWith(Boolean),
     isStarred: starredColumn(userId),
   };
+}
+
+/**
+ * 邮件有算作附件的附件行：COUNTS_AS_ATTACHMENT 的手写形式（内嵌图不算附件），标记列与 hasAttachments 筛选共用。
+ * 外层写全限定名、内层用别名，原因见上；别名按用途区分，EXPLAIN 回归据此分辨是哪一处走了索引。
+ */
+function attachmentExists(alias: 'flag_att' | 'filter_att'): SQL {
+  const att = sql.raw(alias);
+  return sql`EXISTS (SELECT 1 FROM attachments AS ${att}
+    WHERE ${att}.message_id = "messages"."id" AND NOT (${att}.disposition = 'inline' AND ${att}.content_id <> ''))`;
 }
 
 /**
@@ -465,11 +473,8 @@ function listFilterConditions(query: ListMessagesQuery): SQL[] {
     conds.push(sql`((${messages.direction} = 'inbound' and ${inboundAddress}) or ${inRecipients})`);
   }
   if (query.hasCode) conds.push(sql`${messages.verificationCode} <> ''`);
-  if (query.hasAttachments) {
-    // 与列表 hasAttachments（flagColumns）同一口径：带 Content-ID 的内联图不算附件
-    conds.push(sql`exists (select 1 from attachments as filter_att where filter_att.message_id = ${messages.id}
-      and not (filter_att.disposition = 'inline' and filter_att.content_id <> ''))`);
-  }
+  // 与列表 hasAttachments（flagColumns）同一口径：带 Content-ID 的内联图不算附件
+  if (query.hasAttachments) conds.push(attachmentExists('filter_att'));
   return conds;
 }
 
@@ -970,17 +975,8 @@ export async function loadSourceContent(
   unavailableMessage: string,
   source: 'reply' | 'forward',
 ): Promise<MessageRow> {
-  const db = createDb(env);
-  const viewer: Viewer = { userId: sender.userId, role: sender.role };
-  const scope = resolveScope(viewer);
-  const row = await db
-    .select({ ...messageColumns, ...visibilityColumns(viewer, scope) })
-    .from(messages)
-    .where(eq(messages.id, id))
-    .get();
-  if (!row || !isVisible(viewer, scope, row, row)) {
-    throw new AppError('source_unavailable', unavailableMessage, { details: { source } });
-  }
+  const row = await loadVisible(env, { userId: sender.userId, role: sender.role }, id,
+    () => new AppError('source_unavailable', unavailableMessage, { details: { source } }));
   return { ...row, ...(await readMailBody(env, row)) };
 }
 
@@ -996,22 +992,21 @@ function starredColumn(userId: number) {
     WHERE flag_star.user_id = ${userId} AND flag_star.message_id = "messages"."id")`.mapWith(Boolean);
 }
 
-/** 线程行：摘要列 + 邮件头 + 附件与星标标记；附件口径同 COUNTS_AS_ATTACHMENT（内嵌图不算附件） */
+/** 线程行：摘要列 + 邮件头 + 附件与星标标记（同列表，见 flagColumns） */
 function threadColumns(userId: number) {
-  return {
-    ...threadSelection,
-    hasAttachments: sql<boolean>`EXISTS (SELECT 1 FROM attachments AS flag_att
-      WHERE flag_att.message_id = "messages"."id" AND NOT (flag_att.disposition = 'inline' AND flag_att.content_id <> ''))`
-      .mapWith(Boolean),
-    isStarred: starredColumn(userId),
-  };
+  return { ...threadSelection, ...flagColumns(userId) };
 }
 
 /**
- * 取一封可见邮件的整行（含正文）与可见性事实，一次往返；不可见与不存在同为 not_found。
- * 翻译等只需要文字内容的读取用它。
+ * 取一封可见邮件的整行（D1 正文列）与可见性事实，一次往返；不可见与不存在抛同一个错误（默认 not_found）。
+ * 翻译、回复/转发的来源邮件等需要文字内容的读取用它，完整正文另经 readMailBody。
  */
-async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
+async function loadVisible(
+  env: Env,
+  viewer: Viewer,
+  id: number,
+  unavailable: () => AppError = () => new AppError('not_found', '邮件不存在'),
+): Promise<MessageRow> {
   const db = createDb(env);
   const scope = resolveScope(viewer);
   const row = await db
@@ -1019,7 +1014,7 @@ async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<Messag
     .from(messages)
     .where(eq(messages.id, id))
     .get();
-  if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
+  if (!row || !isVisible(viewer, scope, row, row)) throw unavailable();
   return row;
 }
 
