@@ -9,9 +9,8 @@ import { signToken } from '../src/lib/jwt.js';
 import { TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
-import {
-  fetchUrlAttachments, isForbiddenAddress, parseIPv6,
-} from '../src/services/url-attachment.js';
+import { isForbiddenAddress, parseIPv6 } from '../src/lib/ssrf.js';
+import { fetchUrlAttachments } from '../src/services/url-attachment.js';
 import type { Env } from '../src/types.js';
 
 const app = createApp();

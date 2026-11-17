@@ -7,6 +7,8 @@ import {
   type UrlAttachment,
 } from '@hpc-mail/shared';
 import { AppError } from '../lib/errors.js';
+import { dohAnswers, dohQuery, RR } from '../lib/public-dns.js';
+import { isForbiddenAddress, isInternalHostname, parseIPv4 } from '../lib/ssrf.js';
 import type { Env } from '../types.js';
 import { attachmentDisposition, type StoredAttachment } from './outbound.js';
 import { consumeDraftAttachments, draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment } from './upload.js';
@@ -27,7 +29,6 @@ export interface UrlFetchOptions {
   timeoutMs?: number;
 }
 
-const DOH_ENDPOINT = 'https://cloudflare-dns.com/dns-query';
 const USER_AGENT = 'HPC-Mail-Attachment-Fetcher/1.0';
 
 const FORBIDDEN_FIX = '只能引用公网可访问的 https 地址；内网或本站的文件先下载，再用 POST /v1/uploads（网页会话用 /api/uploads）上传后写进 attachmentTokens';
@@ -45,85 +46,7 @@ function fetchFailed(url: string, reason: string): AppError {
   });
 }
 
-// ---------- IP 地址判定（纯函数，导出供单测） ----------
-
-/** 点分十进制 IPv4 → 4 个八位组；不是严格的点分十进制返回 null（URL 解析器已把 0x7f.1 等写法规范成点分十进制） */
-export function parseIPv4(value: string): number[] | null {
-  const parts = value.split('.');
-  if (parts.length !== 4) return null;
-  const octets = parts.map((part) => (/^\d{1,3}$/.test(part) ? Number(part) : NaN));
-  return octets.every((octet) => Number.isInteger(octet) && octet <= 255) ? octets : null;
-}
-
-/** 内网、回环、链路本地（含云元数据 169.254.169.254）、CGNAT、保留、文档、基准测试、组播与广播网段 */
-export function isForbiddenIPv4(octets: number[]): boolean {
-  const [a = 0, b = 0, c = 0] = octets;
-  return a === 0 || a === 10 || a === 127 || a >= 224
-    || (a === 100 && b >= 64 && b <= 127)
-    || (a === 169 && b === 254)
-    || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && b === 0 && (c === 0 || c === 2))
-    || (a === 192 && b === 88 && c === 99)
-    || (a === 192 && b === 168)
-    || (a === 198 && (b === 18 || b === 19))
-    || (a === 198 && b === 51 && c === 100)
-    || (a === 203 && b === 0 && c === 113);
-}
-
-/** IPv6 文本（可带方括号、可含末尾点分 IPv4）→ 8 个 16 位组；非法返回 null */
-export function parseIPv6(value: string): number[] | null {
-  let text = value.replace(/^\[|\]$/g, '').toLowerCase();
-  if (text.includes('%')) return null; // 带 zone id 的链路本地地址
-  const tail: number[] = [];
-  const v4Match = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text);
-  if (v4Match) {
-    const v4 = parseIPv4(v4Match[2]!);
-    if (!v4) return null;
-    tail.push((v4[0]! << 8) | v4[1]!, (v4[2]! << 8) | v4[3]!);
-    text = v4Match[1]!.endsWith('::') ? v4Match[1]! : v4Match[1]!.slice(0, -1);
-  }
-  const halves = text.split('::');
-  if (halves.length > 2) return null;
-  const parse = (part: string) => (part === '' ? [] : part.split(':').map((group) => (/^[0-9a-f]{1,4}$/.test(group) ? parseInt(group, 16) : NaN)));
-  const head = parse(halves[0]!);
-  const rest = halves.length === 2 ? parse(halves[1]!) : [];
-  if ([...head, ...rest].some((group) => Number.isNaN(group))) return null;
-  const explicit = head.length + rest.length + tail.length;
-  if (halves.length === 1 ? explicit !== 8 : explicit > 7) return null;
-  return [...head, ...Array(8 - explicit).fill(0), ...rest, ...tail];
-}
-
-/**
- * 只放行全球单播 2000::/3 中的公网段；IPv4 映射（::ffff:0:0/96）、IPv4 兼容（::/96）、NAT64（64:ff9b::/96）
- * 与 6to4（2002::/16）按其中嵌入的 IPv4 判断。Teredo、ORCHID 等 2001::/23 协议段与文档段 2001:db8::/32 一律拒绝。
- */
-export function isForbiddenIPv6(groups: number[]): boolean {
-  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups as [number, number, number, number, number, number, number, number];
-  const embedded = (hi: number, lo: number) => isForbiddenIPv4([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff]);
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0) {
-    if (g5 === 0xffff) return embedded(g6, g7);
-    if (g5 === 0) return (g6 === 0 && g7 <= 1) || embedded(g6, g7);
-    return true;
-  }
-  if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) return embedded(g6, g7);
-  if (g0 === 0x2002) return embedded(g1, g2);
-  if ((g0 & 0xe000) !== 0x2000) return true;
-  if (g0 === 0x2001 && g1 < 0x0200) return true;
-  if (g0 === 0x2001 && g1 === 0x0db8) return true;
-  return false;
-}
-
-/** IP 文本落在禁止网段（或无法解析）时为 true */
-export function isForbiddenAddress(ip: string): boolean {
-  const v4 = parseIPv4(ip);
-  if (v4) return isForbiddenIPv4(v4);
-  const v6 = parseIPv6(ip);
-  return v6 ? isForbiddenIPv6(v6) : true;
-}
-
 // ---------- URL 与主机检查 ----------
-
-const BLOCKED_SUFFIXES = ['.localhost', '.local', '.internal', '.home.arpa', '.lan', '.intranet'];
 
 /** 协议、账号密码、端口与主机名的静态检查；返回规范化的主机名（IPv6 去方括号） */
 function checkUrl(url: URL, selfHosts: string[]): string {
@@ -132,25 +55,17 @@ function checkUrl(url: URL, selfHosts: string[]): string {
   if (url.username || url.password) throw forbidden(shown, '地址里不能带账号密码');
   if (url.port && url.port !== '443') throw forbidden(shown, '只允许默认端口 443');
   const host = url.hostname.toLowerCase().replace(/\.$/, '');
-  if (host.startsWith('[')) {
+  if (host.startsWith('[') || parseIPv4(host)) {
     if (isForbiddenAddress(host)) throw forbidden(shown, '内网、回环、链路本地或保留地址');
-    return host.slice(1, -1);
+    return host.replace(/^\[|\]$/g, '');
   }
-  if (parseIPv4(host)) {
-    if (isForbiddenAddress(host)) throw forbidden(shown, '内网、回环、链路本地或保留地址');
-    return host;
-  }
-  if (!host.includes('.') || host === 'localhost' || BLOCKED_SUFFIXES.some((suffix) => host.endsWith(suffix))) {
-    throw forbidden(shown, '内网主机名');
-  }
+  if (isInternalHostname(host)) throw forbidden(shown, '内网主机名');
   for (const self of selfHosts) {
     const name = self.toLowerCase().replace(/\.$/, '');
     if (name && (host === name || host.endsWith(`.${name}`))) throw forbidden(shown, '不能引用本站自身的地址');
   }
   return host;
 }
-
-interface DohAnswer { type: number; data: string }
 
 /** 单个附件的拉取时限：DNS、每一跳请求与读取内容共用 */
 interface Deadline { signal: AbortSignal; message: string }
@@ -163,13 +78,9 @@ interface Deadline { signal: AbortSignal; message: string }
 async function assertPublicHost(host: string, shown: string, deadline: Deadline): Promise<void> {
   const { signal } = deadline;
   if (parseIPv4(host) || host.includes(':')) return; // IP 字面量已在 checkUrl 判定
-  const lookups = await Promise.all([1, 28].map(async (type) => {
+  const lookups = await Promise.all([RR.A, RR.AAAA].map(async (type) => {
     try {
-      const response = await fetch(`${DOH_ENDPOINT}?name=${encodeURIComponent(host)}&type=${type}`, {
-        headers: { accept: 'application/dns-json' }, signal,
-      });
-      if (!response.ok) return null;
-      return await response.json() as { Status?: number; Answer?: DohAnswer[] };
+      return dohAnswers(await dohQuery(host, type, signal), type);
     } catch (error) {
       if (signal.aborted) throw fetchFailed(shown, deadline.message);
       console.error('附件地址 DNS 解析失败:', error);
@@ -177,8 +88,7 @@ async function assertPublicHost(host: string, shown: string, deadline: Deadline)
     }
   }));
   if (lookups.every((lookup) => lookup === null)) throw fetchFailed(shown, 'DNS 解析失败');
-  const addresses = lookups.flatMap((lookup) => (lookup?.Answer ?? []).filter((answer) => answer.type === 1 || answer.type === 28)
-    .map((answer) => answer.data.trim()));
+  const addresses = lookups.flatMap((lookup) => (lookup ?? []).map((data) => data.trim()));
   if (!addresses.length) throw fetchFailed(shown, '域名解析不到任何地址');
   if (addresses.some(isForbiddenAddress)) throw forbidden(shown, '域名解析到内网、回环、链路本地或保留地址');
 }

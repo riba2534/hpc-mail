@@ -11,6 +11,7 @@ import {
   type SystemDomainVerdict, type SystemDomainWriteStep,
 } from '@hpc-mail/shared';
 import type { OnboardingAcceptance, OnboardingChangeEvent } from '../db/schema.js';
+import { dohAnswers, dohQuery, PUBLIC_LOOKUP_TIMEOUT_MS, rdapDomain, RR } from '../lib/public-dns.js';
 import { CF_SPF_INCLUDE, decodeTxtContent, isSpfContent, mergeCloudflareSpf } from '../lib/spf.js';
 import {
   CloudflareApiError, createSendingSubdomain, deleteDnsRecord, enableRouting, getCatchAll, getDnsRecord, getRouting, getSendingDnsStatus,
@@ -879,13 +880,12 @@ async function readSnapshot(
 // RDAP 与 DNSSEC（只作提示，失败一律是「未知」）
 
 const RDAP_BOOTSTRAP = 'https://data.iana.org/rdap/dns.json';
-const RDAP_TIMEOUT_MS = 5000;
 const RDAP_BOOTSTRAP_TTL_MS = 24 * 60 * 60 * 1000;
 let rdapBootstrap: { services: [string[], string[]][]; expiresAt: number } | null = null;
 
 async function rdapBaseFor(tld: string): Promise<string | null> {
   if (!rdapBootstrap || rdapBootstrap.expiresAt <= Date.now()) {
-    const res = await fetch(RDAP_BOOTSTRAP, { signal: AbortSignal.timeout(RDAP_TIMEOUT_MS) });
+    const res = await fetch(RDAP_BOOTSTRAP, { signal: AbortSignal.timeout(PUBLIC_LOOKUP_TIMEOUT_MS) });
     if (!res.ok) return null;
     const body = await res.json() as { services?: [string[], string[]][] };
     rdapBootstrap = { services: body.services ?? [], expiresAt: Date.now() + RDAP_BOOTSTRAP_TTL_MS };
@@ -903,12 +903,8 @@ export async function lookupRegistrar(domain: string): Promise<SystemDomainRegis
     const tld = domain.toLowerCase().split('.').pop() ?? '';
     const base = await rdapBaseFor(tld);
     if (!base) return unknown;
-    const res = await fetch(`${base.replace(/\/?$/, '/')}domain/${encodeURIComponent(domain)}`, {
-      headers: { accept: 'application/rdap+json' }, signal: AbortSignal.timeout(RDAP_TIMEOUT_MS),
-    });
-    if (!res.ok) return unknown;
-    const body = await res.json() as { entities?: RdapEntity[] };
-    const registrar = body.entities?.find((entity) => entity.roles?.includes('registrar'));
+    const body = await rdapDomain<{ entities?: RdapEntity[] }>(base, domain);
+    const registrar = body?.entities?.find((entity) => entity.roles?.includes('registrar'));
     const fn = registrar?.vcardArray?.[1]?.find((field) => field[0] === 'fn')?.[3];
     if (typeof fn !== 'string' || !fn.trim()) return unknown;
     return { name: fn.trim(), cloudflare: /cloudflare/i.test(fn) };
@@ -920,12 +916,8 @@ export async function lookupRegistrar(domain: string): Promise<SystemDomainRegis
 /** DNSSEC 三态：DoH 查询 DS，NOERROR / NXDOMAIN 为确定结果，其余（SERVFAIL、HTTP 失败、超时）为 unknown */
 export async function dnssecState(domain: string): Promise<DnssecState> {
   try {
-    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=DS`, {
-      headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return 'unknown';
-    const body = await res.json() as { Status?: number; Answer?: { type: number }[] };
-    if (body.Status === 0) return body.Answer?.some((answer) => answer.type === 43) ? 'on' : 'off';
+    const body = await dohQuery(domain, 'DS');
+    if (body.Status === 0) return dohAnswers(body, RR.DS).length ? 'on' : 'off';
     if (body.Status === 3) return 'off';
     return 'unknown';
   } catch {
