@@ -132,14 +132,16 @@ async function releaseLoginAttempt(env: Env, counters: LoginCounters): Promise<v
 /**
  * 登录成功：(用户名|IP) 维度清零，IP 维度只退回本次占位——之前的失败照算，
  * 否则用自己的账号登录一次就能清空 IP 维度，再对其他用户名继续猜。
+ * 与记录本次登录时间和 IP 合进同一个 batch。
  */
-async function settleLoginSuccess(env: Env, counters: LoginCounters): Promise<void> {
+async function settleLoginSuccess(env: Env, counters: LoginCounters, userId: number, clientIp: string): Promise<void> {
   const { pair, ip } = counters;
   await env.db.batch([
     // 置回 0 而不是删行（清理任务会按窗口回收）
     env.db.prepare('UPDATE rate_counters SET count = 0 WHERE scope = ? AND subject = ? AND "window" = ?')
       .bind(pair.scope, pair.subject, pair.window),
     counterStatement(env, ip.scope, ip.subject, ip.window, -1),
+    env.db.prepare('UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?').bind(Date.now(), clientIp, userId),
   ]);
 }
 
@@ -251,12 +253,8 @@ export async function login(
     if (!wrongGuess) await releaseLoginAttempt(env, counters);
     throw error;
   }
-  await settleLoginSuccess(env, counters);
   const previousIp = user.lastLoginIp;
-  await db
-    .update(users)
-    .set({ lastLoginAt: new Date(), lastLoginIp: ip })
-    .where(eq(users.id, user.id));
+  await settleLoginSuccess(env, counters, user.id, ip);
 
   // 新 IP 登录飞书告警：与上次登录 IP 不同则异步推送（走登录用户自己的个人飞书，不阻塞登录）
   if (ctx && previousIp && previousIp !== ip) {
