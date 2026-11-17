@@ -106,7 +106,7 @@ export function checkCustomHeaders(input: Record<string, string>): CustomHeaderC
       reasons.push(`${name}：名称需为 1–${MAX_CUSTOM_HEADER_NAME_LENGTH} 位 ASCII，不能含空格或冒号`);
     } else if (X_HEADER.test(name)) {
       normalized.push([`X-${name.slice(2)}`, value, name]);
-    } else if (API_FIELD_HEADERS[lower]) {
+    } else if (Object.hasOwn(API_FIELD_HEADERS, lower)) {
       rejected.push(name);
       reasons.push(`${name}：请改用请求字段 ${API_FIELD_HEADERS[lower]}`);
     } else if (PLATFORM_HEADERS.some((header) => header.toLowerCase() === lower) || lower.startsWith('arc-')) {
@@ -135,12 +135,13 @@ export function checkCustomHeaders(input: Record<string, string>): CustomHeaderC
     if (typeof value !== 'string' || value.trim() === '') return fail(original, '值不能为空');
     if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(value)) return fail(original, '值不能包含换行或控制字符');
     if (utf8Bytes(value) > MAX_CUSTOM_HEADER_VALUE_BYTES) return fail(original, `值超过 ${MAX_CUSTOM_HEADER_VALUE_BYTES} 字节`);
-    if (ALLOWED[canonical] && /[^\x20-\x7e\t]/.test(value)) return fail(original, '该头只接受可打印 ASCII');
-    const allowedValues = ENUM_VALUES[canonical];
+    // 查表只认自有属性：canonical 只会是白名单名或 X- 头，这里再防一层原型链上的同名属性
+    if (Object.hasOwn(ALLOWED, canonical) && ALLOWED[canonical] && /[^\x20-\x7e\t]/.test(value)) return fail(original, '该头只接受可打印 ASCII');
+    const allowedValues = Object.hasOwn(ENUM_VALUES, canonical) ? ENUM_VALUES[canonical] : undefined;
     if (allowedValues && !allowedValues.includes(value.trim().toLowerCase())) {
       return fail(original, `只能为 ${allowedValues.join(' / ')}`);
     }
-    const rule = VALUE_PATTERNS[canonical];
+    const rule = Object.hasOwn(VALUE_PATTERNS, canonical) ? VALUE_PATTERNS[canonical] : undefined;
     if (rule && !rule.pattern.test(value.trim())) return fail(original, rule.message);
     if (canonical === 'List-Unsubscribe-Post' && value.trim() !== 'List-Unsubscribe=One-Click') {
       return fail(original, '只能为 List-Unsubscribe=One-Click（区分大小写）');

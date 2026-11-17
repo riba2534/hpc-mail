@@ -15,6 +15,11 @@ export default defineConfig(async () => {
             jwt_secret: 'test-jwt-secret-for-vitest-only-0000000000',
             TEST_MIGRATIONS: migrations,
           },
+          // 只给 rate-limit.test.ts 核对真实 binding 的调用约定；业务 binding（rl_*）在测试里用进程内替身
+          ratelimits: {
+            TEST_RATE_LIMIT_2: { namespace_id: '990002', simple: { limit: 2, period: 60 } },
+            TEST_RATE_LIMIT_1: { namespace_id: '990001', simple: { limit: 1, period: 60 } },
+          },
         },
       }),
     ],
