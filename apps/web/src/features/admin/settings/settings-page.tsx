@@ -124,7 +124,8 @@ function AiModelSection({
   onChange: (updater: (model: AiModelSetting) => void) => void;
 }) {
   const savedKey = saved?.apiKey === SECRET_MASK;
-  const test = useMutation({ mutationFn: testAiModel });
+  // 失败原因在按钮下方就地展示，不再弹提示
+  const test = useMutation({ mutationFn: testAiModel, meta: { errorToast: false } });
   // 表单改动后，旧的测试结果不再代表当前配置
   const tested = test.variables?.baseUrl === value.baseUrl && test.variables.apiKey === value.apiKey && test.variables.model === value.model;
   const insecureUrl = value.baseUrl !== '' && !value.baseUrl.startsWith('https://');

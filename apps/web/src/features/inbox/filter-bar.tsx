@@ -26,6 +26,9 @@ export interface FilterBarProps {
   onClearFacets?: () => void;
 }
 
+/** 停止输入这么久才发起搜索 */
+const SEARCH_DEBOUNCE_MS = 400;
+
 const UNREAD_OPTIONS = [
   { value: 'all', label: '全部' },
   { value: 'unread', label: '未读' },
@@ -74,16 +77,19 @@ export function FilterBar({
   onClearFacets,
 }: FilterBarProps) {
   const [text, setText] = useState(filters.q);
+  // 输入法组字期间（如拼音尚未选字）不搜索，选字上屏后再按去抖时间触发
+  const [composing, setComposing] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
 
   useEffect(() => setText(filters.q), [filters.q]);
 
   useEffect(() => {
+    if (composing) return;
     const timer = globalThis.setTimeout(() => {
       if (text !== filters.q) onQueryChange(text);
-    }, 250);
+    }, SEARCH_DEBOUNCE_MS);
     return () => globalThis.clearTimeout(timer);
-  }, [text, filters.q, onQueryChange]);
+  }, [text, composing, filters.q, onQueryChange]);
 
   const activeCount =
     (filters.domain ? 1 : 0) + (filters.address ? 1 : 0) + (showUnread && filters.unread ? 1 : 0);
@@ -131,6 +137,11 @@ export function FilterBar({
             aria-label="搜索邮件"
             value={text}
             onChange={(event) => setText(event.target.value)}
+            onCompositionStart={() => setComposing(true)}
+            onCompositionEnd={(event) => {
+              setComposing(false);
+              setText(event.currentTarget.value);
+            }}
             placeholder="搜索主题、发件人、正文…"
             className={cn(inputClassName, 'border-line-strong pl-9 focus:border-accent focus:ring-2 focus:ring-accent/20')}
             {...{ [SEARCH_SHORTCUT_ATTR]: '' }}

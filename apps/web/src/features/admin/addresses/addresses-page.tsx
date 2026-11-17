@@ -60,7 +60,7 @@ function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onC
       invalidateMailboxOwnership(queryClient);
       onClose();
     },
-    onError: () => toast({ title: '释放失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '释放失败' },
   });
 
   return (

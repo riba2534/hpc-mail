@@ -57,7 +57,7 @@ export function ResetPasswordDialog({ target, onClose }: { target: AdminUser | n
       toast({ title: '密码已重置', variant: 'success' });
       void queryClient.invalidateQueries({ queryKey: queryKeys.admin.users });
     },
-    onError: () => toast({ title: '重置失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '重置失败' },
   });
 
   return (
@@ -282,7 +282,7 @@ export function UsersPage() {
     mutationFn: ({ id, patch }: { id: number; patch: Parameters<typeof adminApi.updateUser>[1] }) =>
       adminApi.updateUser(id, patch),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.admin.users }),
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '更新用户失败' },
   });
 
   const remove = useMutation({
@@ -292,7 +292,7 @@ export function UsersPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.admin.users });
       setDeleting(null);
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '删除失败' },
   });
 
   const [search, setSearch] = useState('');
