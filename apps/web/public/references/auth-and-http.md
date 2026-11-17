@@ -97,12 +97,13 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 | 403 `forbidden`、`user_disabled`、`registration_closed` | 权限/策略/状态阻止；不换身份绕过 |
 | 403 `totp_setup_required` | 见 API 绑定流程 |
 | 404 `not_found` | 资源不存在或不在可见范围；核对 ID/作用域 |
+| 404 `source_unavailable` | 回复或转发引用的原邮件不存在、不可见，或原附件已丢失；去掉 `replyToMessageId`/`forwardAttachmentsFrom` 后可作为新邮件发送 |
 | 409 `address_taken` | 地址被占用；可用性检查只是提示，最终以认领结果为准 |
 | 409 `conflict` | 并发冲突或版本过期：重新读取当前状态再决定 |
 | 409 `send_in_progress` | 同一 Idempotency-Key 的发送仍在处理或结果待确认：查已发送邮件核对，稍后用同一 Key 重试，绝不换 Key 重发 |
 | 409 `idempotency_mismatch` | 该 Idempotency-Key 已用于不同的发信内容：先核对原发送，新内容换新 Key |
 | 413 `payload_too_large` | 核对正文/附件限制，或小上传改分片 |
-| 429 `rate_limited` | 按 reset/消息退避并受总截止时间限制；外发日配额、上传草稿限额、托管域名创建与立即检测的频率限制也会用此码 |
+| 429 `rate_limited` | 按 reset/消息退避并受总截止时间限制。`/v1` 的 message 区分范围：「API 调用频率超限」是这把 Key 超限，「API 调用频率超限（账户级）」是同一用户所有 Key 合计超限，「API 总调用频率超限」是全站繁忙；换 Key 不能绕过账户级限制。外发日配额、上传草稿限额、托管域名添加与立即检测的频率限制也会用此码 |
 | 500 `internal`、网络超时、非 JSON | 读操作可有限退避重试；发送按相同幂等请求查结果，其他变更先读回状态 |
 
 `/v1` 响应可能带 `X-RateLimit-Limit/Remaining/Reset`，Reset 为下一分钟 Unix 秒数。除每 Key 限额，还有用户合计 1200 次/分钟、实例 10000 次/分钟，已超出 Key 或用户限额的请求不计入实例限额；长轮询内部查库按用户额外限 120 次/分钟，不能靠多个 Key 放大。JWT 业务请求也限流（用户 600、实例 5000 次/分钟，超出用户限额的请求同样不计入实例限额）。注册每 IP 10 次/小时，含失败尝试。所有轮询/重试设总体期限，无法确定结果就报告待确认及 requestId。

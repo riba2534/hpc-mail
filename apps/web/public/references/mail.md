@@ -179,7 +179,7 @@ if not matched:
 - 管理员可用任何已认领邮箱的 `mailboxId`；用 `localPart+domain` 时，域名须是系统域名、仍有存量邮箱的旧域名，或托管域名，不检查该地址是否被认领。不能推断任意外部域名可用。
 - 托管域名上的地址（无论谁发）都要求该域发信已开通（`steps.sending` 为 ready），否则 400。系统域名不受此限。
 
-`replyToMessageId` 与 `forwardAttachmentsFrom` 的来源邮件必须对发件人可见：自己认领地址上的邮件，或共享给自己的未删除来信；管理员另可引用未认领地址上的邮件。不存在或不可见一律 404 `not_found`。用 Key 调用时，带这两个字段还需要 `mail.read`，只有 `mail.send` 返回 403。
+`replyToMessageId` 与 `forwardAttachmentsFrom` 的来源邮件必须对发件人可见：自己认领地址上的邮件，或共享给自己的未删除来信；管理员另可引用未认领地址上的邮件。来源不存在或不可见返回 404 `source_unavailable`（message 为「回复的原邮件不存在或不可见」或「转发的原邮件不存在或不可见」），转发时原附件已丢失也返回它（「附件「文件名」已丢失，无法完整转发」）；去掉 `replyToMessageId`/`forwardAttachmentsFrom` 即可作为新邮件发送，丢失的附件需自行重新附上。发件邮箱 `mailboxId` 不存在仍是 404 `not_found`。用 Key 调用时，带这两个字段还需要 `mail.read`，只有 `mail.send` 返回 403。
 
 例子是请求结构，ID/地址/正文必须替换为用户确认的值并安全序列化：
 
