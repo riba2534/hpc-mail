@@ -112,10 +112,14 @@ export interface SendIdentity {
   reason: SendIdentityBlockReason | null;
 }
 
-/** 可用任意前缀发信的域名：目前只有管理员在系统域名上（from 写 localPart+domain 或 "Name <任意前缀@域名>"） */
+/**
+ * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"）：
+ * kind=system 管理员可用的系统域名；kind=hosted 调用者作为所有者、已生效且发信就绪的托管域名，
+ * 发出时自动把该地址认领给所有者（不占全站每人认领上限），成员与共享不适用。
+ */
 export interface SendIdentityDomain {
   domain: string;
-  kind: 'system';
+  kind: 'system' | 'hosted';
   anyLocalPart: true;
 }
 
