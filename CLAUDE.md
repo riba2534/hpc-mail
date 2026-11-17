@@ -76,8 +76,9 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 - **本机当前可运行 workerd 集成测试**（2026-10-05 验证 Node 26 / glibc 2.43）。低版本 glibc 环境需在 CI（ubuntu-latest）运行。worker 测试用独立 `wrangler.test.toml`（去掉 miniflare 无法模拟的 `send_email` binding）。
 - **本地 D1 与线上一样限制单条语句 100 个绑定参数**（`test/d1-param-limit.test.ts` 有哨兵）：满额输入（100 个 id、50 个邀请码等）要有用例走到；drizzle 会把带默认值的列也绑定成参数，多行插入按每行实际参数数分批。
-- **vitest-pool-workers 同一测试文件内的用例共享 D1/KV 存储**，不自动隔离。跨用例造数据要么错开（不同地址/用户名），要么在用例开头显式清空（如 `updateSettings(env, { domains: { list: [] } })`）。这是 db.test.ts 里反复出现的 gotcha。
-- **`apps/worker/.dev.vars` 会被 vitest-pool-workers 读入测试环境**。本地 e2e 往里写真实 `cf_api_token` 后，「没有凭据」类用例会拿到真实凭据而失败；跑 worker 测试前先移走。
+- worker 测试插件是 `@cloudflare/vitest-plugin`（原 vitest-pool-workers）。测试运行时总强开 nodejs_compat，生产靠 wrangler.toml 的 `no_nodejs_compat`/`no_nodejs_compat_v2` 关闭（compatibility_date 2026-08-04 起默认开启），由 `test/compat-config.test.ts` 守护两份 wrangler 配置一致。
+- **同一测试文件内的用例共享 D1/KV 存储**，不自动隔离。跨用例造数据要么错开（不同地址/用户名），要么在用例开头显式清空（如 `updateSettings(env, { domains: { list: [] } })`）。这是 db.test.ts 里反复出现的 gotcha。
+- **`apps/worker/.dev.vars` 会被测试插件读入测试环境**。本地 e2e 往里写真实 `cf_api_token` 后，「没有凭据」类用例会拿到真实凭据而失败；跑 worker 测试前先移走。
 
 ## 部署
 
