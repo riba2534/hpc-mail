@@ -17,6 +17,7 @@ import {
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_TOTAL_BYTES,
   SINGLE_UPLOAD_THRESHOLD_BYTES,
+  type ApiErrorDetails,
   type InternalSendMailRequest,
   type UploadedPart,
   internalSendMailSchema,
@@ -277,7 +278,12 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   }, []);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   // kind 为 reply / forward：回复或转发引用的原邮件已不可用
-  const [sendError, setSendError] = useState<{ message: string; kind: 'uncertain' | 'in_progress' | 'key_mismatch' | 'error' | SendSource } | null>(null);
+  const [sendError, setSendError] = useState<{
+    message: string;
+    kind: 'uncertain' | 'in_progress' | 'key_mismatch' | 'delivery_failed' | 'error' | SendSource;
+    /** delivery_failed：已记录的失败发件与逐收件人原因 */
+    details?: ApiErrorDetails;
+  } | null>(null);
   const [dragging, setDragging] = useState(false);
   // 原邮件已删除或不可见时，用户可以去掉回复关联 / 原邮件附件，再作为新邮件发送
   const [replyToMessageId, setReplyToMessageId] = useState(initial.replyToMessageId);
@@ -462,8 +468,14 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         sendIdempotencyKeyRef.current = null;
         sendPayloadHashRef.current = null;
       }
-      const sessionChanged = err instanceof ApiError && err.code === 'session_changed';
       const message = err instanceof ApiError ? err.message : '发送失败，请重试';
+      if (err instanceof ApiError && err.code === 'delivery_failed') {
+        // 服务端已记下一封全部失败的外发，已发送列表要显示它
+        syncSentMessage(queryClient, { sourceIds: [], selfDelivered: false });
+        setSendError({ message, kind: 'delivery_failed', details: err.details });
+        return;
+      }
+      const sessionChanged = err instanceof ApiError && err.code === 'session_changed';
       const fallback = failure === 'in_progress' || failure === 'key_mismatch' ? failure
         : failure === 'uncertain' && !sessionChanged ? 'uncertain' : 'error';
       setSendError({ message, kind: missingSendSource(err, payload) ?? fallback });
@@ -700,6 +712,9 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       <PageHeader title={title} />
       {recoveredSendPending && <p role="status" className="mb-4 rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
         上次发送结果待确认，可用原内容重试查询；修改内容前请核对已发送邮件。
+      </p>}
+      {(initial.unconfirmed?.length ?? 0) > 0 && <p role="status" className="mb-4 break-words rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
+        这些收件人的投递结果未确认，可能已经收到，没有自动加入：{initial.unconfirmed!.join('、')}。确认对方没收到后再手动添加，避免重复投递。
       </p>}
       <form
         ref={formRef}
@@ -956,6 +971,25 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
                 服务器仍在处理这封邮件，或上次发送的结果尚未确认。请到
                 <Link to="/sent" className="mx-0.5 font-medium text-accent hover:underline">已发送</Link>
                 查看是否已经发出；内容不变时再次点击发送只会查询原结果，不会重复投递，修改内容则会作为一封新邮件发送。
+              </p>
+            </div>
+          ) : sendError.kind === 'delivery_failed' ? (
+            <div role="alert" className="rounded-md border border-critical/40 bg-critical-soft p-3 text-sm text-ink-secondary">
+              <p className="font-medium text-critical">发送失败：所有收件人都没有收到</p>
+              {(sendError.details?.recipientOutcomes?.length ?? 0) > 0 ? (
+                <ul className="mt-1 list-disc pl-4">
+                  {sendError.details!.recipientOutcomes!.map((outcome) => (
+                    <li key={outcome.address} className="break-words">{outcome.address}：{outcome.error || '发送失败'}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-1 break-words">{sendError.message}</p>
+              )}
+              <p className="mt-1">
+                按原因修正后可以再次发送，会作为一封新邮件发出。
+                {sendError.details?.messageId !== undefined && (
+                  <Link to={`/mail/${sendError.details.messageId}`} className="ml-0.5 font-medium text-accent hover:underline">查看失败记录</Link>
+                )}
               </p>
             </div>
           ) : sendError.kind === 'key_mismatch' ? (

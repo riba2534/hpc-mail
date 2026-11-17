@@ -70,4 +70,10 @@ describe('buildReply / buildForward', () => {
     expect(result.bcc).toEqual(['failed-secret@example.com']);
     expect(message.recipients.bcc).toEqual(['failed-secret@example.com']);
   });
+  it('unconfirmed (unknown) recipients may already have the mail: listed, never retried automatically', () => {
+    const message = makeDetail({direction:'outbound',status:'unknown',recipients:{to:['ok@example.com','maybe@example.com'],cc:['failed@example.com'],bcc:[]},recipientOutcomes:[{address:'ok@example.com',status:'sent'},{address:'maybe@example.com',status:'unknown',error:'投递中断，结果未确认'},{address:'failed@example.com',status:'failed',error:'rejected'}]});
+    const retry = buildResend(message,true);
+    expect(retry).toMatchObject({to:[],cc:['failed@example.com'],bcc:[],unconfirmed:['maybe@example.com']});
+    expect(buildResend(message)).not.toHaveProperty('unconfirmed');
+  });
 });
