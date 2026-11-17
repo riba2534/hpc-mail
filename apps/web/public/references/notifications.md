@@ -65,6 +65,6 @@ status 为 `pending|processing|succeeded|failed|skipped|unknown`。pending/proce
 
 飞书/PushDeer 每条最多 3 次自动尝试，失败退避；Webhook 默认 1 次且不自动重试，避免不支持幂等的接收端重复执行。队列/通知失败不回滚已成功收件。新 IP 登录告警按个人飞书/PushDeer 配置发送，是系统事件，并非所有渠道同样适用。
 
-手动 retry 必须是当前用户 job、通道当前 enabled、status 为 failed 或 unknown、messageId 非 null，且 channel 不是 forward。unknown 先核对接收端是否已收到，用户确认需重试时才提交，可能重复通知；已成功/处理中 retry 会拒绝。测试行应调用对应测试接口，forward 应核对收件情况后按用户要求手工转发原邮件，不能 job retry 自动重发。返回 ok 后重新查 health 确认真实投递结果。终结通知记录约 30 天后清理。
+手动 retry 必须是当前用户 job、通道当前 enabled、status 为 failed 或 unknown、messageId 非 null，且 channel 不是 forward。unknown 先核对接收端是否已收到，用户确认需重试时才提交，可能重复通知；已成功/处理中 retry 会拒绝。测试行应调用对应测试接口，forward 应核对收件情况后按用户要求手工转发原邮件，不能 job retry 自动重发。返回 ok 后重新查 health 确认真实投递结果；源邮件已被永久删除时不再推送，任务转为 skipped。邮件永久删除时其通知任务的内容一并清空，已成功或跳过的任务也不保留推送内容。终结通知记录约 30 天后清理。
 
 `health.data.forward` 为 `domainLimit,targetLimit,windowEndsAt,targets:[{address,attempts,remaining}],domains:[{domain,attempts,remaining}]`。当前单收件域 500 次/日、单转发目标 200 次/日，按 UTC 日结算；这是实例共用的尝试计数，其他用户同一目标/域也会占用，不是仅本用户额度，失败尝试也可能消耗。以实时 remaining 与窗口时间为准，不靠改用户/Key/目标规避限额。超限或失败不意味着原邮件没有保存在邮箱，应读取原邮件并报告转发情况。

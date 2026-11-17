@@ -49,7 +49,7 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 
 按 `reason` 决定换前缀、换域名或告知用户额度已满，不要对 quota/domain_quota/daily_limit/domain_limit 反复换前缀重试。检查与认领之间状态仍可能变化，认领可能 403、409 `address_taken` 或域名/用户权限配置冲突。普通用户受系统保留前缀、公共或专属配置中的用户总认领上限和每域认领上限；管理员豁免，0 表示该限额不限。并发冲突刷新域名/邮箱状态后按任务要求重试，不能忽略错误声称认领成功。
 
-显示名最多 64 字符，允许空串清除；不是改地址。普通用户仅可改/释放自己的邮箱，管理员可处理全站邮箱；不能凭“共享给我”修改它。普通用户发件可用自己的 `mailboxId` 或已认领 `localPart+domain`；管理员任意发件仍限服务器认可的系统/保留域。
+显示名最多 64 字符，允许空串清除；不是改地址。普通用户仅可改/释放自己的邮箱，管理员可处理全站邮箱；不能凭“共享给我”修改它。普通用户发件可用自己的 `mailboxId` 或已认领 `localPart+domain`；管理员可用任意已认领邮箱的 `mailboxId`，或在系统域名、仍有存量邮箱的旧域名、托管域名上用 `localPart+domain` 发件。托管域名上的地址都要求该域发信已开通，见[邮件参考](mail.md#发送)。
 
 ## 释放、历史与共享边界
 
@@ -59,7 +59,7 @@ availability 与认领使用同一套规则、同一判定顺序，是瞬时提�
 
 选择动作时复用已有用户意图：只要释放可用默认行为；要求删邮箱及历史时带 deleteHistory。缺失且会影响隐私/保留正确性的关键选择才需要澄清，不能把接口的二选一说明变成每次重复批准流程。结果 `deletedMessages` 是被清除的记录数量；释放不停止域名 catch-all，后来到该地址的新邮件仍可能入库。
 
-所有者可以共享自己认领的邮箱，管理员可以共享全站任意已认领邮箱。共享公开邮箱的**全部现有及未来未删除收件**，不是自共享时刻起的新信，不包括发件或回收站。grantee 可以是启用中的普通用户或管理员，最多 100 人；邮箱所有者已经有访问权，无需加入名单。共享不能当发件身份/回复引用/附件转发来源，不能删除、恢复、purge、重命名或释放邮箱；允许查看详情/线程/附件/raw、设置自己独立的星标。共享邮件的已读状态属于所有者：成员逐封标记计 0、全部已读不包含共享邮件；成员的未读数和 `unread=1` 筛选只统计自己认领的地址。仅被分享人的通知偏好不会因共享自动收到推送，通知按收信时实际 owner 结算。
+所有者可以共享自己认领的邮箱，管理员可以共享全站任意已认领邮箱。共享公开邮箱的**全部现有及未来未删除收件**，不是自共享时刻起的新信，不包括发件或回收站。grantee 可以是启用中的普通用户或管理员，最多 100 人；邮箱所有者已经有访问权，无需加入名单。共享不能当发件身份，不能删除、恢复、purge、重命名或释放邮箱；允许查看详情/线程/附件/raw、设置自己独立的星标，共享来信也可以作为回复（`replyToMessageId`）或附件转发（`forwardAttachmentsFrom`）的来源，发件身份仍须是自己认领的地址。共享邮件的已读状态属于所有者：成员逐封标记计 0、全部已读不包含共享邮件；成员的未读数和 `unread=1` 筛选只统计自己认领的地址。仅被分享人的通知偏好不会因共享自动收到推送，通知按收信时实际 owner 结算。
 
 共享管理 JWT 接口（`/admin` 路径需要管理员）：
 
@@ -94,7 +94,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 先读现值，合并**本次已授权的变更**，带顶层 `expectedDomainsRevision`（读取默认 0），不要把整份陈旧 settings PUT 回去。服务端自动增加 revision。409 时重新 GET 并检查他人变更，再基于新版本合并；不能只改 revision 强行覆盖旧 list。设置请求其他字段可独立更新，不附带 domains 就不会覆盖域名列表。
 
-- 新增域名只是业务配置；不会自动写 DNS、开通 Cloudflare Email Routing、把 catch-all 接到 Worker 或配置外发服务。
+- 新增域名只是业务配置；不会自动写 DNS、开通 Cloudflare Email Routing、把 catch-all 接到 Worker 或配置外发服务。已被用户托管的域名不能加为系统域名，返回 409 `conflict`；反之系统域名也不能被托管。
 - `public:false` 关闭使用公共配置的普通用户的新认领与域名公开列表；专属配置仍可单独授权该域名；已认领邮箱继续存在、可收可发，已有共享不因此撤销。
 - 从 list 删除停止在该域新认领，保留旧邮箱/历史；只要还有该域存量邮箱，它仍被视为站内路由域，既有邮箱可发件。它不等于注销域名或停收邮件，也不会移除 Cloudflare 的 DNS/路由。
 - 配置为空且无存量邮箱时没有可用发件/认领域；需管理员先完成实际域名接入。不应承诺外部投递由“保存域名”即可成功。
@@ -110,7 +110,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 | `GET /hosted-domains` | 自己拥有（`role:"owner"`）与被共享（`role:"member"`）的域名；管理员全站用 `GET /admin/hosted-domains?status=&q=` |
 | `POST /hosted-domains` | `{domain}`，填已注册的根域名 → 201，`status:"pending"`、`nameServers` 两条、`originalNameServers`、`warnings`（如需先关闭 DNSSEC）、`expiresAt`（到期未改 NS 自动删除） |
 | `GET /hosted-domains/:id` | 进度：`status` 与 `steps:{nameServers,routing,catchAll,sending}`（各为 waiting/ready/error）、`lastError`、`checkedAt` |
-| `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态 |
+| `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态；另有每人每分钟上限，超出返回 429 |
 | `PUT /hosted-domains/:id` | `{memberLimit}`：每位成员在该域最多认领数，0 不限 |
 | `GET` / `PUT /hosted-domains/:id/members` | 成员名单；PUT `{userIds,expectedOwnerId}` 整体替换（已禁用的现有成员可保留，新增的须为启用中的用户），选人用 `GET /mailboxes/share-users` |
 | `DELETE /hosted-domains/:id/members/:userId` | 移除成员；成员传自己的 id 即退出共享。已认领的地址保留 |
@@ -123,7 +123,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - 权限：所有者与管理员可查看进度、管理成员、过户、删除；管理员还能在任何人的托管域名下认领地址，并像其他邮箱一样用 `/admin/mailboxes/:id/transfer`、`/admin/mailbox-shares` 过户或共享其中的地址（含自动认领给所有者的地址）；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；自动认领默认不限数量（`hosted_domains.autoClaimLimit` 为 0），管理员设了正数上限时，域内地址达到上限后未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
 - 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
-- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400；Cloudflare 限流 429。
+- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。创建与立即检测有每人每分钟上限，并计入全站 Cloudflare 调用预算；超出或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
 
 ### 托管域名的 DNS 解析
 
