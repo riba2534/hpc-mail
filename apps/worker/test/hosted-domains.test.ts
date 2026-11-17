@@ -759,10 +759,10 @@ describe('添加与立即检测的 Cloudflare 调用额度', () => {
     expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - 1);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, f.domain('busy'))).get()).toBeUndefined();
 
-    // 删除：撤发信接入、删 zone，共 2 次；额度满时照常执行，只计数
+    // 删除：撤发信接入、核对 zone 身份、删 zone，共 3 次；额度满时照常执行，只计数
     await data(await call('DELETE', `/hosted-domains/${taken.id}`, owner.jwt));
-    expect(cf.calls.slice(callsBefore)).toHaveLength(2);
-    expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE + 1);
+    expect(cf.calls.slice(callsBefore)).toHaveLength(3);
+    expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE + 2);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, taken.id)).get()).toBeUndefined();
   });
 
@@ -855,8 +855,8 @@ describe('托管域名的 Cloudflare 调用序列基准', () => {
         `GET ${z}/email/routing/rules/catch_all`,
         `GET ${z}/email/sending/subdomains/sub-${zoneId}/dns/status`, `POST ${z}/email/sending/subdomains/sub-${zoneId}/dns`,
       ],
-      // 删除先撤发信接入，再删 zone
-      afterDelete: [`DELETE ${z}/email/sending/subdomains/sub-${zoneId}`, `DELETE ${z}`],
+      // 删除先撤发信接入，再读出 zone 核对名称与创建时间后删除
+      afterDelete: [`DELETE ${z}/email/sending/subdomains/sub-${zoneId}`, `GET ${z}`, `DELETE ${z}`],
     });
   });
 });

@@ -139,8 +139,24 @@ export async function getZone(creds: CloudflareCredentials, zoneId: string, name
   }
 }
 
-/** 已不存在视为成功 */
-export async function deleteZone(creds: CloudflareCredentials, zoneId: string, name: string): Promise<void> {
+/** 删除前核对的 zone 身份：不能是系统域名；创建时间不早于本站记录（留 1 分钟时钟误差） */
+export interface ZoneDeleteGuard {
+  notBefore?: Date | null;
+  protectedNames?: readonly string[];
+}
+
+/**
+ * 先读出 zone 核对身份再删除：名称须与记录一致，身份不符时抛错且不删除（D1 里的 zone_id 被人工改错时
+ * 不会删到别的 zone）。已不存在视为成功。
+ */
+export async function deleteZone(creds: CloudflareCredentials, zoneId: string, name: string, guard: ZoneDeleteGuard = {}): Promise<void> {
+  if (guard.protectedNames?.includes(name)) throw new Error(`拒绝删除：${name} 是本站的系统域名`);
+  const zone = await getZone(creds, zoneId, name);
+  if (!zone) return;
+  if (zone.name !== name) throw new Error(`拒绝删除：zone ${zoneId} 的名称为 ${zone.name}，与记录的 ${name} 不符`);
+  if (guard.notBefore && zone.created_on && new Date(zone.created_on).getTime() < guard.notBefore.getTime() - 60_000) {
+    throw new Error(`拒绝删除：zone ${zoneId} 创建于 ${zone.created_on}，早于本站记录`);
+  }
   try {
     await cf(creds, 'DELETE', `/zones/${zoneId}`);
   } catch (error) {

@@ -12,7 +12,7 @@ import {
   CloudflareApiError, catchAllTargetsWorker, cloudflareCredentials, countZones, createSendingSubdomain, createZone, deleteSendingSubdomain,
   deleteZone, enableRouting, findZone, getCatchAll, getRouting, getSendingDnsStatus, getZone, isCloudflareNotFound,
   isTransientCloudflareError, listSendingSubdomains, putCatchAll, repairSendingDns, requestActivationCheck, verifyToken,
-  type CloudflareCredentials,
+  type CloudflareCredentials, type ZoneDeleteGuard,
 } from './cloudflare.js';
 import { hasDnssec } from './domain-check.js';
 import { systemDomainListedSql } from './domain-occupancy.js';
@@ -51,11 +51,11 @@ export const MAX_HOSTED_CREATES_PER_MINUTE = 5;
 export const MAX_HOSTED_CHECKS_PER_MINUTE = 10;
 /**
  * 计入全站额度的 Cloudflare 调用数（按调用序列基准用例核实）：添加先按名称查 zone 再创建 2 次，建好后后台预配置
- * catch-all 与发信 5 次；删除撤发信接入、删 zone 2 次；检测在等待 NS 时 2 次，生效后补齐配置约 4 次。
+ * catch-all 与发信 5 次；删除撤发信接入、核对并删 zone 3 次；检测在等待 NS 时 2 次，生效后补齐配置约 4 次。
  */
 const CREATE_CF_CALLS = 2;
 const PRECONFIGURE_CF_CALLS = 5;
-const TEARDOWN_CF_CALLS = 2;
+const TEARDOWN_CF_CALLS = 3;
 const CHECK_CF_CALLS = 4;
 const SITE_BUSY = '当前域名操作较多，请稍后再试';
 
@@ -79,6 +79,12 @@ async function runDetached(ctx: ExecCtx | null | undefined, label: string, task:
   const guarded = task().catch((error) => console.error(`${label}失败:`, error));
   if (ctx) ctx.waitUntil(guarded);
   else await guarded;
+}
+
+/** 删除 zone 前核对身份：不能是系统域名，创建时间不早于本站记录 */
+async function zoneGuard(env: Env, row: HostedRow): Promise<ZoneDeleteGuard> {
+  const settings = await getSettings(env);
+  return { notBefore: row.createdAt, protectedNames: settings.domains.list.map((entry) => entry.domain) };
 }
 
 /** 用户操作触发的后台调用（预配置、删除）只计入全站额度，不因额度拒绝；计数失败不影响任务本身 */
@@ -388,7 +394,8 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
   }).where(and(eq(hostedDomains.id, id), sql`${hostedDomains.zoneId} IS NULL`)).returning({ id: hostedDomains.id });
   if (!filled.length) {
     // 建 zone 期间占位已被删除：不留下没有记录的 zone
-    await deleteZone(creds, zone.id, domain).catch((error) => console.error('回收孤儿 zone 失败:', error));
+    await deleteZone(creds, zone.id, domain, { notBefore: new Date(reservedAt), protectedNames: settings.domains.list.map((entry) => entry.domain) })
+      .catch((error) => console.error('回收孤儿 zone 失败:', error));
     throw new AppError('conflict', '该域名已被删除，请重新添加');
   }
   await logAdminAction(env, viewer, 'hosted_domain.create', domain, `zone ${zone.id}，NS ${(zone.name_servers ?? []).join(' / ')}`, ip);
@@ -492,7 +499,7 @@ async function preconfigure(env: Env, creds: CloudflareCredentials, id: number):
 
 /** 删除 zone 与记录（只用于从未生效的 pending 域名，没有地址和邮件） */
 async function dropPending(env: Env, creds: CloudflareCredentials, row: HostedRow, reason: string): Promise<void> {
-  if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain);
+  if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain, await zoneGuard(env, row));
   const [removed] = await env.db.batch([
     env.db.prepare("DELETE FROM hosted_domains WHERE id = ? AND status = 'pending' AND activated_at IS NULL").bind(row.id),
     env.db.prepare('DELETE FROM hosted_domain_members WHERE domain_id = ?1 AND NOT EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1)').bind(row.id),
@@ -540,7 +547,7 @@ async function teardown(env: Env, creds: CloudflareCredentials, row: HostedRow):
     if (zoneId) {
       // 发信接入随 zone 删除，单独删除失败不阻塞
       if (row.sendingTag) await deleteSendingSubdomain(creds, zoneId, row.sendingTag).catch(() => undefined);
-      await deleteZone(creds, zoneId, row.domain);
+      await deleteZone(creds, zoneId, row.domain, await zoneGuard(env, row));
     }
   } catch (error) {
     await createDb(env).update(hostedDomains).set({ lastError: `删除 Cloudflare 配置失败：${errorText(error)}`, checkedAt: new Date() })
