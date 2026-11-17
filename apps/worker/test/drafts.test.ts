@@ -380,3 +380,19 @@ describe('保留期', () => {
     expect(await row(unsent!.id)).toBeTruthy();
   });
 });
+
+describe('人审：发送时锁定审阅过的版本', () => {
+  it('审阅后被 Agent 改过就 409 不发；版本一致才发；已发送的带旧版本仍重放原结果', async () => {
+    const me = await account('draft-review');
+    const created = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 'review-a@hpc.email'))), 201);
+    const changed = await data<Draft>(await call(`/v1/drafts/${created.id}`, req(me.key, 'PATCH', { to: ['review-b@hpc.email'] })));
+    const stale = await failure(await call(`/api/drafts/${created.id}/send`, req(me.jwt, 'POST', { expectedVersion: created.version })), 409);
+    expect(stale).toMatchObject({ code: 'draft_state_conflict', details: { draftStatus: 'draft', draftVersion: changed.version } });
+    expect(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.address, me.address), eq(messages.direction, 'outbound')))).toEqual([]);
+    const sent = await data<MessageSummary>(await call(`/api/drafts/${created.id}/send`, req(me.jwt, 'POST', { expectedVersion: changed.version })), 201);
+    expect(sent.recipientsTo).toEqual(['review-b@hpc.email']);
+    const replay = await data<MessageSummary>(await call(`/api/drafts/${created.id}/send`, req(me.jwt, 'POST', { expectedVersion: changed.version })), 201);
+    expect(replay.id).toBe(sent.id);
+    expect((await failure(await call(`/api/drafts/${created.id}/send`, req(me.jwt, 'POST', { expectedVersion: 'x' })), 400)).code).toBe('validation_failed');
+  });
+});

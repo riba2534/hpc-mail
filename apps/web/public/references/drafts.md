@@ -27,7 +27,7 @@ shell 示例复用[入口指南](../skill.md)的 `hpc()`、`FROM`、`WORK`。草
 | `GET /drafts/:id` | `mail.read` 或 `mail.send` | 草稿详情（含正文与附件） |
 | `PATCH /drafts/:id` | `mail.send` | 修改后的草稿详情 |
 | `DELETE /drafts/:id` | `mail.send` | `{success:true}`，同时释放它的附件 |
-| `POST /drafts/:id/send` | `mail.send` | 与 `POST /messages` 相同：201 发件摘要 / 422 / 4xx |
+| `POST /drafts/:id/send` | `mail.send` | 与 `POST /messages` 相同：201 发件摘要 / 422 / 4xx；可带 `{expectedVersion}` |
 
 草稿内容带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时，创建、修改与发送都另需 `mail.read`（同直接发信）。只能看到、操作自己的草稿，管理员也一样；别人的草稿 id 返回 404。
 
@@ -85,6 +85,7 @@ jq -n '{sendAt:"2026-11-18T09:00:00+08:00"}' |
 - 201：发件摘要（部分收件人失败也是 201，看 `status`、`errorDetail`、`recipientOutcomes`）。草稿变为 `sent`，`messageId` 指向这条发件记录，附件回收。
 - 422 `delivery_failed`：每个收件人都被拒收，什么也没发出。草稿变为 `failed`，`messageId` 指向这次失败的发件记录，附件仍归草稿；修正收件人后可以再发送。
 - 其他 4xx（内容不完整、发件人无权、配额用尽等）：没有发出，草稿保持原来的状态（定时的仍是定时），`errorDetail` 记下原因。
+- 请求体可以省略；代表用户审阅后发送时带上审阅时读到的版本 `{"expectedVersion": N}`：草稿在审阅之后被改过（例如 Agent 又改了收件人）就返回 409 `draft_state_conflict`、不发送，重新读取审阅后再发。网页的发送按钮就是这样做的。
 - 每份草稿只会发出一次：已发送的再调用返回 201 和原来的发件摘要；正在发送时返回 409 `send_in_progress`，稍后读取草稿看结果，不要换别的方式重发。草稿发送不用 `Idempotency-Key`。
 - 发送途中服务中断时：如果发件记录已经建立（可能已外发），草稿按发件记录定为 `sent` 或 `failed`，绝不自动重发；确认没有外发的，安排过定时的会在下一分钟重试（最多 3 次），其余标 `failed` 由用户决定。
 

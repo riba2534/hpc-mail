@@ -624,7 +624,7 @@ async function performSend(
 
 /**
  * 立即发送（POST /drafts/:id/send）：草稿、定时、失败三种状态都可以；已发送的重放原结果，发送中 409。
- * authorize 在认领前按草稿内容做 scope 检查（Key 引用来源邮件需 mail.read）。
+ * authorize 在认领前按草稿内容做 scope 检查（Key 引用来源邮件需 mail.read）；expectedVersion 是审阅时的版本，不一致 409。
  */
 export async function sendDraftNow(
   env: Env,
@@ -633,6 +633,7 @@ export async function sendDraftNow(
   id: number,
   origin: string,
   authorize?: (content: StoredDraftContent) => void,
+  expectedVersion?: number,
 ): Promise<MessageSummary> {
   const db = createDb(env);
   const row = await db.select().from(drafts).where(and(eq(drafts.id, id), eq(drafts.userId, sender.userId))).get();
@@ -650,6 +651,10 @@ export async function sendDraftNow(
     throw stateConflict(current, current.status === 'sent' ? '草稿已发送，发件记录已不存在' : '草稿状态已变化，请重新读取');
   };
   if (!EDITABLE.includes(row.status)) return settled(row);
+  // 人审：审阅之后又被改过就不发，免得发出审阅者没看过的内容（认领条件同样带版本，读与认领之间的修改也拦得住）
+  if (expectedVersion !== undefined && expectedVersion !== row.version) {
+    throw stateConflict(row, `草稿在你审阅之后被修改过（当前版本 ${row.version}），请重新审阅后再发送`);
+  }
   authorize?.(row.content);
   const claimed = await db.update(drafts).set({
     status: 'sending', attempt: sql`${drafts.attempt} + 1`, claimedAt: new Date(), version: sql`${drafts.version} + 1`, updatedAt: new Date(),

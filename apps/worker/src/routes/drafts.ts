@@ -1,4 +1,4 @@
-import { draftInputSchema, listDraftsQuerySchema, type StoredDraftContent } from '@hpc-mail/shared';
+import { draftInputSchema, listDraftsQuerySchema, sendDraftRequestSchema, type StoredDraftContent } from '@hpc-mail/shared';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { AppError } from '../lib/errors.js';
 import { ok, parseBody, parseId, parseQuery } from '../lib/http.js';
@@ -91,12 +91,16 @@ export function createDraftRoutes(authentication: MiddlewareHandler<AppContext>)
     return ok(c, { success: true as const });
   });
 
-  /** 立即发送：结果与 POST /messages 相同（201 / 422 delivery_failed / 4xx）；已发送的重放原结果 */
+  /**
+   * 立即发送：结果与 POST /messages 相同（201 / 422 delivery_failed / 4xx）；已发送的重放原结果。
+   * 请求体可省略；人审时带 {expectedVersion} 锁定审阅过的版本
+   */
   app.post('/:id/send', async (c) => {
     requireWrite(c);
     const id = parseId(c.req.param('id'));
     const actor = actorOf(c);
-    const summary = await sendDraftNow(c.env, c.executionCtx, actor.sender, id, new URL(c.req.url).origin, sourceGuard(c));
+    const body = c.req.header('Content-Length') === '0' || c.req.raw.body === null ? {} : await parseBody(c, sendDraftRequestSchema);
+    const summary = await sendDraftNow(c.env, c.executionCtx, actor.sender, id, new URL(c.req.url).origin, sourceGuard(c), body.expectedVersion);
     return ok(c, summary, 201);
   });
 

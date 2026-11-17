@@ -60,6 +60,15 @@ export type DraftInput = z.infer<typeof draftInputSchema>;
 /** 请求体的输入形状（构造请求时用） */
 export type DraftRequestBody = z.input<typeof draftInputSchema>;
 
+/**
+ * 立即发送（POST /drafts/:id/send）的可选请求体。人审场景下带上审阅时看到的 version：
+ * 草稿在审阅后被改过（如 Agent 又 PATCH 了收件人）时返回 409，不会发出没看过的内容。已发送的仍重放原结果。
+ */
+export const sendDraftRequestSchema = z.object({
+  expectedVersion: z.number().int().positive().optional(),
+});
+export type SendDraftRequest = z.infer<typeof sendDraftRequestSchema>;
+
 export const listDraftsQuerySchema = z.object({
   status: z.preprocess((v) => (v === '' ? undefined : v), z.enum(DRAFT_STATUSES).optional()),
   cursor: z.preprocess((v) => (v === '' ? undefined : v), z.string().max(128).optional()),

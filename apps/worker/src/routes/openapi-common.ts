@@ -476,6 +476,7 @@ export const schemas: Record<string, Schema> = {
   MultipartInitResult: object({ token: str, uploadId: str, partBytes: positiveId, partCount: positiveId }),
   MultipartPartResult: object({ partNumber: positiveId, etag: str }), MultipartCompleteResult: object({ token: str, size: int }),
   DraftInput: draftInput, DraftSummary: draftSummary, Draft: draft, DraftPage: page(ref('DraftSummary')),
+  SendDraftRequest: object({ expectedVersion: { ...positiveId, description: 'Version the reviewer saw; a different current version returns 409 draft_state_conflict.' } }, ['expectedVersion']),
 };
 export const query = (name: string, schema: Schema, description?: string, required = false): Schema => ({ name, in: 'query', required, schema, ...(description ? { description } : {}) });
 export const scopeQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed', 'user'] }, 'Default mine. unclaimed/user are administrator-only; user requires userId. Shared inboxes add read-only inbound visibility.'),
@@ -664,7 +665,8 @@ export function draftPaths(keyScopes = false): Paths {
         description: 'Not while sending (409 draft_state_conflict). Deleting a sent draft only removes the draft; the outbound message stays.' }),
     },
     '/drafts/{id}/send': { post: { ...operation('Send a draft now', ref('MessageSummary'), { scope: write, status: 201,
-      description: 'Same result as POST /messages: 201 with the outbound summary (partial failure included), 422 delivery_failed when every recipient was rejected (the draft becomes failed and keeps its attachments), other 4xx before anything is sent (the draft keeps its previous status and records errorDetail). Works from draft, scheduled or failed and ignores sendAt. Exactly once per draft: a sent draft replays the original summary with 201; a draft being sent returns 409 send_in_progress. The daily outbound quota applies as for any send.' }), ...sourceRule } },
+      request: 'SendDraftRequest', requestRequired: false,
+      description: 'Optional body {expectedVersion}: the version the reviewer saw; if the draft changed since (for example an agent edited the recipients), 409 draft_state_conflict and nothing is sent. Same result as POST /messages: 201 with the outbound summary (partial failure included), 422 delivery_failed when every recipient was rejected (the draft becomes failed and keeps its attachments), other 4xx before anything is sent (the draft keeps its previous status and records errorDetail). Works from draft, scheduled or failed and ignores sendAt. Exactly once per draft: a sent draft replays the original summary with 201; a draft being sent returns 409 send_in_progress. The daily outbound quota applies as for any send.' }), ...sourceRule } },
   };
 }
 export function uploadPaths(scope?: string): Paths {
