@@ -230,6 +230,35 @@ describe('Webhook v2 事件投递', () => {
     expect(row).toMatchObject({ status: 'failed', last_error: expect.stringContaining('停用') });
   });
 
+  it('永久删除邮件时作废它的投递载荷，不再自动或手动重发；回收站里的邮件也不能手动重发（A4）', async () => {
+    const user = await account('purge');
+    const endpoint = await data<CreatedWebhookEndpoint>(await create(user.jwt, { includeBody: true }), 201);
+    const hits = receiver(() => 503);
+    await receive(user.box.address, 'to purge');
+    await receive(user.box.address, 'to trash');
+    expect(hits).toHaveLength(2);
+    const deliveries = (await data<Page<WebhookDelivery>>(await request(`/api/webhooks/${endpoint.id}/deliveries`, { headers: auth(user.jwt) }))).items;
+    const ids = await env.db.prepare(`SELECT id, CAST(substr(event_key, 15) AS INTEGER) AS message_id, payload FROM webhook_deliveries
+      WHERE endpoint_id = ? ORDER BY id`).bind(endpoint.id).all<{ id: number; message_id: number; payload: string }>();
+    expect(ids.results.every((row) => row.payload.includes('482913'))).toBe(true);
+    const [purged, trashed] = ids.results;
+    // 第二封失败用尽后进回收站：仍保留载荷，但不能手动重发
+    await env.db.prepare("UPDATE webhook_deliveries SET status = 'failed' WHERE id = ?").bind(trashed!.id).run();
+    await data(await request('/api/messages/delete', json(user.jwt, { ids: [purged!.message_id, trashed!.message_id] })));
+    expect((await request(`/api/webhooks/${endpoint.id}/deliveries/${trashed!.id}/retry`, { method: 'POST', headers: auth(user.jwt) })).status).toBe(409);
+    await data(await request('/api/messages/purge', json(user.jwt, { ids: [purged!.message_id] })));
+    const row = await env.db.prepare('SELECT status, payload, last_error FROM webhook_deliveries WHERE id = ?').bind(purged!.id)
+      .first<{ status: string; payload: string; last_error: string }>();
+    expect(row).toMatchObject({ status: 'failed', payload: '', last_error: expect.stringContaining('永久删除') });
+    await env.db.prepare('UPDATE webhook_deliveries SET next_attempt_at = 0 WHERE id = ?').bind(purged!.id).run();
+    await processWebhookDeliveries(env, { ids: [purged!.id] });
+    vi.unstubAllGlobals();
+    const later = receiver(() => 200);
+    expect((await request(`/api/webhooks/${endpoint.id}/deliveries/${purged!.id}/retry`, { method: 'POST', headers: auth(user.jwt) })).status).toBe(409);
+    expect(later).toHaveLength(0);
+    expect(deliveries).toHaveLength(2);
+  });
+
   it('发信成功与失败分别发 mail.sent / mail.failed，同一封只发一次', async () => {
     const user = await account('sent');
     await data(await create(user.jwt, { events: ['mail.sent', 'mail.failed'] }), 201);

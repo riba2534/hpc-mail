@@ -4,9 +4,10 @@ import { messages } from '../db/schema.js';
 import type { Env, ExecCtx } from '../types.js';
 import { harvestPurgeStatement } from './claude-facts.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
+import { purgeWebhookDeliveriesStatement } from './webhooks.js';
 
 /** purgeStatements 里删除 messages 行那条语句的下标；调用方据此读取实际删除条数 */
-export const PURGE_MESSAGES_INDEX = 6;
+export const PURGE_MESSAGES_INDEX = 7;
 
 /** All metadata removal and garbage references commit together, before awaiting R2. */
 export function purgeStatements(env: Env, token: string): D1PreparedStatement[] {
@@ -28,6 +29,8 @@ export function purgeStatements(env: Env, token: string): D1PreparedStatement[] 
     env.db.prepare(`UPDATE notification_jobs SET payload = '{}' WHERE payload <> '{}' AND id IN (
       SELECT j.id FROM messages m CROSS JOIN notification_jobs j
       WHERE m.purge_token = ? AND j.dedupe_key >= 'mail:' || m.id || ':' AND j.dedupe_key < 'mail:' || m.id || ';')`).bind(token),
+    // Webhook v2 投递的载荷同属派生副本：作废未完成与失败的投递，删除后不再自动或手动重发
+    purgeWebhookDeliveriesStatement(env, token),
     env.db.prepare('DELETE FROM messages WHERE purge_token = ?').bind(token),
   ];
 }

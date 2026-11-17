@@ -231,14 +231,33 @@ export async function listWebhookDeliveries(
   return { items: page.items.map(toDelivery), nextCursor: page.nextCursor };
 }
 
-/** 手动重试一条已失败的投递：只发一次，端点必须是启用状态 */
+/** 邮件事件的去重键是 `<type>:<邮件 id>`，这里取出邮件 id（SQL 表达式，列名由调用方给出） */
+const MAIL_EVENT_TYPES_SQL = `('mail.received', 'mail.sent', 'mail.failed')`;
+const eventMessageIdSql = (column: string) => `CAST(substr(${column}, instr(${column}, ':') + 1) AS INTEGER)`;
+
+/**
+ * 永久删除邮件（purgeStatements，与删除同一事务）时作废它的事件投递：载荷含主题、收件人、验证码与正文，是邮件的派生副本。
+ * 未完成与已失败的投递清空载荷、记为 SOURCE_GONE，自动重试与手动重试都不再发；已成功的投递载荷本来就是空的。
+ * 只扫未成功的投递（idx_webhook_deliveries_due 的 status 前缀），按 purge_token 取要删的邮件 id
+ */
+export function purgeWebhookDeliveriesStatement(env: Env, token: string): D1PreparedStatement {
+  return env.db.prepare(`UPDATE webhook_deliveries SET payload = '', status = 'failed', last_error = ?, updated_at = ?
+    WHERE status IN ('pending', 'processing', 'failed') AND event_type IN ${MAIL_EVENT_TYPES_SQL}
+      AND ${eventMessageIdSql('event_key')} IN (SELECT id FROM messages WHERE purge_token = ?)`)
+    .bind(SOURCE_GONE, Date.now(), token);
+}
+
+/** 手动重试一条已失败的投递：只发一次，端点必须是启用状态；邮件事件的源邮件已删除（含回收站）时拒绝 */
 export async function retryWebhookDelivery(env: Env, userId: number, endpointId: number, deliveryId: number, ctx?: ExecCtx | null): Promise<WebhookDelivery> {
   const endpoint = await loadEndpoint(env, userId, endpointId);
   if (endpoint.status !== 'active') throw new AppError('conflict', '端点已停用，先重新启用再重试');
   const row = await env.db.prepare(`UPDATE webhook_deliveries SET status = 'pending', next_attempt_at = ?, updated_at = ?
-    WHERE id = ? AND endpoint_id = ? AND status = 'failed' AND last_error <> ? RETURNING *`)
+    WHERE id = ? AND endpoint_id = ? AND status = 'failed' AND last_error <> ?
+      AND (event_type NOT IN ${MAIL_EVENT_TYPES_SQL} OR EXISTS (SELECT 1 FROM messages AS source
+        WHERE source.id = ${eventMessageIdSql('webhook_deliveries.event_key')} AND source.deleted_at IS NULL))
+    RETURNING *`)
     .bind(Date.now(), Date.now(), deliveryId, endpointId, SOURCE_GONE).first<DeliveryRow>();
-  if (!row) throw new AppError('conflict', '只有投递失败的记录可以重试');
+  if (!row) throw new AppError('conflict', '只有投递失败、且源邮件未删除的记录可以重试');
   runDetached(ctx, processWebhookDeliveries(env, { ids: [Number(row.id)] }));
   return toDelivery(row);
 }

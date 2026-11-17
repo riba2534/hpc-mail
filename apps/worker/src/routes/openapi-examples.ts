@@ -304,7 +304,7 @@ export const ERROR_EXAMPLES = {
   NotFoundWebhook: { code: 'not_found', message: 'Webhook 端点不存在' },
   WebhookEndpointLimit: { code: 'forbidden', message: '每个用户最多 10 个 Webhook 端点' },
   WebhookUrlInvalid: { code: 'validation_failed', message: 'Webhook 地址不能指向本站' },
-  WebhookNotRetryable: { code: 'conflict', message: '只有投递失败的记录可以重试' },
+  WebhookNotRetryable: { code: 'conflict', message: '只有投递失败、且源邮件未删除的记录可以重试' },
   // fix/docs 与按错误码补的默认建议相同时不重复写（usedExamples 会补上）
   AttachmentUrlForbidden: { code: 'attachment_url_forbidden', message: '附件地址不允许：内网、回环、链路本地或保留地址',
     details: { url: 'https://169.254.169.254/latest/meta-data/' } },
