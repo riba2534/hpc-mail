@@ -55,7 +55,8 @@ export function classifySendError(error: unknown): SendFailure {
 }
 
 /**
- * 发信引用的原邮件已删除或对发件人不可见（服务端 404 source_unavailable）。来源按请求里带的字段区分；
+ * 发信引用的原邮件已删除或对发件人不可见（服务端 404 source_unavailable）。服务端在 details.source 里指明是
+ * 哪一个引用（请求里确实带了该字段才采信）；旧服务端没有这个字段时按请求里带的字段推断：
  * 服务端先校验转发附件再校验回复线程，两者都带时归到转发。
  */
 export function missingSendSource(
@@ -63,6 +64,9 @@ export function missingSendSource(
   payload: Pick<InternalSendMailRequest, 'replyToMessageId' | 'forwardAttachmentsFrom'>,
 ): SendSource | null {
   if (!(error instanceof ApiError) || error.code !== 'source_unavailable') return null;
+  const reported = error.details?.source;
+  if (reported === 'reply' && payload.replyToMessageId) return 'reply';
+  if (reported === 'forward' && payload.forwardAttachmentsFrom) return 'forward';
   if (payload.forwardAttachmentsFrom) return 'forward';
   if (payload.replyToMessageId) return 'reply';
   return null;
