@@ -33,12 +33,13 @@ import {
 import { EmptyState } from '@/components/ui/empty-state';
 import { IconButton } from '@/components/ui/icon-button';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import { buildForward, buildReply, buildReplyAll, buildResend } from '@/features/compose/compose-init';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import { Badge } from '@/components/ui/badge';
 import type { MailListLinkState } from '@/features/inbox/mail-list';
-import { mailHref, parseMailView } from '@/features/inbox/mail-view';
+import { mailHref, mailViewParams, parseMailView } from '@/features/inbox/mail-view';
 import { type MessageListData, syncReadState } from '@/features/inbox/message-cache';
 import { messageDetailQueryOptions } from '@/features/inbox/message-queries';
 import { useDeleteMessages } from '@/features/inbox/use-delete-messages';
@@ -47,10 +48,10 @@ import { useStarMutation } from '@/features/inbox/use-star';
 import { cn } from '@/lib/cn';
 import { attachmentIcon } from './attachment-icon';
 import { countRemoteImages } from './count-remote-images';
+import { downloadWithAuth } from './download';
 import { EmailHtml } from '@/lib/email-html';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
-import { getAuthToken } from '@/lib/auth-token';
 import { extractOtp } from '@/lib/otp';
 import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
@@ -61,6 +62,9 @@ import { useDocumentTitle } from '@/lib/use-document-title';
 import { useCurrentUser } from '@/lib/use-session';
 import { QueryErrorState } from '@/components/query-error-state';
 import { ApiError } from '@/api/errors';
+
+/** 详情的新鲜期，必须远小于内嵌图签名 URL 的最短剩余有效期（1 小时） */
+const MESSAGE_DETAIL_STALE_MS = 30_000;
 
 /** 去重（不区分大小写，保留首次出现的写法） */
 function uniqueAddresses(addresses: string[], exclude: ReadonlySet<string> = new Set()): string[] {
@@ -130,12 +134,17 @@ export function MessagePage() {
   const mutationScope = scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
   const [imagesAllowedFor, setImagesAllowedFor] = useState<number | null>(null);
   const [htmlRoot, setHtmlRoot] = useState<HTMLElement | null>(null);
+  const [downloadingId, setDownloadingId] = useState<number | null>(null);
   const markedRef = useRef<number | null>(null);
 
   const { data: ownedMailboxes } = useMailboxesQuery(false);
   const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
     ...messageDetailQueryOptions(messageId, view),
     enabled: Number.isInteger(messageId) && messageId > 0,
+    // 正文内嵌图的签名 URL 按小时对齐签发、剩余有效期至少 1 小时：回到窗口时刷新过期的详情换上仍有效的签名；
+    // 同一小时内重拉的正文完全相同，iframe 不重建
+    staleTime: MESSAGE_DETAIL_STALE_MS,
+    refetchOnWindowFocus: true,
   });
 
   const star = useStarMutation(view);
@@ -222,24 +231,25 @@ export function MessagePage() {
 
   // 下载原始 .eml：带鉴权头 fetch → blob → 触发下载
   const downloadEml = async () => {
+    const qs = searchParams.toString();
     try {
-      const qs = searchParams.toString();
-      const res = await fetch(`/api/messages/${messageId}/raw${qs ? `?${qs}` : ''}`, {
-        headers: { Authorization: `Bearer ${getAuthToken() ?? ''}` },
-      });
-      if (!res.ok) {
-        toast({ title: '下载失败', variant: 'error' });
-        return;
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `message-${messageId}.eml`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-    } catch {
-      toast({ title: '下载失败', variant: 'error' });
+      await downloadWithAuth(`/api/messages/${messageId}/raw${qs ? `?${qs}` : ''}`, `message-${messageId}.eml`);
+    } catch (error) {
+      toast({ title: '下载失败', description: (error as Error).message, variant: 'error' });
+    }
+  };
+
+  // 附件同样走 JWT 下载（签名 URL 只留给正文内嵌图）；带上详情的可见性范围，管理员审计视图才能下载
+  const downloadAttachment = async (attachment: MessageDetail['attachments'][number]) => {
+    if (downloadingId !== null) return;
+    setDownloadingId(attachment.id);
+    const qs = mailViewParams(view ?? {}).toString();
+    try {
+      await downloadWithAuth(`/api/attachments/${attachment.id}${qs ? `?${qs}` : ''}`, attachment.filename || `attachment-${attachment.id}`);
+    } catch (error) {
+      toast({ title: '附件下载失败', description: (error as Error).message, variant: 'error' });
+    } finally {
+      setDownloadingId(null);
     }
   };
 
@@ -544,17 +554,21 @@ export function MessagePage() {
                   const Icon = attachmentIcon(attachment.mimeType, attachment.filename);
                   return (
                     <li key={attachment.id}>
-                      <a
-                        href={attachment.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="flex items-center gap-3 rounded-md border border-line px-3 py-2 text-sm transition-colors hover:bg-surface-hover"
+                      <button
+                        type="button"
+                        title={`下载 ${attachment.filename}`}
+                        aria-busy={downloadingId === attachment.id}
+                        disabled={downloadingId !== null}
+                        onClick={() => void downloadAttachment(attachment)}
+                        className="flex w-full items-center gap-3 rounded-md border border-line px-3 py-2 text-left text-sm transition-colors hover:bg-surface-hover disabled:cursor-wait"
                       >
                         <Icon className="size-5 shrink-0 text-ink-tertiary" aria-hidden />
                         <span className="min-w-0 flex-1 truncate text-ink">{attachment.filename}</span>
                         <span className="shrink-0 text-xs text-ink-tertiary">{formatBytes(attachment.size)}</span>
-                        <Download className="size-4 shrink-0 text-ink-tertiary" />
-                      </a>
+                        {downloadingId === attachment.id
+                          ? <Spinner className="size-4 shrink-0 text-ink-tertiary" />
+                          : <Download className="size-4 shrink-0 text-ink-tertiary" />}
+                      </button>
                     </li>
                   );
                 })}
