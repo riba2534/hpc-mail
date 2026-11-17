@@ -3,11 +3,13 @@ import {
   MAX_HOSTED_DOMAIN_BATCH,
   batchCheckHostedDomainsRequestSchema,
   batchCreateHostedDomainsRequestSchema,
+  LIST_PAGE_MAX_LIMIT,
+  listMailboxesQuerySchema,
   listMessagesQuerySchema,
   replyMessageRequestSchema,
   waitMessagesQuerySchema,
 } from '../src/index.js';
-import { MCP_TOOL_NAMES, mcpSearchQuery, mcpToolInputSchemas, mcpWaitQuery } from '../src/schemas/mcp.js';
+import { MCP_TOOL_NAMES, mcpMailboxQuery, mcpSearchQuery, mcpToolInputSchemas, mcpWaitQuery } from '../src/schemas/mcp.js';
 
 describe('MCP 工具参数', () => {
   it('工具清单固定为 10 个，参数都能生成 object 类型的 JSON Schema', () => {
@@ -63,6 +65,15 @@ describe('MCP 工具参数', () => {
       .toEqual({ afterId: '0', timeout: '25', address: 'one@x.com' });
     expect(mcpToolInputSchemas.wait_for_message.safeParse({ timeout: 51 }).success).toBe(false);
     expect(mcpToolInputSchemas.wait_for_message.safeParse({ address: Array.from({ length: 21 }, (_, i) => `a${i}@x.com`) }).success).toBe(false);
+  });
+
+  it('list_mailboxes 转成的查询串始终是分页模式（默认 50 条），被 GET /v1/mailboxes 的 schema 原样接受', () => {
+    const args = mcpToolInputSchemas.list_mailboxes.parse({ q: ' Bob@ ', domain: 'Example.org', cursor: 'abc', limit: 7 });
+    const { response_format: _format, ...filters } = args;
+    expect(mcpMailboxQuery(filters)).toEqual({ limit: '7', q: 'bob@', domain: 'example.org', cursor: 'abc' });
+    expect(listMailboxesQuerySchema.parse(mcpMailboxQuery(filters))).toMatchObject({ paged: true, limit: 7, q: 'bob@', domain: 'example.org' });
+    expect(listMailboxesQuerySchema.parse(mcpMailboxQuery({}))).toMatchObject({ paged: true, limit: 50 });
+    expect(mcpToolInputSchemas.list_mailboxes.safeParse({ limit: LIST_PAGE_MAX_LIMIT + 1 }).success).toBe(false);
   });
 
   it('release_mailbox 的 mailboxId 与 address 必须且只能给一个', () => {

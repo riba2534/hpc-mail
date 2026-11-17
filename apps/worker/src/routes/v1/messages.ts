@@ -77,7 +77,7 @@ const BATCH_SEND_CONCURRENCY = 4;
  */
 app.post('/batch', async (c) => {
   requireScope(c, 'mail.send');
-  assertRequestSize(c);
+  await assertRequestSize(c);
   const key = c.get('apiKey')!;
   const { items } = await parseBody(c, batchSendRequestSchema);
   const headerKey = c.req.header('Idempotency-Key')?.trim() || undefined;

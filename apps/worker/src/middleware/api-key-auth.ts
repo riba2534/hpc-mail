@@ -14,7 +14,7 @@ import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { writeApiRequestLog } from '../services/api-request-log.js';
 import { getSettings, settingsQuery } from '../services/setting.js';
 import { limitApiKeyRequest } from '../services/rate-limit.js';
-import type { AppContext, Env } from '../types.js';
+import type { ApiKeyContext, AppContext, Env } from '../types.js';
 
 const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
 const LAST_USED_THROTTLE_MS = 60_000;
@@ -57,12 +57,29 @@ async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ s
 }
 
 /**
+ * 已在外层请求上完成鉴权与限流的内部请求（/mcp 的工具调用转发给 /v1 的请求）。只有服务端自己构造的 Request 对象
+ * 能登记，外部请求无从伪造；登记的请求沿用外层的 Key 上下文，不再查库、不再计限流，只写本身路径的审计。
+ */
+const preauthorized = new WeakMap<Request, { key: ApiKeyContext; ip: string }>();
+
+export function trustInternalRequest(request: Request, c: Context<AppContext>): void {
+  preauthorized.set(request, { key: c.get('apiKey')!, ip: c.get('apiClientIp') ?? 'unknown' });
+}
+
+/**
  * /v1 鉴权：设置 + hash 查 key（唯一一次 D1 往返）→ 状态/过期/IP → 限流（Rate Limiting binding）→ finally 审计。
  * 中间件自身拒绝的请求（Key 禁用/过期、IP 白名单、用户停用、限流）每 Key 每分钟只写 1 行明细，
  * 其余只在 rate_counters 累加，拒绝请求再多也只是一行计数，写不满审计表。
  */
 export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   const startedAt = Date.now();
+  const inherited = preauthorized.get(c.req.raw);
+  if (inherited) {
+    c.set('apiClientIp', inherited.ip);
+    c.set('apiKey', inherited.key);
+    await auditing(c, inherited.key.id, inherited.ip, startedAt, next);
+    return;
+  }
 
   const token = bearerToken(c);
   const keyHash = KEY_PATTERN.test(token) ? await sha256Hex(token) : null;
@@ -89,8 +106,6 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
 
   // key 已定位：从这里起的拒绝（状态/过期/IP/限流）都进审计，安全监控最需要这些
   const ip = clientIp(c).toLowerCase();
-  let statusCode = 200;
-  let admitted = false;
   try {
     if (row.status !== 'active') throw new AppError('unauthorized', 'API Key 已禁用');
     if (row.userStatus !== 'active') throw new AppError('user_disabled', 'API Key 所属用户已被禁用');
@@ -123,27 +138,40 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     if (rate.rejectedBy === 'user') throw new AppError('rate_limited', 'API 调用频率超限（账户级），请稍后重试');
     if (rate.rejectedBy === 'global') throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
     await touchLastUsed(c, record, ip, now);
+  } catch (err) {
+    await writeAudit(c, row.id, ip, startedAt, false, err instanceof AppError ? err.status : 500);
+    throw err;
+  }
+  await auditing(c, row.id, ip, startedAt, next);
+};
 
-    admitted = true;
+/** 放行的请求：执行后续处理，按结果逐条写审计 */
+async function auditing(c: Context<AppContext>, apiKeyId: number, ip: string, startedAt: number, next: () => Promise<void>): Promise<void> {
+  let statusCode = 200;
+  try {
     await next();
     statusCode = c.res.status;
   } catch (err) {
     statusCode = err instanceof AppError ? err.status : 500;
     throw err;
   } finally {
-    // 审计日志不阻塞响应；无 ExecutionContext（单测直调）时同步写入
-    await runDetached(execCtx(c), 'API 审计日志写入', () => writeApiRequestLog(c.env, admitted, {
-      apiKeyId: row.id,
-      requestId: c.get('requestId') ?? '',
-      method: c.req.method,
-      // 数字 id 段归一并截断，任意长的 URL 不会原样落库
-      path: routeLabel(c.req.path).slice(0, AUDIT_PATH_MAX),
-      statusCode,
-      ip,
-      durationMs: Math.max(0, Date.now() - startedAt),
-    }));
+    await writeAudit(c, apiKeyId, ip, startedAt, true, statusCode);
   }
-};
+}
+
+/** 审计日志不阻塞响应；无 ExecutionContext（单测直调）时同步写入 */
+async function writeAudit(c: Context<AppContext>, apiKeyId: number, ip: string, startedAt: number, admitted: boolean, statusCode: number): Promise<void> {
+  await runDetached(execCtx(c), 'API 审计日志写入', () => writeApiRequestLog(c.env, admitted, {
+    apiKeyId,
+    requestId: c.get('requestId') ?? '',
+    method: c.req.method,
+    // 数字 id 段归一并截断，任意长的 URL 不会原样落库
+    path: routeLabel(c.req.path).slice(0, AUDIT_PATH_MAX),
+    statusCode,
+    ip,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  }));
+}
 
 /**
  * last_used 每把 Key 最多 60 秒写一次：查 key 时已读出旧值，未到期不发语句；写入走 waitUntil，不阻塞响应。
