@@ -247,7 +247,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
   // 附件行指向已不存在的邮件（附件写入前邮件被永久删除等）：登记对象清理并删行
   await step(report, 'attachments.orphans', () => purgeOrphanAttachments(env));
-  // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组
+  // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组。
+  // auth-user/auth-global/api-user/api-global 已由 Rate Limiting binding 计数，只剩升级前写入的旧行待回收
   await step(report, 'counters', async () => {
     await purgeCounters(env, [
       OUTBOUND_QUOTA_SCOPE, 'fwd-domain', 'fwd-target', FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, 'ai-extract', TRANSLATE_CHARS_SCOPE,
