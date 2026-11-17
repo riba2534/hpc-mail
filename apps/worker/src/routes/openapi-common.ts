@@ -2,7 +2,7 @@ import {
   API_SCOPES, ERROR_CODES, MAX_BATCH_CLAIM, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
   SETTING_SCHEMAS, batchMailboxRequestSchema, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
   adminBatchClaimRequestSchema, adminBatchReleaseRequestSchema, adminBatchTransferRequestSchema, adminBatchShareRequestSchema,
-  internalSendMailSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
+  internalSendMailSchema, apiMarkReadRequestSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, userMailboxPolicySchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
@@ -17,6 +17,7 @@ import {
   MAIL_AUTH_RESULTS, PROMPT_INJECTION_REASONS, ERROR_STATUS,
   MAX_HOSTED_DOMAIN_BATCH, batchCreateHostedDomainsRequestSchema, batchCheckHostedDomainsRequestSchema,
   DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, SUPPRESSION_REASONS,
+  LIST_PAGE_DEFAULT_LIMIT, LIST_PAGE_MAX_LIMIT,
 } from '@hpc-mail/shared';
 import { DEFAULT_ERROR_HINTS, REQUEST_ID_PATTERN } from '../middleware/error.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
@@ -451,7 +452,14 @@ export const schemas: Record<string, Schema> = {
   SendMailRequest: send, MailAddress: mailAddress,
   ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
-  MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
+  MarkReadRequest: fromZod(markReadRequestSchema),
+  ApiMarkReadRequest: (() => {
+    const schema = fromZod(apiMarkReadRequestSchema);
+    (schema.properties as Record<string, Schema>).includeUnread = { ...(schema.properties as Record<string, Schema>).includeUnread,
+      description: 'true: in the caller’s own view (no scope or scope=mine) the response also carries unread, the same capped count as GET /messages/unread-count after this change.' };
+    return schema;
+  })(),
+  MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
   MarkAllReadRequest: (() => {
     const schema = fromZod(markAllReadRequestSchema);
     schema.description = 'All fields optional; {} or an empty body marks every unread, non-trash inbound message in the caller’s own claimed mailboxes. domain/address/q narrow the range; q uses the list search semantics (case-insensitive substring of subject, sender address/name, recipients and the first 4 KB of the body text). Mail shared with the caller is never changed. Administrators use scope=unclaimed for unclaimed addresses. Unknown fields are ignored.';
@@ -811,3 +819,19 @@ export function uploadPaths(scope?: string): Paths {
       description: 'Own draft only. Aborts unfinished multipart uploads or deletes the completed draft object. R2 failure keeps the durable reference for cleanup.' }) },
   };
 }
+
+/** 可选分页的列表：出现 cursor 或 limit 即返回 Page，都不出现时返回旧版完整数组 */
+const pageSwitch = 'Presence of cursor or limit (even empty) switches the response from the full array to a page {items, nextCursor}.';
+export const optionalPageQuery = [
+  query('cursor', { type: 'string', maxLength: 128 }, `${pageSwitch} Pass the previous nextCursor unchanged; empty means the first page; null nextCursor means no next page. A cursor that is present but cannot be decoded returns 400 validation_failed.`),
+  query('limit', { type: 'integer', minimum: 1, maximum: LIST_PAGE_MAX_LIMIT, default: LIST_PAGE_DEFAULT_LIMIT }, `${pageSwitch} Items per page.`),
+];
+export const arrayOrPage = (items: Schema): Schema => ({ oneOf: [
+  { ...array(items), title: 'Full array (neither cursor nor limit present)' },
+  { ...page(items), title: 'Page (cursor or limit present)' },
+] });
+export const mailboxSearchQuery = [
+  query('q', { type: 'string', maxLength: 254 }, 'Case-insensitive literal substring of the address or the owner username (no wildcards).'),
+  query('domain', domainName, 'Exact domain.'),
+];
+export const mailboxListDescription = 'Ordered by mailbox id, newest first. q and domain filter in both response forms. Without cursor and limit the response stays the complete array, as before; scripts listing every mailbox with all=1 should page with limit and nextCursor instead.';

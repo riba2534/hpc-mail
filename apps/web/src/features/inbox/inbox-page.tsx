@@ -2,7 +2,9 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, MailOpen, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { UNREAD_COUNT_CAP, type MarkAllReadRequest } from '@hpc-mail/shared';
+import type { MarkAllReadRequest } from '@hpc-mail/shared';
+// 运行时常量走零依赖子路径：主入口会把全部 zod schema 拉进 /inbox 首屏
+import { UNREAD_COUNT_CAP } from '@hpc-mail/shared/constants';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { useRestoredQueryRefreshing } from '@/app/query-persistence';

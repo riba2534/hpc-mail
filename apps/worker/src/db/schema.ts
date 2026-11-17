@@ -20,7 +20,11 @@ export const users = sqliteTable('users', {
     .default('active'),
   /** 强一致鉴权版本：改密/禁用时原子 +1，旧 JWT 立即失效 */
   authVersion: integer('auth_version').notNull().default(0),
-  /** 是否已把旧 KV uepoch 惰性迁入 D1；避免版本 0 用户每请求读取 KV */
+  /**
+   * 已废弃：曾标记旧 KV uepoch 是否已惰性迁入 D1。0030 迁移把存量全部置 1，当前代码不再读取；
+   * 列保留（迁移只增不删），建户时显式写 1，回滚到上一版本时可直接走其快路径。
+   * 不改列默认值：SQLite 改默认值要整表重建
+   */
   authVersionMigrated: integer('auth_version_migrated', { mode: 'boolean' }).notNull().default(false),
   inviteId: integer('invite_id'),
   /** 头像 R2 key（null 表示无头像）；随每次上传变化，用于 URL 版本号防缓存 */
@@ -108,6 +112,8 @@ export const messages = sqliteTable(
     errorDetail: text('error_detail').notNull().default(''),
     isRead: integer('is_read', { mode: 'boolean' }).notNull().default(false),
     size: integer('size').notNull().default(0),
+    /** 入站 pending 自愈（定时任务用 R2 原文重走收件）已失败的次数；达到上限标为 degraded */
+    inboundRepairAttempts: integer('inbound_repair_attempts').notNull().default(0),
     createdAt: createdAtColumn(),
   },
   (t) => [
@@ -134,6 +140,8 @@ export const messages = sqliteTable(
     index('idx_messages_raw_r2').on(t.rawR2Key).where(sql`${t.rawR2Key} IS NOT NULL`),
     // 外发 pending 恢复：定时任务找出超过 1 小时仍未回填结果的发件行，正常时只有正在投递的少数几行
     index('idx_messages_outbound_pending').on(t.createdAt).where(sql`${t.direction} = 'outbound' AND ${t.status} = 'pending'`),
+    // 入站 pending 自愈：附件等未保存完整的收件行，正常时为 0 行
+    index('idx_messages_inbound_pending').on(t.createdAt).where(sql`${t.direction} = 'inbound' AND ${t.status} = 'pending'`),
   ],
 );
 

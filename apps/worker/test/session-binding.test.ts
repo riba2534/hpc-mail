@@ -3,9 +3,12 @@ import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
-import { sessions, users } from '../src/db/schema.js';
+import { invites, sessions, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { register } from '../src/services/auth.js';
 import { createSession } from '../src/services/session.js';
+import { updateSettings } from '../src/services/setting.js';
+import { createUser } from '../src/services/user.js';
 
 /**
  * 2026-10-11 串号事故回归：换库切换窗口里，旧库签发给用户 A（id 103）的令牌带着 KV 里的旧会话，
@@ -55,5 +58,32 @@ describe('会话与令牌用户绑定', () => {
     }
     // 会话本身未受影响，原主人仍可使用
     expect((await me(await signToken(env.jwt_secret, { sub: owner.id, sid, epoch: 0, uepoch: 0 }))).status).toBe(200);
+  });
+});
+
+describe('新用户写入即为已迁移（auth_version_migrated 恒为 1，回滚到上一版本时直接走其快路径）', () => {
+  it('开放注册、邀请码注册、管理员创建三条插入路径', async () => {
+    const db = createDb(env);
+    const migratedOf = async (username: string) =>
+      (await db.select().from(users).where(eq(users.username, username)).get())!.authVersionMigrated;
+    try {
+      await updateSettings(env, { register_mode: 'open' });
+      const open = `bind-open-${rand()}`;
+      await register(env, { username: open, password: 'password123' }, '10.9.0.1');
+      expect(await migratedOf(open)).toBe(true);
+
+      const code = `M${crypto.randomUUID().replace(/-/g, '').slice(0, 11).toUpperCase()}`;
+      await db.insert(invites).values({ code, maxUses: 1, usedCount: 0, status: 'active' });
+      await updateSettings(env, { register_mode: 'invite' });
+      const invited = `bind-invite-${rand()}`;
+      await register(env, { username: invited, password: 'password123', inviteCode: code }, '10.9.0.2');
+      expect(await migratedOf(invited)).toBe(true);
+    } finally {
+      await updateSettings(env, { register_mode: 'closed' });
+    }
+
+    const created = `bind-admin-${rand()}`;
+    await createUser(env, { username: created, password: 'password123', role: 'user' });
+    expect(await migratedOf(created)).toBe(true);
   });
 });

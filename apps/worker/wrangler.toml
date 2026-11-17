@@ -1,6 +1,9 @@
 name = "hpc-cloud-mail"
 main = "src/index.ts"
-compatibility_date = "2025-06-04"
+compatibility_date = "2026-11-16"
+# 2026-08-04 起 nodejs_compat 随日期默认开启；本 Worker 不依赖 Node API（mimetext 走 browser 入口），
+# 显式关闭以保持运行时不出现 process/Buffer 等全局、process.env 不注入 secrets。
+compatibility_flags = ["no_nodejs_compat", "no_nodejs_compat_v2"]
 # account_id 不入库：wrangler 从 CLOUDFLARE_ACCOUNT_ID 环境变量读取（CI 由 GitHub Variables 提供）
 # 默认跑在 workers.dev（Deploy to Cloudflare 一键部署路径）；
 # 自有域名部署由 CI 注入 routes 并关闭 workers_dev（deploy.yml「注入 Cloudflare 资源配置」步骤）

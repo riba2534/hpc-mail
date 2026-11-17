@@ -1,10 +1,11 @@
 import {
-  batchMailboxRequestSchema, batchShareMailboxesRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema,
+  batchMailboxRequestSchema, batchShareMailboxesRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, listMailboxesQuerySchema,
   replaceMailboxSharesRequestSchema, searchUsersQuerySchema, updateMailboxRequestSchema,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
+import { pageRequestOf } from '../lib/pagination.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   checkAvailability,
@@ -26,13 +27,14 @@ import type { AppContext } from '../types.js';
 const app = new Hono<AppContext>();
 app.use('*', requireAuth);
 
-/** admin ?all=1 看全站；否则看自己认领的 */
+/** admin ?all=1 看全站；否则看自己认领的。带 cursor 或 limit 时返回 Page，否则返回完整数组 */
 app.get('/', async (c) => {
   const user = c.get('user')!;
   const all = parseBooleanFlag(c.req.query('all'));
   if (all && user.role !== 'admin') throw new AppError('forbidden', '需要管理员权限');
-  const list = await listMailboxes(c.env, all ? { all: true } : { userId: user.id });
-  return ok(c, list);
+  const query = parseQuery(c, listMailboxesQuerySchema);
+  const scope = all ? { all: true } : { userId: user.id };
+  return ok(c, await listMailboxes(c.env, { ...scope, q: query.q, domain: query.domain }, pageRequestOf(query)));
 });
 
 /** 分享给我的邮箱（只读，不能当发件身份） */

@@ -14,8 +14,6 @@ import { anyHostedSql } from './domain-occupancy.js';
 import { settings as settingsTable } from '../db/schema.js';
 import type { Env, ExecCtx } from '../types.js';
 
-/** 旧版本的 KV 设置缓存键：当前只在更新设置时尽力删除，回滚到旧版本时不会读到陈旧值 */
-const LEGACY_KV_CACHE_KEY = 'setting-cache';
 const SETTINGS_SQL = 'SELECT key, value FROM settings';
 
 /** 设置行与默认值合并（逐 key safeParse，非法回落默认） */
@@ -88,22 +86,6 @@ export function invalidateSettingsMemory(): void {
   generation++;
 }
 
-/**
- * 失效设置缓存：本 isolate 内存立即失效；旧版 KV 缓存尽力删除，不阻塞调用方，失败也不报错。
- * 有 ctx 时交给 waitUntil，没有时 fire-and-forget。
- */
-export async function invalidateSettingsCache(env: Env, ctx?: ExecCtx | null): Promise<void> {
-  invalidateSettingsMemory();
-  const guarded = (async () => {
-    try {
-      await env.kv.delete(LEGACY_KV_CACHE_KEY);
-    } catch {
-      // 删不掉的旧缓存会在 60s TTL 后自然过期
-    }
-  })();
-  if (ctx) ctx.waitUntil(guarded);
-}
-
 /** AI 翻译已启用且 ai_model 配置完整（/api/config 的 translationEnabled 与翻译接口共用此口径） */
 export function isTranslationReady(settings: Pick<Settings, 'translation' | 'ai_model'>): boolean {
   return settings.translation.enabled && isAiModelConfigured(settings.ai_model);
@@ -131,8 +113,8 @@ async function domainsWriteConflict(env: Env, listed: string): Promise<AppError>
   return new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
 }
 
-/** 写设置：逐 key 校验后落库并失效缓存 */
-export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx?: ExecCtx | null): Promise<void> {
+/** 写设置：逐 key 校验后落库并失效本 isolate 缓存（ctx 当前不用，保留给调用方统一传参） */
+export async function updateSettings(env: Env, patch: UpdateSettingsRequest, _ctx?: ExecCtx | null): Promise<void> {
   const db = createDb(env);
   const writes: { key: string; value: string }[] = [];
   let fresh: Settings | undefined;
@@ -184,7 +166,7 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     await db.insert(settingsTable).values(w)
       .onConflictDoUpdate({ target: settingsTable.key, set: { value: w.value } });
   }
-  await invalidateSettingsCache(env, ctx);
+  invalidateSettingsMemory();
 }
 
 /** 管理端回显：AI 模型 apiKey 已配置时显示 SECRET_MASK（飞书/webhook 密钥已下放个人偏好） */

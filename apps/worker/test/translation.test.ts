@@ -8,7 +8,7 @@ import { adminAuditLogs, mailboxShares, mailboxes, messageTranslations, messages
 import { signToken } from '../src/lib/jwt.js';
 import { bumpCounter, dayWindow, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
-import { getSettings, getSettingsFresh, invalidateSettingsCache, invalidateSettingsMemory, isTranslationReady, updateSettings } from '../src/services/setting.js';
+import { getSettings, getSettingsFresh, invalidateSettingsMemory, isTranslationReady, updateSettings } from '../src/services/setting.js';
 import { AiProviderError } from '../src/services/ai-provider.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_PER_MINUTE, TRANSLATE_REQUESTS_SCOPE, translateSegments } from '../src/services/translate.js';
 
@@ -109,7 +109,7 @@ describe('POST /api/messages/:id/translate', () => {
     // 绕过保存校验直接写入不完整配置，仍视为未启用
     await env.db.prepare(`INSERT INTO settings (key, value) VALUES ('ai_model', ?), ('translation', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(JSON.stringify({ ...aiModel, apiKey: '' }), JSON.stringify(translation)).run();
-    await invalidateSettingsCache(env);
+    invalidateSettingsMemory();
     expect((await data<{ translationEnabled: boolean }>(await request('/api/config'))).translationEnabled).toBe(false);
     await failure(await translate(owner.jwt, id, ['Hello world']), 403);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -530,7 +530,7 @@ describe('AI 模型与翻译设置', () => {
       expect(settings.site.title).not.toBe('Legacy KV Title');
     } finally {
       await env.kv.delete('setting-cache');
-      await invalidateSettingsCache(env);
+      invalidateSettingsMemory();
     }
   });
 
