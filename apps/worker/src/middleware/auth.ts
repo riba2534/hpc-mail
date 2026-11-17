@@ -95,8 +95,7 @@ async function fastAuth(c: Context<AppContext>, claims: JwtClaims): Promise<Auth
     avatarKey: row.avatar_key,
     twoFactorEnabled: row.totp_enabled_at !== null,
   };
-  const securityRaw = (securityResult?.results?.[0] as { value?: string } | undefined)?.value;
-  await assertTwoFactorSatisfied(c, authUser, async () => parseRequire2fa(securityRaw));
+  assertTwoFactorSatisfied(c, authUser, (securityResult?.results?.[0] as { value?: string } | undefined)?.value);
   return authUser;
 }
 
@@ -116,16 +115,12 @@ const TWO_FACTOR_EXEMPT = [
  * 分支——未绑定的账号照旧能拿 7 天 JWT，走 API 的脚本连横幅都看不到，管理员以为已强制、
  * 实际上口令一泄就是全量沦陷。
  */
-async function assertTwoFactorSatisfied(
-  c: { req: { url: string } },
-  user: AuthUser,
-  require2fa: () => Promise<boolean>,
-): Promise<void> {
-  // 绝大多数请求在这里就返回，不会多查一次 settings
+function assertTwoFactorSatisfied(c: { req: { url: string } }, user: AuthUser, securityRaw: string | undefined): void {
+  // 绝大多数请求在这里就返回，不解析 security 设置
   if (user.twoFactorEnabled) return;
   const path = new URL(c.req.url).pathname;
   if (TWO_FACTOR_EXEMPT.some((re) => re.test(path))) return;
-  if (!(await require2fa())) return;
+  if (!parseRequire2fa(securityRaw)) return;
   throw new AppError('totp_setup_required', '本站要求开启两步验证，请先完成绑定');
 }
 
