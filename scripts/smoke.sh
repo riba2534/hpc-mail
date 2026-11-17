@@ -156,6 +156,17 @@ unknown=$(curl -sS -w '\n%{http_code}' "$BASE_URL/v1/missing-smoke-endpoint")
 [ "$(echo "$unknown" | tail -1)" = "404" ] || fail "未知 API 未返回 404"
 echo "$unknown" | head -1 | jq -e '.error.code == "not_found" and (.requestId | type == "string")' >/dev/null || fail "未知 API 错误不可解析"
 
+step "系统域名一键接入：会话 OpenAPI 已登记、未登录返回 401（不调用 Cloudflare）"
+curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
+  .paths["/admin/system-domains/zones"].get["x-required-role"] == "admin" and
+  .paths["/admin/system-domains/onboardings"].post["x-required-role"] == "admin" and
+  .paths["/admin/system-domains/hidden-zones"].put["x-required-role"] == "admin"
+' >/dev/null || fail "系统域名接入接口未登记到会话 OpenAPI"
+for path in zones onboardings; do
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/api/admin/system-domains/$path")
+  [ "$code" = "401" ] || fail "未登录访问 /api/admin/system-domains/$path 返回 $code"
+done
+
 step "管理员用户搜索和邮箱过户契约"
 curl -fsS "$BASE_URL/api/openapi.json" | jq -e '
   .paths["/admin/mailboxes/{id}/transfer"].post["x-required-role"] == "admin" and
