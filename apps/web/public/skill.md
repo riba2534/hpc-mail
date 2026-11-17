@@ -164,7 +164,7 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 | 托管域名列表与接入进度、DNS 记录 | `GET /hosted-domains`、`GET /hosted-domains/:id`、`GET /hosted-domains/:id/dns-records` | `domain.read` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
 | 接入自有域名、立即检测、增改删 DNS 记录 | `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
 
-只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；共享管理以及托管域名的删除、成员与过户见 [mailboxes](references/mailboxes-and-domains.md)；个人通知与转发见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
+只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；共享管理以及托管域名的删除、成员与过户见 [mailboxes](references/mailboxes-and-domains.md)；个人通知与转发见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
 
 ## 完成标准与安全
 

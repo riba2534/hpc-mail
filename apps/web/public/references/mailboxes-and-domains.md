@@ -134,7 +134,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 先读现值，合并**本次已授权的变更**，带顶层 `expectedDomainsRevision`（读取默认 0），不要把整份陈旧 settings PUT 回去。服务端自动增加 revision。409 时重新 GET 并检查他人变更，再基于新版本合并；不能只改 revision 强行覆盖旧 list。设置请求其他字段可独立更新，不附带 domains 就不会覆盖域名列表。
 
-- 新增域名只是业务配置；不会自动写 DNS、开通 Cloudflare Email Routing、把 catch-all 接到 Worker 或配置外发服务。已被用户托管的域名不能加为系统域名，返回 409 `conflict`；反之系统域名也不能被托管。
+- 手动新增域名只是业务配置；不会自动写 DNS、开通 Cloudflare Email Routing、把 catch-all 接到 Worker 或配置外发服务。站长 Cloudflare 账户里的域名可以用[系统域名一键接入](administration.md#系统域名一键接入)自动配好收发再加入列表。已被用户托管或正在一键接入的域名不能加为系统域名，返回 409 `conflict`；反之系统域名也不能被托管。
 - `public:false` 关闭使用公共配置的普通用户的新认领与域名公开列表；专属配置仍可单独授权该域名；已认领邮箱继续存在、可收可发，已有共享不因此撤销。
 - 从 list 删除停止在该域新认领，保留旧邮箱/历史；只要还有该域存量邮箱，它仍被视为站内路由域，既有邮箱可发件。它不等于注销域名或停收邮件，也不会移除 Cloudflare 的 DNS/路由。
 - 配置为空且无存量邮箱时没有可用发件/认领域；需管理员先完成实际域名接入。不应承诺外部投递由“保存域名”即可成功。

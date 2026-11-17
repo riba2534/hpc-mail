@@ -1,6 +1,10 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { MessageAuth, MessageRecipients, RecipientOutcome, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
+import {
+  DNSSEC_STATES, SYSTEM_DOMAIN_ONBOARDING_MODES, SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_STEP_STATES, SYSTEM_DOMAIN_ZONE_ORIGINS,
+  type MessageAuth, type MessageRecipients, type RecipientOutcome, type SystemDomainAck, type SystemDomainChangeKind, type SystemDomainCheck,
+  type SystemDomainOnboardingState, type SystemDomainVerdict, type SystemDomainWriteStep, type UserMailboxPolicy, type UserNotifyPrefs,
+} from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -337,6 +341,100 @@ export const hostedDomainMembers = sqliteTable(
   (t) => [
     primaryKey({ columns: [t.domainId, t.userId] }),
     index('idx_hosted_domain_members_user').on(t.userId),
+  ],
+);
+
+/** 远端变更台账事件（system_domain_onboarding.changes，只追加）；at 为毫秒时间戳，before 为写入前读到的原值 */
+export interface OnboardingChangeEvent {
+  seq: number;
+  kind: SystemDomainChangeKind;
+  status: 'started' | 'done' | 'unknown' | 'failed';
+  at: number;
+  target?: string;
+  before?: unknown;
+  error?: string;
+}
+
+/** 已确认的变更：ack 与确认时观察值的哈希一致才算确认（远端又变了需要重新确认） */
+export interface OnboardingAcceptance {
+  ack: SystemDomainAck;
+  observed: string;
+}
+
+/** 最近一次预检快照（system_domain_onboarding.preflight）：结构与 shared SystemDomainPrecheck 一致，另带每个需确认项的观察值 */
+export interface OnboardingPreflightSnapshot {
+  checkedAt: number;
+  fingerprint: string;
+  verdict: SystemDomainVerdict;
+  checks: SystemDomainCheck[];
+  steps: { kind: SystemDomainWriteStep; detail: string }[];
+  /** 需确认项：ack → 观察值哈希 */
+  observed: { ack: SystemDomainAck; observed: string }[];
+  registrar: { name: string | null; cloudflare: boolean | null } | null;
+}
+
+/**
+ * 系统域名自动接入任务。完成后域名写入 settings.domains.list，本表只保留接入历史；公开范围、限额仍以 settings 为准。
+ * 同一域名在非终态中只能有一条（部分唯一索引）；系统列表、hosted_domains 与进行中的任务三方同名互斥（domain-occupancy.ts）。
+ * linked / unknown 来源的 zone 永不删除。状态写入都带 lease_token（fencing），取消只置 cancel_requested_at。
+ */
+export const systemDomainOnboarding = sqliteTable(
+  'system_domain_onboarding',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    domain: text('domain').notNull(),
+    mode: text('mode', { enum: SYSTEM_DOMAIN_ONBOARDING_MODES }).notNull(),
+    state: text('state', { enum: SYSTEM_DOMAIN_ONBOARDING_STATES }).notNull().$type<SystemDomainOnboardingState>(),
+    stateChangedAt: integer('state_changed_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+    /** 创建时的 cf_account_id：凭据换了账户则进入 blocked，不再调用 Cloudflare */
+    accountId: text('account_id').notNull(),
+    zoneId: text('zone_id'),
+    zoneOrigin: text('zone_origin', { enum: SYSTEM_DOMAIN_ZONE_ORIGINS }).notNull().default('unknown'),
+    /** 最近读到的 zone 状态：initializing / pending / active / moved / missing；未读为空串 */
+    zoneStatus: text('zone_status').notNull().default(''),
+    nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalNameServers: text('original_name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalRegistrar: text('original_registrar').notNull().default(''),
+    dnssec: text('dnssec', { enum: DNSSEC_STATES }).notNull().default('unknown'),
+    routingState: text('routing_state', { enum: SYSTEM_DOMAIN_STEP_STATES }).notNull().default('unknown'),
+    /** Cloudflare 原始 routing.status */
+    routingStatus: text('routing_status').notNull().default(''),
+    catchAllState: text('catch_all_state', { enum: SYSTEM_DOMAIN_STEP_STATES }).notNull().default('unknown'),
+    sendingState: text('sending_state', { enum: SYSTEM_DOMAIN_STEP_STATES }).notNull().default('unknown'),
+    /** Cloudflare 原始发信 DNS status */
+    sendingStatus: text('sending_status').notNull().default(''),
+    sendingTag: text('sending_tag'),
+    preflight: text('preflight', { mode: 'json' }).$type<OnboardingPreflightSnapshot>(),
+    accepted: text('accepted', { mode: 'json' }).notNull().$type<OnboardingAcceptance[]>().default(sql`'[]'`),
+    confirmedBy: integer('confirmed_by'),
+    confirmedAt: integer('confirmed_at', { mode: 'timestamp_ms' }),
+    changes: text('changes', { mode: 'json' }).notNull().$type<OnboardingChangeEvent[]>().default(sql`'[]'`),
+    errorCode: text('error_code').notNull().default(''),
+    lastError: text('last_error').notNull().default(''),
+    /** 连续失败次数，用于退避；取得进展时清零 */
+    attempts: integer('attempts').notNull().default(0),
+    /** cron 下次处理时间；NULL 不自动处理 */
+    nextCheckAt: integer('next_check_at', { mode: 'timestamp_ms' }),
+    /** 最近一次与 Cloudflare 核对的时间（手动检测节流） */
+    checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+    leaseToken: text('lease_token'),
+    leaseUntil: integer('lease_until', { mode: 'timestamp_ms' }),
+    cancelRequestedAt: integer('cancel_requested_at', { mode: 'timestamp_ms' }),
+    cancelRequestedBy: integer('cancel_requested_by'),
+    /** 取消时同时删除本任务创建、从未激活的 zone */
+    cancelDeleteZone: integer('cancel_delete_zone', { mode: 'boolean' }).notNull().default(false),
+    createdBy: integer('created_by').notNull(),
+    /** 完成时写入的 domains revision */
+    settingsRevision: integer('settings_revision'),
+    activatedAt: integer('activated_at', { mode: 'timestamp_ms' }),
+    finishedAt: integer('finished_at', { mode: 'timestamp_ms' }),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    uniqueIndex('uniq_system_onboarding_active_domain').on(t.domain)
+      .where(sql`${t.state} NOT IN ('completed', 'cancelled', 'failed')`),
+    index('idx_system_onboarding_due').on(t.state, t.nextCheckAt),
   ],
 );
 

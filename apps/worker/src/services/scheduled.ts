@@ -33,6 +33,8 @@ import { offloadMailBodies } from './body-offload.js';
 import { cleanupDeliveryRefs } from './delivery-events.js';
 import { syncDeliveryEventSubscriptions } from './event-subscriptions.js';
 import { cleanupExpiredSuppressions } from './suppression.js';
+import { syncDueOnboarding } from './system-domain.js';
+import { SYSTEM_DOMAIN_CF_SCOPE, SYSTEM_DOMAIN_CF_WINDOW_MINUTES } from './zone-catalog.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -203,6 +205,8 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   // 历史正文分批搬到 R2（放在清理之前：本轮没被引用的对象登记后同一轮就能回收）
   await step(report, 'bodies.offload', () => offloadMailBodies(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
+  // 系统域名接入由管理员发起、数量很少（每轮最多 3 条，墙钟 20 秒），先于托管同步，不被它占满 Cloudflare 额度
+  await step(report, 'system_domains.onboarding', () => syncDueOnboarding(env));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
   // 投递回执订阅：只为新域名或失败超过 6 小时的域名调用 Cloudflare，其余时候只读本地记录
   await step(report, 'delivery_events.subscriptions', () => syncDeliveryEventSubscriptions(env));
@@ -274,6 +278,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
       CANARY_RATE_SCOPE,
     ], minuteWindow(1) - 120);
+    await purgeCounters(env, SYSTEM_DOMAIN_CF_SCOPE, minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES) - 24);
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });

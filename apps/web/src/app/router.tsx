@@ -50,7 +50,10 @@ const AdminUserMailPage = page(
 );
 const AdminMailPage = page(preloadable(() => import('@/features/admin/mail/admin-mail-page')), (m) => m.AdminMailPage);
 const InvitesPage = page(preloadable(() => import('@/features/admin/invites/invites-page')), (m) => m.InvitesPage);
-const DomainsPage = page(preloadable(() => import('@/features/admin/domains/domains-page')), (m) => m.DomainsPage);
+// 系统域名接入详情页与收件域名页同一个 chunk，共用同一个 loader，不做二级懒加载
+const loadDomainsPage = preloadable(() => import('@/features/admin/domains/domains-page'));
+const DomainsPage = page(loadDomainsPage, (m) => m.DomainsPage);
+const OnboardingDetailPage = page(loadDomainsPage, (m) => m.OnboardingDetailPage);
 const AdminHostedDomainsPage = page(
   preloadable(() => import('@/features/admin/hosted-domains/admin-hosted-domains-page')),
   (m) => m.AdminHostedDomainsPage,
@@ -100,6 +103,7 @@ export const router = createBrowserRouter([
           { path: 'mail', element: <AdminMailPage />, handle: title('全站邮件') },
           { path: 'invites', element: <InvitesPage />, handle: title('邀请码') },
           { path: 'domains', element: <DomainsPage />, handle: title('收件域名') },
+          { path: 'domains/onboarding/:id', element: <OnboardingDetailPage />, handle: title('域名接入') },
           { path: 'hosted-domains', element: <AdminHostedDomainsPage />, handle: title('托管域名') },
           { path: 'addresses', element: <AddressesPage />, handle: title('全站地址') },
           { path: 'addresses/:mailboxId/mail', element: <AdminAddressMailPage />, handle: title('地址邮件') },

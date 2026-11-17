@@ -10,6 +10,7 @@ import adminMailboxShares from './routes/admin/mailbox-shares.js';
 import adminMailboxes from './routes/admin/mailboxes.js';
 import adminSettings from './routes/admin/settings.js';
 import adminSuppressions from './routes/admin/suppressions.js';
+import adminSystemDomains from './routes/admin/system-domains.js';
 import adminUsers from './routes/admin/users.js';
 import apiKeys from './routes/api-keys.js';
 import attachments from './routes/attachments.js';
@@ -60,6 +61,7 @@ export function createApp() {
   api.route('/admin/mailboxes', adminMailboxes);
   api.route('/admin/settings', adminSettings);
   api.route('/admin/hosted-domains', adminHostedDomains);
+  api.route('/admin/system-domains', adminSystemDomains);
   api.route('/admin/invites', adminInvites);
   api.route('/admin/api-keys', adminApiKeys);
   api.route('/admin/audit-logs', adminAudit);

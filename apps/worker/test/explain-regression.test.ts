@@ -7,6 +7,9 @@ import { mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { encodeCursor } from '../src/lib/pagination.js';
 import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
 import { purgeStatements } from '../src/services/message-lifecycle.js';
+import { anyOnboardingSql, hostedTakenSql, onboardingActiveSql } from '../src/services/domain-occupancy.js';
+import { syncDueOnboarding } from '../src/services/system-domain.js';
+import { occupancyFacts } from '../src/services/zone-catalog.js';
 import {
   countUnread, findNextMessage, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
 } from '../src/services/message.js';
@@ -458,4 +461,26 @@ describe('默认视图改走地址索引：结果与改前逐条一致', () => {
       expect(await getRecentContacts(env, viewer), who).toEqual([...expected].slice(0, 100));
     }
   }, 20_000); // 逐视图逐页回放，CI 慢机上整文件曾到 5 秒以上
+});
+
+describe('执行计划回归：系统域名接入', () => {
+  const planOf = async (sql: string, ...params: unknown[]) =>
+    (await env.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...params).all<{ detail: string }>()).results.map((row) => row.detail).join(' | ');
+
+  it('同名互斥按域名走部分唯一索引与托管唯一索引（表达式与索引的 WHERE 一致）', async () => {
+    expect(await planOf(`SELECT ${onboardingActiveSql('?1')}`, 'x.test')).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(await planOf(`SELECT ${anyOnboardingSql('?1')}`, '["x.test"]')).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(await planOf(`SELECT ${hostedTakenSql('?1')}`, 'x.test')).toMatch(/hosted_domains_domain_unique \(domain=\?\)/);
+    const facts = await capturePlans((e) => occupancyFacts(e, 'x.test', 1));
+    expect(facts).toHaveLength(1);
+    expect(facts[0]!.plan).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(facts[0]!.plan).toMatch(/hosted_domains_domain_unique \(domain=\?\)/);
+  });
+
+  it('定时任务按 (state, next_check_at) 索引取到期任务', async () => {
+    const plans = await capturePlans((e) => syncDueOnboarding({ ...e, cf_api_token: 't', cf_account_id: 'a' }));
+    expect(plans).toHaveLength(1);
+    expect(plans[0]!.plan).toMatch(/idx_system_onboarding_due \(state=\? AND next_check_at<\?\)/);
+    expect(plans[0]!.plan).not.toMatch(/SCAN system_domain_onboarding\b/);
+  });
 });
