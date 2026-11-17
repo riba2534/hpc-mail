@@ -2,7 +2,7 @@
 
 ## 目录
 
-- [读取与搜索](#读取与搜索)：列表参数、摘要与详情字段、翻译、管理员 scope
+- [读取与搜索](#读取与搜索)：列表参数与筛选（时间、发件人、收件人、验证码、附件）、摘要与详情字段、翻译、管理员 scope
 - [增量同步](#增量同步)：`afterId` 拉新邮件，避免重复读取详情
 - [等待本次验证码](#等待本次验证码)：`/v1/messages/wait` 的过滤、多地址、`include=body` 与游标、Python 示例
 - [维护状态与回收站](#维护状态与回收站)：已读、全部已读、星标、删除、恢复、永久删除
@@ -26,10 +26,28 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`AP
 
 列表支持 `direction=inbound|outbound`、`address`（完整地址）、`domain`、`q`（最长 256 字符，主题/发件地址/发件名/文本正文/收件人子串）、`unread=1`（只匹配你认领的地址，共享邮件不出现在未读筛选里）、`starred=1`、`trash=1`、`afterId`（非负安全整数，0 是合法空基线）、`cursor`、`limit`（1–100）。布尔查询接受 `1/true/0/false`；`unread=0` 与 `starred=0` 表示不筛选，不是“只看已读/未星标”。`trash=1` 只看软删除，未传看非回收站。
 
+筛选参数（`/api` 与 `/v1` 相同，可与上面的参数任意组合，多个条件同时满足）：
+
+| 参数 | 格式 | 匹配 |
+|---|---|---|
+| `since` | ISO 8601：`2026-11-17`（UTC 零点）、`2026-11-17T08:00:00Z` 或 `2026-11-17T16:00:00+08:00` | `createdAt` ≥ since（含边界） |
+| `until` | 同上 | `createdAt` < until（不含边界）；同时给出时 since 必须早于 until |
+| `from` | 完整地址，或 `@域名` | `fromAddress` 精确匹配（不区分大小写）；`@域名` 只匹配该域，不含子域（`@example.com` 不匹配 `a@mail.example.com`） |
+| `to` | 完整地址，或 `@域名` | 外发看 To/Cc/Bcc；收件看收件地址（`address`）与原信 To/Cc |
+| `hasCode` | `1/true` | 只看收件时识别出验证码的邮件（存储的码）；读取时临时识别出的码不参与筛选 |
+| `hasAttachments` | `1/true` | 只看带附件的邮件，口径同摘要的 `hasAttachments`（正文内联图不算） |
+
+没有时区的日期时间（`2026-11-17T08:00:00`）和纯数字时间戳返回 400 `validation_failed`，避免本地时区与秒/毫秒的歧义。`hasCode=0`、`hasAttachments=0` 与不传相同。读取量随匹配的稀疏程度增加：`from`、`to` 这类条件命中很少时，建议同时给 `since` 把范围收窄到需要的时间段。
+
 ```bash
 hpc '/messages' --get --data-urlencode 'direction=inbound' \
   --data-urlencode "address=$HPC_MAIL_ADDRESS" --data-urlencode 'limit=30'
 hpc '/messages' --get --data-urlencode 'q=验证码' --data-urlencode 'unread=1'
+# 最近 24 小时 GitHub 发来的、带附件的邮件
+hpc '/messages' --get --data-urlencode "since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
+  --data-urlencode 'from=@github.com' --data-urlencode 'hasAttachments=1'
+# 发给 bob 的外发邮件
+hpc '/messages' --get --data-urlencode 'direction=outbound' --data-urlencode 'to=bob@example.net'
 ```
 
 `/api` 列表首页（不带 `cursor`、`afterId`）另带 `head`，是该页内容的不透明指纹，只用于和 `/api/messages/sync` 比较是否相等；`/v1` 列表没有该字段。后续页带 `cursor=<data.nextCursor>`，保留过滤条件。`cursor` 只用服务器返回的值：伪造或截断后无法解码时返回 400 `validation_failed`，不会静默从首页重来（API Key 调用日志、管理员审计日志的分页同样如此）。

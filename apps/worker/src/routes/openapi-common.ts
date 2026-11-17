@@ -383,10 +383,23 @@ export const scopeQuery = [query('scope', { type: 'string', enum: ['mine', 'uncl
   query('userId', positiveId, 'Required for administrator scope=user; mutations cannot modify another owner’s mail.')];
 export const mutationQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed'] }, 'Default mine; unclaimed requires administrator. Query or JSON body scope are accepted; conflicting values return 400.')];
 export const pageQuery = [query('cursor', { type: 'string', maxLength: 128 }, 'Opaque server nextCursor. Omit on first page; null means no next page. A cursor that is present but cannot be decoded returns 400 validation_failed instead of silently restarting from the first page.'), query('limit', { type: 'integer', minimum: 1, maximum: 100, default: 30 })];
+const isoTimeQuery: Schema = { type: 'string', maxLength: 40, examples: ['2026-11-17', '2026-11-17T08:00:00Z', '2026-11-17T16:00:00+08:00'],
+  description: 'ISO 8601: a date (UTC midnight) or a date-time with Z or ±HH:MM. A date-time without a time zone or a bare number returns 400 validation_failed.' };
+const addressFilterQuery: Schema = { type: 'string', maxLength: 254, examples: ['alice@example.net', '@example.net'] };
+/** 列表筛选：多个条件同时满足，0/false 与不传相同 */
+const listFilterQuery = [
+  query('since', isoTimeQuery, 'Only mail with createdAt at or after this time (inclusive).'),
+  query('until', isoTimeQuery, 'Only mail with createdAt before this time (exclusive). With since, since must be earlier.'),
+  query('from', addressFilterQuery, 'Sender filter, case-insensitive: a full address matches fromAddress exactly; @domain matches that exact domain (subdomains excluded).'),
+  query('to', addressFilterQuery, 'Recipient filter with the same address/@domain rule: outbound mail matches To/Cc/Bcc; inbound mail matches the receiving address or the original To/Cc.'),
+  query('hasCode', { type: 'string', enum: ['1', 'true', '0', 'false'] }, '1/true: only mail with a verification code recognized when it was received (the stored code). 0/false applies no filter.'),
+  query('hasAttachments', { type: 'string', enum: ['1', 'true', '0', 'false'] }, '1/true: only mail with attachments, same rule as hasAttachments in summaries (inline body images do not count). 0/false applies no filter.'),
+];
 export const listQuery = [query('direction', { type: 'string', enum: ['inbound', 'outbound'] }), query('domain', str), query('address', str),
   ...['unread', 'starred', 'trash'].map(name => query(name, { type: 'string', enum: ['1', 'true', '0', 'false'] })),
   query('q', { type: 'string', maxLength: 256 }, 'Literal substring search in subject/from/body; Unicode is supported.'),
-  ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'), ...pageQuery];
+  ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'),
+  ...listFilterQuery, ...pageQuery];
 export const idempotencyHeader = { name: 'Idempotency-Key', in: 'header', required: false,
   description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed (201 with the original summary, or the same 422 delivery_failed when every recipient failed) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it. After 422 delivery_failed, correct the recipients and use a new key. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key; confirm unknown recipients before resending to them. Outbound mail still pending an hour after creation is marked unknown, after which the same key replays 201 with status unknown. Completed keys are retained at least two days.',
   schema: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$' } };

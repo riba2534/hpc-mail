@@ -345,6 +345,47 @@ function searchCondition(q: string | undefined): SQL | undefined {
   );
 }
 
+/**
+ * since 的 id 下界：created_at >= since 的邮件里最小的 id，经 idx_messages_created_id 只读这段时间窗口的索引项。
+ * 任何满足 since 的邮件 id 都不小于它，所以结果精确、不依赖 id 与时间同序；按地址取数时它成为索引里的 id 区间，
+ * 主人邮件很多、窗口内很少时不必逐封回表判断时间。没有邮件满足时取极大值，直接得到空页。
+ * until 不加边界：默认视图从最新一封往回取，until 之后的邮件通常不多，换来的读取量不值得多扫一段索引。
+ */
+const MAX_ROW_ID = Number.MAX_SAFE_INTEGER;
+
+/**
+ * 列表筛选（B3）：since/until 按 created_at（含/不含），from 匹配发件地址，to 匹配收件人，
+ * hasCode 只看收件时识别出的码，hasAttachments 与列表的 hasAttachments 同一口径。
+ * 都只追加到 WHERE，不改变 addressIndexOwner 的选路；发件人与收件人在写入时已规范为小写，lower() 兜住旧数据。
+ */
+function listFilterConditions(query: ListMessagesQuery): SQL[] {
+  const conds: SQL[] = [];
+  if (query.since !== undefined) {
+    conds.push(gte(messages.createdAt, new Date(query.since)));
+    conds.push(sql`${messages.id} >= coalesce((select min(b.id) from ${messages} as b indexed by idx_messages_created_id
+      where b.created_at >= ${query.since}), ${MAX_ROW_ID})`);
+  }
+  if (query.until !== undefined) conds.push(lt(messages.createdAt, new Date(query.until)));
+  if (query.from) {
+    conds.push(query.from.startsWith('@')
+      ? sql`lower(${messages.fromAddress}) like ${`%${query.from}`}`
+      : sql`lower(${messages.fromAddress}) = ${query.from}`);
+  }
+  if (query.to) {
+    // recipients 是 {"to":[...],"cc":[...],"bcc":[...]} 的 JSON：带引号匹配整个地址，@域名 匹配到结尾的引号（不含子域）
+    const inRecipients = sql`instr(lower(${messages.recipients}), ${query.to.startsWith('@') ? `${query.to}"` : `"${query.to}"`}) > 0`;
+    const inboundAddress = query.to.startsWith('@')
+      ? sql`${messages.address} like ${`%${query.to}`}`
+      : sql`${messages.address} = ${query.to}`;
+    conds.push(sql`((${messages.direction} = 'inbound' and ${inboundAddress}) or ${inRecipients})`);
+  }
+  if (query.hasCode) conds.push(sql`${messages.verificationCode} <> ''`);
+  if (query.hasAttachments) {
+    conds.push(sql`exists (select 1 from ${attachmentsTable} where ${attachmentsTable.messageId} = ${messages.id} and ${COUNTS_AS_ATTACHMENT})`);
+  }
+  return conds;
+}
+
 const pageColumns = asSqlColumns({ ...summarySelection, deletedAt: messages.deletedAt });
 type PageRow = { [K in keyof typeof pageColumns]: (typeof pageColumns)[K]['_']['type'] };
 
@@ -374,6 +415,7 @@ function messagePageQuery(db: Db, viewer: Viewer, query: ListMessagesQuery) {
   const cursorId = decodeCursor(query.cursor);
   if (cursorId) conds.push(lt(messages.id, cursorId));
   if (query.afterId) conds.push(gt(messages.id, query.afterId));
+  conds.push(...listFilterConditions(query));
   conds.push(...source.prefix);
 
   const where = and(...conds.filter((x): x is SQL => x !== undefined));
