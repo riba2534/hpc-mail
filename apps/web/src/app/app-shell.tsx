@@ -45,6 +45,7 @@ import { usePublicConfig } from '@/lib/use-config';
 import { formatDocumentTitle, useTitleOverride } from '@/lib/use-document-title';
 import { useKeyboardShortcuts } from '@/lib/use-keyboard-shortcuts';
 import { useCurrentUser } from '@/lib/use-session';
+import { useBuildVersionCheck } from './build-version';
 import { lazyWithReload } from './chunk-reload';
 import { PageLoader } from './page-loader';
 import { preloadable } from './route-modules';
@@ -327,6 +328,7 @@ export function AppShell() {
   const bottomNavHidden = hidesBottomNav(pathname);
   useKeyboardShortcuts({ onHelp: () => setShortcutsOpen(true) });
   useShellDocumentTitle(siteTitle, unreadCount);
+  useBuildVersionCheck();
 
   return (
     <div className="flex min-h-dvh flex-col bg-canvas md:flex-row">
