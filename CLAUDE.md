@@ -97,7 +97,11 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 ## AI Agent 操作指南 `/skill.md`
 
-`apps/web/public/skill.md` 是一份**给外部 AI Agent 的 API 使用说明书**，随前端构建部署到 https://hpc.email/skill.md（Worker assets 直接返回 raw Markdown）。YAML frontmatter 的 `name` 和 `description` 应准确说明目标系统及触发条件；入口说明认证选择和完整能力地图，详细参数和示例放入其链接的主题参考。API Key 用 `/v1`，JWT 用 `/api`；账户设置及管理员功能只使用 JWT，不扩张邮箱 Key 的权限。**改动了会影响 AI 使用的 API（端点、字段、认证）时，同步更新技能、参考文档和对应 OpenAPI**，保证指引与实现一致。
+`apps/web/public/skill.md` 是一份**给外部 AI Agent 的 API 使用说明书**，随前端构建部署到 https://hpc.email/skill.md（Worker assets 直接返回 raw Markdown）。YAML frontmatter 的 `name` 和 `description` 应准确说明目标系统及触发条件；入口说明认证选择和完整能力地图，详细参数和示例放入其链接的主题参考。**改动了会影响 AI 使用的 API（端点、字段、认证、scope）时，同步更新技能、参考文档和对应 OpenAPI**，保证指引与实现一致。
+
+- **API Key 走 `/v1`、JWT 走 `/api`；用户自己的功能尽量经 Key 开放，逐项按 scope 授权**（`API_SCOPES`，路由用 `requireScope` 校验）：收信 `mail.read`，已读/星标/删除/恢复 `mail.write`，发信、草稿与上传 `mail.send`（引用原信时另需 `mail.read`），认领 `mailbox.read`/`mailbox.write`，共享自己的邮箱 `mailbox.share`，托管域名的查看、添加、检测、重连与 DNS 记录 `domain.read`/`domain.write`，Webhook v2 端点 `webhook.write`，通知偏好 `notify.read`/`notify.write`（飞书、PushDeer、通用 Webhook 及其测试与重试；限定了邮箱或域名的 Key 不能修改这些作用于全部来信的配置，也不能看投递健康）。`/v1/me`、`/v1/status`、`/v1/domains` 任一有效 Key 可调，`/v1/identities` 要 `mail.send` 或 `mailbox.read` 之一。
+- **`admin` scope**：只有管理员能授予，必须带 IP 白名单且有效期不超过 `MAX_ADMIN_KEY_TTL_DAYS`（90 天）；只有带它的管理员 Key 才按管理员执行（跨范围读信、任意邮箱或前缀发信、不受外发配额），不带它的管理员 Key 等同普通用户。`/api/admin/*` 管理后台不经 Key。
+- **仍只用 JWT**：登录、改密、两步验证与会话，创建和修改 Key 本身，邮箱转发目标（所有来信都会外发，是被盗 Key 的外泄口；`PUT /v1/notify-prefs` 带 `forward` 返回 403），托管域名的成员上限、删除、成员与过户。所有 scope 默认不授予：已有 Key 不自动获得新 scope，网页创建 Key 默认只勾「只读收信」，「完全访问」也不含 `admin`。
 
 - `/llms.txt`、首页 HTML 链接和 API 响应 `Link` 头提供文档发现入口；`/api/openapi.json` 与 `/v1/openapi.json` 分别描述会话和 API Key 接口，公开返回原始 OpenAPI JSON（不包 `{data}`）。两份描述均以请求站点 origin 为 server，适用于自部署。
 - 邮件 `scope` 必须显式校验，query/body 同时指定时必须一致；非法值不能静默退回个人邮箱。未知 API 返回统一 JSON 错误信封；缺失 Markdown 文档不能返回 SPA HTML 冒充技能正文。
