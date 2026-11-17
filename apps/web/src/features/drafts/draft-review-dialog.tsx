@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import type { Draft, MailAddress, Mailbox } from '@hpc-mail/shared';
+import type { Draft, Mailbox } from '@hpc-mail/shared';
 import { ImageOff, Paperclip } from 'lucide-react';
 import { type ReactNode, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -12,10 +12,8 @@ import { countRemoteImages } from '@/features/message/count-remote-images';
 import { EmailHtml } from '@/lib/email-html';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
-import { draftKeys, draftsApi } from './drafts-api';
-import { DRAFT_STATUS_META, draftFromLabel, draftSourceLabel, draftStatusLabel } from './draft-format';
-
-const EDITABLE = new Set<Draft['status']>(['draft', 'scheduled', 'failed']);
+import { draftDetailQueryOptions } from './draft-cache';
+import { DRAFT_STATUS_META, draftFromLabel, draftSourceLabel, draftStatusLabel, formatAddressList, isDraftEditable } from './draft-format';
 
 export interface DraftActionHandlers {
   onSend: (draft: Draft) => void;
@@ -23,8 +21,6 @@ export interface DraftActionHandlers {
   onCancelSchedule: (draft: Draft) => void;
   onDelete: (draft: Draft) => void;
 }
-
-const addressList = (items: MailAddress[]) => items.map((item) => (item.name ? `${item.name} <${item.address}>` : item.address)).join('、');
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -94,10 +90,10 @@ function DraftDetail({ draft, mailboxes }: { draft: Draft; mailboxes: Mailbox[] 
         </Field>
         <Field label="来源">{draftSourceLabel(draft)}</Field>
         <Field label="发件地址">{draftFromLabel(draft.from, mailboxes) ?? <span className="text-critical">未设置</span>}</Field>
-        <Field label="收件人">{draft.to.length ? addressList(draft.to) : <span className="text-ink-tertiary">（未填写）</span>}</Field>
-        {draft.cc.length > 0 && <Field label="抄送">{addressList(draft.cc)}</Field>}
-        {draft.bcc.length > 0 && <Field label="密送">{addressList(draft.bcc)}</Field>}
-        {draft.replyTo.length > 0 && <Field label="回复地址">{addressList(draft.replyTo)}</Field>}
+        <Field label="收件人">{draft.to.length ? formatAddressList(draft.to) : <span className="text-ink-tertiary">（未填写）</span>}</Field>
+        {draft.cc.length > 0 && <Field label="抄送">{formatAddressList(draft.cc)}</Field>}
+        {draft.bcc.length > 0 && <Field label="密送">{formatAddressList(draft.bcc)}</Field>}
+        {draft.replyTo.length > 0 && <Field label="回复地址">{formatAddressList(draft.replyTo)}</Field>}
         {draft.replyToMessageId !== null && (
           <Field label="回复">
             <Link to={`/mail/${draft.replyToMessageId}`} className="text-accent hover:underline">邮件 #{draft.replyToMessageId}</Link>
@@ -146,11 +142,10 @@ export function DraftReviewDialog({
   ...actions
 }: DraftActionHandlers & { draftId: number | null; mailboxes: Mailbox[] | undefined; busy: boolean; onClose: () => void }) {
   const { data: draft, isLoading, isError, error, refetch } = useQuery({
-    queryKey: draftKeys.detail(draftId ?? 0),
-    queryFn: ({ signal }) => draftsApi.get(draftId!, signal),
+    ...draftDetailQueryOptions(draftId ?? 0),
     enabled: draftId !== null,
   });
-  const editable = draft ? EDITABLE.has(draft.status) : false;
+  const editable = draft ? isDraftEditable(draft.status) : false;
 
   return (
     <Dialog open={draftId !== null} onOpenChange={(open) => !open && onClose()}>

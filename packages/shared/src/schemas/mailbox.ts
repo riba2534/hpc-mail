@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import { LOCAL_PART_REGEX, MAX_BATCH_CLAIM, MAX_BATCH_SHARE_MAILBOXES, MAX_MAILBOX_GRANTEES } from '../constants.js';
+import { LOCAL_PART_REGEX, MAX_BATCH_CLAIM, MAX_BATCH_SHARE_MAILBOXES, MAX_DISPLAY_NAME_LENGTH, MAX_MAILBOX_GRANTEES } from '../constants.js';
 import type { ErrorCode } from '../envelope.js';
+import { emptyAsUndefined, pageQueryShape } from './query.js';
 
 export const localPartSchema = z
   .string()
@@ -21,8 +22,6 @@ export const domainSchema = z
 export const LIST_PAGE_DEFAULT_LIMIT = 50;
 export const LIST_PAGE_MAX_LIMIT = 200;
 
-const blankAsUndefined = (value: unknown) => (value === '' ? undefined : value);
-
 /** 查询参数里出现 cursor 或 limit（值可为空）即分页模式 */
 const markPaged = (raw: unknown) =>
   raw !== null && typeof raw === 'object' ? { ...raw, paged: 'cursor' in raw || 'limit' in raw } : raw;
@@ -36,8 +35,8 @@ export function withOptionalPage<T extends z.ZodRawShape>(shape: T) {
   return z.preprocess(markPaged, z.object({
     ...shape,
     paged: z.boolean(),
-    cursor: z.preprocess(blankAsUndefined, z.string().max(128).optional()),
-    limit: z.preprocess(blankAsUndefined, z.coerce.number().int(limitMessage).min(1, limitMessage).max(LIST_PAGE_MAX_LIMIT, limitMessage).optional())
+    cursor: pageQueryShape.cursor,
+    limit: emptyAsUndefined(z.coerce.number().int(limitMessage).min(1, limitMessage).max(LIST_PAGE_MAX_LIMIT, limitMessage))
       .default(LIST_PAGE_DEFAULT_LIMIT),
   }));
 }
@@ -48,7 +47,7 @@ const listSearchSchema = z.string().trim().toLowerCase().max(254).optional();
 /** GET /api/mailboxes 与 /v1/mailboxes（all=1 另由路由校验权限）；q、domain 在两种模式下都生效 */
 export const listMailboxesQuerySchema = withOptionalPage({
   q: listSearchSchema,
-  domain: z.preprocess(blankAsUndefined, domainSchema.optional()),
+  domain: emptyAsUndefined(domainSchema),
 });
 export type ListMailboxesQuery = z.infer<typeof listMailboxesQuerySchema>;
 
@@ -58,7 +57,6 @@ export const adminMailboxSharesQuerySchema = withOptionalPage({
     .refine(Number.isSafeInteger, 'mailboxId 需为正整数').optional(),
   q: listSearchSchema,
 });
-export type AdminMailboxSharesQuery = z.infer<typeof adminMailboxSharesQuerySchema>;
 
 export const CLAIM_PLAN_STRATEGIES = ['uniform', 'claude'] as const;
 export type ClaimPlanStrategy = (typeof CLAIM_PLAN_STRATEGIES)[number];
@@ -109,7 +107,7 @@ export interface ClaimPlan {
 }
 
 export const updateMailboxRequestSchema = z.object({
-  displayName: z.string().trim().max(64),
+  displayName: z.string().trim().max(MAX_DISPLAY_NAME_LENGTH),
 });
 export type UpdateMailboxRequest = z.infer<typeof updateMailboxRequestSchema>;
 

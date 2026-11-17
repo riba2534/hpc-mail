@@ -40,7 +40,7 @@
 
 ## forbidden-scope
 
-API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺哪个。`GET /v1/me` 查看当前 Key 的 scopes；Key 不能给自己加 scope，要由用户在网页的 API Key 页面（或用 JWT 调 `PUT /api/api-keys/:id`）修改，或换用带该 scope 的 Key。带 `replyToMessageId` 或 `forwardAttachmentsFrom` 发信时除 `mail.send` 外还需要 `mail.read`；`GET /v1/identities` 需要 `mail.send` 或 `mailbox.read` 之一。托管域名接口查看需要 `domain.read`，添加、检测与改 DNS 需要 `domain.write`。
+API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺哪个。`GET /v1/me` 查看当前 Key 的 scopes；Key 不能给自己加 scope，要由用户在网页的 API Key 页面（或用 JWT 调 `PUT /api/api-keys/:id`）修改，或换用带该 scope 的 Key。带 `replyToMessageId` 或 `forwardAttachmentsFrom` 发信时除 `mail.send` 外还需要 `mail.read`；`GET /v1/identities` 需要 `mail.send` 或 `mailbox.read` 之一。托管域名接口查看需要 `domain.read`，添加、检测、重新接入与改 DNS 需要 `domain.write`。
 
 ## forbidden-sender
 
@@ -70,11 +70,11 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 全部收件人都在本站抑制名单里（HTTP 422）：此前从同一发信域名发给他们的信被退回，或被标为垃圾邮件。什么也没有发出，没有创建发件记录，不占当日外发配额，`Idempotency-Key` 已释放，改正后可以继续用。`details.suppressed` 每项为 `{address,reason,sendingDomain,since,expiresAt}`：`reason` 为 `hard_bounce`（永久退信，地址或域名不可用）、`soft_bounce`（临时失败且重试耗尽）或 `complaint`（收件人投诉）；`expiresAt` 是自动解除时间，null 表示需管理员解除。
 
-换用其他收件人；对方地址恢复后由管理员在抑制名单中解除（`DELETE /api/admin/suppressions/:id`，见[管理员功能](administration.md#投递回执与抑制名单)），软退信 24 小时、一般硬退信 7 天后自动解除。名单只拦从 `sendingDomain` 发出的信，但不要为绕过它改用其他发信域名：地址不存在会再次退信，投诉过的人不应再收到这类邮件。只有部分收件人被抑制时照常发送其余收件人（201），被抑制的收件人在 `recipientOutcomes` 里为 `failed` 并带 `code:"recipient_suppressed"`，补发时去掉它们；其余收件人也全部失败时是 422 `delivery_failed`。详见[抑制名单](mail.md#抑制名单)。
+换用其他收件人，或等 `expiresAt` 自动解除；对方地址恢复后由管理员在抑制名单中解除（`DELETE /api/admin/suppressions/:id`，见[管理员功能](administration.md#投递回执与抑制名单)）。不要为绕过名单改用其他发信域名。只有部分收件人被抑制时照常发送其余收件人（201），被抑制的收件人在 `recipientOutcomes` 里为 `failed` 并带 `code:"recipient_suppressed"`，补发时去掉它们。各类条目的期限与部分抑制的细节见[抑制名单](mail.md#抑制名单)。
 
 ## rate_limited
 
-请求频率或每日外发配额超限（HTTP 429）。按 `X-RateLimit-Reset` 或错误信息稍后重试，设总期限，不要换 Key 绕过账户级限制；`GET /v1/me` 查看速率上限与今日外发用量（`outbound.resetsAt` 是配额重置时间）。
+请求频率或配额超限（HTTP 429）。`/v1` 的 message 区分范围：「API 调用频率超限」是这把 Key 超限，「API 调用频率超限（账户级）」是同一用户所有 Key 合计超限，「API 总调用频率超限」是全站繁忙。每日外发配额、待发送附件配额、托管域名添加与立即检测的频率限制也用这个码。按 `X-RateLimit-Reset` 或错误信息稍后重试，设总期限，不要换 Key 绕过账户级限制；`GET /v1/me` 查看速率上限与今日外发用量（`outbound.resetsAt` 是配额重置时间）。各级限额见[限流](auth-and-http.md#错误与限流)。
 
 ## key-restricted
 
@@ -87,6 +87,7 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 ## reauth_failed
 
 `password` 与当前登录密码不符（HTTP 403，网页会话不会因此失效）。同一账户 15 分钟内失败 5 次后返回 429 `rate_limited`，等窗口结束再试。
+
 ## attachment_url_forbidden
 
 URL 附件的地址不允许拉取（HTTP 400），没有发出，`details.url` 是被拒的地址（重定向时是跳转目标）。只接受公网可访问的 `https://` 地址，默认端口 443，地址里不能带账号密码；IP 字面量或域名解析结果落在内网、回环、链路本地（含云元数据 `169.254.169.254`）、CGNAT、组播、保留或文档网段时拒绝，`localhost`、`*.local`、`*.internal` 等内网主机名与本站自身的地址也拒绝。重定向的每一跳都按同样规则检查。内网或本站的文件先下载，再用 `POST /v1/uploads`（JWT 用 `POST /api/uploads`）上传后写进 `attachmentTokens`。详见[附件](attachments.md#url-附件)。
@@ -111,6 +112,6 @@ URL 附件拉取失败（HTTP 422），没有发出，`details.url` 是出错的
 | 404 `not_found` | 资源不存在或不在可见范围；发件 `mailboxId` 不存在也是它 |
 | 409 `address_taken` | 认领的地址已被占用，换前缀 |
 | 409 `conflict` | 并发冲突或版本过期：重新读取当前状态再决定 |
-| 500 `internal` | 服务端错误。发信时用同一个 `Idempotency-Key` 与同一请求体重试取回结果；其他变更先读回状态 |
+| 500 `internal`、网络超时 | 读操作可有限退避重试；发信用同一个 `Idempotency-Key` 与同一请求体重试取回结果；其他变更先读回状态 |
 
 登录、注册与两步验证相关的错误码（`bad_credentials`、`totp_required`、`totp_setup_required`、`user_disabled`、`registration_closed`、`invite_invalid`）见[鉴权与错误](auth-and-http.md#错误与限流)。

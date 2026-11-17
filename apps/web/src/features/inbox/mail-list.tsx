@@ -164,7 +164,7 @@ export function MailList({
   const trash = variant === 'trash';
 
   // 「共享来的」= 个人视图里地址不在自己认领列表中：只读，不改已读状态、不能删除
-  const { data: ownedMailboxes } = useMailboxesQuery(false);
+  const { data: ownedMailboxes } = useMailboxesQuery();
   const personalView = (query.scope ?? 'mine') === 'mine';
   const ownedAddresses = useMemo(
     () => (ownedMailboxes ? new Set(ownedMailboxes.map((mailbox) => mailbox.address)) : null),

@@ -2,13 +2,12 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { Draft, DraftSummary, Mailbox } from '@hpc-mail/shared';
 import { useNavigate } from 'react-router-dom';
 import { ApiError, toApiError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
 import { toast } from '@/components/ui/toast';
 import { classifySendError } from '@/features/compose/send-attempt';
 import { deliveryFailureLines, notifySendResult } from '@/features/compose/send-result';
-import { syncSentMessage } from '@/features/inbox/message-cache';
-import { putDraftInLists, refreshDraft, removeDraftFromLists, storeDraft, toDraftSummary } from './draft-cache';
-import { draftKeys, draftsApi } from './drafts-api';
+import { ownedAddressSet, syncAfterSend, syncSentMessage } from '@/features/inbox/message-cache';
+import { markDraftSent, refreshDraft, removeDraftFromLists, storeDraft } from './draft-cache';
+import { draftsApi } from './drafts-api';
 
 /** 发送失败的提示：口径与写信页一致，另加草稿特有的版本冲突与发送中 */
 function notifySendError(error: ApiError): void {
@@ -42,16 +41,13 @@ export function useDraftActions(mailboxes: Mailbox[] | undefined) {
   const send = useMutation({
     mutationFn: (draft: DraftSummary | Draft) => draftsApi.send(draft.id, draft.version),
     onSuccess: (result, draft) => {
-      putDraftInLists(client, { ...toDraftSummary(draft), status: 'sent', messageId: result.id, errorDetail: '', sentAt: new Date().toISOString() });
-      void client.invalidateQueries({ queryKey: draftKeys.detail(draft.id) });
-      const owned = new Set((mailboxes ?? []).map((box) => box.address.toLowerCase()));
+      markDraftSent(client, draft, result.id);
       const sources = 'replyToMessageId' in draft ? [draft.replyToMessageId, draft.forwardAttachmentsFrom] : [];
-      syncSentMessage(client, {
+      syncAfterSend(client, {
         sourceIds: sources.filter((id): id is number => typeof id === 'number'),
-        selfDelivered: [...draft.to, ...draft.cc, ...draft.bcc].some((recipient) => owned.has(recipient.address)),
+        recipients: [...draft.to, ...draft.cc, ...draft.bcc],
+        owned: ownedAddressSet(mailboxes),
       });
-      // 新收件人会进入往来联系人
-      void client.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });
       if (notifySendResult(result)) navigate(`/mail/${result.id}`);
     },
     onError: (err, draft) => {

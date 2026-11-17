@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { MoreHorizontal, Network, Search } from 'lucide-react';
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import { type ReactNode, useCallback, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import type { HostedDomain, HostedDomainsHealth, HostedDomainStatus } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -31,7 +31,8 @@ import {
 } from '@/features/hosted-domains/hosted-domain-meta';
 import { adminHostedDomainApi } from '@/features/hosted-domains/hosted-domains-api';
 import { storeHostedDomain } from '@/features/hosted-domains/use-hosted-domains';
-import { LoadMoreFooter } from '../load-more-footer';
+import { LoadMoreFooter } from '@/components/load-more-footer';
+import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 const ALL_STATUSES = 'all';
 /** 每页条数（服务端上限 200） */
@@ -146,12 +147,8 @@ export function AdminHostedDomainsPage() {
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<HostedDomainStatus | typeof ALL_STATUSES>(ALL_STATUSES);
   const [search, setSearch] = useState('');
-  const [debounced, setDebounced] = useState('');
+  const debounced = useDebouncedValue(search.trim().toLowerCase(), 250);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
-  useEffect(() => {
-    const timer = globalThis.setTimeout(() => setDebounced(search.trim().toLowerCase()), 250);
-    return () => globalThis.clearTimeout(timer);
-  }, [search]);
 
   const filters = { status: status === ALL_STATUSES ? undefined : status, q: debounced || undefined };
   const {
@@ -171,9 +168,12 @@ export function AdminHostedDomainsPage() {
     mutationFn: ({ domain, kind }: PendingAction) =>
       kind === 'suspend' ? adminHostedDomainApi.suspend(domain.id) : adminHostedDomainApi.resume(domain.id),
     onSuccess: (updated, { kind }) => {
+      // 各列表已就地替换；只有按状态筛选的列表可能因此移出这一行，只重拉这些
       storeHostedDomain(queryClient, updated);
-      // 状态变化可能让它移出当前筛选
-      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.hostedDomains });
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.admin.hostedDomains,
+        predicate: (query) => Boolean((query.queryKey[2] as { status?: string } | undefined)?.status),
+      });
       toast({ title: kind === 'suspend' ? `已暂停 ${updated.domain}` : `已恢复 ${updated.domain}`, variant: 'success' });
       setPendingAction(null);
     },

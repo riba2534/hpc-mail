@@ -1,10 +1,8 @@
 import { z } from 'zod';
 import {
-  DEFAULT_PAGE_SIZE,
   DRAFT_STATUSES,
   MAX_ATTACHMENTS,
   MAX_BODY_BYTES,
-  MAX_PAGE_SIZE,
   MAX_REPLY_TO,
   type DraftStatus,
 } from '../constants.js';
@@ -20,7 +18,9 @@ import {
   type AttachmentDisposition,
   type AttachmentTokenRef,
   type SendFrom,
+  type SingleUploadResult,
 } from './mail.js';
+import { emptyAsUndefined, pageQueryShape } from './query.js';
 
 /**
  * 创建（POST /drafts）与修改（PATCH /drafts/:id）服务端草稿共用的请求体。字段与发信请求相同，但都可暂缺：
@@ -70,19 +70,13 @@ export const sendDraftRequestSchema = z.object({
 export type SendDraftRequest = z.infer<typeof sendDraftRequestSchema>;
 
 export const listDraftsQuerySchema = z.object({
-  status: z.preprocess((v) => (v === '' ? undefined : v), z.enum(DRAFT_STATUSES).optional()),
-  cursor: z.preprocess((v) => (v === '' ? undefined : v), z.string().max(128).optional()),
-  limit: z.preprocess((v) => (v === '' ? undefined : v),
-    z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).optional()).default(DEFAULT_PAGE_SIZE),
+  status: emptyAsUndefined(z.enum(DRAFT_STATUSES)),
+  ...pageQueryShape,
 });
 export type ListDraftsQuery = z.infer<typeof listDraftsQuerySchema>;
 
 /** 草稿里的附件：已转存的上传附件（token 可直接写进 attachmentTokens 保留它） */
-export interface DraftAttachment {
-  token: string;
-  filename: string;
-  mimeType: string;
-  size: number;
+export interface DraftAttachment extends SingleUploadResult {
   contentId: string;
   disposition: AttachmentDisposition;
 }

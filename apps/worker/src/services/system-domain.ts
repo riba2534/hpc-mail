@@ -527,7 +527,8 @@ async function decide(run: Run, ev: Evaluation): Promise<SystemDomainOnboardingS
     return null;
   }
   const state = ev.plan?.ready ? 'finalizing' : 'configuring';
-  const ok = await save(run, { ...base, state, errorCode: '', lastError: '' }, true);
+  // 进入写入或完成前把 next_check_at 设为现在：这次处理被截断时，租约过期后由定时任务接手（之后的写回会改成合适的时间）
+  const ok = await save(run, { ...base, state, errorCode: '', lastError: '', nextCheckAt: new Date() }, true);
   return ok ? state : null;
 }
 
@@ -544,13 +545,14 @@ async function evaluate(run: Run, known?: CfZone): Promise<Step> {
 
 function applyHooks(run: Run): ApplyHooks {
   return {
-    // 心跳 + 取消检查：续租；租约丢失或已请求取消时不再写入
-    beforeWrite: async () => {
+    // 心跳 + 取消检查：续租；租约丢失或已请求取消时不再写入。
+    // 已删掉第三方 MX、还没开启 Routing 时（uninterruptible）取消要等这一段做完，否则域名会一直没有 MX
+    beforeWrite: async (_step, opts) => {
       const beat = await run.env.db.prepare(`UPDATE system_domain_onboarding SET lease_until = ?1
         WHERE id = ?2 AND lease_token = ?3 RETURNING cancel_requested_at`).bind(Date.now() + LEASE_MS, run.id, run.token)
         .first<{ cancel_requested_at: number | null }>();
       if (!beat) return false;
-      if (beat.cancel_requested_at !== null) {
+      if (beat.cancel_requested_at !== null && !opts?.uninterruptible) {
         run.cancelSeen = true;
         return false;
       }
@@ -685,14 +687,29 @@ function parseDomains(value: string | null): { list: DomainEntry[]; revision: nu
   }
 }
 
+const MX_GAP_ON_CANCEL = '取消时第三方 MX 已删除、收件路由尚未开启：该域名现在收不到信，请在 Cloudflare 开启 Email Routing，或按变更台账恢复原 MX';
+
+/** 台账里删过第三方 MX，之后没有成功开启 Routing */
+function mxRemovedWithoutRouting(row: OnboardingRow): boolean {
+  if (row.errorCode === 'mx_removed_routing_pending') return true;
+  const lastMx = row.changes.filter((event) => event.kind === 'mx.delete' && event.status === 'done')
+    .reduce((max, event) => Math.max(max, event.seq), 0);
+  return lastMx > 0 && !row.changes.some((event) => event.kind === 'routing.enable' && event.status === 'done' && event.seq > lastMx);
+}
+
 /**
  * 取消（处理器在检查点执行）：本任务创建、从未激活、勾选了删除且 zone 仍未激活时删除 zone（唯一的 deleteZone 调用点），
  * 其余情况不访问 Cloudflare、不回滚已做的配置。建 zone 的请求可能仍在途中：等到占位 10 分钟后按名称确认，找到的 zone 只记录、保留。
  */
 async function stepCancel(run: Run): Promise<Step> {
   const { row } = run;
+  // 第三方 MX 已删、Routing 没开成（例如开启失败后才取消）：取消照常结束，但保留告警，提醒人工开启 Routing 或恢复原 MX
+  const mxGap = mxRemovedWithoutRouting(row);
   const finish = async (fields: OnboardingFields = {}, note = '') => {
-    await save(run, { ...fields, state: 'cancelled', finishedAt: new Date(), nextCheckAt: null, errorCode: '', lastError: note });
+    await save(run, {
+      ...fields, state: 'cancelled', finishedAt: new Date(), nextCheckAt: null,
+      errorCode: mxGap ? 'mx_removed_routing_pending' : '', lastError: [mxGap ? MX_GAP_ON_CANCEL : '', note].filter(Boolean).join('；'),
+    });
     return 'stop' as const;
   };
   // 没有凭据或换了账户：不调用 Cloudflare
@@ -868,7 +885,8 @@ async function createExisting(
   const row = await reserve(env, {
     domain: zone.name, mode: 'existing_zone', state: active ? 'configuring' : 'awaiting_ns', accountId: creds.accountId, zone,
     origin: 'linked', ev, accepted, createdBy: actor.id, leaseToken: token,
-    nextCheckAt: active ? null : Date.now() + AWAITING_NS_RECHECK_MS, changes: [],
+    // 已激活：立即在后台配置；next_check_at 也设为现在，后台处理被截断时租约一过期定时任务就接手
+    nextCheckAt: active ? Date.now() : Date.now() + AWAITING_NS_RECHECK_MS, changes: [],
   });
   if (!row) throw await reservationConflict(env, ev, 'existing_zone');
   await logAdminAction(env, actor, 'system_domain.create', zone.name,
@@ -974,7 +992,7 @@ export async function confirmOnboarding(
       const accepted = ev.snapshot.observed;
       if (!(await save(run, {
         ...evaluationFields(ev, run.row), state: 'configuring', accepted, confirmedBy: actor.id, confirmedAt: new Date(),
-        errorCode: '', lastError: '',
+        errorCode: '', lastError: '', nextCheckAt: new Date(),
       }, true))) throw new AppError('conflict', '正在检查，请稍后再试');
       await logAdminAction(env, actor, 'system_domain.confirm', row.domain, ackLabels(accepted), ip);
     }

@@ -1,9 +1,15 @@
-import type { InfiniteData, QueryClient, QueryKey } from '@tanstack/react-query';
+import { queryOptions, type InfiniteData, type QueryClient, type QueryKey } from '@tanstack/react-query';
 import type { Draft, DraftStatus, DraftSummary, Page } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { draftKeys, draftsApi } from './drafts-api';
 
 export type DraftListData = InfiniteData<Page<DraftSummary>, string>;
+
+/** 草稿详情：审阅弹窗与写信页（编辑服务端草稿）共用同一份 key 与请求 */
+export const draftDetailQueryOptions = (id: number) => queryOptions({
+  queryKey: draftKeys.detail(id),
+  queryFn: ({ signal }) => draftsApi.get(id, signal),
+});
 
 /** 列表只放摘要：详情里的正文、附件等不进列表缓存 */
 export function toDraftSummary(draft: DraftSummary | Draft): DraftSummary {
@@ -67,6 +73,12 @@ export function removeDraftFromLists(client: QueryClient, id: number): void {
     });
   }
   client.removeQueries({ queryKey: draftKeys.detail(id) });
+}
+
+/** 草稿已发出（草稿箱与写信页共用）：列表里标为已发送并带上邮件 id，详情下次重新获取 */
+export function markDraftSent(client: QueryClient, draft: DraftSummary | Draft, messageId: number): void {
+  putDraftInLists(client, { ...toDraftSummary(draft), status: 'sent', messageId, errorDetail: '', sentAt: new Date().toISOString() });
+  void client.invalidateQueries({ queryKey: draftKeys.detail(draft.id) });
 }
 
 /** 保存（创建或修改）后的完整草稿：详情与各列表一起更新 */

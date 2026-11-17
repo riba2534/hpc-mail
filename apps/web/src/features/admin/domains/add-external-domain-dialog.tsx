@@ -5,12 +5,11 @@ import { useNavigate } from 'react-router-dom';
 import { domainSchema, type SystemDomainOnboarding, type SystemDomainPrecheck } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
-import { CopyButton } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { toast } from '@/components/ui/toast';
 import { PrecheckReview, useAckSelection } from './onboard-confirm-dialog';
-import { DNSSEC_LABEL, registrarLabel } from './system-domain-meta';
+import { DNSSEC_LABEL, NameServerList, registrarLabel } from './system-domain-meta';
 import { storeOnboarding, systemDomainApi } from './system-domains-api';
 
 /**
@@ -83,14 +82,7 @@ export function AddExternalDomainDialog({ open, onOpenChange }: { open: boolean;
               {created.nameServers.length > 0 ? (
                 <>
                   <p className="text-ink">到 {created.domain} 的注册商，把名称服务器（NS）改为：</p>
-                  <ul className="flex flex-col gap-1.5">
-                    {created.nameServers.map((ns) => (
-                      <li key={ns} className="flex items-center gap-2">
-                        <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">{ns}</code>
-                        <CopyButton value={ns} label={`复制 ${ns}`} size="sm" />
-                      </li>
-                    ))}
-                  </ul>
+                  <NameServerList nameServers={created.nameServers} />
                 </>
               ) : (
                 <p className="text-ink-secondary">{created.lastError || 'Cloudflare 暂未返回结果，系统约 10 分钟内确认，请在详情页查看。'}</p>

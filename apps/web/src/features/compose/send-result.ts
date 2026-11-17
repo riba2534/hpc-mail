@@ -1,12 +1,13 @@
 import type { ApiErrorDetails, MessageSummary } from '@hpc-mail/shared';
 import { toast } from '@/components/ui/toast';
+import { isFailedOutcome } from '@/features/message/delivery-outcomes';
 
 /**
  * 发送成功（201）后的提示，写信页与草稿箱共用。部分收件人失败或结果未确认时报错误，
  * 返回 true 表示应进入这封发件的详情查看（失败目标可补发，未确认的先向收件人核对）。
  */
 export function notifySendResult(result: Pick<MessageSummary, 'status' | 'errorDetail' | 'recipientOutcomes'>): boolean {
-  const failures = result.recipientOutcomes?.filter((outcome) => outcome.status === 'failed' || outcome.status === 'bounced') ?? [];
+  const failures = result.recipientOutcomes?.filter(isFailedOutcome) ?? [];
   // 结果未确认的收件人可能已经收到：提示先核对，不引导直接重发
   const unconfirmed = result.recipientOutcomes?.filter((outcome) => outcome.status === 'unknown') ?? [];
   const issue = failures.length > 0 || Boolean(result.errorDetail) || result.status === 'failed';
