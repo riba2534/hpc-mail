@@ -42,6 +42,7 @@ import { isAiModelConfigured } from './ai-provider.js';
 import { resolveVerificationCode } from './code-extract.js';
 import { getSettings } from './setting.js';
 import { getJson } from './storage.js';
+import { readMailBody } from './mail-body.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 
 export interface Viewer {
@@ -787,7 +788,7 @@ export async function loadSourceContent(
     if (error instanceof AppError && error.code === 'not_found') throw new AppError('source_unavailable', unavailableMessage);
     throw error;
   }
-  return { ...row, ...(await fullBody(env, row)) };
+  return { ...row, ...(await readMailBody(env, row)) };
 }
 
 /** 详情需要完整行（含正文）；只做可见性判定的调用方用 assertVisible 并自选列 */

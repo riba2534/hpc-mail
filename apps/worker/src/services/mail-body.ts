@@ -1,7 +1,7 @@
 import { MAX_BODY_BYTES } from '@hpc-mail/shared';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
-import { bodyKey, putJson } from './storage.js';
+import { bodyKey, getJson, putJson } from './storage.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -38,4 +38,20 @@ export async function storeMailBody(env: Env, text: string, html: string, seed?:
   const key = bodyKey(seed);
   await putJson(env, key, { text, html });
   return { bodyText: previewBody(text), bodyHtml: previewBody(html), bodyR2Key: key };
+}
+
+/**
+ * 完整正文：有 R2 对象读出 {text, html}，否则用 D1 列。与 PR5b（正文移出 D1）的同名函数同签名，
+ * 集成时以那边的实现为准。
+ */
+export async function readMailBody(
+  env: Env,
+  row: { bodyText: string; bodyHtml: string; bodyR2Key: string | null },
+): Promise<{ bodyText: string; bodyHtml: string }> {
+  if (!row.bodyR2Key) return { bodyText: row.bodyText, bodyHtml: row.bodyHtml };
+  const full = await getJson<{ text?: unknown; html?: unknown }>(env, row.bodyR2Key);
+  return {
+    bodyText: typeof full?.text === 'string' ? full.text : row.bodyText,
+    bodyHtml: typeof full?.html === 'string' ? full.html : row.bodyHtml,
+  };
 }
