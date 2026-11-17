@@ -19,6 +19,7 @@
 
 - 执行 `wrangler rollback <部署前版本 id> -y --message "auto rollback: <run 地址>"`，再轮询 `/api/config` 的 `X-HPC-Build`，确认线上回到部署前的 build。
 - `wrangler rollback` 只换回代码版本，不恢复 cron 触发器：回滚后用 Cloudflare API（`PUT .../workers/scripts/hpc-cloud-mail/schedules`，`scripts/worker-schedules.sh restore`）把触发器恢复为基线值，否则新版本加的 cron 会留在线上、被旧代码当成常规任务执行。恢复失败只告警，Job Summary 写明要手动恢复的值。
+- 启用了投递回执（Variable `DELIVERY_EVENTS_QUEUE`）时，Queue consumer 不随 Worker 版本回滚：consumer 绑在脚本上，回滚后仍把投递事件发给 Worker。回滚目标早于投递回执功能（代码里没有 queue handler）时，每批事件都会处理失败，按 `max_retries = 5` 重试后被丢弃（没有配置死信队列）。收信、发信不受影响，只是这段时间的外发结果不会被回执更新、停在 `sent`。核对与手动解除见下文「手动回滚 Worker」。
 - Job Summary 的「部署失败或被取消：自动回滚」一节列出各验证步骤的结果、回滚目标和是否确认生效。
 - 发布之后的每个步骤都有单步超时，请求也都有单次超时：线上挂住时步骤以失败结束，回滚仍有时间执行。
 - 只回滚 Worker 代码与该版本的 secrets 绑定。D1、KV、R2 的数据都不回滚。
@@ -44,6 +45,16 @@ curl -sI https://<CUSTOM_DOMAIN>/api/config | grep -i x-hpc-build   # 确认线�
 echo '[{"cron":"*/5 * * * *"},{"cron":"0 16 * * *"}]' > /tmp/schedules.json   # 换成基线里的值
 bash scripts/worker-schedules.sh restore /tmp/schedules.json
 ```
+
+回滚也不解除投递回执的 Queue consumer（只在设置了 Variable `DELIVERY_EVENTS_QUEUE` 时存在）。回滚到的版本没有 queue handler 时，事件会在重试 5 次后被丢弃，收发信不受影响。核对与处理：
+
+```bash
+cd apps/worker
+pnpm exec wrangler queues consumer list <队列名>                    # 列出这个 Queue 的 consumer，看 hpc-cloud-mail 是否还在
+pnpm exec wrangler queues consumer remove <队列名> hpc-cloud-mail   # 需要时解除：事件留在 Queue 里，不再投给旧代码
+```
+
+也可以在 Cloudflare 控制台的 Storage & Databases → Queues → 选中该队列 → Settings 里删除 consumer。解除后事件会在 Queue 里保留到保留期结束；修复后重新部署时 CI 会重新注入 consumer，保留期内的积压会继续处理。不解除也可以，只是积压事件会在重试后丢失，对应外发的状态停在 `sent`。
 
 要回到某个提交，先在 `versions list` 里按 Message 找到对应版本 id；部署前的版本 id 也记在每次部署的 Job Summary「回滚基线」里。
 
