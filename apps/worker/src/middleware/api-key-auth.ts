@@ -202,17 +202,36 @@ function restrictionAllowsMailbox(restriction: KeyRestriction, mailbox: { id: nu
   return restriction.mailboxIds.includes(mailbox.id) || restrictionAllowsDomain(restriction, mailbox.domain);
 }
 
-/** 地址不在 Key 限定范围内时 403 forbidden（docs: /references/errors.md#key-restricted）。域名命中时不查库 */
-export async function assertKeyCanUseAddress(c: Context<AppContext>, address: string): Promise<void> {
-  const restriction = keyRestriction(c);
-  if (!restriction) return;
-  const normalized = normalizeEmail(address);
-  if (restrictionAllowsDomain(restriction, getEmailDomain(normalized))) return;
-  if (restriction.mailboxIds.length) {
-    const row = await c.env.db.prepare('SELECT id FROM mailboxes WHERE address = ?').bind(normalized).first<{ id: number }>();
-    if (row && restriction.mailboxIds.includes(Number(row.id))) return;
+/**
+ * 落在 Key 范围内的地址（规范化后）：域名命中的不查库，其余一条 json_each 查询取认领行 id 再比对，
+ * 地址再多也只有一次往返。
+ */
+export async function addressesWithinKey(
+  c: Context<AppContext>, restriction: KeyRestriction, addresses: readonly string[],
+): Promise<Set<string>> {
+  const normalized = [...new Set(addresses.map((address) => normalizeEmail(address)))];
+  const allowed = new Set(normalized.filter((address) => restrictionAllowsDomain(restriction, getEmailDomain(address))));
+  const rest = normalized.filter((address) => !allowed.has(address));
+  if (rest.length && restriction.mailboxIds.length) {
+    const { results } = await c.env.db.prepare('SELECT id, address FROM mailboxes WHERE address IN (SELECT value FROM json_each(?))')
+      .bind(JSON.stringify(rest)).all<{ id: number; address: string }>();
+    for (const row of results) if (restriction.mailboxIds.includes(Number(row.id))) allowed.add(row.address);
   }
-  throw restrictedError(` ${normalized}`);
+  return allowed;
+}
+
+/** 调用方传入的地址都要在 Key 限定范围内，否则 403 forbidden（docs: /references/errors.md#key-restricted），最多一次查询 */
+export async function assertKeyCanUseAddresses(c: Context<AppContext>, addresses: readonly string[]): Promise<void> {
+  const restriction = keyRestriction(c);
+  if (!restriction || !addresses.length) return;
+  const allowed = await addressesWithinKey(c, restriction, addresses);
+  const outside = addresses.map((address) => normalizeEmail(address)).find((address) => !allowed.has(address));
+  if (outside !== undefined) throw restrictedError(` ${outside}`);
+}
+
+/** 单个地址的 assertKeyCanUseAddresses */
+export function assertKeyCanUseAddress(c: Context<AppContext>, address: string): Promise<void> {
+  return assertKeyCanUseAddresses(c, [address]);
 }
 
 /** 域名不在 Key 限定的 domains 中时 403（只限定了邮箱的 Key 不能使用任何域名级能力，如认领） */

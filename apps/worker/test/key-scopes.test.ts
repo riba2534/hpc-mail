@@ -219,6 +219,49 @@ describe('限定到邮箱的 Key', () => {
     expect((await request(`/v1/mailboxes/${allowed.id}`, json(key, { displayName: 'ok' }, 'PUT'))).status).toBe(200);
   });
 
+  it('wait 在全站新信多于 50 封、改为逐地址取数时也只返回范围内的邮件（A1）', async () => {
+    const user = await account('wait-gate');
+    const allowed = await own(user.id, `ks-wg-allowed-${seq}@hpc.email`);
+    const hidden = await own(user.id, `ks-wg-hidden-${seq}@hpc.email`);
+    const key = (await keyFor(user.jwt, { allowedMailboxIds: [allowed.id] })).key;
+    const inHidden = await receive(hidden.address, 'hidden code 482913');
+    // 其他人的新信把 afterId 之后的全站邮件推过 50 封，wait 走逐地址的分流语句
+    await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 60)
+      INSERT INTO messages (direction, address, domain, from_address, subject, preview, status)
+      SELECT 'inbound', 'ks-wg-filler-' || i || '@elsewhere.test', 'elsewhere.test', 'sender@example.net', 'filler', 'p', 'received' FROM n`).run();
+    const inAllowed = await receive(allowed.address, 'allowed later');
+    for (const include of ['', '&include=body']) {
+      const waited = await data<{ message: MessageSummary | null }>(
+        await request(`/v1/messages/wait?afterId=${inHidden.id - 1}&timeout=1${include}`, { headers: auth(key) }));
+      expect(waited.message?.id).toBe(inAllowed.id);
+    }
+    // 多个地址一次校验：范围外的那个报 403
+    expect((await request(`/v1/messages/wait?address=${allowed.address},${hidden.address}&timeout=1`, { headers: auth(key) })).status).toBe(403);
+    const both = await data<{ message: MessageSummary | null }>(
+      await request(`/v1/messages/wait?address=${allowed.address}&address=${allowed.address.toUpperCase()}&afterId=${inHidden.id - 1}&timeout=1`, { headers: auth(key) }));
+    expect(both.message?.id).toBe(inAllowed.id);
+  });
+
+  it('wait 的多个地址一条查询校验范围，不逐个地址查库（CR6）', async () => {
+    const user = await account('wait-batch');
+    const boxes = await Promise.all(Array.from({ length: 5 }, (_, index) => own(user.id, `ks-wb-${index}-${seq}@hpc.email`)));
+    const key = (await keyFor(user.jwt, { allowedMailboxIds: boxes.map((box) => box.id) })).key;
+    const prepared: string[] = [];
+    const db = new Proxy(env.db, {
+      get(target, property) {
+        if (property === 'prepare') return (query: string) => { prepared.push(query); return target.prepare(query); };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const ctx = createExecutionContext();
+    const response = await app.request(`/v1/messages/wait?address=${boxes.map((box) => box.address).join(',')}&timeout=1`,
+      { headers: { ...auth(key), 'CF-Connecting-IP': IP } }, { ...env, db }, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
+    expect(prepared.filter((query) => /FROM mailboxes WHERE address/.test(query))).toHaveLength(1);
+  });
+
   it('释放后重新认领得到新 id，旧 Key 不再覆盖这个地址', async () => {
     const user = await account('reclaim');
     const box = await own(user.id, `ks-reclaim-${seq}@hpc.email`);

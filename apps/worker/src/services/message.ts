@@ -648,8 +648,10 @@ export async function findNextMessage(
     statements = [scan(MESSAGES, [...visible, after])];
   } else {
     const gate = newMailMoreThan(input.afterId, WAIT_SITE_SCAN_MAX);
+    // 两条分流语句都要带 Key 限定范围：gate 成立时只有逐地址那条有结果
     statements = [
-      scan(MESSAGES_BY_VISIBLE, [inboxScopeCondition(db, scope, access, input.domain, gate), after, ...visiblePrefix({ direction: 'inbound' })]),
+      scan(MESSAGES_BY_VISIBLE, [inboxScopeCondition(db, scope, access, input.domain, gate), after, ...visiblePrefix({ direction: 'inbound' }),
+        restrictCondition(viewer.restrict)]),
       scan(MESSAGES, [...visible, gt(messages.id, sql`(CASE WHEN ${gate} THEN ${Number.MAX_SAFE_INTEGER} ELSE ${input.afterId} END)`)]),
     ];
   }

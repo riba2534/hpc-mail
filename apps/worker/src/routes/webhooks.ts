@@ -4,11 +4,11 @@ import {
   type WebhookEndpoint,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
-import { getEmailDomain } from '../lib/email-address.js';
+import { normalizeEmail } from '../lib/email-address.js';
 import { AppError } from '../lib/errors.js';
 import { execCtx, ok, parseBody, parseId } from '../lib/http.js';
 import { pageLimit } from '../lib/pagination.js';
-import { apiKeyAuth, keyRestriction, requireScope, type KeyRestriction } from '../middleware/api-key-auth.js';
+import { addressesWithinKey, apiKeyAuth, keyRestriction, requireScope } from '../middleware/api-key-auth.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   createWebhookEndpoint,
@@ -23,18 +23,6 @@ import {
 } from '../services/webhooks.js';
 import type { AppContext } from '../types.js';
 
-/** 过滤条件里落在 Key 范围内的地址：域名命中不查库，其余一次查出认领行 id 再比对 */
-async function addressesInKey(c: Context<AppContext>, restriction: KeyRestriction, addresses: readonly string[]): Promise<Set<string>> {
-  const allowed = new Set(addresses.filter((address) => restriction.domains.includes(getEmailDomain(address))));
-  const rest = addresses.filter((address) => !allowed.has(address));
-  if (rest.length && restriction.mailboxIds.length) {
-    const { results } = await c.env.db.prepare('SELECT id, address FROM mailboxes WHERE address IN (SELECT value FROM json_each(?))')
-      .bind(JSON.stringify(rest)).all<{ id: number; address: string }>();
-    for (const row of results) if (restriction.mailboxIds.includes(Number(row.id))) allowed.add(row.address);
-  }
-  return allowed;
-}
-
 /**
  * 限定了邮箱或域名的 Key 只能管理「过滤条件非空、且全部落在范围内」的端点：不带过滤的端点会收到账户的全部事件，
  * 超出这把 Key 能看到的范围。范围外的端点对这把 Key 不可见（404）。
@@ -42,10 +30,10 @@ async function addressesInKey(c: Context<AppContext>, restriction: KeyRestrictio
 async function filtersInKey(c: Context<AppContext>, endpoints: { addresses: string[]; domains: string[] }[]): Promise<boolean[]> {
   const restriction = keyRestriction(c);
   if (!restriction) return endpoints.map(() => true);
-  const allowed = await addressesInKey(c, restriction, [...new Set(endpoints.flatMap((endpoint) => endpoint.addresses))]);
+  const allowed = await addressesWithinKey(c, restriction, [...new Set(endpoints.flatMap((endpoint) => endpoint.addresses))]);
   return endpoints.map((endpoint) => (endpoint.addresses.length + endpoint.domains.length > 0)
     && endpoint.domains.every((domain) => restriction.domains.includes(domain))
-    && endpoint.addresses.every((address) => allowed.has(address)));
+    && endpoint.addresses.every((address) => allowed.has(normalizeEmail(address))));
 }
 
 function restrictedFilters(): AppError {

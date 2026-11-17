@@ -22,7 +22,7 @@ import { AppError } from '../../lib/errors.js';
 import { conditionalDetailResponse } from '../../lib/etag.js';
 import { execCtx, ok, parseBody, parseId, parseQuery, parseValue } from '../../lib/http.js';
 import {
-  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, keyRestriction, requireScope,
+  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseAddresses, assertKeyCanUseDomain, keyRestriction, requireScope,
 } from '../../middleware/api-key-auth.js';
 import { errorObject } from '../../middleware/error.js';
 import {
@@ -224,7 +224,7 @@ app.get('/wait', async (c) => {
   const query = parseQuery(c, {
     safeParse: (raw) => waitMessagesQuerySchema.safeParse({ ...(raw as Record<string, string>), address: addresses?.join(',') }),
   });
-  for (const address of query.address ?? []) await assertKeyCanUseAddress(c, address);
+  if (query.address) await assertKeyCanUseAddresses(c, query.address);
   if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
