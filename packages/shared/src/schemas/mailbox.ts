@@ -274,12 +274,12 @@ function uniqueAddresses<T extends { address: string }>(items: T[], ctx: z.Refin
 }
 
 /** 按地址指定已认领邮箱；expectedOwnerId 可选，给了就与当前所有者比对，不一致的项不处理 */
-const adminBatchMailboxRefSchema = z.object({
+export const adminBatchMailboxRefSchema = z.object({
   address: mailboxAddressSchema,
   expectedOwnerId: userIdSchema.optional(),
 });
 
-const adminBatchMailboxRefsSchema = z.array(adminBatchMailboxRefSchema).min(1).max(MAX_ADMIN_MAILBOX_BATCH).superRefine(uniqueAddresses);
+export const adminBatchMailboxRefsSchema = z.array(adminBatchMailboxRefSchema).min(1).max(MAX_ADMIN_MAILBOX_BATCH).superRefine(uniqueAddresses);
 
 /** 为指定用户批量认领：按该用户自己的认领规则逐个认领，响应同 POST /api/mailboxes/batch */
 export const adminBatchClaimRequestSchema = z.object({
