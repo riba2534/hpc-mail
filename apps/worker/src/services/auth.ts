@@ -33,8 +33,9 @@ const MAX_FAILURES = 5;
 const REGISTER_WINDOW_SECONDS = 60 * 60;
 const MAX_REGISTER_PER_WINDOW = 10;
 
-const LOGIN_FAIL_SCOPE = 'login-fail';
-const REGISTER_SCOPE = 'reg';
+/** 登录失败计数（15 分钟窗口）与按 IP 的注册计数（60 分钟窗口），scheduled 按各自窗口回收 */
+export const LOGIN_FAIL_SCOPE = 'login-fail';
+export const REGISTER_SCOPE = 'reg';
 
 /** IPv6 地址展开成 8 组数值（末尾点分 IPv4 折成两组）；不是合法 IPv6 时为 null */
 function ipv6Groups(value: string): number[] | null {

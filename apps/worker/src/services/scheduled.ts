@@ -14,6 +14,8 @@ import type { Env, ExecCtx } from '../types.js';
 import { API_REJECT_SCOPE, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { REAUTH_FAIL_SCOPE } from './reauth.js';
+import { LOGIN_FAIL_SCOPE, REGISTER_SCOPE } from './auth.js';
+import { FORWARD_CONFIRM_SCOPE } from './forward-confirm.js';
 import { cleanupWebhookDeliveries, processWebhookDeliveries } from './webhooks.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
@@ -57,9 +59,15 @@ const TRASH_RETENTION_DAYS = 7;
 const RETENTION_BATCH = 1000;
 const RETENTION_MAX_BATCHES = 10;
 
-/** 按 where 条件删除邮件（D1 行 + R2 对象：正文/附件/原始 .eml），返回删除条数；限批量 */
-async function purgeMessagesWhere(env: Env, cond: SQL): Promise<number> {
-  return purgeMatchingMessages(env, cond, RETENTION_BATCH);
+/** 按条件分批删除邮件（D1 行 + R2 正文/附件/原始 .eml），每批 RETENTION_BATCH 封、最多 RETENTION_MAX_BATCHES 批；返回删除封数 */
+async function purgeMessagesInBatches(env: Env, cond: SQL): Promise<number> {
+  let total = 0;
+  for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
+    const n = await purgeMatchingMessages(env, cond, RETENTION_BATCH);
+    total += n;
+    if (n < RETENTION_BATCH) break;
+  }
+  return total;
 }
 
 /** 邮件保留清理：未认领地址 + 全局上限；各自独立 try/catch 互不影响；返回删除封数 */
@@ -74,19 +82,11 @@ async function runRetention(env: Env): Promise<number> {
       const cutoff = new Date(Date.now() - unclaimedDays * DAY_MS);
       // 未被任何用户认领的地址收到的 inbound 邮件（catch-all 垃圾的主要来源）
       const claimed = db.select({ address: mailboxes.address }).from(mailboxes);
-      let total = 0;
-      for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
-        const n = await purgeMessagesWhere(
-          env,
-          and(
-            eq(messages.direction, 'inbound'),
-            lt(messages.createdAt, cutoff),
-            notInArray(messages.address, claimed),
-          )!,
-        );
-        total += n;
-        if (n < RETENTION_BATCH) break;
-      }
+      const total = await purgeMessagesInBatches(env, and(
+        eq(messages.direction, 'inbound'),
+        lt(messages.createdAt, cutoff),
+        notInArray(messages.address, claimed),
+      )!);
       deleted += total;
       if (total > 0) console.log(`保留清理：删除未认领地址邮件 ${total} 封`);
     } catch (e) {
@@ -97,12 +97,7 @@ async function runRetention(env: Env): Promise<number> {
   if (allMessagesDays > 0) {
     try {
       const cutoff = new Date(Date.now() - allMessagesDays * DAY_MS);
-      let total = 0;
-      for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
-        const n = await purgeMessagesWhere(env, lt(messages.createdAt, cutoff));
-        total += n;
-        if (n < RETENTION_BATCH) break;
-      }
+      const total = await purgeMessagesInBatches(env, lt(messages.createdAt, cutoff));
       deleted += total;
       if (total > 0) console.log(`保留清理：删除超期邮件 ${total} 封`);
     } catch (e) {
@@ -242,7 +237,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'webhooks.cleanup', () => cleanupWebhookDeliveries(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
-  const staleWindow = Math.floor(Date.now() / 60000) - 120;
+  const staleWindow = minuteWindow(1) - 120;
 
   for (const table of ['api_request_logs', 'admin_audit_logs']) {
     await step(report, `${table}.cleanup`, async () => {
@@ -278,10 +273,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   // 回收站：软删除超过 7 天硬删
   await step(report, 'trash', async () => {
     const trashCutoff = new Date(Date.now() - TRASH_RETENTION_DAYS * DAY_MS);
-    const n = await purgeMessagesWhere(
-      env,
-      and(isNotNull(messages.deletedAt), lt(messages.deletedAt, trashCutoff))!,
-    );
+    const n = await purgeMatchingMessages(env, and(isNotNull(messages.deletedAt), lt(messages.deletedAt, trashCutoff))!, RETENTION_BATCH);
     if (n > 0) console.log(`回收站清理：硬删 ${n} 封`);
     return n;
   });
@@ -298,7 +290,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'counters', async () => {
     await purgeCounters(env, [
       OUTBOUND_QUOTA_SCOPE, 'fwd-domain', 'fwd-target', FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, 'ai-extract', TRANSLATE_CHARS_SCOPE,
-      'fwd-confirm',
+      FORWARD_CONFIRM_SCOPE,
     ], dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
@@ -306,7 +298,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
       CANARY_RATE_SCOPE,
     ], minuteWindow(1) - 120);
     await purgeCounters(env, SYSTEM_DOMAIN_CF_SCOPE, minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES) - 24);
-    await purgeCounters(env, ['login-fail', REAUTH_FAIL_SCOPE], minuteWindow(15) - 8);
-    await purgeCounters(env, 'reg', minuteWindow(60) - 3);
+    await purgeCounters(env, [LOGIN_FAIL_SCOPE, REAUTH_FAIL_SCOPE], minuteWindow(15) - 8);
+    await purgeCounters(env, REGISTER_SCOPE, minuteWindow(60) - 3);
   });
 }
