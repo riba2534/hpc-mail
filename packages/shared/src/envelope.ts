@@ -1,4 +1,5 @@
 import type { RecipientOutcome } from './schemas/mail.js';
+import type { SuppressedRecipient } from './schemas/delivery-events.js';
 
 /** 成功：HTTP 2xx + { data }；失败：HTTP 4xx/5xx + { error, requestId } */
 export interface ApiSuccess<T> {
@@ -14,6 +15,8 @@ export interface ApiErrorDetails {
   recipientOutcomes?: RecipientOutcome[];
   /** source_unavailable：不可用的是哪一个引用（reply = replyToMessageId，forward = forwardAttachmentsFrom 或其附件） */
   source?: 'reply' | 'forward';
+  /** recipient_suppressed：命中抑制名单的收件人（全部收件人都在名单里，没有创建发件记录） */
+  suppressed?: SuppressedRecipient[];
 }
 
 export interface ApiErrorBody {
@@ -71,6 +74,8 @@ export const ERROR_CODES = [
   'header_not_allowed',
   /** 全部收件人被明确拒收，没有任何一份投递成功：422，details 带发件行 id 与逐收件人结果；同 Key 重放返回同样的错误 */
   'delivery_failed',
+  /** 全部收件人都在本站抑制名单里（此前退信或投诉）：422，没有发信也不占配额，details.suppressed 列出原因与解除时间 */
+  'recipient_suppressed',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -96,5 +101,6 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   source_unavailable: 404,
   header_not_allowed: 400,
   delivery_failed: 422,
+  recipient_suppressed: 422,
   internal: 500,
 };

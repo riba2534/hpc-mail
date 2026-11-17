@@ -63,6 +63,8 @@ createdAt, updatedAt, nextAttemptAt, lastAttemptAt
 
 status 为 `pending|processing|succeeded|failed|skipped|unknown`。pending/processing 是待处理；succeeded 是本通道已确认成功；skipped 常为当前策略/配置导致不发送；unknown 是处理超时或副作用结果待确认，不能当作已失败。`pendingCount` 包括 processing，`failedCount` 包括 unknown。健康仅提供各通道最近一次与汇总，不是所有 job 的分页查询接口；测试结果也会记录。
 
+中转转发（`no-reply@收件域名` 重发）交给 Cloudflare 后记为 `succeeded`；收件域名有投递回执订阅时，若之后在 Cloudflare 侧最终退信、失败或被拒，该 forward 任务会改为 `failed`，`lastError` 为「Cloudflare 侧最终投递失败：<SMTP 应答或原因>」，`forward` 通道的 `latest` 与 `failedCount` 随之体现。回执通常在几秒到几分钟内到达，刚显示 `succeeded` 的中转转发之后仍可能变为 `failed`。原样 forward（已验证 destination）没有这类回执，`succeeded` 只表示已交给 Cloudflare。
+
 飞书/PushDeer 每条最多 3 次自动尝试，失败退避；Webhook 默认 1 次且不自动重试，避免不支持幂等的接收端重复执行。队列/通知失败不回滚已成功收件。新 IP 登录告警按个人飞书/PushDeer 配置发送，是系统事件，并非所有渠道同样适用。
 
 手动 retry 必须是当前用户 job、通道当前 enabled、status 为 failed 或 unknown、messageId 非 null，且 channel 不是 forward。unknown 先核对接收端是否已收到，用户确认需重试时才提交，可能重复通知；已成功/处理中 retry 会拒绝。测试行应调用对应测试接口，forward 应核对收件情况后按用户要求手工转发原邮件，不能 job retry 自动重发。返回 ok 后重新查 health 确认真实投递结果；源邮件已被永久删除时不再推送，任务转为 skipped。邮件永久删除时其通知任务的内容一并清空，已成功或跳过的任务也不保留推送内容。终结通知记录约 30 天后清理。

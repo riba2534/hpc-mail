@@ -57,6 +57,8 @@ import { enqueueMailNotifications, processNotificationJobs } from './notificatio
 import { retainExternalAttachments } from './external-attachment.js';
 import { bindIdempotentSend, completeIdempotentStatement, type IdempotencyHandle } from './idempotency.js';
 import { injectAttachmentLinks, stripAttachmentLinks, type AttachmentLink } from './attachment-links.js';
+import { deliveryEventsQueue, deliveryRefInserts } from './delivery-refs.js';
+import { lookupSuppressions, recipientSuppressedError, suppressedFor, suppressionMessage } from './suppression.js';
 export { injectAttachmentLinks } from './attachment-links.js';
 
 export interface Sender {
@@ -513,11 +515,14 @@ async function prepareOutboundMime(
   return (target) => (input.to.length ? (shared ??= build(input.to)) : build([{ address: target, name: '' }]));
 }
 
-/** Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文；并发投递前只 import 一次，部署金丝雀也直接复用 */
-export async function cloudflareSender(env: Env, fromAddress: string): Promise<(toAddr: string, raw: string) => Promise<void>> {
+/**
+ * Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文；并发投递前只 import 一次，部署金丝雀也直接复用。
+ * 返回 send() 给出的 Cloudflare 消息 ID（投递回执按它关联），没有时为 null。
+ */
+export async function cloudflareSender(env: Env, fromAddress: string): Promise<(toAddr: string, raw: string) => Promise<string | null>> {
   // 动态 import：`cloudflare:email` 在 vitest workerd 里静态加载会崩
   const { EmailMessage } = await import('cloudflare:email');
-  return async (toAddr, raw) => { await env.email.send(new EmailMessage(fromAddress, toAddr, raw)); };
+  return async (toAddr, raw) => (await env.email.send(new EmailMessage(fromAddress, toAddr, raw)))?.messageId || null;
 }
 
 function summarize(
@@ -637,10 +642,11 @@ const describeOutcomes = (list: RecipientOutcome[]) => list.map((outcome) => `${
  * 整体状态：有目标送达即 sent/delivered（失败与未确认的目标写进 errorDetail）；没有送达但有结果不明的为 unknown；
  * 全部被明确拒收或根本没尝试（投递前的服务端故障）才是 failed
  */
-function overallResult(outcomes: RecipientOutcome[]): { status: 'sent' | 'delivered' | 'unknown' | 'failed'; errorDetail: string } {
-  const failed = outcomes.filter(outcome => outcome.status === 'failed');
+export function overallResult(outcomes: RecipientOutcome[]): { status: 'sent' | 'delivered' | 'unknown' | 'failed'; errorDetail: string } {
+  // 投递回执：退信算失败；投诉表示已送达
+  const failed = outcomes.filter(outcome => outcome.status === 'failed' || outcome.status === 'bounced');
   const unconfirmed = outcomes.filter(outcome => outcome.status === 'unknown');
-  if (outcomes.some(outcome => outcome.status === 'sent' || outcome.status === 'delivered')) {
+  if (outcomes.some(outcome => outcome.status === 'sent' || outcome.status === 'delivered' || outcome.status === 'complained')) {
     return {
       status: outcomes.some(outcome => outcome.status === 'sent') ? 'sent' : 'delivered',
       errorDetail: [
@@ -689,9 +695,11 @@ export async function sendMail(
     ...(req.from.domain ? [req.from.domain] : []),
     ...[...to, ...cc, ...bcc].map(item => getEmailDomain(item.address)),
   ];
-  const [domains, fromBox] = await Promise.all([
+  // 投递回执启用时，抑制名单与域名、发件邮箱并行查询（查询失败按未抑制处理）；未启用时不查
+  const [domains, fromBox, suppressionRows] = await Promise.all([
     getRoutableDomains(env, settings, candidateDomains),
     lookupFromMailbox(db, req.from),
+    deliveryEventsQueue(env) ? lookupSuppressions(env, [...to, ...cc, ...bcc].map(item => item.address)) : [],
   ]);
   const from = resolveFrom(sender, req, domains, fromBox);
   await assertHostedSendable(env, settings, from.domain);
@@ -746,6 +754,9 @@ export async function sendMail(
   // 只写站内收件副本；发件记录本身不是「收到的验证邮件」
   const verificationLink = settings.code_extract.enabled && internalTargets.length
     ? extractVerificationLink({ subject: req.subject, text, html, fromAddress: from.address }) : '';
+  // 抑制名单按发件域名生效，只拦站外收件人；全部收件人都被抑制时不建发件行、不占配额
+  const suppressed = suppressedFor(suppressionRows.filter(row => externalTargets.includes(row.address)), from.domain);
+  if (suppressed.size && suppressed.size === uniqueTargets.length) throw recipientSuppressedError([...suppressed.values()]);
   await assertOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
 
   let outbound: typeof messages.$inferSelect | undefined;
@@ -790,6 +801,8 @@ export async function sendMail(
     if (results.size < targets.length) writer.write();
   };
   const internalDeliveries: { target: string; messageId: number; ownerIds: number[] }[] = [];
+  /** 已被 Cloudflare 接受的外部收件人与其消息 ID：随最终结果登记，投递回执据此回写 */
+  const sentRefs: { recipient: string; providerMessageId: string | null }[] = [];
 
   /**
    * 投递阶段交给 waitUntil 托住：客户端断开或请求被取消时仍会投递完并回填结果；请求里照常等待最终结果。
@@ -800,7 +813,11 @@ export async function sendMail(
     let outboundAtts: Awaited<ReturnType<typeof persistAttachments>> = [];
 
     const deliverExternal = async () => {
-      if (!externalTargets.length) return;
+      for (const [target, blocked] of suppressed) {
+        record({ address: target, status: 'failed', code: 'recipient_suppressed', error: suppressionMessage(blocked) });
+      }
+      const sendable = externalTargets.filter(target => !suppressed.has(target));
+      if (!sendable.length) return;
       try {
         const payload = await buildExternalPayload(env, origin, text, html, attachments, outboundAtts);
         // 展示正文必须在首次外发前保存，发送成功后不再依赖正文持久化。
@@ -819,13 +836,14 @@ export async function sendMail(
           messageId: outgoingMessageId,
         }, payload.atts);
         const send = await cloudflareSender(env, from.address);
-        await runLimited(externalTargets, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
+        await runLimited(sendable, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
           let handedOver = false;
           try {
             const raw = rawFor(target);
             handedOver = true;
-            await send(target, raw);
+            const providerMessageId = await send(target, raw);
             record({ address: target, status: 'sent' });
+            sentRefs.push({ recipient: target, providerMessageId });
           } catch (error) {
             // 交给 Cloudflare 之前出错一定没发出；之后的报错只有明确拒收才算失败，其余结果不明
             const status = !handedOver || isDefiniteSendRejection(error) ? 'failed' : 'unknown';
@@ -920,8 +938,13 @@ export async function sendMail(
     const persistFinal = async () => {
       try {
         const updateRow = db.update(messages).set({ status, errorDetail, recipientOutcomes: outcomes }).where(eq(messages.id, sent.id));
-        if (handle) await db.batch([updateRow, completeIdempotentStatement(db, handle, summary)]);
-        else await updateRow;
+        // 投递回执的对应关系与最终结果同一事务写入：回执查到对应关系时发件行一定已是终态
+        const refs = sentRefs.length && deliveryEventsQueue(env) ? deliveryRefInserts(db, {
+          kind: 'message', messageId: sent.id, sender: from.address, rfcMessageId: outgoingMessageId, targets: sentRefs,
+        }) : [];
+        if (handle || refs.length) {
+          await db.batch([updateRow, ...(handle ? [completeIdempotentStatement(db, handle, summary)] : []), ...refs]);
+        } else await updateRow;
         return true;
       } catch (error) {
         console.error('投递结果回填失败:', error);

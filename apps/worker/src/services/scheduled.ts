@@ -29,6 +29,9 @@ import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js'
 import { releaseDraftStatements } from './upload.js';
 import { markStaleOutbound } from './outbound-recovery.js';
 import { offloadMailBodies } from './body-offload.js';
+import { cleanupDeliveryRefs } from './delivery-events.js';
+import { syncDeliveryEventSubscriptions } from './event-subscriptions.js';
+import { cleanupExpiredSuppressions } from './suppression.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -198,11 +201,16 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'bodies.offload', () => offloadMailBodies(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
+  // 投递回执订阅：只为新域名或失败超过 6 小时的域名调用 Cloudflare，其余时候只读本地记录
+  await step(report, 'delivery_events.subscriptions', () => syncDeliveryEventSubscriptions(env));
 }
 
 async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'claude_facts.catchup', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_CATCHUP_MS));
   await step(report, 'notification.cleanup', () => cleanupNotificationJobs(env));
+  // 每日核对 Cloudflare 上的投递回执订阅（被删除的重建），并清理过期的回执对应关系与抑制条目
+  await step(report, 'delivery_events.verify', () => syncDeliveryEventSubscriptions(env, { verify: true }));
+  await step(report, 'delivery_events.cleanup', async () => await cleanupDeliveryRefs(env) + await cleanupExpiredSuppressions(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
   const staleWindow = Math.floor(Date.now() / 60000) - 120;

@@ -65,6 +65,22 @@ describe('MessagePage 发件投递状态', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
+  it('投递回执的退信列为失败收件人可单独重试；投诉的收件人单独提示', async () => {
+    show({
+      status: 'delivered', errorDetail: '部分收件人失败: b@outside.com: 550 5.1.1 User unknown',
+      recipientOutcomes: [
+        { address: 'a@outside.com', status: 'delivered', event: 'delivered', eventAt: '2026-10-01T00:01:00Z' },
+        { address: 'b@outside.com', status: 'bounced', event: 'bounced', smtpStatus: '550 5.1.1', error: '550 5.1.1 User unknown' },
+        { address: 'c@outside.com', status: 'complained', event: 'complained' },
+      ],
+    });
+    expect(await screen.findByText('部分收件人失败')).toBeInTheDocument();
+    expect(screen.getByText('b@outside.com：550 5.1.1 User unknown')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '仅重试失败收件人' })).toBeInTheDocument();
+    expect(screen.getByText(/已送达，但这些收件人把邮件标记为垃圾邮件.*c@outside\.com/)).toBeInTheDocument();
+    expect(screen.queryByText(/a@outside\.com：/)).not.toBeInTheDocument();
+  });
+
   it('历史 bounced 等未知状态不再有专门分支：没有错误详情时不显示问题提示', async () => {
     show({ status: 'bounced' });
     await screen.findByText('mail-1');

@@ -1,6 +1,6 @@
 import {
   API_SCOPES, MAX_API_KEYS_PER_USER, MAX_DRAFT_ATTACHMENT_BYTES_PER_USER, MAX_DRAFT_ATTACHMENTS_PER_USER, MAX_HOSTED_DNS_RECORDS,
-  MAX_SEND_REQUEST_BYTES, MULTIPART_PART_BYTES, type ApiErrorDetails, type ErrorCode,
+  MAX_SEND_REQUEST_BYTES, MULTIPART_PART_BYTES, type ApiErrorDetails, type ErrorCode, type SuppressedRecipient,
 } from '@hpc-mail/shared';
 
 /**
@@ -42,6 +42,7 @@ const hostedDomain = {
   originalRegistrar: 'Example Registrar', steps: { nameServers: 'ready', routing: 'ready', catchAll: 'ready', sending: 'ready' },
   warnings: [], lastError: '', memberLimit: 0, memberCount: 1, mailboxCount: 4, createdAt: AT, activatedAt: LATER, checkedAt: LATER, expiresAt: null,
 };
+const suppressed: SuppressedRecipient = { address: 'nobody@example.net', reason: 'hard_bounce', sendingDomain: 'example.org', since: '2026-11-16T09:12:00.000Z', expiresAt: '2026-11-23T09:12:00.000Z' };
 const delivery = {
   id: 301, messageId: 1024, target: 'webhook', status: 'succeeded', attempts: 1, maxAttempts: 1, lastError: '', lastHttpStatus: 200,
   createdAt: AT, updatedAt: LATER, nextAttemptAt: AT, lastAttemptAt: LATER,
@@ -120,6 +121,12 @@ export const SCHEMA_EXAMPLES: Record<string, unknown> = {
     id: '023e105f4ecef8ad9ca31a8372d0c353', type: 'A', name: 'www', fqdn: 'www.alice.dev', content: '203.0.113.10', ttl: 1, priority: null,
     srv: null, caa: null, proxied: false, comment: 'website', kind: 'user', lockedReason: '', modifiedAt: AT,
   },
+  SuppressedRecipient: suppressed,
+  EmailSuppression: { id: 41, ...suppressed, detail: '550 5.1.1 User unknown', updatedAt: '2026-11-16T09:12:00.000Z' },
+  DeliveryEventsOverview: {
+    enabled: true, credentials: true, queue: 'hpc-mail-email-events',
+    subscriptions: [{ domain: 'example.org', kind: 'system', zoneId: '023e105f4ecef8ad9ca31a8372d0c353', subscriptionId: 'f3b2c1d0-5e6a-4b7c-8d9e-0a1b2c3d4e5f', status: 'active', lastError: '', checkedAt: AT }],
+  },
   MessageTranslation: { translations: ['你的验证码是 482913，10 分钟内有效。'], cached: false, skipped: 0 },
   AiModelTestResult: { ok: true, latencyMs: 820, sample: '你的验证码是 123456，10 分钟内有效。' },
   SingleUploadResult: { token: 'upl_8f3c2a1b9d7e', filename: 'report.pdf', size: 482113, mimeType: 'application/pdf' },
@@ -176,6 +183,7 @@ export const ERROR_EXAMPLES = {
   NotFoundAvatar: { code: 'not_found', message: '头像不存在' },
   NotFoundNotificationJob: { code: 'not_found', message: '通知任务不存在' },
   NotFoundGrantee: { code: 'not_found', message: '该用户不在共享名单中' },
+  NotFoundSuppression: { code: 'not_found', message: '抑制条目不存在或已解除' },
   NoRawArchive: { code: 'not_found', message: '该邮件无原始存档' },
   SignatureInvalid: { code: 'unauthorized', message: '签名无效或已过期' },
   BadCredentials: { code: 'bad_credentials', message: '用户名或密码错误' },
@@ -210,6 +218,10 @@ export const ERROR_EXAMPLES = {
   SendPayloadTooLarge: { code: 'payload_too_large', message: `发信请求体超过 ${MAX_SEND_REQUEST_BYTES / MIB}MB 上限` },
   DeliveryFailed: { code: 'delivery_failed', message: '全部收件人投递失败: nobody@example.net: 550 5.1.1 User unknown',
     details: { messageId: 1026, recipientOutcomes: [{ address: 'nobody@example.net', status: 'failed', error: '550 5.1.1 User unknown' }] } },
+  RecipientSuppressed: { code: 'recipient_suppressed', message: '全部收件人都在抑制名单中，没有发送：nobody@example.net（此前退信（地址或域名不可用））',
+    fix: '换用其他收件人；对方地址恢复后由管理员在抑制名单中解除（软退信 24 小时、一般硬退信 7 天后自动解除）',
+    docs: '/references/errors.md#recipient_suppressed',
+    details: { suppressed: [suppressed] } },
   IdempotencyMismatch: { code: 'idempotency_mismatch', message: '相同 Idempotency-Key 不能用于不同的发信内容，请使用新的 Key' },
   SendInProgress: { code: 'send_in_progress', message: '该发信请求正在处理或结果待确认，请查询发送结果，不要换 Key 重发' },
   OutboundQuota: { code: 'rate_limited', message: '已达每日外发上限（100 封），请明日再试' },
