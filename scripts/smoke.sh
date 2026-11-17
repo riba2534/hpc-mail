@@ -112,7 +112,9 @@ while :; do
   page_url="$BASE_URL/?smoke-cache-bust=$(date +%s)-$attempt"
 done
 echo "$asset_meta" | grep -qE '^200 (text|application)/javascript' || fail "现存静态资源响应异常: $asset $asset_meta"
-curl -sS -D - -o /dev/null "$BASE_URL$asset" | tr -d '\r' | grep -qi '^cache-control:.*immutable' || fail "现存静态资源缺少长缓存: $asset"
+# 先把响应头读进变量再判断：pipefail 下 `curl | tr | grep -q` 会因 grep 匹配后提前退出、上游收到 SIGPIPE 而随机判失败
+asset_headers=$(curl -sS -D - -o /dev/null "$BASE_URL$asset" | tr -d '\r')
+grep -qi '^cache-control:.*immutable' <<<"$asset_headers" || fail "现存静态资源缺少长缓存: $asset"
 missing_asset=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BASE_URL/assets/missing-smoke-00000000.js")
 [ "$missing_asset" = "404 text/plain; charset=utf-8" ] || fail "缺失哈希资源未返回 404: $missing_asset"
 
