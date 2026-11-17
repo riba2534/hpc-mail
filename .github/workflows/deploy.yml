@@ -30,10 +30,10 @@ jobs:
     # 一键部署克隆出的仓库不配 Variables，自动跳过本工作流（不产生失败标记）
     if: vars.CLOUDFLARE_ACCOUNT_ID != '' || vars.CUSTOM_DOMAIN != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       # 这些标识可以配成 Variable，也可以配成同名 Secret（Secret 优先）。
-      # 配成 Variable 时只有本步骤的 env 回显是明文；配成 Secret 则全程不出现在公开日志里。
+      # 配成 Variable 时本步骤的 env 回显是明文（之后的日志里屏蔽）；配成 Secret 则全程不出现在公开日志里。
       - name: 校验部署参数并屏蔽日志中的标识
         env:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -46,9 +46,11 @@ jobs:
           CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
         run: |
           set -euo pipefail
-          for name in IN_ACCOUNT_ID IN_D1_DATABASE_ID IN_KV_NAMESPACE_ID IN_ADMIN_USERNAME; do
+          for name in IN_ACCOUNT_ID IN_D1_DATABASE_ID IN_KV_NAMESPACE_ID; do
             [ -z "${!name}" ] || echo "::add-mask::${!name}"
           done
+          # 太短的用户名（如 admin）一屏蔽，日志里所有同样的词都会变成 ***；只屏蔽 6 位及以上的
+          [ "${#IN_ADMIN_USERNAME}" -lt 6 ] || echo "::add-mask::$IN_ADMIN_USERNAME"
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo '::error::缺 CLOUDFLARE_API_TOKEN'; exit 1; }
           # ID 会写进 GITHUB_ENV 并被 sed 注入 wrangler.toml，只允许字母、数字与连字符
           echo "$IN_ACCOUNT_ID" | grep -qE '^[A-Za-z0-9-]{8,64}$' || { echo '::error::缺少或非法的 CLOUDFLARE_ACCOUNT_ID'; exit 1; }
@@ -59,6 +61,8 @@ jobs:
           plen=${#ADMIN_PASSWORD}
           [ "$plen" -ge 12 ] && [ "$plen" -le 128 ] || { echo '::error::ADMIN_PASSWORD 需 12-128 位'; exit 1; }
           echo "$IN_ADMIN_USERNAME" | grep -qE '^[a-z0-9][a-z0-9_-]{2,31}$' || { echo '::error::ADMIN_USERNAME 非法'; exit 1; }
+          # 与 packages/shared 的 RESERVED_USERNAMES 一致：ci-smoke 是部署冒烟专用的普通用户
+          [ "$IN_ADMIN_USERNAME" != "ci-smoke" ] || { echo '::error::ADMIN_USERNAME 不能使用系统保留用户名 ci-smoke（部署冒烟专用账号），请换一个管理员用户名'; exit 1; }
           echo "::add-mask::$JWT_SECRET"
           echo "::add-mask::$ADMIN_PASSWORD"
           {
@@ -257,15 +261,17 @@ jobs:
           fi
           npx wrangler deploy --secrets-file "$secrets_file" --message "ci $GITHUB_SHA"
 
+      # 发布之后的步骤都设单步超时：挂住时以失败结束，自动回滚仍有时间执行
       - name: 等待新版本全球生效
         id: propagate
+        timeout-minutes: 6
         env:
           BUILD_SHA: ${{ github.sha }}
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
         run: |
           set -euo pipefail
           for i in $(seq 1 24); do
-            if curl -sS -D "$RUNNER_TEMP/hpc-config.headers" "$BASE_URL/api/config" | jq -e '.data.registrationMode' >/dev/null 2>&1 && tr -d '\r' < "$RUNNER_TEMP/hpc-config.headers" | grep -qi "^x-hpc-build: $BUILD_SHA$"; then
+            if curl -sS --max-time 15 -D "$RUNNER_TEMP/hpc-config.headers" "$BASE_URL/api/config" | jq -e '.data.registrationMode' >/dev/null 2>&1 && tr -d '\r' < "$RUNNER_TEMP/hpc-config.headers" | grep -qi "^x-hpc-build: $BUILD_SHA$"; then
               echo "新版本已生效（第 $i 次探测）"
               exit 0
             fi
@@ -275,46 +281,42 @@ jobs:
           echo '::error::240s 内新版本未生效'
           exit 1
 
+      # 可选 Secret ADMIN_TOTP_SECRET（管理员 TOTP 种子）：管理员开了两步验证时用它登录，保住管理员检查
       - name: 线上冒烟
         id: smoke
+        timeout-minutes: 10
         env:
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          ADMIN_TOTP_SECRET: ${{ secrets.ADMIN_TOTP_SECRET }}
         run: bash scripts/smoke.sh
 
-      # 金丝雀信经 send_email 真实外发，走 MX → Email Routing → email handler；
-      # Workers Free 计划只能发往已验证地址，可设 Variable DEPLOY_CANARY=off 跳过
+      # 金丝雀信经 send_email 真实外发，走 MX → Email Routing → email handler。须显式启用：
+      # 设置 Variables CANARY_FROM_DOMAIN 与 CANARY_TO_DOMAIN（或 DEPLOY_CANARY=on），否则跳过并 notice
       - name: 收件金丝雀
         id: canary
-        working-directory: apps/worker
+        timeout-minutes: 6
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
           DEPLOY_CANARY: ${{ vars.DEPLOY_CANARY }}
           CANARY_FROM_DOMAIN: ${{ vars.CANARY_FROM_DOMAIN }}
           CANARY_TO_DOMAIN: ${{ vars.CANARY_TO_DOMAIN }}
-        run: |
-          set -euo pipefail
-          # 全新部署还没有系统域名时金丝雀无处可发，跳过（合法状态）
-          if [ "${DEPLOY_CANARY:-}" != "off" ]; then
-            SYSTEM_DOMAIN_COUNT=$(npx wrangler d1 execute "$D1_NAME" --remote --json --command \
-              "SELECT COALESCE(json_array_length(value, '\$.list'), 0) AS n FROM settings WHERE key = 'domains'" |
-              jq -r '.[0].results[0].n // 0')
-            export SYSTEM_DOMAIN_COUNT
-          fi
-          bash ../../scripts/deploy-probe.sh canary
+        run: bash scripts/deploy-probe.sh canary
 
+      # cron 每 5 分钟一次，新版本首次运行后写心跳；最多等 10 分钟
       - name: 等待新版本的 cron 心跳
         id: heartbeat
+        timeout-minutes: 12
         env:
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
-        run: HEARTBEAT_TIMEOUT=420 PROBE_POLL_INTERVAL=15 bash scripts/deploy-probe.sh heartbeat
+        run: HEARTBEAT_TIMEOUT=600 PROBE_POLL_INTERVAL=15 bash scripts/deploy-probe.sh heartbeat
 
-      # 发布之后（含发布步骤本身）任一步骤失败：Worker 回到部署前版本；迁移不回滚
+      # 发布步骤执行过（成功、失败或中途取消）之后，任一步骤失败或整个运行被取消：Worker 回到部署前版本；迁移不回滚
       - name: 失败自动回滚 Worker
-        if: failure() && steps.deploy.outcome != 'skipped'
+        if: (failure() || cancelled()) && steps.deploy.outcome != 'skipped' && steps.deploy.outcome != ''
+        timeout-minutes: 10
         working-directory: apps/worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -326,7 +328,7 @@ jobs:
           set -euo pipefail
           summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
           # outcome 只会是 success/failure/cancelled/skipped，直接展开进表格
-          summary '## 部署失败：自动回滚' '' '| 步骤 | 结果 |' '| --- | --- |' \
+          summary '## 部署失败或被取消：自动回滚' '' '| 步骤 | 结果 |' '| --- | --- |' \
             '| 部署 Worker | ${{ steps.deploy.outcome }} |' \
             '| 等待新版本全球生效 | ${{ steps.propagate.outcome }} |' \
             '| 线上冒烟 | ${{ steps.smoke.outcome }} |' \
