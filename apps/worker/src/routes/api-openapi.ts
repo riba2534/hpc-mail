@@ -1,7 +1,7 @@
 import { HOSTED_DOMAIN_STATUSES, MAX_ADMIN_MAILBOX_BATCH } from '@hpc-mail/shared';
 import {
   array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, conditionalDetail, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
-  mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref,
+  mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref, syncQuery,
   scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedExamples, usedSchemas, type Paths,
 } from './openapi-common.js';
 import { accountSessionPaths } from './openapi-account.js';
@@ -85,7 +85,7 @@ export function buildSessionOpenApiSpec(origin: string) {
         description: 'Default retains all address history for the next claimant. deleteHistory=1 atomically removes all existing address mail and ownership. Owner or administrator only. Previously delivered external links retain their promised 90-day validity.' }),
     },
     '/messages': { get: operation('listMessages', 'List mail with cursor pagination', ref('SessionMessagePage'), { parameters: listQuery, description: 'unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt. Inbound summaries carry verificationLink (empty when none was detected).' }) },
-    '/messages/sync': { get: operation('syncMessages', 'Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: listQuery,
+    '/messages/sync': { get: operation('syncMessages', 'Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: syncQuery,
       description: 'Lightweight polling for the list view: accepts the same filters as GET /messages (cursor and afterId are ignored). Refetch the list only when head differs from the head returned with its first page.' }) },
     '/messages/send': { post: sendMailOperation() },
     '/messages/read': { post: operation('markMessagesRead', 'Mark selected owned messages read/unread',

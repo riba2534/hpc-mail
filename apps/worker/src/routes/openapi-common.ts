@@ -710,6 +710,8 @@ export const listQuery = [query('direction', { type: 'string', enum: ['inbound',
   query('q', { type: 'string', maxLength: 256 }, 'Case-insensitive literal substring of subject, sender address/name, recipients and the first 4 KB of the body text (HTML-only mail: its text content); Unicode is supported. Text further into the body is not searched.'),
   ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'),
   ...listFilterQuery, ...pageQuery];
+/** /messages/sync 只取首页：服务端忽略 cursor 与 afterId，文档里也不列 */
+export const syncQuery = listQuery.filter(param => param.name !== 'cursor' && param.name !== 'afterId');
 export const idempotencyHeader = { name: 'Idempotency-Key', in: 'header', required: false,
   description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed exactly as first returned (201 with the original summary, including status unknown, or the same 422 delivery_failed when every recipient definitely failed) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it; so does 422 recipient_suppressed, which creates no outbound record and uses no quota. After 422 delivery_failed, correct the recipients and use a new key. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key; confirm unknown recipients before resending to them. Outbound mail still pending an hour after creation is marked unknown, after which the same key replays 201 with status unknown; in the rare case the final result cannot be stored, the same key keeps returning 409 send_in_progress until then. Completed keys are retained at least two days.',
   schema: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$' } };
@@ -889,7 +891,13 @@ export function composeOperation(op: 'reply' | 'forward'): Operation {
     description: `${reply
       ? 'Replies to the visible message {id}: the server picks the recipients, adds Re: to the subject, sets In-Reply-To/References and by default quotes the original below your text.'
       : 'Forwards the visible message {id}: subject gets Fwd:, your note comes first, the original header and body follow (includeOriginal), and every original attachment is attached.'} The source must be visible to the key owner like GET /messages/{id} (claimed addresses, non-deleted inbound mail shared with you, and for administrators unclaimed addresses); otherwise 404 source_unavailable. from defaults to the address the source was received at; mail in a mailbox shared with you needs an explicit from (400 from_required otherwise). Results, partial failure, 422 delivery_failed and the Idempotency-Key behave exactly like POST /messages; a replay returns the original result even if the source was deleted since. Needs both mail.send and mail.read.` });
-  return { ...base, 'x-required-scopes': ['mail.send', 'mail.read'] };
+  return ownNotFound({ ...base, 'x-required-scopes': ['mail.send', 'mail.read'] });
+}
+/** 自己声明 404 语义的接口（如回复/转发：原信不存在报 source_unavailable），不再挂路径资源的 not_found 示例 */
+const OWN_NOT_FOUND = new WeakSet<Operation>();
+function ownNotFound(op: Operation): Operation {
+  OWN_NOT_FOUND.add(op);
+  return op;
 }
 /** 路径参数前一段对应的资源：带 {id} 的接口自动带上该资源的 404 示例。新增带参数的路径时在这里登记首个参数的资源。 */
 const NOT_FOUND_BY_RESOURCE: Record<string, ErrorExampleName> = {
@@ -923,7 +931,8 @@ export function describePaths(paths: Paths, defaults: PathDefaults): Paths {
       ...Object.fromEntries(Object.entries(methods).map(([method, value]) => {
         const security = (value.security as Schema[] | undefined) ?? defaults.security;
         return [method, { ...value, security,
-          responses: addErrorExamples(value.responses as Record<string, Schema>, [...(security.length ? defaults.errors : []), ...notFound]) }];
+          responses: addErrorExamples(value.responses as Record<string, Schema>,
+            [...(security.length ? defaults.errors : []), ...(OWN_NOT_FOUND.has(value) ? [] : notFound)]) }];
       })),
       ...(names.length ? { parameters: names.map(name => ({ name, in: 'path', required: true,
         schema: name === 'token' ? { type: 'string', minLength: 1 } : name === 'recordId' ? dnsRecordId : positiveId })) } : {}),
