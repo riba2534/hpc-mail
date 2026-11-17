@@ -2,10 +2,12 @@ import { DEFAULT_SETTINGS } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { sessions, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { requireAuth } from '../src/middleware/auth.js';
 import { hashPassword } from '../src/lib/password.js';
 import { createApiKey } from '../src/services/api-key.js';
 import { loadMailboxPolicyUser, resolveMailboxPolicy } from '../src/services/mailbox-policy.js';
@@ -17,7 +19,7 @@ import {
   settingsQuery,
   updateSettings,
 } from '../src/services/setting.js';
-import type { Env } from '../src/types.js';
+import type { AppContext, Env } from '../src/types.js';
 
 const app = createApp();
 afterEach(() => { vi.restoreAllMocks(); });
@@ -218,33 +220,55 @@ describe('/v1 鉴权往返', () => {
     const id = await seedUser(username);
     return (await createApiKey(env, id, { name: username, scopes: ['mail.read'], rateLimit: 120, allowedIps: [] })).key;
   }
-  /** 去掉 waitUntil 里的审计写入，只看鉴权本身的往返 */
-  const authCalls = (calls: D1Call[]) => calls.filter((call) => !call.sql.some((sql) => sql.includes('api_request_logs')));
+  const isAudit = (call: D1Call) => call.sql.some((sql) => sql.includes('api_request_logs'));
+  const isLastUsed = (call: D1Call) => call.sql.some((sql) => /UPDATE api_keys SET last_used_at/.test(sql));
 
-  it('冷 isolate：设置与 key 合进同一个读 batch，鉴权共 2 次串行 D1；热 isolate 不多于此', async () => {
+  it('冷 isolate：设置与 key 合进同一个读 batch，鉴权只有这 1 次 D1 往返、不为限流写库；热 isolate 只查 key', async () => {
     const key = await apiKey('perf-v1-cold');
     invalidateSettingsMemory();
     const traced = tracedEnv();
     const ctx = createExecutionContext();
     expect((await request('/v1/status', bearer(key), traced.env, ctx)).status).toBe(200);
     await waitOnExecutionContext(ctx);
-    const cold = authCalls(traced.calls);
-    expect(cold.map((call) => call.kind)).toEqual(['batch', 'batch']);
+    // 首次使用写 last_used、放行写审计，两者都在 waitUntil 里
+    expect(traced.calls.filter(isLastUsed)).toHaveLength(1);
+    const cold = traced.calls.filter((call) => !isAudit(call) && !isLastUsed(call));
+    expect(cold.map((call) => call.kind)).toEqual(['batch']);
     expect(cold[0]!.sql).toHaveLength(2);
     expect(cold[0]!.sql.some(isSettingsRead)).toBe(true);
     expect(cold[0]!.sql.some((sql) => sql.includes('api_keys'))).toBe(true);
-    expect(traced.layers()).toBe(3); // 读 batch → 写 batch → waitUntil 审计
+    expect(traced.calls.flatMap((call) => call.sql).some((sql) => /rate_counters|api_rate_limits/.test(sql))).toBe(false);
     expect(traced.kvCalls).toEqual([]);
 
     traced.reset();
     const hotCtx = createExecutionContext();
     expect((await request('/v1/status', bearer(key), traced.env, hotCtx)).status).toBe(200);
     await waitOnExecutionContext(hotCtx);
-    const hot = authCalls(traced.calls);
-    expect(hot.map((call) => call.kind)).toEqual(['single', 'batch']);
-    expect(hot[0]!.sql[0]).toContain('api_keys');
-    expect(traced.layers()).toBe(3);
+    // last_used 60 秒内已写过：不再发写语句；剩下的只有查 key 与 waitUntil 审计
+    expect(traced.calls.filter((call) => !isAudit(call)).map((call) => call.kind)).toEqual(['single']);
+    expect(traced.calls[0]!.sql[0]).toContain('api_keys');
+    expect(traced.layers()).toBe(2); // 查 key → waitUntil 审计
     expect(traced.kvCalls).toEqual([]);
+  });
+
+  it('last_used 写入不阻塞响应：写入永不完成时请求照常返回', async () => {
+    const key = await apiKey('perf-v1-last-used-hang');
+    const traced = tracedEnv();
+    const db = new Proxy(traced.env.db, {
+      get(target, property) {
+        if (property === 'prepare') {
+          return (sql: string) => (/UPDATE api_keys SET last_used_at/.test(sql)
+            ? { bind: () => ({ run: never }) }
+            : target.prepare(sql));
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const { ctx, pending } = collectingCtx();
+    const response = await within(request('/v1/status', bearer(key), { ...traced.env, db } as Env, ctx));
+    expect(response.status).toBe(200);
+    expect(pending.length).toBeGreaterThanOrEqual(2); // last_used 与审计
   });
 
   it('API 关闭优先于 Key 校验；非法 Key 只读设置', async () => {
@@ -266,6 +290,37 @@ describe('/v1 鉴权往返', () => {
     expect(garbage.status).toBe(401);
     expect(traced.calls).toHaveLength(1);
     expect(isSettingsRead(traced.calls[0]!.sql[0]!)).toBe(true);
+  });
+});
+
+describe('/api 鉴权往返（requireAuth）', () => {
+  it('快路径：会话、用户与 security 设置一个只读 batch，鉴权只有这 1 次 D1 往返', async () => {
+    const token = await jwtFor(await seedUser('perf-auth-fast-roundtrip'));
+    const traced = tracedEnv();
+    expect((await request('/api/auth/me', bearer(token), traced.env)).status).toBe(200);
+    const auth = traced.calls.filter((call) => call.sql.some((sql) => /FROM sessions s/.test(sql)));
+    expect(auth).toHaveLength(1);
+    expect(auth[0]!.kind).toBe('batch');
+    expect(auth[0]!.sql).toHaveLength(2);
+    expect(auth[0]!.sql.every((sql) => /^\s*SELECT/i.test(sql))).toBe(true);
+    expect(traced.calls.flatMap((call) => call.sql).some((sql) => /rate_counters|api_rate_limits/.test(sql))).toBe(false);
+  });
+
+  it('慢路径（鉴权版本待迁移）：除一次性的版本迁移外不写库，不再为限流多一次写往返', async () => {
+    const id = await createDb(env).insert(users).values({
+      username: 'perf-auth-slow-roundtrip', passwordHash: 'x', role: 'user', status: 'active', authVersionMigrated: false,
+    }).returning({ id: users.id }).then(([row]) => row!.id);
+    const token = await jwtFor(id);
+    const probe = new Hono<AppContext>();
+    probe.use('*', requireAuth);
+    probe.get('/probe', (c) => c.json({ ok: true }));
+    const traced = tracedEnv();
+    expect((await probe.request('/probe', bearer(token), traced.env, createExecutionContext())).status).toBe(200);
+    // 快路径的只读 batch 发现版本未迁移 → 慢路径：会话、用户行，再由 getUserEpoch 读-迁移-复读（共 6 次，原先另有一次限流写 batch）
+    expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'single', 'single', 'single', 'single', 'single']);
+    const writes = traced.calls.flatMap((call) => call.sql).filter((sql) => !/^\s*select/i.test(sql));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatch(/^update "users" set "auth_version" = \?, "auth_version_migrated" = \?/);
   });
 });
 
