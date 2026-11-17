@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ApiKeySummary } from '@hpc-mail/shared';
+import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ mobile: true }));
@@ -29,11 +30,19 @@ import { ApiKeysPage } from './api-keys-page';
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const router = createMemoryRouter(
+    [
+      { path: '/api-keys', element: <ApiKeysPage /> },
+      { path: '/api-docs', element: <p>文档页</p> },
+    ],
+    { initialEntries: ['/api-keys'] },
+  );
+  render(
     <QueryClientProvider client={client}>
-      <ApiKeysPage />
+      <RouterProvider router={router} />
     </QueryClientProvider>,
   );
+  return router;
 }
 
 describe('ApiKeysPage 窄屏', () => {
@@ -57,5 +66,20 @@ describe('ApiKeysPage 窄屏', () => {
     mocks.mobile = false;
     renderPage();
     expect(await screen.findByRole('table')).toBeInTheDocument();
+  });
+});
+
+describe('ApiKeysPage 文档入口', () => {
+  it('页头「查看 API 文档」进入站内文档页', async () => {
+    mocks.mobile = false;
+    const user = userEvent.setup();
+    const router = renderPage();
+    const link = await screen.findByRole('link', { name: '查看 API 文档' });
+    expect(link).toHaveAttribute('href', '/api-docs');
+    expect(screen.getByRole('button', { name: '创建密钥' })).toBeInTheDocument();
+
+    await user.click(link);
+    expect(await screen.findByText('文档页')).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe('/api-docs');
   });
 });

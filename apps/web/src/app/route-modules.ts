@@ -33,6 +33,7 @@ export const loadHostedDomainDetailPage = preloadable(
   () => import('@/features/hosted-domains/hosted-domain-detail-page'),
 );
 export const loadApiKeysPage = preloadable(() => import('@/features/api-keys/api-keys-page'));
+export const loadApiDocsPage = preloadable(() => import('@/features/api-docs/api-docs-page'));
 export const loadProfilePage = preloadable(() => import('@/features/profile/profile-page'));
 
 const ROUTE_LOADERS: ReadonlyArray<readonly [RegExp, () => Promise<unknown>]> = [
