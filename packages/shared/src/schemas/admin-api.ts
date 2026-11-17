@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { MAX_MAILBOX_GRANTEES, type Role, type UserStatus } from '../constants.js';
 import { usernameSchema } from './auth.js';
 import {
-  adminBatchClaimRequestSchema, adminBatchShareRequestSchema, domainSchema, mailboxAddressSchema,
+  adminBatchClaimRequestSchema, adminBatchShareRequestSchema, domainSchema, mailboxAddressSchema, userIdSchema,
   type AdminMailboxBatchResult, type BatchClaimMailboxResult,
 } from './mailbox.js';
 import type { UserMailboxPolicy } from './mailbox-policy.js';
@@ -16,15 +16,21 @@ import type { UserMailboxPolicy } from './mailbox-policy.js';
 /** 查询接口单次最多查询的条目数（地址、域名、用户名） */
 export const MAX_ADMIN_LOOKUP = 200;
 
-/** 逗号分隔的字符串拆成列表：去空白、去重、保持顺序；已是数组时原样交给后续校验 */
+/** 逗号分隔的字符串拆成列表并丢掉空项；已是数组时原样交给后续校验 */
 function splitLookupList(value: unknown): unknown {
   if (typeof value !== 'string') return value;
-  return [...new Set(value.split(',').map((part) => part.trim()).filter(Boolean))];
+  return value.split(',').map((part) => part.trim()).filter(Boolean);
 }
 
-/** 逗号分隔或重复参数合并后的列表，1–MAX_ADMIN_LOOKUP 项 */
+/**
+ * 逗号分隔或重复参数合并后的列表：每项先按条目 schema 规整（小写、去空白），再去重并保持首次出现的顺序，
+ * 去重后 1–MAX_ADMIN_LOOKUP 项（`Alice@x.org,alice@x.org` 算一项）
+ */
 export function adminLookupList<T extends z.ZodTypeAny>(item: T) {
-  return z.preprocess(splitLookupList, z.array(item).min(1).max(MAX_ADMIN_LOOKUP));
+  return z.preprocess(splitLookupList, z.array(item)
+    .transform((items) => [...new Set(items)])
+    .refine((items) => items.length > 0, '至少给一项')
+    .refine((items) => items.length <= MAX_ADMIN_LOOKUP, `最多 ${MAX_ADMIN_LOOKUP} 项（去重后）`));
 }
 
 // ---------- 目录：用户与托管域名 ----------
@@ -93,13 +99,13 @@ export interface AdminMailboxView {
 
 /** 把每个邮箱的共享成员替换为 userIds（空数组表示清空）；不能包含邮箱所有者。其余同批量共享 */
 export const adminBatchReplaceSharesRequestSchema = adminBatchShareRequestSchema.extend({
-  userIds: z.array(z.number().int().positive()).max(MAX_MAILBOX_GRANTEES),
+  userIds: z.array(userIdSchema).max(MAX_MAILBOX_GRANTEES),
 });
 export type AdminBatchReplaceSharesRequest = z.infer<typeof adminBatchReplaceSharesRequestSchema>;
 
 /** 同 /api/admin 批量认领；shareUserIds 给了就把本次认领到的地址再追加共享给这些用户（规则同批量共享） */
 export const adminClaimAndShareRequestSchema = adminBatchClaimRequestSchema.extend({
-  shareUserIds: z.array(z.number().int().positive()).max(MAX_MAILBOX_GRANTEES).optional(),
+  shareUserIds: z.array(userIdSchema).max(MAX_MAILBOX_GRANTEES).optional(),
 });
 export type AdminClaimAndShareRequest = z.infer<typeof adminClaimAndShareRequestSchema>;
 

@@ -66,8 +66,8 @@ async function fixture() {
   const owner = await actor('owner');
   const target = await actor('target');
   const member = await actor('member');
-  // 管理员 Key：管理员账户 + admin scope
-  const adminKey = await keyFor(admin.jwt, { scopes: ['mailbox.read', 'admin'] });
+  // 运维用的管理员 Key：管理员账户 + admin scope，另带读写邮箱与读信（Claude 查询）的 scope
+  const adminKey = await keyFor(admin.jwt, { scopes: OPS_SCOPES });
   const address = (name: string, domain = DOMAIN) => `${prefix}-${name}@${domain}`;
   async function box(ownerId: number, name: string, domain = DOMAIN) {
     return (await db.insert(mailboxes).values({ address: address(name, domain), domain, userId: ownerId }).returning().get())!;
@@ -84,24 +84,37 @@ const membersOf = async (id: number) => (await db.select().from(mailboxShares).w
   .map((row) => row.userId).sort((a, b) => a - b);
 const ownerOf = async (id: number) => (await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get())?.userId;
 const sorted = (...ids: number[]) => [...ids].sort((a, b) => a - b);
+const OPS_SCOPES = ['mail.read', 'mailbox.read', 'mailbox.write', 'admin'];
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+type AdminCall = [method: string, path: string, body?: unknown];
+
+/** 每个 /v1/admin 接口一次调用：查询（mailbox.read）、写操作（mailbox.write）与 Claude 查询（mail.read） */
+function adminCalls(f: Fixture, address = f.address('x')): { reads: AdminCall[]; writes: AdminCall[]; claude: AdminCall[] } {
+  return {
+    reads: [['GET', `/v1/admin/mailboxes?domain=${DOMAIN}`], ['GET', `/v1/admin/users?usernames=${f.owner.username}`], ['GET', '/v1/admin/hosted-domains']],
+    writes: [
+      ['POST', '/v1/admin/mailboxes/batch/claim', { userId: f.owner.id, items: [{ localPart: `${f.prefix}-x`, domain: DOMAIN }] }],
+      ['POST', '/v1/admin/mailboxes/batch/release', { items: [{ address }] }],
+      ['POST', '/v1/admin/mailboxes/batch/transfer', { userId: f.target.id, items: [{ address, expectedOwnerId: f.owner.id }] }],
+      ['POST', '/v1/admin/mailboxes/batch/share', { userIds: [f.member.id], items: [{ address }] }],
+      ['POST', '/v1/admin/mailboxes/batch/unshare', { userIds: [f.member.id], items: [{ address }] }],
+      ['PUT', '/v1/admin/mailboxes/shares', { userIds: [], items: [{ address }] }],
+    ],
+    claude: [['GET', `/v1/admin/claude/domains?domains=${DOMAIN}`], ['GET', `/v1/admin/claude/addresses?addresses=${address}`]],
+  };
+}
+const callInit = (method: string, body: unknown, key?: string): RequestInit & { key?: string } => ({ method, key,
+  ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) });
 
 describe('/v1/admin 鉴权', () => {
   it('无 Key 401（带 requestId）；普通用户 Key、不带 admin scope 的管理员 Key 都是 403；管理员 JWT 不能调用', async () => {
     const f = await fixture();
     const userKey = await f.keyFor(f.owner.jwt, { scopes: ['mailbox.read', 'mailbox.write', 'mailbox.share'] });
     const plainAdminKey = await f.keyFor(f.admin.jwt, { scopes: ['mailbox.read', 'mailbox.write', 'mailbox.share'] });
-    const calls: Array<[string, string, unknown?]> = [
-      ['GET', `/v1/admin/mailboxes?domain=${DOMAIN}`], ['GET', `/v1/admin/users?usernames=${f.owner.username}`], ['GET', '/v1/admin/hosted-domains'],
-      ['POST', '/v1/admin/mailboxes/batch/claim', { userId: f.owner.id, items: [{ localPart: 'x', domain: DOMAIN }] }],
-      ['POST', '/v1/admin/mailboxes/batch/release', { items: [{ address: f.address('x') }] }],
-      ['POST', '/v1/admin/mailboxes/batch/transfer', { userId: f.target.id, items: [{ address: f.address('x'), expectedOwnerId: f.owner.id }] }],
-      ['POST', '/v1/admin/mailboxes/batch/share', { userIds: [f.member.id], items: [{ address: f.address('x') }] }],
-      ['POST', '/v1/admin/mailboxes/batch/unshare', { userIds: [f.member.id], items: [{ address: f.address('x') }] }],
-      ['PUT', '/v1/admin/mailboxes/shares', { userIds: [], items: [{ address: f.address('x') }] }],
-    ];
-    for (const [method, path, body] of calls) {
-      const init = (key?: string): RequestInit & { key?: string } => ({ method, key,
-        ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) });
+    const { reads, writes, claude } = adminCalls(f);
+    for (const [method, path, body] of [...reads, ...writes, ...claude]) {
+      const init = (key?: string) => callInit(method, body, key);
       const anonymous = await errorOf(await request(path, init()), 401);
       expect(anonymous.code, `${method} ${path}`).toBe('unauthorized');
       expect(anonymous.requestId, `${method} ${path}`).toMatch(/\S/);
@@ -111,6 +124,53 @@ describe('/v1/admin 鉴权', () => {
     }
     // 什么都没写
     expect(await db.select().from(mailboxes).where(eq(mailboxes.address, f.address('x'))).all()).toEqual([]);
+  });
+
+  it('限定了邮箱或域名的管理员 Key 一律 403：管理员运维接口需要不限范围的管理员 Key', async () => {
+    const f = await fixture();
+    const own = await f.box(f.admin.id, 'own');
+    const victim = await f.box(f.owner.id, 'victim');
+    const byDomain = await f.keyFor(f.admin.jwt, { scopes: OPS_SCOPES, allowedDomains: [DOMAIN] });
+    const byMailbox = await f.keyFor(f.admin.jwt, { scopes: OPS_SCOPES, allowedMailboxIds: [own.id] });
+    const { reads, writes, claude } = adminCalls(f, victim.address);
+    for (const key of [byDomain.key, byMailbox.key]) {
+      for (const [method, path, body] of [...reads, ...writes, ...claude]) {
+        const error = await errorOf(await request(path, callInit(method, body, key)), 403);
+        expect(error.code, `${method} ${path}`).toBe('forbidden');
+        expect((error as { fix?: string }).fix, `${method} ${path}`).toContain('不限范围的管理员 Key');
+      }
+    }
+    // 范围内的邮箱也不放行，范围外的邮箱没有被释放或过户
+    expect((await errorOf(await send('/v1/admin/mailboxes/batch/release', byMailbox.key, { items: [{ address: own.address }] }), 403)).code).toBe('forbidden');
+    expect(await ownerOf(own.id)).toBe(f.admin.id);
+    expect(await ownerOf(victim.id)).toBe(f.owner.id);
+    // 同一账户不限范围的 Key 照常可用
+    expect((await request(`/v1/admin/mailboxes?addresses=${victim.address}`, { key: f.adminKey.key })).status).toBe(200);
+  });
+
+  it('除 admin 外，写操作要求 mailbox.write，查询要求 mailbox.read，Claude 查询要求 mail.read', async () => {
+    const f = await fixture();
+    const box = await f.box(f.owner.id, 'keep');
+    const readOnly = await f.keyFor(f.admin.jwt, { scopes: ['mailbox.read', 'admin'] });
+    const writeOnly = await f.keyFor(f.admin.jwt, { scopes: ['mailbox.write', 'admin'] });
+    const { reads, writes, claude } = adminCalls(f, box.address);
+    const denied = async (calls: AdminCall[], key: string, scope: string) => {
+      for (const [method, path, body] of calls) {
+        const error = await errorOf(await request(path, callInit(method, body, key)), 403);
+        expect([error.code, error.message], `${method} ${path}`).toEqual(['forbidden', `需要 API scope: ${scope}`]);
+      }
+    };
+    await denied(writes, readOnly.key, 'mailbox.write');
+    await denied(reads, writeOnly.key, 'mailbox.read');
+    await denied(claude, writeOnly.key, 'mail.read');
+    await denied(claude, readOnly.key, 'mail.read');
+    // 只读的管理员 Key 什么都没改
+    expect(await ownerOf(box.id)).toBe(f.owner.id);
+    expect(await db.select().from(mailboxes).where(eq(mailboxes.address, f.address('x'))).all()).toEqual([]);
+    for (const [method, path] of reads) expect((await request(path, { method, key: readOnly.key })).status, `${method} ${path}`).toBe(200);
+    for (const [method, path] of claude) expect((await request(path, { method, key: f.adminKey.key })).status, `${method} ${path}`).toBe(200);
+    const released = await data<AdminMailboxBatchResult>(await send('/v1/admin/mailboxes/batch/release', writeOnly.key, { items: [{ address: box.address }] }));
+    expect(released.done).toBe(1);
   });
 });
 
@@ -391,6 +451,20 @@ describe('GET /v1/admin/mailboxes', () => {
     const list = await data<AdminMailboxView[]>(await request(`/v1/admin/mailboxes?domain=${domain.toUpperCase()}`, { key: f.adminKey.key }));
     expect(list.map((box) => [box.address, box.ownerId])).toEqual([[x.address, f.owner.id], [y.address, f.target.id]]);
     expect(await data<AdminMailboxView[]>(await request('/v1/admin/mailboxes?domain=nothing-here.test', { key: f.adminKey.key }))).toEqual([]);
+  });
+
+  it('列表先规整再去重：大小写不同的同一地址算一项，上限按去重后的项数计', async () => {
+    const f = await fixture();
+    const box = await f.box(f.owner.id, 'dup');
+    const same = [box.address.toUpperCase(), ` ${box.address} `, box.address].map(encodeURIComponent).join(',');
+    expect((await data<AdminMailboxView[]>(await request(`/v1/admin/mailboxes?addresses=${same}`, { key: f.adminKey.key }))).map((item) => item.id))
+      .toEqual([box.id]);
+    const facts = await data<{ address: string }[]>(await request(`/v1/admin/claude/addresses?addresses=${same}`, { key: f.adminKey.key }));
+    expect(facts.map((item) => item.address)).toEqual([box.address]);
+    // 200 个地址各写一遍大小写变体：去重后正好 200 项，不超上限
+    const distinct = Array.from({ length: 200 }, (_, i) => f.address(`n${i}`));
+    const doubled = [...distinct, ...distinct.map((address) => address.toUpperCase())].join(',');
+    expect(await data<AdminMailboxView[]>(await request(`/v1/admin/mailboxes?addresses=${doubled}`, { key: f.adminKey.key }))).toEqual([]);
   });
 
   it('addresses 与 domain 必须且只能给一个；地址非法或超过 200 个 400', async () => {

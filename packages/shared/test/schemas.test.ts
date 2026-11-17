@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  adminHostedDomainsLookupSchema,
+  adminMailboxesQuerySchema,
+  adminUsersQuerySchema,
+  MAX_ADMIN_LOOKUP,
   claimMailboxRequestSchema,
   batchMailboxRequestSchema,
   claimPlanQuerySchema,
@@ -263,5 +267,22 @@ describe('托管域名设置', () => {
     expect(hostedDomainsSettingSchema.parse({ ...base, autoClaimLimit: 0 }).autoClaimLimit).toBe(0);
     expect(hostedDomainsSettingSchema.parse({ ...base, autoClaimLimit: 500 }).autoClaimLimit).toBe(500);
     for (const bad of [-1, 100001, 1.5]) expect(hostedDomainsSettingSchema.safeParse({ ...base, autoClaimLimit: bad }).success).toBe(false);
+  });
+});
+
+describe('/v1/admin 查询的列表参数', () => {
+  it('按条目 schema 规整（小写、去空白）之后再去重，保持首次出现的顺序', () => {
+    expect(adminMailboxesQuerySchema.parse({ addresses: ' Alice@X.org, alice@x.org ,BOB@x.org,bob@X.ORG' }).addresses)
+      .toEqual(['alice@x.org', 'bob@x.org']);
+    expect(adminUsersQuerySchema.parse({ usernames: 'Alice,alice, ALICE ,bob' }).usernames).toEqual(['alice', 'bob']);
+    expect(adminHostedDomainsLookupSchema.parse({ domains: 'Example.ORG,example.org' }).domains).toEqual(['example.org']);
+  });
+
+  it('上限按去重后的项数计；空项与非法条目整体失败', () => {
+    const names = Array.from({ length: MAX_ADMIN_LOOKUP }, (_, i) => `user-${i}`);
+    expect(adminUsersQuerySchema.parse({ usernames: [...names, ...names.map((name) => name.toUpperCase())].join(',') }).usernames).toHaveLength(MAX_ADMIN_LOOKUP);
+    expect(adminUsersQuerySchema.safeParse({ usernames: [...names, 'one-more'].join(',') }).success).toBe(false);
+    expect(adminUsersQuerySchema.safeParse({ usernames: ',,' }).success).toBe(false);
+    expect(adminMailboxesQuerySchema.safeParse({ addresses: 'a@x.org,not-an-address' }).success).toBe(false);
   });
 });

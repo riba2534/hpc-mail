@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { AppError } from '../../../lib/errors.js';
-import { apiKeyAuth } from '../../../middleware/api-key-auth.js';
+import { apiKeyAuth, keyRestriction } from '../../../middleware/api-key-auth.js';
 import type { AppContext } from '../../../types.js';
 import adminClaude from './claude.js';
 import adminDirectory from './directory.js';
@@ -17,6 +17,13 @@ app.use('*', async (c, next) => {
   if (c.get('apiKey')!.role !== 'admin') {
     throw new AppError('forbidden', '需要管理员 Key', {
       fix: '用管理员账户创建 Key 并勾选 admin scope（「管理员能力」）；GET /v1/me 的 key.effectiveRole 为 admin 时才能调用 /v1/admin',
+      docs: '/references/administration.md#管理员-key-运维接口',
+    });
+  }
+  // 运维接口作用于全站：限定了邮箱或域名的 Key 即使带 admin 也不放行（各接口另按读写要求 scope）
+  if (keyRestriction(c)) {
+    throw new AppError('forbidden', '这把 API Key 限定了可用的邮箱或域名，不能调用管理员运维接口', {
+      fix: '管理员运维接口需要不限范围的管理员 Key：换用没有设置 allowedMailboxIds 与 allowedDomains 的管理员 Key，或在网页「API Key」页面清除这把 Key 的范围',
       docs: '/references/administration.md#管理员-key-运维接口',
     });
   }
