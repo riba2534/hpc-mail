@@ -180,7 +180,7 @@ function cleanupIfPurgedStatement(env: Env, messageId: number, keys: (string | n
 }
 
 /**
- * 收件链路：解析 → 去重 + 归属人 + 偏好的 D1 batch（往返期间完成提码与摘要）→ 非重复时原文/大正文并行写 R2
+ * 收件链路：解析 → 去重 + 归属人 + 偏好的 D1 batch（往返期间完成提码与摘要）→ 非重复时原文与正文并行写 R2（不带 HTML 的短文本只进 D1）
  * → 落库 → 附件落 R2 → waitUntil(邮箱转发、AI 兜底 + 通知队列)。原文/正文/附件未完整保存则 SMTP 重试。
  */
 async function receiveInbound(
@@ -319,7 +319,7 @@ async function receiveInbound(
   const rawR2Key = `raw/${ingestKey}.eml`;
   const [, { bodyText, bodyHtml, bodyR2Key }] = await Promise.all([
     env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } }),
-    storeMailBody(env, text, html, ingestKey, bodySize),
+    storeMailBody(env, text, html, ingestKey, body),
   ]);
   trace.ms.store = Date.now() - storeStarted;
   Object.assign(trace, { rawR2: true, bodyR2: bodyR2Key !== null });

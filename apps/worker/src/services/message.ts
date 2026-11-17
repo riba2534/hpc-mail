@@ -42,7 +42,7 @@ import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { resolveVerificationCode } from './code-extract.js';
 import { getSettings } from './setting.js';
-import { getJson } from './storage.js';
+import { readMailBody } from './mail-body.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 
 export interface Viewer {
@@ -333,7 +333,11 @@ async function messageFlags(db: Db, userId: number, ids: number[]): Promise<{ at
   return { attachments, starred };
 }
 
-/** 列表搜索语义（主题/发件地址/发件名/文本正文/收件人子串）；全部已读按同一语义收窄 */
+/**
+ * 列表搜索语义（主题/发件地址/发件名/正文/收件人子串）；全部已读按同一语义收窄。
+ * 正文只搜 D1 的 body_text：正文前 BODY_PREVIEW_BYTES 的纯文本，只有 HTML 的邮件为 HTML 转出的文字（mail-body.ts）；
+ * 尚未回填的旧行仍是完整文本段。
+ */
 function searchCondition(q: string | undefined): SQL | undefined {
   if (!q) return undefined;
   const term = q.toLowerCase();
@@ -511,7 +515,8 @@ export async function findNextMessage(
         db.select().from(messages).where(and(eq(messages.id, row.id), ...conditions)), ...detailExtras(db, viewer.userId, row.id),
       ]);
       if (!full) { scannedThroughId = row.id; continue; }
-      return { message: await buildDetail(env, full, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
+      const body = await readMailBody(env, full);
+      return { message: await buildDetail(env, full, body, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
     }
     const flags = await messageFlags(db, viewer.userId, [row.id]);
     return { message: { ...summary, hasAttachments: flags.attachments.has(row.id), isStarred: flags.starred.has(row.id) }, scannedThroughId: row.id };
@@ -822,13 +827,6 @@ function rewriteCidUrls(
   return { html: rewritten, inlined };
 }
 
-/** 完整正文：超过 D1 上限的正文在 R2，D1 里只有截断预览 */
-async function fullBody(env: Env, row: Pick<MessageRow, 'bodyText' | 'bodyHtml' | 'bodyR2Key'>) {
-  if (!row.bodyR2Key) return { bodyText: row.bodyText, bodyHtml: row.bodyHtml };
-  const full = await getJson<{ text?: string; html?: string }>(env, row.bodyR2Key);
-  return { bodyText: full?.text ?? row.bodyText, bodyHtml: full?.html ?? row.bodyHtml };
-}
-
 /** 主题与完整正文（可见性同详情），供翻译等只需要文字内容的读取 */
 export async function getMessageContent(
   env: Env,
@@ -836,7 +834,7 @@ export async function getMessageContent(
   id: number,
 ): Promise<{ subject: string; bodyText: string; bodyHtml: string }> {
   const row = await loadVisible(env, viewer, id);
-  return { subject: row.subject, ...(await fullBody(env, row)) };
+  return { subject: row.subject, ...(await readMailBody(env, row)) };
 }
 
 /** 详情所需的附件全行与当前用户星标，调用方放进同一次 batch */
@@ -847,21 +845,19 @@ function detailExtras(db: Db, userId: number, id: number) {
   ] as const;
 }
 
-/** 由已确认可见的整行组装详情：完整正文、附件签名 URL、CID 内联图替换 */
+/** 由已确认可见的整行与完整正文（readMailBody）组装详情：附件签名 URL、CID 内联图替换 */
 async function buildDetail(
   env: Env,
   row: MessageRow,
+  body: { bodyText: string; bodyHtml: string },
   attRows: (typeof attachmentsTable.$inferSelect)[],
   starred: boolean,
   attachmentTtlSeconds?: number,
 ): Promise<MessageDetail> {
-  const [body, signed] = await Promise.all([
-    fullBody(env, row),
-    Promise.all(attRows.map(async (a) => {
-      const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
-      return { ...a, url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}` };
-    })),
-  ]);
+  const signed = await Promise.all(attRows.map(async (a) => {
+    const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
+    return { ...a, url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}` };
+  }));
   const { html, inlined } = rewriteCidUrls(body.bodyHtml, signed);
   return {
     // 验证码与列表、wait、线程同一口径（summarize）：已存值优先，详情不再按正文另算一份
@@ -896,8 +892,11 @@ export async function getMessageDetail(
 ): Promise<MessageDetail> {
   const db = createDb(env);
   const row = await loadVisible(env, viewer, id);
-  const [attRows, starRows] = await db.batch(detailExtras(db, viewer.userId, id));
-  return buildDetail(env, row, attRows, starRows.length > 0, attachmentTtlSeconds);
+  // 正文在 R2 时，R2 读取与附件/星标的 D1 batch 并行，详情只多 max(R2, D1) 而不是两者之和
+  const [[attRows, starRows], body] = await Promise.all([
+    db.batch(detailExtras(db, viewer.userId, id)), readMailBody(env, row),
+  ]);
+  return buildDetail(env, row, body, attRows, starRows.length > 0, attachmentTtlSeconds);
 }
 
 /** 取原始 .eml R2 对象（校验可见性）；无存档返回 null */

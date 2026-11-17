@@ -1,7 +1,7 @@
 import { bytesToHex } from '../lib/crypto.js';
 import type { Env } from '../types.js';
 
-/** 正文溢出：完整 JSON 落 R2 */
+/** 正文对象：完整 text/html 的 JSON（见 mail-body.ts） */
 export function bodyKey(seed?: string): string {
   return `body/${seed ?? crypto.randomUUID()}.json`;
 }

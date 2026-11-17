@@ -11,6 +11,7 @@ import { getMessageDetail, purgeMessages } from '../src/services/message.js';
 import { updateSettings } from '../src/services/setting.js';
 import { releaseMailbox } from '../src/services/mailbox.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
+import { BODY_PREVIEW_BYTES } from '../src/services/mail-body.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { createApp } from '../src/app.js';
 
@@ -239,7 +240,8 @@ describe('收发件功能与故障恢复', () => {
     await Promise.all([waitOnExecutionContext(ctx1), waitOnExecutionContext(ctx2)]);
     const rows = await createDb(env).select().from(messages).where(eq(messages.subject, 'functional-inbound-normal')).all();
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.bodyText.length).toBe(64 * 1024);
+    expect(rows[0]!.bodyText.length).toBe(BODY_PREVIEW_BYTES);
+    expect(rows[0]!.bodyHtml).toBe('');
     expect(rows[0]!.rawR2Key).not.toBeNull();
     expect(rows[0]!.bodyR2Key).not.toBeNull();
     expect((await getMessageDetail(env, viewer, rows[0]!.id)).bodyText === parsed.text).toBe(true);
@@ -342,7 +344,7 @@ describe('收发件功能与故障恢复', () => {
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map(row => row.bodyR2Key)).size).toBe(2);
     for (const row of rows) {
-      expect(new TextEncoder().encode(row.bodyText).length).toBeLessThanOrEqual(64 * 1024);
+      expect(new TextEncoder().encode(row.bodyText).length).toBeLessThanOrEqual(BODY_PREVIEW_BYTES);
       expect(row.bodyText).not.toContain('�');
       expect(JSON.parse(await (await env.r2.get(row.bodyR2Key!))!.text()).text).toBe(text);
     }
