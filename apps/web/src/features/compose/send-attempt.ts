@@ -40,7 +40,9 @@ export function clearSendAttempt(userId: number, key: string | null): void {
  * - key_mismatch：这个 key 已绑定其他内容，当前内容一定没有用它发出。换新 key，由用户再次发送；
  * - rejected：明确的业务错误，没有外发。换新 key，修正后再发。
  */
-export type SendFailure = 'uncertain' | 'in_progress' | 'key_mismatch' | 'rejected';
+type SendFailure = 'uncertain' | 'in_progress' | 'key_mismatch' | 'rejected';
+/** 发信引用的原邮件：回复线程头或转发附件的来源 */
+export type SendSource = 'reply' | 'forward';
 
 export function classifySendError(error: unknown): SendFailure {
   if (!(error instanceof ApiError)) return 'uncertain';
@@ -60,7 +62,7 @@ export function classifySendError(error: unknown): SendFailure {
 export function missingSendSource(
   error: unknown,
   payload: Pick<InternalSendMailRequest, 'replyToMessageId' | 'forwardAttachmentsFrom'>,
-): 'reply' | 'forward' | null {
+): SendSource | null {
   if (!(error instanceof ApiError) || error.code !== 'not_found') return null;
   if (payload.forwardAttachmentsFrom && (error.message === '邮件不存在' || error.message.endsWith('无法完整转发'))) return 'forward';
   if (payload.replyToMessageId && error.message === '邮件不存在') return 'reply';

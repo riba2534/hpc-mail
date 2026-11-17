@@ -61,7 +61,25 @@ import {
 import { exceedsExternalLimit, hasExternalRecipient } from './compose-attachments';
 import { IdentityPicker } from './identity-picker';
 import { RecipientInput } from './recipient-input';
-import { classifySendError, clearSendAttempt, hashSendPayload, missingSendSource, persistSendAttempt, readSendAttempt } from './send-attempt';
+import {
+  classifySendError, clearSendAttempt, hashSendPayload, missingSendSource, persistSendAttempt, readSendAttempt, type SendSource,
+} from './send-attempt';
+
+/** 回复或转发引用的原邮件不可用时的提示文案与去掉来源后的确认 */
+const SOURCE_GONE: Record<SendSource, { title: string; hint: string; action: string; detached: string }> = {
+  reply: {
+    title: '原邮件已不存在，无法关联回复线程',
+    hint: '可以去掉与原邮件的关联，作为一封新邮件发送。',
+    action: '作为新邮件发送',
+    detached: '已改为新邮件，确认后点击发送',
+  },
+  forward: {
+    title: '原邮件的附件已不可用，无法一起转发',
+    hint: '可以去掉原邮件附件，只发送正文和新添加的附件。',
+    action: '去掉原邮件附件',
+    detached: '已去掉原邮件附件，确认后点击发送',
+  },
+};
 
 interface AttachmentUpload {
   key: string;
@@ -258,7 +276,8 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
     for (const attachment of attachmentRefs.current) attachment.abort?.abort();
   }, []);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
-  const [sendError, setSendError] = useState<{ message: string; kind: 'uncertain' | 'in_progress' | 'reply_gone' | 'forward_gone' | 'error' } | null>(null);
+  // kind 为 reply / forward：回复或转发引用的原邮件已不可用
+  const [sendError, setSendError] = useState<{ message: string; kind: 'uncertain' | 'in_progress' | 'error' | SendSource } | null>(null);
   const [dragging, setDragging] = useState(false);
   // 原邮件已删除或不可见时，用户可以去掉回复关联 / 原邮件附件，再作为新邮件发送
   const [replyToMessageId, setReplyToMessageId] = useState(initial.replyToMessageId);
@@ -447,12 +466,8 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       const message = failure === 'key_mismatch'
         ? '发送凭据已用于其他内容，已为这封邮件更换新凭据。请先到已发送确认没有重复，再点击发送。'
         : err instanceof ApiError ? err.message : '发送失败，请重试';
-      const missing = missingSendSource(err, payload);
-      setSendError({
-        message,
-        kind: missing ? (missing === 'reply' ? 'reply_gone' : 'forward_gone')
-          : failure === 'in_progress' ? 'in_progress' : failure === 'uncertain' && !sessionChanged ? 'uncertain' : 'error',
-      });
+      const fallback = failure === 'in_progress' ? 'in_progress' : failure === 'uncertain' && !sessionChanged ? 'uncertain' : 'error';
+      setSendError({ message, kind: missingSendSource(err, payload) ?? fallback });
     },
   });
 
@@ -649,11 +664,12 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   };
 
   // 只去掉失效的来源，不自动重发：由用户确认后再点发送（内容变了，会用新的幂等键）
-  const detachSource = () => {
-    if (sendError?.kind === 'reply_gone') setReplyToMessageId(undefined);
+  const goneSource = sendError?.kind === 'reply' || sendError?.kind === 'forward' ? sendError.kind : null;
+  const detachSource = (source: SendSource) => {
+    if (source === 'reply') setReplyToMessageId(undefined);
     else setForwardAttachmentsFrom(undefined);
     setSendError(null);
-    toast({ title: sendError?.kind === 'reply_gone' ? '已改为新邮件，确认后点击发送' : '已去掉原邮件附件，确认后点击发送' });
+    toast({ title: SOURCE_GONE[source].detached });
   };
 
   // Ctrl/⌘+Enter 发送；等收件人输入框把回车前的地址提交进状态后再提交表单
@@ -925,18 +941,12 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
                 重试发送
               </Button>
             </div>
-          ) : sendError.kind === 'reply_gone' || sendError.kind === 'forward_gone' ? (
+          ) : goneSource ? (
             <div role="alert" className="rounded-md border border-critical/40 bg-critical-soft p-3 text-sm text-ink-secondary">
-              <p className="font-medium text-critical">
-                {sendError.kind === 'reply_gone' ? '原邮件已不存在，无法关联回复线程' : '原邮件的附件已不可用，无法一起转发'}
-              </p>
-              <p className="mt-1">
-                {sendError.kind === 'reply_gone'
-                  ? '可以去掉与原邮件的关联，作为一封新邮件发送。'
-                  : '可以去掉原邮件附件，只发送正文和新添加的附件。'}
-              </p>
-              <Button type="button" size="sm" variant="secondary" className="mt-2" onClick={detachSource}>
-                {sendError.kind === 'reply_gone' ? '作为新邮件发送' : '去掉原邮件附件'}
+              <p className="font-medium text-critical">{SOURCE_GONE[goneSource].title}</p>
+              <p className="mt-1">{SOURCE_GONE[goneSource].hint}</p>
+              <Button type="button" size="sm" variant="secondary" className="mt-2" onClick={() => detachSource(goneSource)}>
+                {SOURCE_GONE[goneSource].action}
               </Button>
             </div>
           ) : sendError.kind === 'in_progress' ? (

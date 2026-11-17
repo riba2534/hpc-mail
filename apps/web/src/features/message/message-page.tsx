@@ -63,9 +63,6 @@ import { useCurrentUser } from '@/lib/use-session';
 import { QueryErrorState } from '@/components/query-error-state';
 import { ApiError } from '@/api/errors';
 
-/** 详情的新鲜期，必须远小于内嵌图签名 URL 的最短剩余有效期（1 小时） */
-const MESSAGE_DETAIL_STALE_MS = 30_000;
-
 /** 去重（不区分大小写，保留首次出现的写法） */
 function uniqueAddresses(addresses: string[], exclude: ReadonlySet<string> = new Set()): string[] {
   const seen = new Set(exclude);
@@ -141,10 +138,6 @@ export function MessagePage() {
   const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
     ...messageDetailQueryOptions(messageId, view),
     enabled: Number.isInteger(messageId) && messageId > 0,
-    // 正文内嵌图的签名 URL 按小时对齐签发、剩余有效期至少 1 小时：回到窗口时刷新过期的详情换上仍有效的签名；
-    // 同一小时内重拉的正文完全相同，iframe 不重建
-    staleTime: MESSAGE_DETAIL_STALE_MS,
-    refetchOnWindowFocus: true,
   });
 
   const star = useStarMutation(view);
@@ -229,25 +222,25 @@ export function MessagePage() {
     goBack();
   };
 
-  // 下载原始 .eml：带鉴权头 fetch → blob → 触发下载
+  // .eml 与附件都带 JWT 和详情的可见性范围下载，管理员审计视图才能取到
+  const viewQuery = mailViewParams(view ?? {}).toString();
+  const withView = (path: string) => (viewQuery ? `${path}?${viewQuery}` : path);
+
   const downloadEml = async () => {
-    const qs = searchParams.toString();
     try {
-      await downloadWithAuth(`/api/messages/${messageId}/raw${qs ? `?${qs}` : ''}`, `message-${messageId}.eml`);
+      await downloadWithAuth(withView(`/api/messages/${messageId}/raw`), `message-${messageId}.eml`);
     } catch (error) {
       toast({ title: '下载失败', description: (error as Error).message, variant: 'error' });
     }
   };
 
-  // 附件同样走 JWT（签名 URL 只留给正文内嵌图）：图片与 PDF 在新标签页打开，其余下载。
-  // 带上详情的可见性范围，管理员审计视图才能取到
+  // 附件不用签名 URL（只留给正文内嵌图）：图片与 PDF 在新标签页打开，其余下载
   const openAttachment = async (attachment: MessageDetail['attachments'][number]) => {
     if (downloadingId !== null) return;
     setDownloadingId(attachment.id);
-    const qs = mailViewParams(view ?? {}).toString();
     try {
       await openOrDownloadWithAuth(
-        `/api/attachments/${attachment.id}${qs ? `?${qs}` : ''}`,
+        withView(`/api/attachments/${attachment.id}`),
         attachment.filename || `attachment-${attachment.id}`,
         attachment.mimeType,
       );
