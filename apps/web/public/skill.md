@@ -57,11 +57,13 @@ hpc '/messages' -X POST -H 'Content-Type: application/json' -H "Idempotency-Key:
 检查：201 表示至少一个收件人成功，`status` 为 `sent`（外发已被服务商接受，不代表已进收件箱）或 `delivered`（收件人都在本站且已投递）。部分失败也是 201，看 `errorDetail` 与 `recipientOutcomes[].status`。按结果处理：
 
 - 422 `delivery_failed`：每个收件人都被拒收，什么也没发出。`error.details.recipientOutcomes` 给出原因，`details.messageId` 是发件记录；同 Key 重试仍是这个 422，修正后换新 Key。
+- 422 `recipient_suppressed`：收件人全都在本站抑制名单里（此前退信或被标为垃圾邮件），没有发出也没有发件记录，Key 已释放；只有部分被抑制时照常 201，这些收件人为 `failed` 并带 `code`。见[错误码](references/errors.md#recipient_suppressed)。
 - 网络错误、超时、5xx：用同一 Key、同一请求体重试，会返回原结果或继续未开始的发送。
 - 409 `send_in_progress`：原请求还在处理或结果待确认。不要换 Key 重发，先查 `GET /messages?direction=outbound&address=<发件地址>`：`pending` 是仍在投递；超过 1 小时会标为 `unknown`（投递中断、结果未确认），之后同 Key 重试返回 201 `unknown`。
 - 409 `idempotency_mismatch`：这个 Key 已用于别的内容。先核对原发送，新内容换新 Key。
 - 其他 4xx（400/403/404/413/429）：没有发出，按 `error.fix` 修正后重试。400 `header_not_allowed` 的 `details.headers` 列出不允许的头。
 - `from` 四种写法：`{mailboxId}`、`{localPart,domain,displayName?}`、`"Name <a@b>"`、`{address,name}`。收件人写 `"a@b"`、`"Name <a@b>"` 或 `{address,name}`，畸形地址 400；To/Cc/Bcc 合计 1–100 个，只有 Bcc 时也写 `to:[]`。`headers` 只收 `X-*` 与白名单头，规则见[自定义邮件头](references/mail.md#自定义邮件头)。
+- 外部收件人的 `sent` 之后会随投递回执变为 `delivered`、`bounced`、`failed` 或 `complained`，整封 `status` 与 `errorDetail` 同步更新（全部退信时变为 `failed`）；要确认送达，稍后重读 `GET /messages/:id`，见[投递回执](references/mail.md#投递回执)。
 
 ### ③ 回复与转发
 ```bash
