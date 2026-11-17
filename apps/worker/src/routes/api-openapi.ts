@@ -1,7 +1,8 @@
 import { HOSTED_DOMAIN_STATUSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
-  page, pageQuery, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
+  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, describePaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
+  mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref,
+  scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 
 /** Complete JWT-session contract; API keys are never accepted for these operations. */
@@ -50,7 +51,8 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/hosted-domains/{id}/transfer': { post: operation('Transfer a hosted domain to another user', ref('HostedDomainTransferResult'), { request: 'TransferHostedDomainRequest',
       description: 'Owner or administrator. The target must be an active user; ordinary owners are limited by the target’s hosted_domains.maxPerUser. includeMailboxes moves the previous owner’s addresses on the domain with all history and revokes their mailbox shares. Members are kept. A stale expectedOwnerId returns 409; retrying a completed transfer returns transferred=false.' }) },
     '/mailboxes': {
-      get: operation('List caller-owned mailboxes', array(ref('Mailbox')), { parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator all=1 or true includes all owners; ordinary users cannot request this range.')] }),
+      get: operation('List caller-owned mailboxes', arrayOrPage(ref('Mailbox')), { parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator all=1 or true includes all owners; ordinary users cannot request this range.'),
+        ...mailboxSearchQuery, ...optionalPageQuery], description: mailboxListDescription }),
       post: operation('Claim an address on a configured domain', ref('Mailbox'), { request: 'ClaimMailboxRequest', status: 201,
         description: 'Claim only a domain returned by /domains. Existing history at the address becomes visible to the claimant. Ordinary users obey their effective public or dedicated domain/global/per-domain quotas and system reserved-prefix restrictions. Dedicated policies do not revoke existing owned mailboxes. Does not provision a domain or Email Routing. Optional strategy=claude rejects any historical Claude suspension with 403 forbidden, including for administrators and hosted domains; checked atomically at insertion. Omitted or uniform preserves ordinary claims.' }),
     },
@@ -81,8 +83,10 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/messages/sync': { get: operation('Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: listQuery,
       description: 'Lightweight polling for the list view: accepts the same filters as GET /messages (cursor and afterId are ignored). Refetch the list only when head differs from the head returned with its first page.' }) },
     '/messages/send': { post: sendMailOperation() },
-    '/messages/read': { post: operation('Mark selected owned messages read/unread', changed, { request: 'MarkReadRequest', parameters: mutationQuery,
-      description: 'Changes only mail at addresses the caller owns (or unclaimed addresses with administrator scope=unclaimed). Shared mail is silently skipped; changed counts actual matches.' }) },
+    '/messages/read': { post: operation('Mark selected owned messages read/unread',
+      object({ changed: int, unread: { ...int, description: 'Only when includeUnread=true in the caller’s own view: unread count after this change, capped like GET /messages/unread-count.' } }, ['unread']),
+      { request: 'ApiMarkReadRequest', parameters: mutationQuery,
+        description: 'Changes only mail at addresses the caller owns (or unclaimed addresses with administrator scope=unclaimed). Shared mail is silently skipped; changed counts actual matches.' }) },
     '/messages/read-all': { post: operation('Mark incoming messages read, optionally narrowed by filters', changed, { parameters: mutationQuery, request: 'MarkAllReadRequest', requestRequired: false,
       description: 'Range is unread, non-trash inbound mail in the caller’s own claimed mailboxes (administrator scope=unclaimed: unclaimed addresses). Shared mail is never changed: its read state belongs to the owner. domain/address/q narrow it with the list search semantics. It never applies pagination.' }) },
     '/messages/delete': { post: operation('Move selected messages to trash', object({ deleted: int }), { request: 'MessageIdsRequest', parameters: mutationQuery,
@@ -161,9 +165,9 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'One item per configured domain, in list order. Judged from official Claude/Anthropic mail by MIME From and subject; senders are not DKIM-verified. Facts are kept after mail is deleted and are refreshed every 5 minutes.' }) },
     '/admin/settings/domain-status': { get: operation('Check public domain DNS onboarding', ref('DomainStatus'), { ...admin, parameters: [query('domain', str, undefined, true)],
       description: 'Checks MX/SPF via public DNS. Cannot prove the private Cloudflare catch-all target or end-to-end email delivery.' }) },
-    '/admin/hosted-domains': { get: operation('List all hosted domains', array(ref('HostedDomain')), { ...admin,
-      parameters: [query('status', { type: 'string', enum: HOSTED_DOMAIN_STATUSES }), query('q', { type: 'string', maxLength: 253 }, 'Domain or owner username substring.')],
-      description: 'Administrators manage details, members, transfer and deletion through /hosted-domains/{id} with full rights.' }) },
+    '/admin/hosted-domains': { get: operation('List all hosted domains', arrayOrPage(ref('HostedDomain')), { ...admin,
+      parameters: [query('status', { type: 'string', enum: HOSTED_DOMAIN_STATUSES }), query('q', { type: 'string', maxLength: 253 }, 'Domain or owner username substring.'), ...optionalPageQuery],
+      description: 'Ordered by id, newest first. Without cursor and limit the response is an array capped at 1000 items, as before; page with limit and nextCursor to see every domain. Administrators manage details, members, transfer and deletion through /hosted-domains/{id} with full rights.' }) },
     '/admin/hosted-domains/health': { get: operation('Check hosted domain prerequisites', ref('HostedDomainsHealth'), { ...admin,
       description: 'Whether the Worker has Cloudflare credentials, whether the token verifies, and the account zone counts. Cloudflare blocks new zones when an account has more than 50 zones and more pending than active ones.' }) },
     '/admin/hosted-domains/{id}/suspend': { post: operation('Suspend a hosted domain', ref('HostedDomain'), { ...admin,
@@ -178,8 +182,10 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/admin/suppressions/{id}': { delete: operation('Remove a suppression entry', success, { ...admin,
       description: 'Removes the entry from this site’s list only, so the next send to the address is attempted again; confirm the address works first. Cloudflare keeps its own suppression list, which must be cleared separately in Cloudflare or sends are still rejected there. 404 not_found when the entry does not exist. Recorded in the administrator audit log as suppression.delete.' }) },
     '/admin/mailbox-shares': {
-      get: operation('List grants on all claimed mailboxes', array(ref('MailboxShareGrant')), { ...admin,
-        parameters: [query('mailboxId', { type: 'integer', minimum: 1 }, 'Only this mailbox (at most one item).')] }),
+      get: operation('List grants on all claimed mailboxes', arrayOrPage(ref('MailboxShareGrant')), { ...admin,
+        parameters: [query('mailboxId', { type: 'integer', minimum: 1 }, 'Only this mailbox: always an array of at most one item; cursor and limit are ignored.'),
+          query('q', { type: 'string', maxLength: 254 }, 'Case-insensitive literal substring of the address or the owner username (no wildcards).'), ...optionalPageQuery],
+        description: 'Each item is one mailbox with its complete grantee list (grantees sorted by username). The full array is sorted by address; pages are ordered by mailbox id, newest first, and limit counts mailboxes, not grantees.' }),
       put: operation('Replace grants on any claimed mailbox', ref('MailboxShareGrant'), { ...admin, request: 'ReplaceMailboxSharesRequest',
         description: 'Administrator JWT can share any claimed mailbox, including other users’ mailboxes, with any active user or administrator except the owner. Empty userIds revokes all shares. At most 100 grantees. expectedOwnerId optionally detects stale ownership with 409. The write also rechecks ownership and recipient status atomically. Owner metadata and grantee status are returned. Grants are read-only incoming mail; owner disable hides shares, role changes preserve them, and release/transfer/deletion revoke them.' }),
     },

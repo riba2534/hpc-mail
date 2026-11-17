@@ -1,11 +1,13 @@
 import type {
   AdminHostedDomainsQuery, HostedDomain, HostedDomainMember, HostedDomainRole, HostedDomainSteps, HostedDomainStepState,
-  HostedDomainTransferResult, HostedDomainsHealth, Settings, TransferHostedDomainRequest,
+  HostedDomainTransferResult, HostedDomainsHealth, Page, Settings, TransferHostedDomainRequest,
 } from '@hpc-mail/shared';
-import { and, desc, eq, inArray, notInArray, or, sql, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
+import { chunk, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
+import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
 import { subscribeHostedDomainEvents } from './event-subscriptions.js';
@@ -248,15 +250,22 @@ export async function listMyHostedDomains(env: Env, viewer: Viewer): Promise<Hos
   ));
 }
 
-export async function listAllHostedDomains(env: Env, viewer: Viewer, query: AdminHostedDomainsQuery): Promise<HostedDomain[]> {
+/** 全站托管域名，按 id 倒序：page 为 null 时返回数组（旧行为，最多 1000 条），否则返回一页 */
+export async function listAllHostedDomains(
+  env: Env, viewer: Viewer, query: Pick<AdminHostedDomainsQuery, 'status' | 'q'>, page: PageRequest | null = null,
+): Promise<HostedDomain[] | Page<HostedDomain>> {
   const conditions: (SQL | undefined)[] = [];
-  if (query.status) conditions.push(eq(hostedDomains.status, query.status));
+  // 分页按 id 倒序取够即停：status 索引不含 id，走它要先算完该状态全部行的计数子查询再排序，一元 + 让规划器不用它
+  if (query.status) conditions.push(page ? sql`+${hostedDomains.status} = ${query.status}` : eq(hostedDomains.status, query.status));
   if (query.q) {
     // instr 按字面匹配，% 和 _ 不当通配符
     conditions.push(or(sql`instr(${hostedDomains.domain}, ${query.q}) > 0`,
       sql`${hostedDomains.userId} IN (SELECT id FROM users WHERE instr(lower(username), ${query.q}) > 0)`));
   }
-  return loadViews(env, viewer, and(...conditions), 1000);
+  if (!page) return loadViews(env, viewer, and(...conditions), 1000);
+  if (page.cursorId) conditions.push(lt(hostedDomains.id, page.cursorId));
+  // 管理员对每个域名都有权限，loadViews 不会滤掉行，多取的一条照常用来判断下一页
+  return toPage(await loadViews(env, viewer, and(...conditions), fetchLimit(page)), page.limit, (view) => view.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -733,9 +742,12 @@ export async function replaceHostedDomainMembers(
   // 只校验新增的人：已被禁用的现有成员可以留在名单里，不妨碍添加其他人
   const added = unique.filter((userId) => !before.some((member) => member.userId === userId));
   if (added.length) {
-    const active = await createDb(env).select({ id: users.id }).from(users)
-      .where(and(inArray(users.id, added), eq(users.status, 'active'))).all();
-    if (active.length !== added.length) throw new AppError('validation_failed', '只能共享给启用中的用户');
+    // 一次最多新增 100 人，连同 status 超过 D1 的 100 个绑定参数：分批放进同一个 batch，仍是一次往返
+    const db = createDb(env);
+    const active = await env.db.batch(chunk(added).map((batch) => d1Statement(env,
+      db.select({ id: users.id }).from(users).where(and(inArray(users.id, batch), eq(users.status, 'active'))))));
+    const activeCount = active.reduce((total, part) => total + part.results.length, 0);
+    if (activeCount !== added.length) throw new AppError('validation_failed', '只能共享给启用中的用户');
   }
   const ids = JSON.stringify(unique);
   const ownerGuard = `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1 AND user_id = ?2 AND status <> 'deleting')`;

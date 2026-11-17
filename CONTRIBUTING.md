@@ -10,7 +10,7 @@
 
 ## 重要限制：worker 集成测试只能在 CI 跑
 
-`apps/worker/test/*.test.ts` 依赖 `@cloudflare/vitest-pool-workers`（workerd），宿主机需要 **glibc ≥ 2.32**（Ubuntu 22.04+）。glibc 过旧的机器上这些测试起不来，请依赖 PR 的 CI 结果兜底；`packages/shared` 与 `apps/web` 的单测不受影响，可本地运行。
+`apps/worker/test/*.test.ts` 依赖 `@cloudflare/vitest-plugin`（workerd，原 vitest-pool-workers），宿主机需要 **glibc ≥ 2.32**（Ubuntu 22.04+）。glibc 过旧的机器上这些测试起不来，请依赖 PR 的 CI 结果兜底；`packages/shared` 与 `apps/web` 的单测不受影响，可本地运行。
 
 ## 提交 PR 前
 

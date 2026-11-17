@@ -168,6 +168,13 @@
       "version": "6",
       "when": 1795420800000,
       "tag": "0029_delivery_events",
+        "breakpoints": true
+      },
+      {
+      "idx": 30,
+      "version": "6",
+      "when": 1795420800001,
+      "tag": "0030_maintenance",
       "breakpoints": true
     }
   ]

@@ -1,6 +1,6 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { MoreHorizontal, Network, Search } from 'lucide-react';
-import { type ReactNode, useEffect, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import type { HostedDomain, HostedDomainsHealth, HostedDomainStatus } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -31,8 +31,11 @@ import {
 } from '@/features/hosted-domains/hosted-domain-meta';
 import { adminHostedDomainApi } from '@/features/hosted-domains/hosted-domains-api';
 import { storeHostedDomain } from '@/features/hosted-domains/use-hosted-domains';
+import { LoadMoreFooter } from '../load-more-footer';
 
 const ALL_STATUSES = 'all';
+/** 每页条数（服务端上限 200） */
+const PAGE_SIZE = 100;
 
 interface PendingAction {
   domain: HostedDomain;
@@ -151,12 +154,17 @@ export function AdminHostedDomainsPage() {
   }, [search]);
 
   const filters = { status: status === ALL_STATUSES ? undefined : status, q: debounced || undefined };
-  const { data, isLoading, isError, error, refetch } = useQuery({
+  const {
+    data, isLoading, isError, error, refetch, hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage,
+  } = useInfiniteQuery({
     queryKey: queryKeys.admin.hostedDomainList(filters),
-    queryFn: () => adminHostedDomainApi.list(filters),
+    queryFn: ({ pageParam }) => adminHostedDomainApi.list(filters, pageParam, PAGE_SIZE),
+    initialPageParam: '',
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
     placeholderData: (previous) => previous,
   });
-  const items = data ?? [];
+  const items = useMemo(() => data?.pages.flatMap((page) => page.items) ?? [], [data]);
+  const loadMore = useCallback(() => void fetchNextPage({ cancelRefetch: false }), [fetchNextPage]);
   const filtered = status !== ALL_STATUSES || debounced !== '';
 
   const act = useMutation({
@@ -210,7 +218,7 @@ export function AdminHostedDomainsPage() {
 
       {isLoading ? (
         <Skeleton className="h-48 w-full rounded-lg" />
-      ) : isError ? (
+      ) : isError && items.length === 0 ? (
         <QueryErrorState error={error} onRetry={() => void refetch()} />
       ) : items.length === 0 ? (
         <EmptyState
@@ -274,6 +282,12 @@ export function AdminHostedDomainsPage() {
           </TableBody>
         </Table>
       )}
+      {items.length > 0 &&
+        (isError ? (
+          <QueryErrorState error={error} onRetry={() => void (isFetchNextPageError ? fetchNextPage() : refetch())} />
+        ) : (
+          <LoadMoreFooter hasNextPage={hasNextPage} isFetchingNextPage={isFetchingNextPage} onLoadMore={loadMore} />
+        ))}
 
       <ConfirmDialog
         open={pendingAction !== null}

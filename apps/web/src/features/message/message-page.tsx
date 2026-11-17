@@ -65,6 +65,11 @@ import { QueryErrorState } from '@/components/query-error-state';
 import { ApiError } from '@/api/errors';
 
 /** 去重（不区分大小写，保留首次出现的写法） */
+/** 详情页 j/k 翻阅的方向 */
+type KeyboardStep = 'next' | 'prev';
+/** 列表行带来的上下文，加上详情页内 j/k 翻阅时记下的方向（决定预取哪一封） */
+type DetailLinkState = Partial<MailListLinkState> & { keyboard?: KeyboardStep };
+
 function uniqueAddresses(addresses: string[], exclude: ReadonlySet<string> = new Set()): string[] {
   const seen = new Set(exclude);
   return addresses.filter((address) => {
@@ -197,23 +202,27 @@ export function MessagePage() {
   const position = order ? order.indexOf(messageId) : -1;
   const prevId = order && position > 0 ? order[position - 1] : undefined;
   const nextId = order && position >= 0 ? order[position + 1] : undefined;
-  const goToMessage = (target: number | undefined) => {
+  // j/k 进入的详情记下方向：连续翻阅时只预取同方向的下一封；直接打开、点链接或按钮切换都不预取
+  const goToMessage = (target: number | undefined, keyboard?: KeyboardStep) => {
     if (target === undefined) return;
-    navigate(mailHref(target, view ?? {}), { replace: true, state: location.state });
+    const state: DetailLinkState = { ...(location.state as DetailLinkState | null), keyboard };
+    navigate(mailHref(target, view ?? {}), { replace: true, state });
   };
+  const keyboardStep = (location.state as DetailLinkState | null)?.keyboard;
+  const prefetchTarget = keyboardStep === 'next' ? nextId : keyboardStep === 'prev' ? prevId : undefined;
   useEffect(() => {
-    for (const target of [nextId, prevId]) {
-      if (target !== undefined) void queryClient.prefetchQuery(messageDetailQueryOptions(target, view));
-    }
+    if (prefetchTarget !== undefined) void queryClient.prefetchQuery(messageDetailQueryOptions(prefetchTarget, view));
     // view 由查询串决定，随 messageId 一起变化
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextId, prevId, queryClient]);
+  }, [prefetchTarget, queryClient]);
 
   const markRead = useMutation({
-    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope }) => messageApi.markRead([args.id], args.isRead, args.scope),
+    // 个人视图让服务端随响应带回未读数，不再单独请求 unread-count
+    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope }) =>
+      messageApi.markRead([args.id], args.isRead, args.scope, args.scope === undefined),
     onSuccess: (result, { id, isRead }) => {
       // 只同步这一封的已读状态与未读数；列表只标记过期，回到列表时由首页探测/单页重拉对齐
-      if (result.changed > 0) syncReadState(queryClient, [id], isRead);
+      if (result.changed > 0) syncReadState(queryClient, [id], isRead, result.unread);
     },
   });
 
@@ -290,8 +299,8 @@ export function MessagePage() {
 
   useMailShortcuts(
     {
-      j: () => goToMessage(nextId),
-      k: () => goToMessage(prevId),
+      j: () => goToMessage(nextId, 'next'),
+      k: () => goToMessage(prevId, 'prev'),
       r: () => void reply(),
       a: () => void replyAll(),
       f: () => void forward(),

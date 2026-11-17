@@ -14,18 +14,20 @@ function base64urlDecode(str: string): Uint8Array {
   return Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0));
 }
 
-/** JWT claims：sub=userId, sid=会话 id, epoch=实例代, uepoch=用户代 */
+/**
+ * JWT claims：sub=userId, sid=会话 id, uepoch=用户鉴权版本（D1 users.auth_version）。
+ * 旧令牌里的 epoch（实例代，恒为 0）不再签发，也从不校验。
+ */
 export interface JwtClaims {
   sub: number;
   sid: string;
-  epoch: number;
   uepoch: number;
   iat: number;
   exp: number;
 }
 
-// 7 天：本系统是「验证码聚合器」，账号价值高，缩短 token 生命周期降低泄露后暴露窗口
-const DEFAULT_TTL_SECONDS = 60 * 60 * 24 * 7;
+/** 7 天：本系统是「验证码聚合器」，账号价值高，缩短 token 生命周期降低泄露后暴露窗口；会话行同寿命 */
+export const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
 
 async function importKey(secret: string, usage: ('sign' | 'verify')[]): Promise<CryptoKey> {
   return crypto.subtle.importKey(
@@ -37,13 +39,14 @@ async function importKey(secret: string, usage: ('sign' | 'verify')[]): Promise<
   );
 }
 
+/** 只签 sub/sid/uepoch；调用方多传的字段（如旧写法的 epoch）不会进令牌 */
 export async function signToken(
   secret: string,
-  payload: Pick<JwtClaims, 'sub' | 'sid' | 'epoch' | 'uepoch'>,
-  ttlSeconds = DEFAULT_TTL_SECONDS,
+  payload: Pick<JwtClaims, 'sub' | 'sid' | 'uepoch'> & { epoch?: number },
+  ttlSeconds = TOKEN_TTL_SECONDS,
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
-  const fullPayload: JwtClaims = { ...payload, iat: now, exp: now + ttlSeconds };
+  const fullPayload: JwtClaims = { sub: payload.sub, sid: payload.sid, uepoch: payload.uepoch, iat: now, exp: now + ttlSeconds };
   const headerStr = base64url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
   const payloadStr = base64url(encoder.encode(JSON.stringify(fullPayload)));
   const data = `${headerStr}.${payloadStr}`;

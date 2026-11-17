@@ -28,6 +28,7 @@ import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotific
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 import { releaseDraftStatements } from './upload.js';
 import { markStaleOutbound } from './outbound-recovery.js';
+import { repairPendingInbound } from './inbound-repair.js';
 import { offloadMailBodies } from './body-offload.js';
 import { cleanupDeliveryRefs } from './delivery-events.js';
 import { syncDeliveryEventSubscriptions } from './event-subscriptions.js';
@@ -184,6 +185,8 @@ export async function runScheduled(env: Env, maintenance = true, cron = maintena
 }
 
 async function runRegular(env: Env, report: StepReport[]): Promise<void> {
+  // 停在 pending 超过 15 分钟的入站信用 R2 原文重走收件；排在通知补录之前，修不了而转为 degraded 的本轮就能补入通知
+  await step(report, 'inbound.repair', () => repairPendingInbound(env));
   await step(report, 'notification.repair', () => repairUnqueuedNotifications(env));
   await step(report, 'notification.process', async () => (await processNotificationJobs(env)).processed);
   // Recover a metadata purge interrupted between reservation and transaction completion.

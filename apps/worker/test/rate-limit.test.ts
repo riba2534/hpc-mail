@@ -22,9 +22,7 @@ import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
 import { fakeRateLimits } from './fake-rate-limits.js';
-// @ts-expect-error Vite 的 ?raw 导入（核对部署配置）
 import wranglerToml from '../wrangler.toml?raw';
-// @ts-expect-error Vite 的 ?raw 导入（核对测试配置）
 import wranglerTestToml from '../wrangler.test.toml?raw';
 
 const app = createApp();

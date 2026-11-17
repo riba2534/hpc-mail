@@ -1,4 +1,4 @@
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   ArrowDown,
@@ -28,7 +28,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { toast } from '@/components/ui/toast';
-import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+import { adminMailboxesQueryOptions } from '@/features/admin/addresses/admin-mailboxes';
 import { cn } from '@/lib/cn';
 
 const WORKER_NAME = 'hpc-cloud-mail';
@@ -214,22 +214,29 @@ function DomainRow({
   );
 }
 
+/** 删除确认里的影响面：只看第一页，还有下一页时说「至少」，不编造总数 */
+function affectedSummary(query: { data?: { pages: { items: unknown[] }[] }; hasNextPage: boolean; isError: boolean }): string {
+  const first = query.data?.pages[0]?.items.length;
+  if (first === undefined) return query.isError ? '（该域的认领地址数暂时无法读取。）' : '（正在统计该域的认领地址…）';
+  if (first === 0) return '（当前该域下暂无已认领地址。）';
+  return query.hasNextPage ? `该域至少有 ${first} 个已认领地址。` : `该域当前有 ${first} 个已认领地址。`;
+}
+
 export function DomainsPage() {
   const queryClient = useQueryClient();
   const { data: settings, isLoading, isError, error: settingsError, refetch } = useQuery({
     queryKey: queryKeys.admin.settings,
     queryFn: () => adminApi.getSettings(),
   });
-  // 全站已认领地址：用于删域名前预估影响面
-  const { data: allMailboxes } = useMailboxesQuery(true);
   const [newDomain, setNewDomain] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // 删域名前预估影响面：确认弹窗打开时只取该域的第一页已认领地址
+  const affected = useInfiniteQuery({ ...adminMailboxesQueryOptions({ domain: removing ?? undefined }), enabled: removing !== null });
   // 接入指南：还没有域名时默认展开，已有域名时默认折叠；用户手动切换后以手动为准
   const [guideToggled, setGuideToggled] = useState<boolean | null>(null);
 
   const list = settings?.domains.list ?? [];
-  const affected = removing ? (allMailboxes ?? []).filter((box) => box.domain === removing) : [];
 
   // 每个域名一条接入自检 query，进页面自动探测 MX；支持单独「重新检测」
   const statusQueries = useQueries({
@@ -479,11 +486,7 @@ export function DomainsPage() {
         title="移除这个域名？"
         description={
           removing
-            ? `移除 ${removing} 后将停止新的地址认领。已有邮箱和历史邮件保留，已有邮箱仍可收发；关闭收件还需在 Cloudflare 停用 Catch-all。${
-                affected.length > 0
-                  ? `当前已加载 ${affected.length} 个该域的认领地址。`
-                  : '（当前该域下暂无已认领地址。）'
-              }`
+            ? `移除 ${removing} 后将停止新的地址认领。已有邮箱和历史邮件保留，已有邮箱仍可收发；关闭收件还需在 Cloudflare 停用 Catch-all。${affectedSummary(affected)}`
             : undefined
         }
         confirmLabel="移除"

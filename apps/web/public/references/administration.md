@@ -51,7 +51,7 @@
 
 管理员 JWT 可 `POST /api/admin/mailboxes/:id/transfer`，将任意现有已认领邮箱直接转给指定的启用中用户（普通用户或管理员）。自己或别人认领的均可；此操作不经过未认领状态。目标普通用户有专属邮箱权限时，域名范围、系统保留前缀、总数和单域名数量必须符合其权限，超出时先调整配置。目标用户使用公共配置或为管理员时，保留原有强制过户豁免。它不创建尚未存在的邮箱。
 
-先读 `GET /api/mailboxes?all=1`（已知邮箱 ID 时用 `GET /api/admin/mailboxes/:id`，不存在返回 404）核对邮箱 `id,address,userId`，再用 `GET /api/admin/users/search?q=用户名&excludeUserId=当前主人ID` 查找目标用户。q 为 1–32 字符的用户名片段，完全匹配优先，其次前缀和其他包含匹配；hasMore=true 时继续补充用户名缩小范围。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
+先读 `GET /api/mailboxes?all=1&q=<地址片段>&limit=50`（已知邮箱 ID 时用 `GET /api/admin/mailboxes/:id`，不存在返回 404）核对邮箱 `id,address,userId`，再用 `GET /api/admin/users/search?q=用户名&excludeUserId=当前主人ID` 查找目标用户。q 为 1–32 字符的用户名片段，完全匹配优先，其次前缀和其他包含匹配；hasMore=true 时继续补充用户名缩小范围。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
 
 ```bash
 # API="$BASE/api"，AUTH 为管理员 JWT；三个 ID 均来自上面的实际查询
@@ -77,7 +77,7 @@ hpc '/messages' --get --data-urlencode 'scope=user' \
 hpc '/messages' --get --data-urlencode 'scope=unclaimed' --data-urlencode 'direction=inbound'
 ```
 
-详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。要查看某个已认领邮箱自己的收件或发件，用 `scope=user&userId=<归属人>&address=<完整地址>`，再以 `direction=inbound|outbound` 区分。全站地址管理用 `GET /mailboxes?all=1`，编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
+详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。要查看某个已认领邮箱自己的收件或发件，用 `scope=user&userId=<归属人>&address=<完整地址>`，再以 `direction=inbound|outbound` 区分。全站地址管理用 `GET /mailboxes?all=1`（带 `limit`/`cursor` 分页、`q`/`domain` 筛选，见[邮箱列表](mailboxes-and-domains.md#发现域名与邮箱)），编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
 
 ## 邀请码
 
