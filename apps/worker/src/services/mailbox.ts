@@ -10,7 +10,7 @@ import { AppError } from '../lib/errors.js';
 import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import {
-  claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
+  asActor, claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
   type ClaimSettings, type MailboxPolicyUser,
 } from './mailbox-policy.js';
 import { hostedSendBlock, USABLE_HOSTED_SQL } from './domain.js';
@@ -248,7 +248,12 @@ export function evaluateClaimPolicy(
 interface ClaimContext {
   userId: number;
   settings: ClaimSettings;
+  /** 按凭据有效角色收窄后的用户（规则判定与托管域名守卫用它，见 asActor） */
   user: MailboxPolicyUser;
+  /** 读取时的账户角色：写入守卫据此确认角色没有变化 */
+  dbRole: Role;
+  /** 凭据的有效角色（API Key 没有 admin scope 时为 user） */
+  actorRole: Role;
   owned: OwnedCounts;
   /** 已被认领的地址：读取时已存在的，加上本批刚认领的 */
   taken: Set<string>;
@@ -278,10 +283,13 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
     ...(claudeDomains.length ? [env.db.prepare(`SELECT DISTINCT domain FROM claude_address_facts
       WHERE domain IN (SELECT value FROM json_each(?)) AND suspended > 0`).bind(JSON.stringify(claudeDomains))] : []),
   ]);
+  const dbUser = mailboxPolicyUserFromResult(userResult);
   return {
     userId: actor.userId,
     settings: claimSettingsFrom(settingsResult),
-    user: mailboxPolicyUserFromResult(userResult),
+    user: asActor(dbUser, actor.role),
+    dbRole: dbUser.role,
+    actorRole: actor.role,
     owned: ownedCountsFromResult(ownedResult),
     taken: new Set(((takenResult?.results ?? []) as { address: string }[]).map((row) => row.address)),
     hosted: hostedAccessFromResult(hostedResult),
@@ -341,7 +349,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
            ${returning}`,
         )
         .bind(address, req.domain, userId, perDomainLimit, userId, req.domain, perDomainLimit,
-          userId, policyUser.role, req.domain, policyUser.role, userId, userId, req.strategy === 'claude' ? 1 : 0, req.domain)
+          userId, context.dbRole, req.domain, policyUser.role, userId, userId, req.strategy === 'claude' ? 1 : 0, req.domain)
         .first<MailboxSqlRow>()
       : await env.db
         .prepare(
@@ -368,7 +376,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
           perDomainLimit,
           settings.domains.revision ?? 0,
           userId,
-          policyUser.role,
+          context.dbRole,
           policyUser.mailboxPolicyRevision,
           req.domain,
           req.strategy === 'claude' ? 1 : 0,
@@ -404,12 +412,13 @@ async function claimGuardError(env: Env, context: ClaimContext, req: ClaimMailbo
     return new AppError('conflict', '域名配置已改变，请刷新后重试');
   }
   const currentUser = mailboxPolicyUserFromResult(userResult);
-  if ((!hosted && currentUser.mailboxPolicyRevision !== context.user.mailboxPolicyRevision) || currentUser.role !== context.user.role) {
+  if ((!hosted && currentUser.mailboxPolicyRevision !== context.user.mailboxPolicyRevision) || currentUser.role !== context.dbRole) {
     return new AppError('conflict', '邮箱权限已改变，请刷新后重试');
   }
   if (hosted) {
     const access = hostedAccessFromResult(hostedResult).get(req.domain);
-    if (!access || evaluateClaimPolicy(current, currentUser, { total: 0, byDomain: new Map() }, req.localPart, req.domain, access).blocked) {
+    if (!access || evaluateClaimPolicy(current, asActor(currentUser, context.actorRole), { total: 0, byDomain: new Map() },
+      req.localPart, req.domain, access).blocked) {
       return hostedConflict();
     }
   }
@@ -493,7 +502,7 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
         OR (hosted = 0 AND NOT ${systemDomainListedSql('counted.domain')})
         OR (hosted = 1 AND NOT EXISTS (SELECT 1 FROM hosted_domains h WHERE h.domain = counted.domain
           AND h.status IN (${USABLE_HOSTED_SQL})
-          AND (?5 = 'admin' OR h.user_id = ?2
+          AND (?7 = 'admin' OR h.user_id = ?2
             OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?2))))
       ) THEN 'guard'
       WHEN strategy = 'claude' AND domain IN (SELECT domain FROM blocked_domains) THEN 'claude_suspended'
@@ -527,8 +536,9 @@ async function claimChunk(env: Env, context: ClaimContext, items: ClaimMailboxRe
       code: policy.blocked?.error.code ?? null, message: policy.blocked?.error.message ?? null,
     };
   });
+  // ?5 账户角色（守卫确认未变），?7 凭据有效角色（托管域名权限）
   const bindings = [JSON.stringify(inputs), context.userId, context.owned.total, context.settings.domains.revision ?? 0,
-    context.user.role, context.user.mailboxPolicyRevision];
+    context.dbRole, context.user.mailboxPolicyRevision, context.user.role];
   const [plan, inserted] = await env.db.batch([
     env.db.prepare(`${BATCH_CLAIM_PLAN_SQL} SELECT position, address, is_new, blocked, policy_message, user_limit, domain_limit FROM planned ORDER BY position`).bind(...bindings),
     env.db.prepare(`${BATCH_CLAIM_PLAN_SQL}

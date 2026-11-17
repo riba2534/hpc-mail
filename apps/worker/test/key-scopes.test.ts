@@ -171,6 +171,39 @@ describe('创建 Key 前重新验证密码', () => {
   });
 });
 
+describe('没有 admin scope 的管理员 Key 认领按普通用户规则（A26）', () => {
+  it('私有系统域名、保留前缀、他人的托管域名都不能认领，可用性与 /domains 同样按普通用户', async () => {
+    const admin = await account('claim-admin', 'admin');
+    const other = await account('claim-owner');
+    await updateSettings(env, { domains: { list: [{ domain: 'hpc.email', public: true, perUserLimit: 0 }, { domain: 'priv.test', public: false, perUserLimit: 0 }] } });
+    const hosted = `ks-claim-hosted-${seq}.test`;
+    await db.insert(hostedDomains).values({ domain: hosted, userId: other.id, status: 'active', zoneId: `z-claim-${seq}` });
+    const key = (await keyFor(admin.jwt)).key;
+    const claim = (localPart: string, domain: string, token = key) => request('/v1/mailboxes', json(token, { localPart, domain }));
+    expect((await claim(`ks-priv-${seq}`, 'priv.test')).status).toBe(403);
+    expect((await claim('postmaster', 'hpc.email')).status).toBe(403);
+    expect((await claim(`ks-hosted-${seq}`, hosted)).status).toBe(403);
+    const batch = await data<{ claimed: unknown[]; stoppedBy: { code: string } | null }>(
+      await request('/v1/mailboxes/batch', json(key, { items: [{ localPart: `ks-batch-${seq}`, domain: hosted }] })));
+    expect(batch.claimed).toEqual([]);
+    expect(batch.stoppedBy?.code).toBe('forbidden');
+    const availability = await data<{ available: boolean; reason?: string }[]>(await request('/v1/mailboxes/availability/batch', json(key, {
+      items: [{ localPart: `ks-av-${seq}`, domain: 'priv.test' }, { localPart: 'postmaster', domain: 'hpc.email' }, { localPart: `ks-av-${seq}`, domain: hosted }],
+    })));
+    expect(availability.map((item) => item.reason)).toEqual(['domain_unavailable', 'reserved', 'domain_unavailable']);
+    expect((await data<{ domains: string[] }>(await request('/v1/domains', { headers: auth(key) }))).domains).toEqual(['hpc.email']);
+
+    // 带 admin scope 的 Key 与网页会话仍按管理员规则
+    const scoped = await keyFor(admin.jwt);
+    await grantLegacyAdminScope(env, scoped.id);
+    expect((await claim(`ks-priv-${seq}`, 'priv.test', scoped.key)).status).toBe(201);
+    expect((await data<{ domains: string[] }>(await request('/v1/domains', { headers: auth(scoped.key) }))).domains).toContain(hosted);
+    const viaBatch = await data<{ claimed: unknown[] }>(await request('/v1/mailboxes/batch', json(scoped.key, { items: [{ localPart: `ks-batch-${seq}`, domain: hosted }] })));
+    expect(viaBatch.claimed).toHaveLength(1);
+    expect((await request('/api/mailboxes', json(admin.jwt, { localPart: `ks-hosted-${seq}`, domain: hosted }))).status).toBe(201);
+  });
+});
+
 describe('限定到邮箱的 Key', () => {
   it('读取、等待、未读数、变更、发信、回复来源与邮箱管理都只在范围内', async () => {
     const user = await account('restrict');

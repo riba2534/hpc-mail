@@ -59,7 +59,7 @@ app.get('/identities', apiKeyAuth, async (c) => {
 // 与网页及认领校验共用用户的公共/专属规则。
 app.get('/domains', apiKeyAuth, async (c) => {
   const key = c.get('apiKey')!;
-  const domains = await getVisibleDomains(c.env, key.userId);
+  const domains = await getVisibleDomains(c.env, { userId: key.userId, role: key.role });
   const restriction = keyRestriction(c);
   // 只能在 allowedDomains 里认领；只限定了邮箱的 Key 没有可认领的域名
   return ok(c, { domains: restriction ? domains.filter((domain) => restrictionAllowsDomain(restriction, domain)) : domains });
