@@ -8,6 +8,7 @@ import { getVisibleDomains } from '../../services/domain.js';
 import { listSendIdentities } from '../../services/identities.js';
 import type { AppContext } from '../../types.js';
 import { createUploadRoutes } from '../uploads.js';
+import v1HostedDomainBatch from './hosted-domain-batch.js';
 import v1Mailboxes from './mailboxes.js';
 import v1Messages from './messages.js';
 import { buildOpenApiSpec } from './openapi.js';
@@ -57,6 +58,8 @@ app.get('/domains', apiKeyAuth, async (c) => {
 /** OpenAPI 描述（公开，无需 key） */
 app.get('/openapi.json', (c) => c.json(buildOpenApiSpec(new URL(c.req.url).origin)));
 
+// 批量接口按路由挂「已鉴权即跳过」的鉴权，与同前缀的其他托管域名路由谁先挂都只鉴权一次
+app.route('/hosted-domains', v1HostedDomainBatch);
 app.route('/mailboxes', v1Mailboxes);
 app.route('/messages', v1Messages);
 app.route('/uploads', createUploadRoutes(apiKeyAuth, async (c, next) => {

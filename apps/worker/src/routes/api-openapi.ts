@@ -1,6 +1,6 @@
 import { HOSTED_DOMAIN_STATUSES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, hostedDomainBatchPaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
   page, pageQuery, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
@@ -38,6 +38,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       post: operation('Host a domain', ref('HostedDomain'), { request: 'CreateHostedDomainRequest', status: 201,
         description: `Requires /config hostedDomainsEnabled. Enter a registered root domain (not a subdomain). The site creates a Cloudflare zone and returns status pending with the two nameServers to set at the registrar; existing DNS records at the old nameservers are not migrated automatically; recreate common records (website, verification and so on) with /hosted-domains/{id}/dns-records, preferably before changing the nameservers. Disable DNSSEC at the registrar first. After the nameservers take effect, receiving (Email Routing catch-all) and sending (Email Sending) are configured automatically; poll GET /hosted-domains/{id}. Mail to any unclaimed address on an active hosted domain is claimed for the owner on arrival. Ordinary users obey hosted_domains.maxPerUser and pending limits; domains already used on this site, system domains and zones already in the site account are rejected with 409. More than ${MAX_HOSTED_CREATES_PER_MINUTE} attempts per user per minute (including attempts Cloudflare rejected; administrators included) return 429 rate_limited. The site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} Cloudflare calls per minute, shared with checks, deletions and DNS records, is charged with the real calls: 2 when the domain is reserved (an exhausted budget returns 429 rate_limited, as does Cloudflare rate limiting) and 5 more for the background preconfiguration.` }),
     },
+    ...hostedDomainBatchPaths(),
     '/hosted-domains/{id}': {
       get: operation('Read a hosted domain and its setup progress', ref('HostedDomain'), { description: 'Owner, member or administrator; otherwise 404.' }),
       put: operation('Set the per-member claim limit', ref('HostedDomain'), { request: 'UpdateHostedDomainRequest', description: 'Owner or administrator.' }),

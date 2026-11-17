@@ -1,6 +1,6 @@
 import { MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, identitiesDescription, int, listQuery,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, hostedDomainBatchPaths, identitiesDescription, int, listQuery,
   mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths,
   usedSchemas, type Paths,
 } from '../openapi-common.js';
@@ -78,6 +78,7 @@ export function buildOpenApiSpec(origin: string) {
     '/messages/{id}/attachments/{attId}': { get: operation('Download a visible message attachment', str, { scope: 'mail.read', parameters: scopeQuery, binary: 'application/octet-stream',
       description: 'Binary bytes with a safe Content-Type/Content-Disposition, without a data envelope. Attachment must belong to message id and the message must be visible.' }) },
     ...uploadPaths('mail.send'),
+    ...hostedDomainBatchPaths('domain.write'),
   };
   return {
     openapi: '3.1.0', info: specInfo('HPC Mail Open API', `API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; requests already over a key or user limit do not count toward the instance limit. 429 rate_limited messages tell the scopes apart: API 调用频率超限 is this key, API 调用频率超限（账户级） is all keys of the same user combined, and API 总调用频率超限 is the whole site. Users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API. Every response carries X-Request-ID; ${clientRequestIdRule}.`),

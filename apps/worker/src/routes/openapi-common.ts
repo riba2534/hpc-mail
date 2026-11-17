@@ -12,9 +12,10 @@ import {
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
   ALLOWED_CUSTOM_HEADERS, MAX_CUSTOM_HEADER_VALUE_BYTES, MAX_CUSTOM_NON_X_HEADERS, MAX_CUSTOM_HEADERS_TOTAL_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_SEND_REQUEST_BYTES, MAX_REPLY_TO, MAX_DISPLAY_NAME_LENGTH,
-  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES,
+  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES, MAX_HOSTED_DOMAIN_BATCH, batchCreateHostedDomainsRequestSchema, batchCheckHostedDomainsRequestSchema,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
+import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
 
 export type Schema = Record<string, unknown>;
 export type Operation = Record<string, unknown>;
@@ -172,6 +173,17 @@ const delivery = object({ id: positiveId, messageId: nullable(positiveId), targe
   attempts: int, maxAttempts: positiveId, lastError: str, lastHttpStatus: nullable(int), createdAt: date, updatedAt: date,
   nextAttemptAt: date, lastAttemptAt: nullable(date),
 });
+/** 批量托管域名的结果：items 与请求顺序一一对应，每项成功带最新视图，失败带与错误信封相同的 code/message/fix */
+function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
+  const error = object({ code: { type: 'string', enum: ERROR_CODES }, message: str, fix: str, docs: str }, ['fix', 'docs']);
+  return object({
+    items: { ...array({ anyOf: [
+      object({ ...key, ok: { type: 'boolean', const: true }, hostedDomain: ref('HostedDomain') }),
+      object({ ...key, ok: { type: 'boolean', const: false }, error }),
+    ] }), description: 'One result per requested item, in request order. Items not processed because of the rate budget or an earlier account-level error have ok=false and a message starting with 未处理.' },
+    succeeded: int, failed: int,
+  });
+}
 export const schemas: Record<string, Schema> = {
   Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
     description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient was attempted and rejected, nothing was delivered; details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422.' },
@@ -329,6 +341,8 @@ export const schemas: Record<string, Schema> = {
   })(),
   CreateHostedDomainRequest: fromZod(createHostedDomainRequestSchema), UpdateHostedDomainRequest: fromZod(updateHostedDomainRequestSchema),
   ReplaceHostedDomainMembersRequest: fromZod(replaceHostedDomainMembersRequestSchema), TransferHostedDomainRequest: fromZod(transferHostedDomainRequestSchema),
+  BatchCreateHostedDomainsRequest: fromZod(batchCreateHostedDomainsRequestSchema), BatchCheckHostedDomainsRequest: fromZod(batchCheckHostedDomainsRequestSchema),
+  HostedDomainBatchCreateResult: hostedDomainBatchResult({ domain: domainName }), HostedDomainBatchCheckResult: hostedDomainBatchResult({ id: positiveId }),
   TranslateMessageRequest: (() => {
     const schema = fromZod(translateMessageRequestSchema);
     schema.description = `Segments cut from this message subject/body in display order, translated in order. 1–${MAX_TRANSLATE_SEGMENTS} segments, each at most ${MAX_TRANSLATE_SEGMENT_CHARS} characters, combined at most ${MAX_TRANSLATE_BATCH_CHARS} characters; split longer messages into several requests.`;
@@ -476,6 +490,16 @@ export function mailboxBatchPaths(scopes?: { read: string; write: string }): Pat
       parameters: [query('count', { type: 'integer', minimum: 1, maximum: MAX_BATCH_CLAIM }, 'Number of addresses to allocate.', true),
         query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: only zero-suspension domains, balanced by Claude accounts plus pending claims.', true)],
       description: 'Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy excludes every domain with any historical Claude suspension from both items and pool, regardless of paid status or deprecated thresholds. It balances accounts plus recent pending claims and stops at claim_random.dailyLimit or claim quotas without spilling over to suspended domains. Generate prefixes, then pass strategy=claude on each item for availability and actual claims, including after manual suffix changes. Claims atomically recheck suspension facts; a plan does not reserve eligibility.' }) },
+  };
+}
+/** 批量添加与批量立即检测托管域名：会话与 API Key 两套接口同形，API Key 另需 domain.write */
+export function hostedDomainBatchPaths(scope?: string): Paths {
+  const budget = `Items are processed one by one in request order with exactly the rules of the single endpoint, and each gets its own result; the HTTP status is 200 even when items fail. Before processing, the current minute’s per-user count and the site-wide Cloudflare budget (${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} calls per minute) are read: items beyond what they allow are not attempted, not counted and never reach Cloudflare, and fail with rate_limited and a message starting with 未处理; retry only those items after about a minute.`;
+  return {
+    '/hosted-domains/batch': { post: operation('Host several domains in order', ref('HostedDomainBatchCreateResult'), { request: 'BatchCreateHostedDomainsRequest', scope,
+      description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domains, same rules as POST /hosted-domains for each. ${budget} Each attempted item counts toward the ${MAX_HOSTED_CREATES_PER_MINUTE} additions per user per minute and costs 2 site-wide calls when reserved (plus 5 for background preconfiguration). A rate_limited, forbidden (per-user hosted or pending limit) or user_disabled failure stops the batch: the remaining items fail with the same code without being attempted. Other failures, such as 409 for a domain already used, affect only that item. Ordinary users may keep only hosted_domains.maxPendingPerUser domains pending at once. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
+    '/hosted-domains/batch-check': { post: operation('Check several hosted domains now', ref('HostedDomainBatchCheckResult'), { request: 'BatchCheckHostedDomainsRequest', scope,
+      description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domain ids, same rules as POST /hosted-domains/{id}/check for each (owner or administrator; members get forbidden and other users not_found for that item only). ${budget} Each attempted item counts toward the ${MAX_HOSTED_CHECKS_PER_MINUTE} checks per user per minute; a check that reaches Cloudflare costs 4 site-wide calls. rate_limited or user_disabled stops the batch. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
   };
 }
 export function uploadPaths(scope?: string): Paths {

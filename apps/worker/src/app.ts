@@ -16,6 +16,7 @@ import uploads from './routes/uploads.js';
 import avatar from './routes/avatar.js';
 import config from './routes/config.js';
 import domains from './routes/domains.js';
+import hostedDomainBatch from './routes/hosted-domain-batch.js';
 import hostedDomains from './routes/hosted-domains.js';
 import identities from './routes/identities.js';
 import mailboxes from './routes/mailboxes.js';
@@ -42,6 +43,8 @@ export function createApp() {
   api.route('/avatar', avatar);
   api.route('/config', config);
   api.route('/domains', domains);
+  // 批量接口按路由挂「已鉴权即跳过」的鉴权，与同前缀子应用谁先挂都只鉴权一次
+  api.route('/hosted-domains', hostedDomainBatch);
   api.route('/hosted-domains', hostedDomains);
   api.route('/identities', identities);
   api.route('/mailboxes', mailboxes);
