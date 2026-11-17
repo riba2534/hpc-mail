@@ -558,8 +558,11 @@ export function gatePlan(plan: Pick<MailPlan, 'checks' | 'observed'>, accepted: 
 // apply
 
 export interface ApplyHooks {
-  /** 每次远端写入前调用（心跳 + 取消检查）：返回 false 表示租约已丢失或已请求取消，立即停止、不再发起写入 */
-  beforeWrite(step: SystemDomainWriteStep): Promise<boolean>;
+  /**
+   * 每次远端写入前调用（心跳 + 取消检查）：返回 false 表示租约已丢失或已请求取消，立即停止、不再发起写入。
+   * uninterruptible：处在「删除第三方 MX → 开启 Routing」这一段中（已删掉 MX），只看租约，取消要等这一段做完
+   */
+  beforeWrite(step: SystemDomainWriteStep, opts?: { uninterruptible?: boolean }): Promise<boolean>;
   /** 追加台账事件（不受租约约束）；seq 省略时分配新的并返回 */
   record(event: Omit<OnboardingChangeEvent, 'seq' | 'at'> & { seq?: number }): Promise<number>;
   /** 墙钟截止时间（ms）：到点后不再开始新的写入，返回 stopped */
@@ -632,9 +635,12 @@ export async function applyMailPlan(
   /** 执行一步写入：beforeWrite → started → exec；结果不明时 verify，原值重试 1 次 */
   async function write(step: SystemDomainWriteStep, opts: {
     target?: string; before?: unknown; exec: () => Promise<unknown>; verify: () => Promise<Verified>;
+    /** 已删掉第三方 MX、Routing 还没开：截止时间与取消都不打断，只有租约丢失才停 */
+    uninterruptible?: boolean;
   }): Promise<StepResult> {
-    if (Date.now() >= hooks.deadline) return { kind: 'stopped' };
-    if (!(await hooks.beforeWrite(step))) return { kind: 'stopped' };
+    const guard = { uninterruptible: opts.uninterruptible === true };
+    if (!guard.uninterruptible && Date.now() >= hooks.deadline) return { kind: 'stopped' };
+    if (!(await hooks.beforeWrite(step, guard))) return { kind: 'stopped' };
     const seq = await hooks.record({ kind: step, status: 'started', ...(opts.target ? { target: opts.target } : {}), ...(opts.before === undefined ? {} : { before: opts.before }) });
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -662,7 +668,7 @@ export async function applyMailPlan(
           return { kind: 'drift', message: `${STEP_LABEL[step]}时远端配置被改成了其他值，需要重新确认` };
         }
         // 仍是原值：写入没有生效，重试 1 次（重试前再过一次心跳）
-        if (attempt === 1 || !(await hooks.beforeWrite(step))) {
+        if (attempt === 1 || !(await hooks.beforeWrite(step, guard))) {
           await hooks.record({ seq, kind: step, status: 'unknown', error: errorText(error) });
           return attempt === 1 ? { kind: 'error', error } : { kind: 'stopped' };
         }
@@ -750,6 +756,7 @@ export async function applyMailPlan(
     for (const record of facts.foreignMx) {
       const result = await write('mx.delete', {
         target: record.id, before: { name: record.name, content: record.content, priority: record.priority ?? null, ttl: record.ttl },
+        uninterruptible: mxDeleted,
         exec: () => deleteDnsRecord(creds, zoneId, record.id),
         verify: async () => {
           try {
@@ -775,6 +782,7 @@ export async function applyMailPlan(
   if (planned.has('routing.enable') || mxDeleted || catchAllDeferred) {
     const result = await write('routing.enable', {
       target: zoneId,
+      uninterruptible: mxDeleted,
       exec: () => enableRouting(creds, zoneId),
       verify: async () => ((await getRouting(creds, zoneId)).enabled ? 'target' : 'original'),
     });

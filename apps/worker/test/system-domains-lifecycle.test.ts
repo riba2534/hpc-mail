@@ -96,6 +96,46 @@ describe('取消', () => {
     expect(cf.writes()).toHaveLength(1);
   });
 
+  it('A17 删第三方 MX 到开启 Routing 之间取消：这一段做完才处理取消，域名不会没有 MX', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('gap');
+    cf = fakeCloudflare({ zones: [{ name: domain, records: [
+      { type: 'MX', name: domain, content: 'mx1.other.example', priority: 10 },
+      { type: 'MX', name: domain, content: 'mx2.other.example', priority: 20 },
+    ] }] });
+    const zone = cf.zoneByName(domain)!;
+    const admin = await actor('lc-admin');
+    // 第一条 MX 删除请求发出时管理员点了取消（执行者持有租约，取消只写标记）
+    cf.onCall({ method: 'DELETE', path: /\/dns_records\// }, async () => {
+      const row = await env.db.prepare('SELECT id FROM system_domain_onboarding WHERE domain = ?').bind(domain).first<{ id: number }>();
+      expect((await data<SystemDomainOnboarding>(await cancel(admin.jwt, row!.id))).cancelRequested).toBe(true);
+    });
+    const created = await data<SystemDomainOnboarding>(await onboardExisting(admin, zone.id), 201);
+    const done = await task(created.id);
+    expect(done).toMatchObject({ state: 'cancelled', errorCode: '' });
+    expect(zone.routingEnabled).toBe(true);
+    expect(cf.recordsOf(zone, domain, 'MX').map((r) => r.content).sort())
+      .toEqual(['route1.mx.cloudflare.net', 'route2.mx.cloudflare.net', 'route3.mx.cloudflare.net']);
+    // 这一段之后的步骤照常因取消停止
+    expect(cf.writes().some((w) => w.includes('/email/sending/'))).toBe(false);
+    expect(await systemList()).toMatchObject({ domains: [] });
+  });
+
+  it('A17 删了 MX、Routing 没开成就取消：照常取消但保留「MX 已删除」告警', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('gap2');
+    cf = fakeCloudflare({ zones: [{ name: domain, records: [{ type: 'MX', name: domain, content: 'mx1.other.example', priority: 10 }] }] });
+    const zone = cf.zoneByName(domain)!;
+    cf.fail({ method: 'POST', path: /\/email\/routing\/dns$/, status: 400, code: 9999, times: 5 });
+    const admin = await actor('lc-admin');
+    const created = await data<SystemDomainOnboarding>(await onboardExisting(admin, zone.id), 201);
+    expect(await task(created.id)).toMatchObject({ state: 'blocked', errorCode: 'mx_removed_routing_pending' });
+    const cancelled = await data<SystemDomainOnboarding>(await cancel(admin.jwt, created.id));
+    expect(cancelled).toMatchObject({ state: 'cancelled', errorCode: 'mx_removed_routing_pending' });
+    expect(cancelled.lastError).toContain('该域名现在收不到信');
+    expect(zone.routingEnabled).toBe(false);
+  });
+
   it('本任务新建、从未激活的 zone：勾选删除时取消删除 zone 并审计，不勾选保留；取消时已激活则保留', async () => {
     const f = await resetSystemDomains();
     cf = fakeCloudflare();
