@@ -67,7 +67,7 @@ export const changePasswordRequestSchema = z.object({
   /** 改密时一并吊销本人全部 API Key（默认吊销：账号可能已泄露，旧 Key 不应继续有效） */
   revokeApiKeys: z.boolean().default(true),
 });
-export type ChangePasswordRequest = z.infer<typeof changePasswordRequestSchema>;
+export type ChangePasswordRequest = z.input<typeof changePasswordRequestSchema>;
 
 export interface SessionUser {
   id: number;
