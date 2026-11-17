@@ -13,6 +13,8 @@ export const API_SCOPES = [
   'mail.send',
   'mailbox.read',
   'mailbox.write',
+  'domain.read',
+  'domain.write',
   /** 管理自己邮箱的共享（只接受 userId，不提供用户搜索） */
   'mailbox.share',
   /** 配置 Webhook v2 端点 */
@@ -116,10 +118,20 @@ export const MAX_BATCH_SHARE_MAILBOXES = 100;
 export const MAX_MAILBOX_GRANTEES = 100;
 /** 每个托管域名最多共享给多少位成员 */
 export const MAX_HOSTED_DOMAIN_MEMBERS = 100;
+/**
+ * 批量添加 / 批量检测托管域名单次最多的项数。实际能处理的还受每人每分钟添加与检测次数、
+ * pending 上限和全站 Cloudflare 额度约束，额度不够的项明确失败且不计数，下一分钟可用剩余项重试。
+ */
+export const MAX_HOSTED_DOMAIN_BATCH = 20;
 export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */
 export const USERNAME_REGEX = /^[a-z0-9][a-z0-9_-]{2,31}$/;
+/**
+ * 系统保留用户名：注册与管理员创建都不能使用。ci-smoke 由部署流水线的 seed 脚本维护（密码由 JWT_SECRET 派生），
+ * 若被他人抢先注册，seed 会重置其密码。
+ */
+export const RESERVED_USERNAMES: readonly string[] = ['ci-smoke'];
 
 /** 邮箱前缀（local part）：1-64 位，小写字母数字开头结尾，中间允许 . _ + - */
 export const LOCAL_PART_REGEX = /^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?$/;
@@ -154,6 +166,8 @@ export const DEFAULT_RESERVED_LOCAL_PARTS = [
  */
 export const DEFAULT_RELAY_DAILY_LIMIT = 300;
 export const DEFAULT_RELAY_PER_USER_DAILY_LIMIT = 50;
+/** 未认领地址的来信中转全站合计（不按管理员人数叠加） */
+export const DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT = 50;
 
 /** AI 翻译：单次请求的片段数、单片段字符数与总字符数上限（前端据此分批） */
 export const MAX_TRANSLATE_SEGMENTS = 60;

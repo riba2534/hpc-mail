@@ -1,5 +1,6 @@
 import { env } from 'cloudflare:test';
 import { eq, sql } from 'drizzle-orm';
+import type { MessageAuth } from '@hpc-mail/shared';
 import { describe, expect, it } from 'vitest';
 import { createDb } from '../src/db/client.js';
 import { claudeAddressFacts, mailboxes, messages, users } from '../src/db/schema.js';
@@ -17,9 +18,17 @@ function domainOf() {
   return `facts-${++sequence}.test`;
 }
 
+/** 收件时 Cloudflare 判定 DKIM 通过、签名域即发件域的认证结果（真实官方来信的样子） */
+function signedBy(fromAddress: string, overrides: Partial<MessageAuth> = {}): MessageAuth {
+  const domain = fromAddress.slice(fromAddress.lastIndexOf('@') + 1).toLowerCase();
+  return { spf: 'pass', dkim: 'pass', dkimDomain: domain, dmarc: 'pass', aligned: true, ...overrides };
+}
+
+/** 默认是通过认证、To 头即收件地址的来信；extra 可覆盖 auth 与 recipients */
 async function receive(address: string, fromAddress: string, subject: string, extra: Partial<typeof messages.$inferInsert> = {}) {
   return (await db.insert(messages).values({
-    address, domain: address.split('@')[1]!, direction: 'inbound', status: 'received', fromAddress, subject, ...extra,
+    address, domain: address.split('@')[1]!, direction: 'inbound', status: 'received', fromAddress, subject,
+    auth: signedBy(fromAddress), recipients: { to: [address], cc: [], bcc: [] }, ...extra,
   }).returning().get())!;
 }
 
@@ -69,6 +78,37 @@ describe('Claude 地址事实归纳', () => {
     expect(Object.keys(facts).sort()).toEqual(['ok', 'up']);
     expect(facts.ok).toMatchObject({ suspended: true });
     expect(facts.up).toMatchObject({ suspended: true });
+  });
+
+  it('只认 DKIM 通过且签名域与白名单发件域对齐、收件地址在 To 头里的来信；没有认证结果的历史邮件不再归纳，已有事实不撤销', async () => {
+    const domain = domainOf();
+    const ban = 'Your account has been suspended';
+    const from = 'no-reply@mail.anthropic.com';
+    await receive(`ok@${domain}`, from, ban);
+    await receive(`parent@${domain}`, from, ban, { auth: signedBy(from, { dkimDomain: 'anthropic.com' }) });
+    await receive(`nores@${domain}`, from, ban, { auth: null });
+    await receive(`fail@${domain}`, from, ban, { auth: signedBy(from, { dkim: 'fail' }) });
+    // SPF 与 DMARC 都通过，但没有通过的 DKIM 签名
+    await receive(`spfonly@${domain}`, from, ban, { auth: signedBy(from, { dkim: 'none', dkimDomain: '' }) });
+    await receive(`esp@${domain}`, from, ban, { auth: signedBy(from, { dkimDomain: 'sendgrid.net' }) });
+    await receive(`child@${domain}`, from, ban, { auth: signedBy(from, { dkimDomain: 'x.mail.anthropic.com' }) });
+    await receive(`lookalike@${domain}`, from, ban, { auth: signedBy(from, { dkimDomain: 'il.anthropic.com' }) });
+    // From/To/Subject 头重复（aligned=false）：显示的主题可能不是被签名的那个
+    await receive(`dup@${domain}`, from, ban, { auth: signedBy(from, { aligned: false }) });
+    // 正版封号信原样重投到别的地址：DKIM 照样通过，To 头还是原来的收件人
+    await receive(`replay@${domain}`, from, ban, { recipients: { to: [`victim@${domain}.other`], cc: [], bcc: [] } });
+    await receive(`cc@${domain}`, from, ban, { recipients: { to: [`someone@${domain}`], cc: [`cc@${domain}`], bcc: [] } });
+
+    await harvestRecentClaudeFacts(env, 0);
+    expect(Object.keys(await factsOf(domain)).sort()).toEqual(['ok', 'parent']);
+
+    // 本功能之前按旧口径归纳的事实保持原样：同一地址再来一封没有认证结果的信，不会推翻也不会新增
+    const legacy = domainOf();
+    await db.insert(claudeAddressFacts).values({ address: `old@${legacy}`, domain: legacy, paid: false, suspended: true,
+      firstSeenAt: new Date(Date.now() - 50 * HOUR), suspendedAt: new Date(Date.now() - 50 * HOUR) });
+    await receive(`old@${legacy}`, 'invoice+statements@mail.anthropic.com', 'Your receipt from Anthropic, PBC #1', { auth: null });
+    await harvestRecentClaudeFacts(env, 0);
+    expect((await factsOf(legacy)).old).toMatchObject({ suspended: true, paid: false });
   });
 
   it('重复归纳幂等；标志只增不减，邮件没了统计仍在', async () => {

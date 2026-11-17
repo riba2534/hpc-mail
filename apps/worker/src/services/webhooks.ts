@@ -25,9 +25,9 @@ import { resolveVerificationCode } from './code-extract.js';
 import { getDomains } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
 import { NotificationDeliveryError, notificationRequest } from './notification-http.js';
+import { readMailBody } from './mail-body.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { sendPushDeerNotification } from './pushdeer.js';
-import { getJson } from './storage.js';
 import { svixHeaders, validateNotifyWebhookUrl } from './webhook-notify.js';
 
 /** 发给某个用户的 Webhook v2 事件 */
@@ -412,13 +412,8 @@ async function mailReceivedData(env: Env, messageId: number, includeBody: boolea
     createdAt: new Date(Number(row.created_at)).toISOString(),
   };
   if (includeBody) {
-    let text = row.body_text;
-    let html = row.body_html;
-    if (row.body_r2_key) {
-      const full = await getJson<{ text?: string; html?: string }>(env, row.body_r2_key);
-      if (typeof full?.text === 'string') text = full.text;
-      if (typeof full?.html === 'string') html = full.html;
-    }
+    // 完整正文在 R2 时 D1 只有搜索用的截断文本，统一经 readMailBody 读全文
+    const { bodyText: text, bodyHtml: html } = await readMailBody(env, { bodyText: row.body_text, bodyHtml: row.body_html, bodyR2Key: row.body_r2_key });
     message.text = clip(text);
     message.html = clip(html);
     message.bodyTruncated = text.length > WEBHOOK_BODY_MAX_CHARS || html.length > WEBHOOK_BODY_MAX_CHARS;

@@ -30,12 +30,28 @@ const SCOPE_LABELS: Record<ApiScope, string> = {
   'mail.send': '发送邮件',
   'mailbox.read': '读取邮箱',
   'mailbox.write': '管理邮箱',
+  'domain.read': '查看托管域名',
+  'domain.write': '接入域名与解析',
   'mailbox.share': '管理共享',
   'webhook.write': '配置 Webhook',
   'notify.read': '读取通知配置',
   'notify.write': '修改通知配置',
   admin: '管理员能力',
 };
+
+/** 托管域名两项权限的用途与风险，勾选后显示在权限列表下方 */
+export function domainScopeNote(scopes: readonly ApiScope[]): { tone: 'caution' | 'info'; text: string } | null {
+  if (scopes.includes('domain.write')) {
+    return {
+      tone: 'caution',
+      text: '「接入域名与解析」可用你的账户添加托管域名、立即检测，并修改托管域名的 DNS 解析，改错会影响网站与收发信。删除域名、成员与过户仍需登录网页。只把这把密钥交给可信的程序。',
+    };
+  }
+  if (scopes.includes('domain.read')) {
+    return { tone: 'info', text: '「查看托管域名」可读取你托管域名的接入进度、名称服务器与 DNS 记录。' };
+  }
+  return null;
+}
 
 type ScopePreset = 'read' | 'send' | 'full' | 'custom';
 
@@ -176,6 +192,7 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
   };
 
   const scopePreset: ScopePreset = customScopes ? 'custom' : matchScopePreset(scopes);
+  const domainNote = domainScopeNote(scopes);
   const applyScopePreset = (value: ScopePreset) => {
     const preset = SCOPE_PRESETS.find((item) => item.value === value);
     if (preset) {
@@ -280,6 +297,11 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
                         </label>
                       ))}
                     </div>
+                    {domainNote && (
+                      <p className={domainNote.tone === 'caution' ? 'text-xs text-caution' : 'text-xs text-ink-tertiary'}>
+                        {domainNote.text}
+                      </p>
+                    )}
                   </div>
                   <FormField label="速率限制" description="每分钟最大请求数">
                     {(field) => (

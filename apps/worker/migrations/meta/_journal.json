@@ -169,6 +169,13 @@
       "when": 1794913647111,
       "tag": "0023_webhooks_v2",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1795392000000,
+      "tag": "0028_inbound_auth_results",
+      "breakpoints": true
     }
   ]
 }

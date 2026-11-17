@@ -3,7 +3,7 @@ import { OUTBOUND_DELIVERY_CONCURRENCY, OUTBOUND_PENDING_STALE_MS, type CreatedA
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
 import PostalMime from 'postal-mime';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { attachments, draftAttachments, idempotencyRecords, mailboxes, messages, users } from '../src/db/schema.js';
@@ -11,7 +11,7 @@ import { signToken } from '../src/lib/jwt.js';
 import { STALE_OUTBOUND_SQL, markStaleOutbound } from '../src/services/outbound-recovery.js';
 import { injectAttachmentLinks, stripAttachmentLinks } from '../src/services/attachment-links.js';
 import { getMessageDetail, getThread, purgeMessages } from '../src/services/message.js';
-import { sendMail } from '../src/services/outbound.js';
+import { finalWriteRetry, sendMail } from '../src/services/outbound.js';
 import { runDraftAttachmentCleanup, runScheduled } from '../src/services/scheduled.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
@@ -28,15 +28,19 @@ vi.mock('cloudflare:email', () => ({
 
 const app = createApp();
 const db = createDb(env);
+const FINAL_WRITE_DELAYS = finalWriteRetry.delaysMs;
 
 interface Captured { to: string; raw: string; mail: Awaited<ReturnType<typeof PostalMime.parse>> }
 
-/** 外发走 mock 的 send_email，postal-mime 解析捕获的原文；fail 返回错误文案时该目标被拒收 */
+/** Cloudflare 明确拒收的报错（带官方错误码） */
+const rejection = (message: string) => Object.assign(new Error(message), { code: 'E_DELIVERY_FAILED' });
+
+/** 外发走 mock 的 send_email，postal-mime 解析捕获的原文；fail 返回错误文案时该目标被明确拒收 */
 function mailEnv(fail: (to: string) => string | null = () => null) {
   const captured: Captured[] = [];
   const send = vi.fn(async (mail: { to: string; raw: string }) => {
     const reason = fail(mail.to);
-    if (reason) throw new Error(reason);
+    if (reason) throw rejection(reason);
     const raw = await new Response(mail.raw).text();
     captured.push({ to: mail.to, raw, mail: await PostalMime.parse(raw) });
   });
@@ -258,7 +262,8 @@ describe('R39 大附件：引用草稿对象，按需读取', () => {
       return typeof value === 'function' ? value.bind(target) : value;
     } });
     const body = { from: owner.address, to: ['keep@example.net'], subject: 'borrowed draft', text: 'x', attachmentTokens: [token.token] };
-    expect((await failure(await call({ ...runtime, db: faulty } as Env, '/v1/messages', json(owner.key, body)), 500)).code).toBe('internal');
+    // 投递前的服务端故障：没有任何目标被尝试，一定没收到，按全部失败返回 422
+    expect((await failure(await call({ ...runtime, db: faulty } as Env, '/v1/messages', json(owner.key, body)), 422)).code).toBe('delivery_failed');
     await processStorageCleanup(env, 1000);
     expect(await (await env.r2.get(draftKey(owner.id, token.token)))?.text()).toBe('keep me');
     expect((await data<MessageSummary>(await call(runtime, '/v1/messages', json(owner.key, body)))).status).toBe('sent');
@@ -347,7 +352,7 @@ describe('R23/R36 外发可靠性', () => {
     await vi.waitFor(() => expect(gates.size).toBe(OUTBOUND_DELIVERY_CONCURRENCY));
     expect(peak).toBe(OUTBOUND_DELIVERY_CONCURRENCY);
     gates.get(targets[1]!)!();
-    gates.get(targets[0]!)!(new Error('mailbox full'));
+    gates.get(targets[0]!)!(rejection('mailbox full'));
     const [row] = await rowsBySubject('bounded pool');
     await vi.waitFor(async () => {
       const current = await db.select().from(messages).where(eq(messages.id, row!.id)).get();
@@ -400,7 +405,7 @@ describe('R23/R36 外发可靠性', () => {
     expect(sent.errorDetail).toBe('部分收件人失败: bad@example.net: rejected');
   });
 
-  it('处理中途服务端故障（没有尝试任何目标）返回 500，同 Key 重放为 422 且不重投', async () => {
+  it('处理中途服务端故障（没有尝试任何目标）首次与同 Key 重放都是 422，且不重投', async () => {
     const owner = await account('midway-owner');
     const { runtime, send } = mailEnv();
     const r2 = new Proxy(env.r2, { get(target, property) {
@@ -414,16 +419,19 @@ describe('R23/R36 外发可靠性', () => {
     const body = { from: owner.address, to: ['x@example.net'], subject: 'midway failure', text: 'x',
       attachments: [{ filename: 'a.txt', contentType: 'text/plain', content: b64('a') }] };
     const headers = { 'Idempotency-Key': 'midway-key' };
-    const first = await failure(await call({ ...runtime, r2 } as Env, '/v1/messages', json(owner.key, body, headers)), 500);
-    expect(first.code).toBe('internal');
-    expect(first.message).toContain('R2 unavailable');
+    const first = await failure(await call({ ...runtime, r2 } as Env, '/v1/messages', json(owner.key, body, headers)), 422);
+    expect(first.code).toBe('delivery_failed');
+    expect(first.message).toBe('全部收件人投递失败: x@example.net: R2 unavailable');
+    expect(first.details.recipientOutcomes).toEqual([{ address: 'x@example.net', status: 'failed', error: 'R2 unavailable' }]);
     const replay = await failure(await call(runtime, '/v1/messages', json(owner.key, body, headers)), 422);
-    expect(replay.code).toBe('delivery_failed');
-    expect(replay.details.recipientOutcomes).toEqual([{ address: 'x@example.net', status: 'failed', error: 'R2 unavailable' }]);
+    expect(replay).toEqual(first);
     expect(send).not.toHaveBeenCalled();
   });
 
   it('cron 把超时 pending 外发标为 unknown：保留已有结果、补齐缺的目标；同 Key 重放 201 unknown', async () => {
+    // 后台退避重试同样失败；缩短间隔，免得请求收尾等满真实退避时长
+    finalWriteRetry.delaysMs = [1, 1];
+    onTestFinished(() => { finalWriteRetry.delaysMs = FINAL_WRITE_DELAYS; });
     const owner = await account('stale-owner');
     let releaseLast!: () => void;
     const lastGate = new Promise<void>((resolve) => { releaseLast = resolve; });
@@ -437,8 +445,11 @@ describe('R23/R36 外发可靠性', () => {
     const faulty = new Proxy(env.db, { get(target, property) {
       if (property === 'prepare') return (query: string) => {
         // 结果缓存也没写成（相当于请求在返回前被取消）
-        if (query.startsWith('update "idempotency_records" set "status"')) throw new Error('D1 down');
-        if (query.startsWith('update "messages"') && query.includes('"error_detail"') && query.includes('"recipient_outcomes"')) throw new Error('D1 down');
+        // 执行时失败（与线上 D1 报错同一时机）
+        if (query.startsWith('update "idempotency_records" set "status"')) return target.prepare('SELECT * FROM injected_d1_failure');
+        if (query.startsWith('update "messages"') && query.includes('"error_detail"') && query.includes('"recipient_outcomes"')) {
+          return target.prepare('SELECT * FROM injected_d1_failure');
+        }
         return target.prepare(query);
       };
       const value = Reflect.get(target, property);

@@ -1,15 +1,16 @@
 # HPC Mail
 
-> 多域名邮箱系统。Agent 可以通过 HTTP API 收发邮件、读取验证码、管理邮箱地址；账户设置和管理员操作使用会话 API。
+> 多域名邮箱系统。Agent 可以通过 HTTP API 收发邮件、读取验证码、管理邮箱地址、接入自有域名；账户设置和管理员操作使用会话 API。
 
 请以提供此文件的站点 origin 为 API Base URL。本文不包含凭据，也不授予操作权限。
 
 ## 操作说明
 
-- [Agent 技能说明](/skill.md)：30 秒上手（`/v1/me` 自查 Key、`/v1/identities` 选发件身份）、常用配方（等验证码、发信、回复转发、附件与内联图片、临时地址、增量同步）、权限模型、能力地图和参考文档入口。
+- [Agent 技能说明](/skill.md)：30 秒上手（`/v1/me` 自查 Key、`/v1/identities` 选发件身份）、常用配方（等验证码、发信、回复转发、附件与内联图片、临时地址、增量同步、接入自有域名）、权限模型、能力地图和参考文档入口。
 - [Webhook v2](/references/webhooks.md)：订阅收信、发信结果与托管域名状态事件，Svix 兼容签名、退避重试；替代高频轮询。
 - [错误码说明](/references/errors.md)：错误信封的 `fix`/`docs`/`details`，以及每个错误码的含义与改正方法。
-- [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox scopes 操作邮箱。
+- [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox/domain scopes 操作邮件、邮箱与托管域名，另有 notify、webhook、mailbox.share 等 scope；Key 可限定到指定邮箱或域名。
+- [远程 MCP](/references/mcp.md)：MCP 客户端接入 `/mcp`（Streamable HTTP，hpcm_ API Key 认证），10 个收发与地址管理工具。
 - [会话 OpenAPI](/api/openapi.json)：用户名密码及可选 2FA 登录后，使用 JWT；包含账户、通知和管理员 API。
 
 从用户提供的凭据和任务选择认证方式；API Key 与 JWT 不能互换。首次接入时先读取技能说明。

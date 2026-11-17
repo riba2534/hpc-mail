@@ -266,6 +266,8 @@ export interface MailText {
   readonly plain: string;
   /** plain 来自 HTML 转换且超长只转换了开头 */
   readonly plainTruncated: boolean;
+  /** HTML 段转出的文本，与 plain 共用同一次转换（纯文本段只是占位时提码改看它） */
+  readonly htmlText: string;
   /** 与 makePreview 相同的摘要 */
   preview(limit?: number): string;
 }
@@ -280,6 +282,7 @@ export function mailText(text: string, html: string): MailText {
   return {
     get plain() { return text || htmlText().text; },
     get plainTruncated() { return !text && htmlText().truncated; },
+    get htmlText() { return htmlText().text; },
     preview: (limit = PREVIEW_LIMIT) => previewOf((text && text.trim()) || htmlText().text, limit),
   };
 }

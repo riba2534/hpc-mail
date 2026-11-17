@@ -33,7 +33,7 @@
 
 ## forbidden-scope
 
-API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺哪个。`GET /v1/me` 查看当前 Key 的 scopes；Key 不能给自己加 scope，要由用户在网页的 API Key 页面（或用 JWT 调 `PUT /api/api-keys/:id`）修改，或换用带该 scope 的 Key。带 `replyToMessageId` 或 `forwardAttachmentsFrom` 发信时除 `mail.send` 外还需要 `mail.read`；`GET /v1/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
+API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺哪个。`GET /v1/me` 查看当前 Key 的 scopes；Key 不能给自己加 scope，要由用户在网页的 API Key 页面（或用 JWT 调 `PUT /api/api-keys/:id`）修改，或换用带该 scope 的 Key。带 `replyToMessageId` 或 `forwardAttachmentsFrom` 发信时除 `mail.send` 外还需要 `mail.read`；`GET /v1/identities` 需要 `mail.send` 或 `mailbox.read` 之一。托管域名接口查看需要 `domain.read`，添加、检测与改 DNS 需要 `domain.write`。
 
 ## forbidden-sender
 
@@ -53,7 +53,7 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 ## delivery_failed
 
-全部收件人都被明确拒收，没有任何一份投递成功（HTTP 422）。`details.messageId` 是已记录的发件行（在 `direction=outbound` 列表里可见），`details.recipientOutcomes` 给出每个收件人的失败原因。这次不占当日外发配额。同一个 `Idempotency-Key` 重试会返回同样的错误；按原因修正收件人后换新 Key 重发。只有部分收件人失败时仍返回 201，结果在 `recipientOutcomes` 里，只补发 `failed` 的地址。
+全部收件人都明确失败，没有任何一份投递成功（HTTP 422）：发信服务逐个拒收，或服务端在开始投递前出错。结果不明的收件人（超时、网络错误）不算失败，那种情况返回 201 与 `status:"unknown"`。`details.messageId` 是已记录的发件行（在 `direction=outbound` 列表里可见），`details.recipientOutcomes` 给出每个收件人的失败原因。这次不占当日外发配额。同一个 `Idempotency-Key` 重试会返回同样的错误；按原因修正收件人后换新 Key 重发。只有部分收件人失败时仍返回 201，结果在 `recipientOutcomes` 里，只补发 `failed` 的地址。
 
 ## rate_limited
 
@@ -79,6 +79,6 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 | 404 `not_found` | 资源不存在或不在可见范围；发件 `mailboxId` 不存在也是它 |
 | 409 `address_taken` | 认领的地址已被占用，换前缀 |
 | 409 `conflict` | 并发冲突或版本过期：重新读取当前状态再决定 |
-| 500 `internal` | 服务端错误。发信时用同一个 `Idempotency-Key` 与同一请求体重试取回结果（可能继续发送，也可能得到 422 `delivery_failed`）；其他变更先读回状态 |
+| 500 `internal` | 服务端错误。发信时用同一个 `Idempotency-Key` 与同一请求体重试取回结果；其他变更先读回状态 |
 
 登录、注册与两步验证相关的错误码（`bad_credentials`、`totp_required`、`totp_setup_required`、`user_disabled`、`registration_closed`、`invite_invalid`）见[鉴权与错误](auth-and-http.md#错误与限流)。
