@@ -43,10 +43,10 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 | 工具 | 用途 | 对应 REST | Key scope |
 |---|---|---|---|
 | `get_me` | Key、所属用户、scopes、速率上限、今日外发用量，以及可认领新地址的 `domains` | `GET /v1/me`、`GET /v1/domains` | 任一有效 Key |
-| `list_identities` | 能发信的地址，`canSend=true` 的才能当 `from` | `GET /v1/identities` | `mail.send` 或 `mailbox.read` |
+| `list_identities` | 能发信的地址，`canSend=true` 的才能当 `from`。REST 一次返回全部身份，工具里分页：`limit` 默认 50、最多 200，`q` 按地址子串过滤，结果带 `total`、`truncated`，`nextCursor` 传回 `cursor` 翻页；`domains` 最多 200 个，更多时带 `domainsTotal` | `GET /v1/identities` | `mail.send` 或 `mailbox.read` |
 | `list_mailboxes` | 分页列出自己认领的邮箱、id、邮件数、能否发信：`limit` 默认 50、最多 200，`nextCursor` 传回 `cursor` 翻页，`q` 按地址子串、`domain` 按域名过滤 | `GET /v1/mailboxes` | `mailbox.read` |
 | `claim_mailbox` | 认领 `localPart@domain`，可带 `strategy` | `POST /v1/mailboxes` | `mailbox.write` |
-| `release_mailbox` | 按 `mailboxId` 或 `address` 释放（按地址时用地址过滤查出 id）；`deleteHistory:true` 永久删除该地址全部邮件 | `DELETE /v1/mailboxes/:id` | `mailbox.write`，按 `address` 另需 `mailbox.read` |
+| `release_mailbox` | 按 `mailboxId` 或 `address` 释放（按地址时用地址与域名过滤分页查找，精确比对到命中或翻完为止）；`deleteHistory:true` 永久删除该地址全部邮件 | `DELETE /v1/mailboxes/:id` | `mailbox.write`，按 `address` 另需 `mailbox.read` |
 | `send_email` | 发信，参数与 REST 发信请求体相同，另有 `idempotencyKey` | `POST /v1/messages` | `mail.send`，带 `replyToMessageId` 或 `forwardAttachmentsFrom` 另需 `mail.read` |
 | `reply_email` | 回复：服务端按原信填收件人、`Re: ` 主题、线程头与引用 | `POST /v1/messages/:id/reply` | `mail.send` 与 `mail.read` |
 | `search_messages` | 列表与搜索，从新到旧，`cursor` 翻页 | `GET /v1/messages` | `mail.read` |
@@ -64,7 +64,7 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 
 成功结果同时放在 `structuredContent`（对象）与 `content[0].text`（同一 JSON 的字符串）里。
 
-- `detailed`：与对应 REST 接口的 `data` 相同；列表包一层（`{mailboxes:[…], nextCursor}`）。`get_message` 返回 `bodyText`、`bodyHtml` 与 5 分钟有效的附件签名链接，`wait_for_message` 命中时带正文（等同 `include=body`）。两者的 `bodyText`、`bodyHtml` 各自最多 100000 字符，超出时截断并带 `bodyTruncated: true` 与 `hint`；完整原文用 `GET /v1/messages/:id/raw` 下载 .eml，附件用 `GET /v1/messages/:id/attachments/:attId`。
+- `detailed`：与对应 REST 接口的 `data` 相同；列表包一层（`{mailboxes:[…], nextCursor}`）。`get_message` 返回 `bodyText`、`bodyHtml` 与 5 分钟有效的附件签名链接，`wait_for_message` 命中时带正文（等同 `include=body`）。两者的 `bodyText`、`bodyHtml` 各自最多 100000 字符，超出时截断并带 `bodyTruncated: true` 与 `hint`。完整正文用 REST `GET /v1/messages/:id` 读取（不截断）；来信（`hasRaw: true`）另可用 `GET /v1/messages/:id/raw` 下载原始 .eml，发出的邮件没有原始存档，`/raw` 返回 404；附件用 `GET /v1/messages/:id/attachments/:attId`。
 - `concise`：只留常用字段，空字段省略。邮件摘要为 `id,direction,address,from,fromName,subject,preview,verificationCode,verificationLink,isRead,hasAttachments,createdAt`，`preview` 最多 200 字符；`get_message` 返回纯文本 `text`（HTML 邮件自动转文本），超过 2000 字符截断并标 `textTruncated: true`，附件只列 `id,filename,mimeType,size`；发信结果为 `id,status,address,subject,recipientOutcomes,errorDetail`。
 
 工具执行失败（权限、参数、业务规则、限流）不会让请求出错，而是返回 `isError: true`：
