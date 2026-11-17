@@ -26,6 +26,7 @@ import { chunk, D1_ID_BATCH, D1_MAX_BOUND_PARAMS, D1_PAIR_BATCH } from '../src/l
 import { asciiFallbackFilename, buildSecureHeaders } from '../src/lib/attachment-security.js';
 import { generateCode, generateTotpSecret, verifyTotp } from '../src/lib/totp.js';
 import { AppError } from '../src/lib/errors.js';
+import { signAttachment, verifyAttachmentSig } from '../src/lib/crypto.js';
 import {
   DEFAULT_PUSHDEER_ENDPOINT,
   sendPushDeerNotification,
@@ -232,9 +233,65 @@ describe('code-extract 正则', () => {
       expect(resolveVerificationCode(subject, preview, '472913', { bodyTruncated: true })).toBe('472913');
     });
 
+    /**
+     * 列表/wait 手里只有 160 字摘要：开头的日期、订单号离主题里的关键词更近，真码在摘要之外，
+     * 一度用摘要里的年份/订单号盖掉收件时按完整正文存下的码。
+     */
+    it.each([
+      ['年份', 'Signed in on November 17, 2026 from a new device.'],
+      ['订单号', 'Order #20261117 is waiting for you to sign in on a new device.'],
+    ])('摘要里的%s不覆盖第 160 字之后的已存验证码', (_name, lead) => {
+      const subject = 'Your verification code';
+      const body = `${lead}\nWe need to confirm it is really you before the checkout can continue, so please enter the code below within ten minutes.\nYour verification code is 482913.`;
+      const preview = makePreview(body, '');
+      expect(body.indexOf('482913')).toBeGreaterThan(PREVIEW_LIMIT);
+      expect(extractCodeByRegex(subject, body)).toBe('482913');
+      // 摘要单独看确实会提出日期或订单里的数字
+      expect(extractCodeByRegex(subject, preview, { bodyTruncated: true })).not.toBe('');
+      expect(resolveVerificationCode(subject, preview, '482913', { bodyTruncated: true })).toBe('482913');
+    });
+
     it('正文超过提码扫描上限时贴着结尾的候选同样不可信', () => {
       expect(extractCodeByRegex('', `你的验证码：${'。'.repeat(CODE_SCAN_BODY_CHARS)}913472`)).toBe('');
     });
+  });
+});
+
+describe('附件签名 URL', () => {
+  const HOUR = 3600;
+  const at = (seconds: number) => vi.spyOn(Date, 'now').mockReturnValue(seconds * 1000);
+
+  it('站内详情的签名按小时对齐：同一小时内 URL 相同，有效期至少 1 小时', async () => {
+    const base = Math.floor(Date.now() / 1000 / HOUR) * HOUR;
+    try {
+      at(base);
+      const first = await signAttachment(SECRET, 42);
+      at(base + HOUR - 1);
+      const last = await signAttachment(SECRET, 42);
+      expect(last).toEqual(first);
+      expect(first.exp).toBe(base + 2 * HOUR);
+      expect(first.exp - (base + HOUR - 1)).toBeGreaterThanOrEqual(HOUR);
+      at(base + HOUR);
+      expect((await signAttachment(SECRET, 42)).exp).toBe(base + 3 * HOUR);
+
+      // 打开详情 6 分钟后（旧版 5 分钟即过期）仍可下载；过了 exp 才失效
+      at(base + HOUR - 1 + 6 * 60);
+      expect(await verifyAttachmentSig(SECRET, 42, first.exp, first.sig)).toBe(true);
+      at(first.exp);
+      expect(await verifyAttachmentSig(SECRET, 42, first.exp, first.sig)).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('显式 TTL（外发 90 天链接）仍从当前时刻起算', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    try {
+      at(now);
+      expect((await signAttachment(SECRET, 42, 90 * 86400)).exp).toBe(now + 90 * 86400);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
 

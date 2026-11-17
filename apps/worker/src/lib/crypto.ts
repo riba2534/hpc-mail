@@ -53,15 +53,23 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
   return constantTimeEqual(encoder.encode(a), encoder.encode(b));
 }
 
-const ATTACHMENT_TTL_SECONDS = 5 * 60;
+/** 站内详情签名的时间桶：exp 对齐到整点 */
+const ATTACHMENT_BUCKET_SECONDS = 60 * 60;
 
-/** 附件签名 URL：HMAC(jwt_secret, `att:{id}.{exp}`)；ttlSeconds 默认 5 分钟（登录用户短期下载），外发转链接传长 TTL */
+/**
+ * 附件签名 URL：HMAC(jwt_secret, `att:{id}.{exp}`)。
+ * 不传 ttlSeconds 时供站内详情（附件与 CID 内联图）：exp 取当前小时之后的第二个整点，有效期 1–2 小时，
+ * 同一小时内重复请求得到相同的 URL，内嵌图的正文 HTML 不随每次刷新变化。外发转链接传长 TTL。
+ */
 export async function signAttachment(
   secret: string,
   attId: number,
-  ttlSeconds: number = ATTACHMENT_TTL_SECONDS,
+  ttlSeconds?: number,
 ): Promise<{ exp: number; sig: string }> {
-  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const now = Math.floor(Date.now() / 1000);
+  const exp = ttlSeconds === undefined
+    ? (Math.floor(now / ATTACHMENT_BUCKET_SECONDS) + 2) * ATTACHMENT_BUCKET_SECONDS
+    : now + ttlSeconds;
   const sig = await hmacSha256Hex(secret, `att:${attId}.${exp}`);
   return { exp, sig };
 }

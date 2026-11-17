@@ -59,6 +59,16 @@ const INTENT_SOURCE = [
 ].join('|');
 const INTENT = new RegExp(INTENT_SOURCE, 'i');
 
+/**
+ * 弱意图：引导句在 to 与动词之间多一个词或用 -ing 形式（"the link below to securely sign in"、
+ * "button to continue signing in"，Claude 安全登录邮件即此类），或提到 secure link。
+ * 只凭弱意图放行时，候选须是按钮文字含动作词、路径/查询带验证特征的链接，营销邮件里的普通链接进不来。
+ */
+const WEAK_INTENT = new RegExp([
+  '\\b(?:link|button)\\s+(?:below\\s+)?to\\s+(?:[a-z]+\\s+)?(?:verify(?:ing)?|confirm(?:ing)?|activat(?:e|ing)|sign(?:ing)?[\\s-]?in|log(?:ging)?[\\s-]?in)\\b',
+  '\\bsecure\\s+(?:(?:sign|log)[\\s-]?in\\s+)?link\\b',
+].join('|'), 'i');
+
 /** URL 路径/查询中的验证特征（不看主机名，避免 login.example.com 首页误判） */
 const URL_KEYWORD = /verif|confirm|activat|magic|log-?in|sign-?in|auth|token|reset/i;
 /** 长随机段：验证链接几乎都带一次性 token */
@@ -256,7 +266,8 @@ function score(occurrence: Occurrence, url: URL, sender: string): number {
 
 /**
  * 从入站邮件中识别最可能的验证/登录链接；没有可信候选返回空串。
- * 整封邮件须先具备验证意图（主题含动作词，或正文含强意图短语），营销邮件导航栏的「登录」不会入选。
+ * 整封邮件须先具备验证意图（主题含动作词，或正文含强意图短语），营销邮件导航栏的「登录」不会入选；
+ * 只有弱意图时另要求按钮文字与链接路径同时带验证特征（见 WEAK_INTENT）。
  */
 export function extractVerificationLink(input: LinkExtractInput): string {
   const subject = input.subject ?? '';
@@ -268,13 +279,15 @@ export function extractVerificationLink(input: LinkExtractInput): string {
   if (occurrences.length === 0) return '';
 
   const body = (text || htmlText).slice(0, INTENT_SCAN_CHARS);
-  if (!ACTION.test(subject) && !INTENT.test(subject) && !INTENT.test(body)) return '';
+  const strong = ACTION.test(subject) || INTENT.test(subject) || INTENT.test(body);
+  if (!strong && !WEAK_INTENT.test(subject) && !WEAK_INTENT.test(body)) return '';
 
   const sender = senderDomain(input.fromAddress);
   let best: { href: string; score: number; order: number } | null = null;
   for (const occurrence of occurrences) {
     const url = acceptUrl(occurrence.raw);
     if (!url) continue;
+    if (!strong && !(ACTION.test(occurrence.label) && URL_KEYWORD.test(decodeSafe(url.pathname + url.search)))) continue;
     const value = score(occurrence, url, sender);
     if (value < ACCEPT_SCORE) continue;
     if (!best || value > best.score || (value === best.score && occurrence.order < best.order)) {
