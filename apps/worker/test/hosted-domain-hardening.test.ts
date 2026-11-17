@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CreatedApiKey, HostedDomain } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
-import { adminAuditLogs, hostedDomainMembers, hostedDomains, mailboxes, messages, users } from '../src/db/schema.js';
+import { adminAuditLogs, hostedDomainMembers, hostedDomains, mailboxes, messages, users, webhookDeliveries, webhookEndpoints } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import {
   CloudflareApiError, deleteZone, getZone, isTransientCloudflareError, type CloudflareCredentials,
@@ -727,5 +727,37 @@ describe('修复轮 A19：重新接入占等待生效额度，并按 pendingDays
     expect(cf.byName(domain)).toBeUndefined();
     expect(await db.select().from(mailboxes).where(eq(mailboxes.domain, domain)).all()).toHaveLength(1);
     expect(await db.select().from(messages).where(eq(messages.domain, domain)).all()).toHaveLength(1);
+  });
+});
+
+describe("修复轮二 A19'：重新接入到期撤回同样发 moved 事件与提醒", () => {
+  it('到期撤回时入队 hosted_domain.moved Webhook，并按个人偏好提醒一次', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const domain = f.domain();
+    cf.ready(f.domain('elsewhere'));
+    await enableNotices(owner.id);
+    await db.insert(webhookEndpoints).values({ userId: owner.id, url: 'https://hooks.example.com/hpc', secret: 'whsec_dGVzdA==',
+      events: ['hosted_domain.moved'], accessRole: 'user' });
+    const row = await seed(cf, owner.id, domain, { status: 'moved', zoneStatus: 'missing', zoneMissingAt: new Date(Date.now() - 3 * DAY) }, { absent: true });
+    expect((await data<HostedDomain>(await call('POST', `/hosted-domains/${row.id}/reconnect`, owner.jwt))).status).toBe('pending');
+    cf.notices.length = 0;
+
+    const longAgo = new Date(Date.now() - 8 * DAY);
+    cf.byName(domain)!.createdOn = longAgo.toISOString();
+    await db.update(hostedDomains).set({ createdAt: longAgo, checkedAt: null }).where(eq(hostedDomains.id, row.id));
+    await syncHostedDomain(runtime, row.id);
+    expect(await rowOf(row.id)).toMatchObject({ status: 'moved', zoneStatus: 'missing' });
+    const queued = await db.select().from(webhookDeliveries).where(eq(webhookDeliveries.userId, owner.id)).all();
+    expect(queued.map((delivery) => delivery.eventType)).toEqual(['hosted_domain.moved']);
+    expect(cf.notices.map((notice) => notice.channel).sort()).toEqual(['feishu', 'pushdeer']);
+    expect(cf.notices[0]!.body).toContain(domain);
+
+    // 之后的巡检不再重复
+    await db.update(hostedDomains).set({ checkedAt: null }).where(eq(hostedDomains.id, row.id));
+    await syncHostedDomain(runtime, row.id);
+    expect(await db.select().from(webhookDeliveries).where(eq(webhookDeliveries.userId, owner.id)).all()).toHaveLength(1);
+    expect(cf.notices).toHaveLength(2);
   });
 });
