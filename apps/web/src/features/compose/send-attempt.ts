@@ -48,7 +48,6 @@ export function classifySendError(error: unknown): SendFailure {
   if (!(error instanceof ApiError)) return 'uncertain';
   if (error.code === 'send_in_progress') return 'in_progress';
   if (error.code === 'idempotency_mismatch') return 'key_mismatch';
-  if (error.code === 'delivery_failed') return 'rejected';
   const uncertain = ['network', 'timeout', 'conflict', 'malformed', 'session_changed'].includes(error.code)
     || error.httpStatus === 408
     || (error.httpStatus !== null && error.httpStatus >= 500);

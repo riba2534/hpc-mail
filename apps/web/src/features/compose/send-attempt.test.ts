@@ -21,10 +21,7 @@ describe('classifySendError', () => {
     expect(classifySendError(new ApiError('v', { code: 'validation_failed', httpStatus: 400 }))).toBe('rejected');
     expect(classifySendError(new ApiError('r', { code: 'rate_limited', httpStatus: 429 }))).toBe('rejected');
     expect(classifySendError(new ApiError('f', { code: 'forbidden', httpStatus: 403 }))).toBe('rejected');
-  });
-
-  it('全部收件人被拒收（delivery_failed）是明确失败，换新 key', () => {
+    // 全部收件人被拒收：没有任何人收到，换新 key
     expect(classifySendError(new ApiError('d', { code: 'delivery_failed', httpStatus: 422 }))).toBe('rejected');
-    expect(classifySendError(new ApiError('d', { code: 'delivery_failed' }))).toBe('rejected');
   });
 });

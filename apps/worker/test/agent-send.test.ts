@@ -6,13 +6,13 @@ import PostalMime from 'postal-mime';
 import { describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
-import { attachments, draftAttachments, mailboxes, messages, users } from '../src/db/schema.js';
+import { attachments, draftAttachments, idempotencyRecords, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import { STALE_OUTBOUND_SQL, markStaleOutbound } from '../src/services/outbound-recovery.js';
 import { injectAttachmentLinks, stripAttachmentLinks } from '../src/services/attachment-links.js';
 import { getMessageDetail, getThread, purgeMessages } from '../src/services/message.js';
 import { sendMail } from '../src/services/outbound.js';
-import { runDraftAttachmentCleanup } from '../src/services/scheduled.js';
+import { runDraftAttachmentCleanup, runScheduled } from '../src/services/scheduled.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
@@ -431,6 +431,17 @@ describe('R23/R36 外发可靠性', () => {
     expect((await db.select().from(messages).where(eq(messages.id, fresh!.id)).get())!.status).toBe('pending');
     const replay = await data<MessageSummary>(await call(runtime, '/v1/messages', json(owner.key, body, headers)));
     expect(replay).toMatchObject({ id: sent.id, status: 'unknown' });
+  });
+
+  it('幂等清理把 unknown 视为终态：绑定 unknown 发件行的 pending 记录过保留期后删除', async () => {
+    const owner = await account('stale-idem-owner');
+    const [row] = await db.insert(messages).values({ direction: 'outbound', address: owner.address, domain: 'hpc.email',
+      status: 'unknown', subject: 'unknown idem', recipients: { to: ['z@example.net'], cc: [], bcc: [] } }).returning();
+    const old = new Date(Date.now() - 3 * 86400_000);
+    await db.insert(idempotencyRecords).values({ actorType: 'user', actorId: owner.id, key: 'unknown-idem', requestHash: 'h',
+      status: 'pending', messageId: row!.id, updatedAt: old, createdAt: old });
+    await runScheduled(env, true);
+    expect(await db.select().from(idempotencyRecords).where(eq(idempotencyRecords.key, 'unknown-idem')).get()).toBeUndefined();
   });
 
   it('cron 查询走 idx_messages_outbound_pending 部分索引', async () => {
