@@ -36,7 +36,7 @@ import { domainsCasSql, invalidateSettingsMemory } from './setting.js';
 import {
   acksOf, backOffCloudflare, cfBudgetGuard, cfBusyError, cfWindow, errorText, evaluateNewZone, evaluateZone, MAX_SYSTEM_DOMAINS,
   noteThrottle, occupancyChecks, occupancyFacts, requireCfCalls, requireCredentials, reserveCfCalls, resolveAccountZone,
-  SYSTEM_DOMAIN_CF_SCOPE, zonesView, type Evaluation,
+  SYSTEM_DOMAIN_CF_SCOPE, throttleSeconds, zonesView, type Evaluation,
 } from './zone-catalog.js';
 
 type OnboardingRow = typeof systemDomainOnboarding.$inferSelect;
@@ -993,6 +993,7 @@ export async function confirmOnboarding(
     await save(run, {});
     if (error instanceof AppError) throw error;
     await noteThrottle(env, error);
+    if (error instanceof BudgetExhausted || throttleSeconds(error) !== null) throw cfBusyError();
     throw new AppError('internal', `读取 Cloudflare 配置失败：${errorText(error)}`);
   }
   run.prepared = ev;
@@ -1021,14 +1022,14 @@ export async function cancelOnboarding(
     WHERE id = ?4 AND state NOT IN ${ONBOARDING_TERMINAL_SQL} RETURNING id`)
     .bind(now, actor.id, req.deleteCreatedZone ? 1 : 0, id).first();
   if (!flagged) throw finished((await loadRow(env, id)).state);
-  if (!row.cancelRequestedAt) {
+  // 首次取消，或改了是否删除 zone，都记审计
+  if (!row.cancelRequestedAt || row.cancelDeleteZone !== req.deleteCreatedZone) {
     await logAdminAction(env, actor, 'system_domain.cancel', row.domain,
       `任务 #${id}${req.deleteCreatedZone ? '；删除本任务创建、从未激活的 zone' : row.zoneId ? '；保留 zone 与已做的配置' : ''}`, ip);
   }
-  const creds = cloudflareCredentials(env);
-  const { lease, overBudget } = await acquireLease(env, id, 'force', req.deleteCreatedZone ? 2 : 0);
-  if (overBudget) throw cfBusyError();
-  if (lease) await drive(newRun(env, creds, lease));
+  // 额度不够或在退避期内时不立即处理：标记已写入，定时任务稍后处理
+  const { lease } = await acquireLease(env, id, 'force', req.deleteCreatedZone ? 2 : 0);
+  if (lease) await drive(newRun(env, cloudflareCredentials(env), lease));
   return getOnboarding(env, id);
 }
 

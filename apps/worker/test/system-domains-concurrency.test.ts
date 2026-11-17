@@ -206,6 +206,23 @@ describe('完成写入与 revision', () => {
     const late = await errorOf(await call('POST', `${BASE}/onboardings/${done.id}/cancel`, admin.jwt, { deleteCreatedZone: false }), 409);
     expect(late.message).toBe('接入已完成，如需停用请在系统域名列表中移除');
   });
+
+  it('完成写入前租约被其他执行者接手：过期的处理器写不进列表，也不把任务置为完成', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain();
+    cf = fakeCloudflare({ zones: [{ name: domain }] });
+    const admin = await actor('cc-admin');
+    const id = await insertTask({ domain, createdBy: admin.id, state: 'finalizing', zoneId: cf.zoneByName(domain)!.id, zoneStatus: 'active' });
+    const racing = beforeStatement(runtime, FINALIZE_CAS, async () => {
+      await env.db.prepare(`UPDATE system_domain_onboarding SET lease_token = 'taken-over', lease_until = ? WHERE id = ?`)
+        .bind(Date.now() + 60_000, id).run();
+    });
+    const before = await systemList();
+    await syncDueOnboarding(racing);
+    expect(await systemList()).toEqual(before);
+    expect(await task(id)).toMatchObject({ state: 'finalizing' });
+    expect((await auditActions(domain)).map((entry) => entry.action)).toEqual([]);
+  });
 });
 
 describe('租约', () => {
