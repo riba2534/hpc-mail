@@ -20,7 +20,7 @@ import { cn } from '@/lib/cn';
 import { AddExternalDomainDialog } from './add-external-domain-dialog';
 import { OnboardConfirmDialog } from './onboard-confirm-dialog';
 import { OnboardingProgress, OnboardingStateBadge, registrarLabel } from './system-domain-meta';
-import { storeOnboarding, systemDomainApi, systemDomainKeys, useSystemDomainZones } from './system-domains-api';
+import { storeOnboarding, systemDomainApi, systemDomainKeys, useActiveOnboardingsPolling, useSystemDomainZones } from './system-domains-api';
 
 const errorMessage = (error: unknown, fallback: string) => (error instanceof ApiError ? error.message : fallback);
 
@@ -174,6 +174,7 @@ export function CloudflareZonesCard() {
   const [busyZone, setBusyZone] = useState<string | null>(null);
   const zonesQuery = useSystemDomainZones(showHidden);
   const view = zonesQuery.data;
+  useActiveOnboardingsPolling(queryClient, view, showHidden);
 
   // 任务从列表里消失（完成或取消）时，上方系统域名列表可能变了
   const activeIds = useRef<Set<number> | null>(null);

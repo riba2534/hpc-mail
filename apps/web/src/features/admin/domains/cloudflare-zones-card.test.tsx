@@ -49,10 +49,11 @@ function renderCard() {
   return { client, ...utils };
 }
 
-function routeGet(zonesView: SystemDomainZonesView, precheck?: SystemDomainPrecheck) {
+function routeGet(zonesView: SystemDomainZonesView, precheck?: SystemDomainPrecheck, active: () => unknown[] = () => []) {
   mocks.get.mockImplementation(async (path: string) => {
     if (path.endsWith('/zones')) return zonesView;
     if (path.endsWith('/precheck')) return precheck;
+    if (path.endsWith('/onboardings')) return active();
     throw new Error(`unexpected ${path}`);
   });
 }
@@ -100,8 +101,9 @@ describe('Cloudflare 中可接入的域名', () => {
 
   it('可直接接入：点一下就创建任务，不弹确认框', async () => {
     const ready = zone('ready.test');
-    routeGet(view([ready]));
-    mocks.post.mockResolvedValue({ id: 7, domain: 'ready.test', mode: 'existing_zone', state: 'configuring', zoneId: ready.zoneId, steps: steps(), errorCode: '', lastError: '', updatedAt: '', nextCheckAt: null, cancelRequested: false });
+    const task = { id: 7, domain: 'ready.test', mode: 'existing_zone', state: 'configuring', zoneId: ready.zoneId, steps: steps(), errorCode: '', lastError: '', updatedAt: '', nextCheckAt: null, cancelRequested: false };
+    routeGet(view([ready]), undefined, () => [task]);
+    mocks.post.mockResolvedValue(task);
     const { client } = renderCard();
     fireEvent.click(await screen.findByRole('button', { name: '接入 ready.test' }));
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/admin/system-domains/onboardings', { mode: 'existing_zone', zoneId: ready.zoneId }, expect.anything()));
@@ -178,6 +180,20 @@ describe('Cloudflare 中可接入的域名', () => {
     expect(screen.getByText('new.test')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '重试' }));
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/admin/system-domains/onboardings/3/check', undefined, expect.anything()));
+    client.clear();
+  });
+
+  it('有进行中的任务时只轮询只读 D1 的任务列表并就地合并；任务结束才重拉可接入列表', async () => {
+    const running = { id: 21, domain: 'run.test', mode: 'existing_zone' as const, state: 'configuring' as const, steps: steps(), errorCode: '', lastError: '', updatedAt: '', nextCheckAt: null, cancelRequested: false };
+    let active: unknown[] = [{ ...running, state: 'blocked', zoneId: 'z', lastError: '本站 Cloudflare Token 缺少 DNS: Edit 权限' }];
+    routeGet(view([zone('run.test', { category: 'onboarding', readiness: null, onboarding: running })]), undefined, () => active);
+    const { client } = renderCard();
+    expect(await screen.findByText('本站 Cloudflare Token 缺少 DNS: Edit 权限')).toBeInTheDocument();
+    const zoneCalls = () => mocks.get.mock.calls.filter(([path]) => String(path).endsWith('/zones')).length;
+    expect(zoneCalls()).toBe(1);
+    active = [];
+    await client.refetchQueries({ queryKey: ['admin', 'system-domain-onboardings', 'active'] });
+    await waitFor(() => expect(zoneCalls()).toBe(2));
     client.clear();
   });
 

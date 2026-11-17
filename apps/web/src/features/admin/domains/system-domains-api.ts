@@ -19,6 +19,7 @@ export const systemDomainKeys = {
   zonesRoot: ['admin', 'system-domain-zones'] as const,
   zones: (hidden: boolean) => ['admin', 'system-domain-zones', hidden] as const,
   onboarding: (id: number) => ['admin', 'system-domain-onboarding', id] as const,
+  activeOnboardings: ['admin', 'system-domain-onboardings', 'active'] as const,
 };
 
 /** 预检、接入与检测会同步调用 Cloudflare，给足时间 */
@@ -69,14 +70,57 @@ export function activeStatesOf(view: SystemDomainZonesView | undefined): SystemD
   return tasks.map((task) => task.state);
 }
 
+/**
+ * 可接入列表本身不轮询：它要读 Cloudflare 的 zone 列表并做就绪预检，服务端缓存过期后每次都会重新调用 Cloudflare。
+ * 行内进度改由 useActiveOnboardingsPolling 轮询只读 D1 的进行中任务列表。
+ */
 export function useSystemDomainZones(hidden: boolean) {
   return useQuery({
     queryKey: systemDomainKeys.zones(hidden),
     queryFn: () => systemDomainApi.zones(hidden),
-    staleTime: 30_000,
+    staleTime: 60_000,
     retry: false,
-    refetchInterval: (query) => pollIntervalFor(activeStatesOf(query.state.data)),
   });
+}
+
+/**
+ * 有进行中的任务时轮询 GET /onboardings?active=1（只读 D1），把最新摘要就地合进可接入列表；
+ * 某个任务不再进行中（完成、取消或失败）时才重拉一次可接入列表，让该行移走。
+ */
+export function useActiveOnboardingsPolling(client: QueryClient, view: SystemDomainZonesView | undefined, hidden: boolean) {
+  const states = activeStatesOf(view);
+  const query = useQuery({
+    queryKey: systemDomainKeys.activeOnboardings,
+    queryFn: async () => {
+      const tasks = await systemDomainApi.list(true);
+      mergeActiveTasks(client, hidden, tasks.map(summaryOf));
+      return tasks;
+    },
+    enabled: states.length > 0,
+    retry: false,
+    refetchInterval: (current) => pollIntervalFor(current.state.data ? current.state.data.map((task) => task.state) : states),
+  });
+  return query;
+}
+
+/** 合并进行中任务的最新摘要；视图里有任务已不在进行中时重拉可接入列表 */
+function mergeActiveTasks(client: QueryClient, hidden: boolean, tasks: SystemDomainOnboardingSummary[]): void {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  let finished = false;
+  client.setQueryData<SystemDomainZonesView>(systemDomainKeys.zones(hidden), (view) => {
+    if (!view) return view;
+    const pick = (task: SystemDomainOnboardingSummary) => {
+      const fresh = byId.get(task.id);
+      if (!fresh) finished = true;
+      return fresh ?? task;
+    };
+    return {
+      ...view,
+      zones: view.zones.map((zone) => (zone.onboarding ? { ...zone, onboarding: pick(zone.onboarding) } : zone)),
+      unlistedTasks: view.unlistedTasks.map(pick),
+    };
+  });
+  if (finished) void client.invalidateQueries({ queryKey: systemDomainKeys.zonesRoot });
 }
 
 export function useSystemDomainOnboarding(id: number) {
