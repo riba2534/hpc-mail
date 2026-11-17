@@ -883,7 +883,6 @@ export async function loadAttachmentForViewer(
   return att;
 }
 
-/** 签名 URL 下载：所属邮件须仍在且不在回收站，删除或移入回收站后已签出的 URL 随即失效 */
 export async function loadAttachmentById(
   env: Env,
   attId: number,
@@ -891,9 +890,6 @@ export async function loadAttachmentById(
   const db = createDb(env);
   const att = await db.select().from(attachmentsTable).where(eq(attachmentsTable.id, attId)).get();
   if (!att) throw new AppError('not_found', '附件不存在');
-  const live = await db.select({ id: messages.id }).from(messages)
-    .where(and(eq(messages.id, att.messageId), isNull(messages.deletedAt))).get();
-  if (!live) throw new AppError('not_found', '附件不存在');
   return att;
 }
 

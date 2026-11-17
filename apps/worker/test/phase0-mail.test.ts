@@ -9,7 +9,7 @@ import { createDb } from '../src/db/client.js';
 import { attachments, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import { handleInbound } from '../src/services/inbound.js';
-import { deleteMessages, findNextMessage, getMessageDetail, restoreMessages } from '../src/services/message.js';
+import { deleteMessages, findNextMessage, getMessageDetail } from '../src/services/message.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 
@@ -310,18 +310,16 @@ describe('R05 站内详情签名 URL 与 JWT 附件下载', () => {
     expect(expOf(api.attachments[0]!.url) - now).toBeGreaterThanOrEqual(3600 - 1);
   });
 
-  it('邮件移入回收站后已签出的 URL 失效，恢复后在有效期内重新可用', async () => {
+  it('回收站里的邮件打开详情，内嵌图的签名 URL 仍可用', async () => {
     await baseSettings();
-    const owner = await account('f8-trash');
+    const owner = await account('trash-inline');
     const viewer = { userId: owner.id, role: 'user' as const };
-    const id = await mail(owner.address, { subject: 'Signed attachment' });
-    await attach(id, 'signed.txt');
-    const url = (await getMessageDetail(env, viewer, id)).attachments[0]!.url;
-    expect((await request(url)).status).toBe(200);
+    const id = await mail(owner.address, { subject: 'Inline in trash', bodyHtml: '<img src="cid:trash-logo">' });
+    await attach(id, 'logo.png', { contentId: 'trash-logo', disposition: 'inline' });
     expect(await deleteMessages(env, viewer, [id])).toBe(1);
-    expect(await errorOf(await request(url), 404)).toBe('not_found');
-    expect(await restoreMessages(env, viewer, [id])).toBe(1);
-    expect((await request(url)).status).toBe(200);
+    const detail = await getMessageDetail(env, viewer, id);
+    expect(detail.bodyHtml).toBe(`<img src="${detail.attachments[0]!.url}">`);
+    expect((await request(detail.attachments[0]!.url)).status).toBe(200);
   });
 
   it('JWT 下载与详情同一可见范围：管理员带 scope=user 审计他人附件，普通用户不能用 scope=user，非法 scope 显式拒绝', async () => {
