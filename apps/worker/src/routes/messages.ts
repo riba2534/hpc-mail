@@ -1,10 +1,11 @@
 import {
+  apiMarkReadRequestSchema,
   deleteMessagesRequestSchema,
   listMessagesQuerySchema,
-  markReadRequestSchema,
   markAllReadRequestSchema,
   starMessagesRequestSchema,
   translateMessageRequestSchema,
+  type MarkReadResult,
   type MessageListPage,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
@@ -72,10 +73,15 @@ app.post('/send', (c) => {
   return handleSend(c, { type: 'user', id: user.id }, { userId: user.id, role: user.role });
 });
 
+/** includeUnread：个人视图顺带返回标记后的未读数（与 GET /unread-count 同口径），详情页省掉一次未读数请求 */
 app.post('/read', async (c) => {
-  const req = await parseBody(c, markReadRequestSchema);
-  const changed = await markMessages(c.env, mutationViewerOf(c, req.scope), req.ids, req.isRead);
-  return ok(c, { changed });
+  const req = await parseBody(c, apiMarkReadRequestSchema);
+  const viewer = mutationViewerOf(c, req.scope);
+  const result: MarkReadResult = { changed: await markMessages(c.env, viewer, req.ids, req.isRead) };
+  if (req.includeUnread && (viewer.scope === undefined || viewer.scope === 'mine')) {
+    result.unread = await countUnread(c.env, viewer.userId, viewer.role, UNREAD_COUNT_CAP);
+  }
+  return ok(c, result);
 });
 
 /**

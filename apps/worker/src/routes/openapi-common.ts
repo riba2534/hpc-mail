@@ -1,7 +1,7 @@
 import {
   API_SCOPES, ERROR_CODES, MAX_BATCH_CLAIM, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
   SETTING_SCHEMAS, batchMailboxRequestSchema, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
-  internalSendMailSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
+  internalSendMailSchema, apiMarkReadRequestSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, userMailboxPolicySchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
@@ -349,7 +349,14 @@ export const schemas: Record<string, Schema> = {
   SendMailRequest: send, MailAddress: mailAddress,
   ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
-  MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
+  MarkReadRequest: fromZod(markReadRequestSchema),
+  ApiMarkReadRequest: (() => {
+    const schema = fromZod(apiMarkReadRequestSchema);
+    (schema.properties as Record<string, Schema>).includeUnread = { ...(schema.properties as Record<string, Schema>).includeUnread,
+      description: 'true: in the caller’s own view (no scope or scope=mine) the response also carries unread, the same capped count as GET /messages/unread-count after this change.' };
+    return schema;
+  })(),
+  MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
   MarkAllReadRequest: (() => {
     const schema = fromZod(markAllReadRequestSchema);
     schema.description = 'All fields optional; {} or an empty body marks every unread, non-trash inbound message in the caller’s own claimed mailboxes. domain/address/q narrow the range; q uses the list search semantics (case-insensitive substring of subject, sender address/name, text body, recipients). Mail shared with the caller is never changed. Administrators use scope=unclaimed for unclaimed addresses. Unknown fields are ignored.';

@@ -508,6 +508,21 @@ export const markReadRequestSchema = z.object({
 });
 export type MarkReadRequest = z.infer<typeof markReadRequestSchema>;
 
+/**
+ * /api（网页会话）专用：includeUnread=true 且是个人视图时，响应带回标记后的未读数（与 GET /api/messages/unread-count
+ * 同口径、同封顶），详情页标已读后不必再请求一次未读数。/v1 的 /read 仍用 markReadRequestSchema，契约不变。
+ */
+export const apiMarkReadRequestSchema = markReadRequestSchema.extend({
+  includeUnread: z.boolean().optional(),
+});
+export type ApiMarkReadRequest = z.infer<typeof apiMarkReadRequestSchema>;
+
+export interface MarkReadResult {
+  changed: number;
+  /** 仅 /api 请求带 includeUnread=true 且为个人视图时返回 */
+  unread?: number;
+}
+
 export const deleteMessagesRequestSchema = z.object({
   ids: z.array(z.number().int().positive()).min(1).max(500),
   scope: mutationScopeSchema,
