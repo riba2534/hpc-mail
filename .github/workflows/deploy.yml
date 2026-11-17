@@ -221,6 +221,20 @@ jobs:
           node apps/worker/scripts/seed-admin.mjs
           node apps/worker/scripts/seed-smoke.mjs
 
+      # 冒烟账号密码与运维端点令牌都由 JWT_SECRET 派生（公式见 seed-smoke.mjs 与 services/ops-probe.ts），
+      # 只把屏蔽后的派生值交给后续步骤，验证步骤不再接触 JWT_SECRET
+      - name: 派生冒烟密码与探针令牌
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          derive() { printf '%s' "$1" | openssl dgst -sha256 -hmac "$JWT_SECRET" -hex | awk '{print $NF}'; }
+          smoke_password=$(derive ci-smoke-password-v1 | cut -c1-32)
+          canary_token=$(derive hpc-canary-v1)
+          echo "::add-mask::$smoke_password"
+          echo "::add-mask::$canary_token"
+          { echo "SMOKE_PASSWORD=$smoke_password"; echo "CANARY_TOKEN=$canary_token"; } >> "$GITHUB_ENV"
+
       # secrets 随代码进同一个版本：部署后逐个 secret put 会各自生成新版本，回滚目标随之失真
       - name: 部署 Worker（代码与 secrets 同一版本）
         id: deploy
@@ -266,15 +280,7 @@ jobs:
         env:
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        run: |
-          set -euo pipefail
-          # 冒烟账号 ci-smoke 的密码由 JWT_SECRET 派生（与 seed-smoke.mjs 同一公式），只把派生值交给脚本
-          SMOKE_PASSWORD=$(printf '%s' 'ci-smoke-password-v1' | openssl dgst -sha256 -hmac "$JWT_SECRET" -hex | awk '{print $NF}' | cut -c1-32)
-          echo "::add-mask::$SMOKE_PASSWORD"
-          export SMOKE_PASSWORD
-          unset JWT_SECRET
-          bash scripts/smoke.sh
+        run: bash scripts/smoke.sh
 
       # 金丝雀信经 send_email 真实外发，走 MX → Email Routing → email handler；
       # Workers Free 计划只能发往已验证地址，可设 Variable DEPLOY_CANARY=off 跳过
@@ -283,7 +289,6 @@ jobs:
         working-directory: apps/worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
           DEPLOY_CANARY: ${{ vars.DEPLOY_CANARY }}
@@ -291,10 +296,6 @@ jobs:
           CANARY_TO_DOMAIN: ${{ vars.CANARY_TO_DOMAIN }}
         run: |
           set -euo pipefail
-          CANARY_TOKEN=$(printf '%s' 'hpc-canary-v1' | openssl dgst -sha256 -hmac "$JWT_SECRET" -hex | awk '{print $NF}')
-          echo "::add-mask::$CANARY_TOKEN"
-          export CANARY_TOKEN
-          unset JWT_SECRET
           # 全新部署还没有系统域名时金丝雀无处可发，跳过（合法状态）
           if [ "${DEPLOY_CANARY:-}" != "off" ]; then
             SYSTEM_DOMAIN_COUNT=$(npx wrangler d1 execute "$D1_NAME" --remote --json --command \
@@ -307,16 +308,9 @@ jobs:
       - name: 等待新版本的 cron 心跳
         id: heartbeat
         env:
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          CANARY_TOKEN=$(printf '%s' 'hpc-canary-v1' | openssl dgst -sha256 -hmac "$JWT_SECRET" -hex | awk '{print $NF}')
-          echo "::add-mask::$CANARY_TOKEN"
-          export CANARY_TOKEN
-          unset JWT_SECRET
-          HEARTBEAT_TIMEOUT=420 PROBE_POLL_INTERVAL=15 bash scripts/deploy-probe.sh heartbeat
+        run: HEARTBEAT_TIMEOUT=420 PROBE_POLL_INTERVAL=15 bash scripts/deploy-probe.sh heartbeat
 
       # 发布之后（含发布步骤本身）任一步骤失败：Worker 回到部署前版本；迁移不回滚
       - name: 失败自动回滚 Worker
@@ -328,20 +322,16 @@ jobs:
           PREVIOUS_BUILD: ${{ steps.baseline.outputs.build }}
           BASE_URL: https://${{ vars.CUSTOM_DOMAIN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          OUTCOMES: |
-            部署 Worker=${{ steps.deploy.outcome }}
-            等待新版本全球生效=${{ steps.propagate.outcome }}
-            线上冒烟=${{ steps.smoke.outcome }}
-            收件金丝雀=${{ steps.canary.outcome }}
-            cron 心跳=${{ steps.heartbeat.outcome }}
         run: |
           set -euo pipefail
           summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
-          summary '## 部署失败：自动回滚' '' '| 步骤 | 结果 |' '| --- | --- |'
-          while IFS='=' read -r name outcome; do
-            [ -z "$name" ] || summary "| $name | $outcome |"
-          done <<< "$OUTCOMES"
-          summary ''
+          # outcome 只会是 success/failure/cancelled/skipped，直接展开进表格
+          summary '## 部署失败：自动回滚' '' '| 步骤 | 结果 |' '| --- | --- |' \
+            '| 部署 Worker | ${{ steps.deploy.outcome }} |' \
+            '| 等待新版本全球生效 | ${{ steps.propagate.outcome }} |' \
+            '| 线上冒烟 | ${{ steps.smoke.outcome }} |' \
+            '| 收件金丝雀 | ${{ steps.canary.outcome }} |' \
+            '| cron 心跳 | ${{ steps.heartbeat.outcome }} |' ''
           if [ -z "$ROLLBACK_VERSION_ID" ]; then
             summary '部署前没有线上版本（首次部署），无可回滚目标；新版本保持在线，请按上表排查。'
             echo '::warning::首次部署失败，没有可回滚的版本'

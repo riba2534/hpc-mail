@@ -1,4 +1,3 @@
-import type { ApiErrorBody } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { bytesToHex } from '../lib/crypto.js';
 import { normalizeDomain } from '../lib/email-address.js';
@@ -59,10 +58,7 @@ app.post('/canary', async (c) => {
   try {
     await sendCanaryMail(c.env, from, to, nonce);
   } catch (error) {
-    const message = `金丝雀外发失败: ${error instanceof Error ? error.message : String(error)}`;
-    console.error(JSON.stringify({ level: 'error', requestId: c.get('requestId'), operation: 'POST /api/internal/canary', message }));
-    const body: ApiErrorBody = { error: { code: 'internal', message }, requestId: c.get('requestId') };
-    return c.json(body, 502);
+    throw new AppError('internal', `金丝雀外发失败: ${error instanceof Error ? error.message : String(error)}`, 502);
   }
   return ok(c, { nonce, from, to, build: buildId(c.env), sentAt: new Date().toISOString() });
 });

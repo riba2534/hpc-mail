@@ -48,7 +48,8 @@ for (const file of walk(srcDir).filter((f) => /\.[cm]?[jt]sx?$/.test(f) && !/\.d
 const migrations = readdirSync(migrationsDir).filter((f) => f.endsWith('.sql')).sort();
 const violations = [];
 const indexes = new Set();
-const drops = [];
+/** 被删除、且之后的迁移没有重建的索引：名字 → 删除它的迁移 */
+const dropped = new Map();
 for (const [order, file] of migrations.entries()) {
   const sql = stripComments(readFileSync(join(migrationsDir, file), 'utf8'));
   if (/__new_messages\b/.test(sql)) {
@@ -57,20 +58,18 @@ for (const [order, file] of migrations.entries()) {
   // 按语句顺序重放索引的增删
   for (const m of sql.matchAll(new RegExp(`\\b(CREATE\\s+(?:UNIQUE\\s+)?INDEX(?:\\s+IF\\s+NOT\\s+EXISTS)?|DROP\\s+INDEX(?:\\s+IF\\s+EXISTS)?)\\s+${NAME}`, 'gi'))) {
     const name = m[2];
-    if (/^CREATE/i.test(m[1])) indexes.add(name);
-    else {
+    if (/^CREATE/i.test(m[1])) {
+      indexes.add(name);
+      // 之后的迁移重建了同名索引：那次删除已成历史，当前引用的是新建的这个（同一迁移里删了再建不算）
+      if (dropped.get(name)?.order < order) dropped.delete(name);
+    } else {
       indexes.delete(name);
-      drops.push({ order, file, name });
+      dropped.set(name, { order, file });
     }
   }
 }
-for (const { order, file, name } of drops) {
-  if (!referenced.has(name)) continue;
-  // 之后的迁移重新建了同名索引，说明这是历史上的删除、当前引用的是新建的那一个
-  const recreated = migrations.slice(order + 1).some((later) =>
-    new RegExp(`CREATE\\s+(?:UNIQUE\\s+)?INDEX(?:\\s+IF\\s+NOT\\s+EXISTS)?\\s+\`?"?${name}"?\`?\\s`, 'i')
-      .test(stripComments(readFileSync(join(migrationsDir, later), 'utf8'))));
-  if (!recreated) {
+for (const [name, { file }] of dropped) {
+  if (referenced.has(name)) {
     violations.push(`${file}：DROP INDEX ${name}，但 ${referenced.get(name)} 仍用 INDEXED BY 引用它（迁移先于代码上线，旧代码会直接报错）`);
   }
 }

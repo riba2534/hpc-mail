@@ -6,15 +6,15 @@
 #   部署流程由 apps/worker/scripts/seed-smoke.mjs 创建该账号。
 # 管理员开了两步验证时登录返回 totp_required，管理员专属检查跳过（打印 notice，不算失败），
 #   普通用户检查照常由冒烟账号完成。
-# 可选：SMOKE_USERNAME（默认 ci-smoke）、SMOKE_ASSET_RETRIES（默认 5）、SMOKE_ASSET_RETRY_INTERVAL（默认 10 秒）
+# 可选：SMOKE_ASSET_RETRY_INTERVAL（静态资源重试间隔，默认 10 秒）
 set -euo pipefail
 
 : "${BASE_URL:?需要 BASE_URL}"
 : "${ADMIN_USERNAME:?需要 ADMIN_USERNAME}"
 : "${ADMIN_PASSWORD:?需要 ADMIN_PASSWORD}"
 : "${SMOKE_PASSWORD:?需要 SMOKE_PASSWORD（冒烟账号密码）}"
-SMOKE_USERNAME=${SMOKE_USERNAME:-ci-smoke}
-ASSET_RETRIES=${SMOKE_ASSET_RETRIES:-5}
+SMOKE_USERNAME=ci-smoke
+ASSET_RETRIES=5
 ASSET_RETRY_INTERVAL=${SMOKE_ASSET_RETRY_INTERVAL:-10}
 
 PASS=0
@@ -46,6 +46,17 @@ assert_logout() {
   code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/api/auth/me" -H "Authorization: Bearer $token")
   [ "$code" = "401" ] || fail "$2 登出后 me 返回 $code（期望 401）"
 }
+
+# check_me <token> <角色> <用户名> <称呼>：校验身份且无密码字段泄漏，结果写入 ME
+check_me() {
+  ME=$(curl -sS "$BASE_URL/api/auth/me" -H "Authorization: Bearer $1")
+  [ "$(jq -r '.data.role' <<< "$ME")" = "$2" ] || fail "$4 role != $2: $ME"
+  [ "$(jq -r '.data.username' <<< "$ME")" = "$3" ] || fail "$4 username 不符: $ME"
+  grep -qi 'password' <<< "$ME" && fail "me 响应疑似泄漏密码字段" || true
+}
+
+# 站点强制两步验证而 ME 对应的账号尚未绑定
+needs_2fa_setup() { [ "$require2fa" = "true" ] && [ "$(jq -r '.data.twoFactorEnabled' <<< "$ME")" != "true" ]; }
 
 # ---------- 公开端点 ----------
 
@@ -89,10 +100,12 @@ echo "$config" | jq -e '.data.domains | type == "array"' >/dev/null || fail "dom
 require2fa=$(echo "$config" | jq -r '.data.require2fa // false')
 
 step "OpenAPI 可读"
-curl -fsS "$BASE_URL/v1/openapi.json" | jq -e '.openapi == "3.1.0"' >/dev/null || fail "OpenAPI 结构异常"
+v1_openapi=$(curl -fsS "$BASE_URL/v1/openapi.json") || fail "/v1/openapi.json 不可读"
+session_openapi=$(curl -fsS "$BASE_URL/api/openapi.json") || fail "/api/openapi.json 不可读"
+jq -e '.openapi == "3.1.0"' <<< "$v1_openapi" >/dev/null || fail "OpenAPI 结构异常"
 
 step "Agent 技能与会话 API 可发现"
-curl -fsS "$BASE_URL/api/openapi.json" | jq -e '.openapi == "3.1.0" and (.paths["/auth/login"].post.requestBody != null) and (.paths["/admin/settings"].put != null)' >/dev/null || fail "会话 OpenAPI 缺少认证或管理员能力"
+jq -e '.openapi == "3.1.0" and (.paths["/auth/login"].post.requestBody != null) and (.paths["/admin/settings"].put != null)' <<< "$session_openapi" >/dev/null || fail "会话 OpenAPI 缺少认证或管理员能力"
 agent_skill=$(curl -fsS "$BASE_URL/skill.md")
 grep -q '^name: hpc-mail$' <<< "$agent_skill" || fail "Agent 技能元数据缺失"
 agent_index=$(curl -fsS "$BASE_URL/llms.txt")
@@ -106,14 +119,14 @@ missing_document=$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$BAS
 
 step "认领、过户、邮箱权限与共享的机器契约"
 for namespace in api v1; do
-  curl -fsS "$BASE_URL/$namespace/openapi.json" | jq -e '
+  [ "$namespace" = api ] && spec=$session_openapi || spec=$v1_openapi
+  jq -e '
     .components.schemas.ClaimMailboxRequest.properties.strategy.enum == ["uniform", "claude"] and
     (.components.schemas.ClaimMailboxRequest.required | index("strategy") == null) and
     any(.paths["/mailboxes/availability"].get.parameters[]; .name == "strategy" and .schema.enum == ["uniform", "claude"]) and
     (.components.schemas.MailboxAvailability.properties.reason.enum | index("claude_suspended") != null)
-  ' >/dev/null || fail "$namespace Claude 认领契约缺失"
+  ' <<< "$spec" >/dev/null || fail "$namespace Claude 认领契约缺失"
 done
-session_openapi=$(curl -fsS "$BASE_URL/api/openapi.json")
 jq -e '
   .paths["/admin/mailboxes/{id}/transfer"].post["x-required-role"] == "admin" and
   .paths["/admin/users/search"].get["x-required-role"] == "admin" and
@@ -157,19 +170,16 @@ echo "$v1" | head -1 | jq -e '.requestId' >/dev/null || fail "/v1 错误体缺 r
 # ---------- 冒烟账号（普通用户） ----------
 
 user_checks() {
-  local me list domains
+  local list domains
   step "冒烟账号 $SMOKE_USERNAME 真实登录"
   login "$SMOKE_USERNAME" "$SMOKE_PASSWORD"
   USER_TOKEN=$(jq -r '.data.token // empty' <<< "$LOGIN_BODY" 2>/dev/null || true)
   [ -n "$USER_TOKEN" ] || fail "冒烟账号登录失败（部署流程的 seed-smoke.mjs 负责创建）: HTTP $LOGIN_STATUS $LOGIN_BODY"
 
   step "冒烟账号为普通用户且无密码字段泄漏"
-  me=$(curl -fsS "$BASE_URL/api/auth/me" -H "Authorization: Bearer $USER_TOKEN")
-  [ "$(echo "$me" | jq -r '.data.role')" = "user" ] || fail "冒烟账号 role != user: $me"
-  [ "$(echo "$me" | jq -r '.data.username')" = "$SMOKE_USERNAME" ] || fail "冒烟账号 username 不符: $me"
-  echo "$me" | grep -qi 'password' && fail "me 响应疑似泄漏密码字段" || true
+  check_me "$USER_TOKEN" user "$SMOKE_USERNAME" 冒烟账号
 
-  if [ "$require2fa" = "true" ] && [ "$(echo "$me" | jq -r '.data.twoFactorEnabled')" != "true" ]; then
+  if needs_2fa_setup; then
     step "强制两步验证拦截未绑定账号"
     gated=$(curl -sS -w '\n%{http_code}' "$BASE_URL/api/messages?limit=1" -H "Authorization: Bearer $USER_TOKEN")
     [ "$(echo "$gated" | tail -1)" = "403" ] || fail "require2fa 开启时未绑定账号未被拦截"
@@ -200,14 +210,11 @@ user_checks() {
 # ---------- 管理员（未开两步验证时） ----------
 
 admin_checks() {
-  local me list domains first_domain dlist settings claude_stats claude_plan claude_probe suspended_domain
+  local list domains first_domain dlist settings claude_stats claude_plan claude_probe suspended_domain
   local zero_domain zero_availability fresh_claude_stats message_id admin_id transfer_input invalid_transfer
   step "当前用户为 admin 且无密码字段泄漏"
-  me=$(curl -sS "$BASE_URL/api/auth/me" -H "Authorization: Bearer $ADMIN_TOKEN")
-  [ "$(echo "$me" | jq -r '.data.role')" = "admin" ] || fail "role != admin: $me"
-  [ "$(echo "$me" | jq -r '.data.username')" = "$ADMIN_USERNAME" ] || fail "username 不符: $me"
-  echo "$me" | grep -qi 'password' && fail "me 响应疑似泄漏密码字段" || true
-  if [ "$require2fa" = "true" ] && [ "$(echo "$me" | jq -r '.data.twoFactorEnabled')" != "true" ]; then
+  check_me "$ADMIN_TOKEN" admin "$ADMIN_USERNAME" 管理员
+  if needs_2fa_setup; then
     # 站点要求两步验证而管理员还没绑定：管理员自己也会被拦，属于配置问题而非本次发布引入
     echo "::warning::站点开启了强制两步验证但管理员尚未绑定，跳过其余管理员检查"
     step "管理员登出后旧 token 失效"
@@ -286,7 +293,7 @@ admin_checks() {
   fi
 
   step "管理员用户搜索和邮箱过户"
-  admin_id=$(echo "$me" | jq -r '.data.id')
+  admin_id=$(jq -r '.data.id' <<< "$ME")
   curl -fsS --get "$BASE_URL/api/admin/users/search" --data-urlencode "q=$ADMIN_USERNAME" \
     -H "Authorization: Bearer $ADMIN_TOKEN" | jq --argjson userId "$admin_id" -e '
       .data.items[0].id == $userId and (.data.items | length) <= 20 and
@@ -330,11 +337,9 @@ admin_checks() {
 step "管理员真实登录"
 login "$ADMIN_USERNAME" "$ADMIN_PASSWORD"
 ADMIN_TOKEN=$(jq -r '.data.token // empty' <<< "$LOGIN_BODY" 2>/dev/null || true)
-admin_totp=false
 if [ -z "$ADMIN_TOKEN" ]; then
   # totp_required 只在密码正确后返回，说明管理员凭据有效、只是开了两步验证
   if [ "$LOGIN_STATUS" = "401" ] && jq -e '.error.code == "totp_required"' <<< "$LOGIN_BODY" >/dev/null 2>&1; then
-    admin_totp=true
     echo "::notice::管理员已开启两步验证（totp_required），跳过管理员专属检查；普通用户检查由 $SMOKE_USERNAME 完成"
   else
     fail "管理员登录未返回 token: HTTP $LOGIN_STATUS $LOGIN_BODY"
@@ -343,6 +348,7 @@ fi
 
 user_checks
 
-[ "$admin_totp" = "true" ] || admin_checks
+# 走到这里时管理员令牌为空只可能是 totp_required
+[ -z "$ADMIN_TOKEN" ] || admin_checks
 
 echo "冒烟全部通过（$PASS 项）"

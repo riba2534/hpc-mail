@@ -62,9 +62,8 @@ probe_canary() {
     summary '- 收件金丝雀：尚未配置系统域名，已跳过'
     return 0
   fi
-  local started=$SECONDS deadline=$((SECONDS + CANARY_TIMEOUT)) sends=0 received build
+  local started=$SECONDS deadline=$((SECONDS + CANARY_TIMEOUT)) sends=1 received build
   send_canary
-  sends=1
   while :; do
     sleep "$POLL_INTERVAL"
     internal "/api/internal/canary/$nonce"
@@ -91,7 +90,7 @@ probe_canary() {
 }
 
 probe_heartbeat() {
-  local started=$SECONDS deadline=$((SECONDS + HEARTBEAT_TIMEOUT)) cron_build
+  local started=$SECONDS deadline=$((SECONDS + HEARTBEAT_TIMEOUT)) cron_build failed_steps
   while :; do
     internal /api/internal/health
     [ "$HTTP_STATUS" != "404" ] || fail "健康端点返回 404：令牌与线上 jwt_secret 不符，或线上版本还没有该端点"
@@ -101,8 +100,9 @@ probe_heartbeat() {
       summary "- cron 心跳：新版本已运行（$(field '.data.cron.at')，cron \`$(field '.data.cron.cron')\`）"
       if [ "$(field '.data.cron.ok')" != "true" ]; then
         # 失败步骤多为外部依赖（如 Cloudflare API）抖动，不判定发布失败，只提示人工跟进
-        echo "::warning::新版本 cron 有失败步骤：$(jq -r '.data.cron.failedSteps // [] | join(", ")' <<< "$HTTP_BODY")"
-        summary "  - 失败步骤：$(jq -r '.data.cron.failedSteps // [] | join(", ")' <<< "$HTTP_BODY")"
+        failed_steps=$(field '(.data.cron.failedSteps // []) | join(", ")')
+        echo "::warning::新版本 cron 有失败步骤：$failed_steps"
+        summary "  - 失败步骤：$failed_steps"
       fi
       return 0
     fi
