@@ -108,6 +108,26 @@ export function isTranslationReady(settings: Pick<Settings, 'translation' | 'ai_
   return settings.translation.enabled && isAiModelConfigured(settings.ai_model);
 }
 
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * apiKey 为 SECRET_MASK 表示沿用已存密钥，只能发往原来的接口：baseUrl 换了源（协议、主机或端口）时
+ * 必须重新填写，否则管理员会话失窃后改个地址就能把已存密钥外带出去（清空地址不会发出密钥，允许）。保存设置与测试接口共用。
+ */
+export function resolveMaskedAiKey(saved: Settings['ai_model'], baseUrl: string, apiKey: string): string {
+  if (apiKey !== SECRET_MASK) return apiKey;
+  if (saved.apiKey && baseUrl && originOf(baseUrl) !== originOf(saved.baseUrl)) {
+    throw new AppError('validation_failed', '接口地址已更换，请重新填写 API Key');
+  }
+  return saved.apiKey;
+}
+
 /** domains 的 CAS 没有写入：区分「被用户托管」和「revision 已变化」，给出可操作的原因 */
 async function domainsWriteConflict(env: Env, listed: string): Promise<AppError> {
   const hosted = await env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))')
@@ -134,8 +154,9 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     if (!parsed.success) throw new AppError('validation_failed', '配置格式非法');
     if (key === 'ai_model') {
       const value = parsed.data as Settings['ai_model'];
-      // 提交 SECRET_MASK 表示保留已存 apiKey
-      next.ai_model = { ...value, apiKey: value.apiKey === SECRET_MASK ? (await loadCurrent()).ai_model.apiKey : value.apiKey };
+      // 提交 SECRET_MASK 表示保留已存 apiKey（接口地址的源不变时）
+      const apiKey = value.apiKey === SECRET_MASK ? resolveMaskedAiKey((await loadCurrent()).ai_model, value.baseUrl, value.apiKey) : value.apiKey;
+      next.ai_model = { ...value, apiKey };
       writes.push({ key, value: JSON.stringify(next.ai_model) });
     } else if (key === 'translation') {
       next.translation = parsed.data as Settings['translation'];

@@ -13,7 +13,7 @@ import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { describeSettingsChange, logAdminAction } from '../../services/audit.js';
 import { getDomainClaudeStats } from '../../services/claim-plan.js';
 import { checkDomainOnboarding } from '../../services/domain-check.js';
-import { getSettingsFresh, maskSettings, updateSettings } from '../../services/setting.js';
+import { getSettingsFresh, maskSettings, resolveMaskedAiKey, updateSettings } from '../../services/setting.js';
 import { AiProviderError, isAiModelConfigured } from '../../services/ai-provider.js';
 import { translateSegments } from '../../services/translate.js';
 import type { AppContext } from '../../types.js';
@@ -55,16 +55,16 @@ app.get('/domain-claude-stats', async (c) => ok(c, await getDomainClaudeStats(c.
 
 const AI_MODEL_TEST_SAMPLE = 'Your verification code is 123456. It expires in 10 minutes.';
 
-/** 测试 AI 模型：用翻译的同一调用格式译一句固定示例。未提交的字段与 SECRET_MASK 用已保存值；不计用户额度 */
+/**
+ * 测试 AI 模型：用翻译的同一调用格式译一句固定示例。未提交的字段与 SECRET_MASK 用已保存值，
+ * 但沿用已存 Key 时接口地址的源必须与已保存的一致；不计用户额度
+ */
 app.post('/ai-model-test', async (c) => {
   const req: AiModelTestRequest = c.req.header('Content-Length') === '0' || c.req.raw.body === null
     ? {} : await parseBody(c, aiModelTestRequestSchema);
   const saved = (await getSettingsFresh(c.env)).ai_model;
-  const config = {
-    baseUrl: req.baseUrl || saved.baseUrl,
-    apiKey: req.apiKey && req.apiKey !== SECRET_MASK ? req.apiKey : saved.apiKey,
-    model: req.model || saved.model,
-  };
+  const baseUrl = req.baseUrl || saved.baseUrl;
+  const config = { baseUrl, apiKey: resolveMaskedAiKey(saved, baseUrl, req.apiKey || SECRET_MASK), model: req.model || saved.model };
   if (!isAiModelConfigured(config)) throw new AppError('validation_failed', '请先填写接口地址、API Key 和模型');
   const started = Date.now();
   try {
