@@ -63,9 +63,10 @@ export function AuthGuard() {
     );
   }
 
+  // 按账户给外壳加 key：换账户整个重挂，同一账户换发 token（改密）保留外壳与页面状态
   return (
     <CurrentUserContext.Provider value={user}>
-      <AppShell key={token} />
+      <AppShell key={user.id} />
     </CurrentUserContext.Provider>
   );
 }
