@@ -15,9 +15,10 @@ import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { createDb } from '../db/client.js';
 import { draftAttachments } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import { ok, parseBody, parseId } from '../lib/http.js';
+import { execCtx, ok, parseBody, parseId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
-import { draftKey, newDraftToken } from '../services/upload.js';
+import { scheduleStorageCleanup } from '../services/storage-cleanup.js';
+import { draftKey, newDraftToken, releaseDraftStatements } from '../services/upload.js';
 import type { AppContext } from '../types.js';
 
 function uploadOwner(c: Context<AppContext>): { id: number } {
@@ -245,7 +246,10 @@ export function createUploadRoutes(authentication: MiddlewareHandler<AppContext>
     return ok(c, { token, size: obj.size });
   });
 
-  /** 删除草稿附件：取消未完成的 multipart（abort）或删已完成的 R2 对象，并删行 */
+  /**
+   * 删除草稿附件：未完成的 multipart 直接 abort；已完成的对象可能已被发出（含全部失败而保留）的邮件附件引用，
+   * 删行同时登记清理台账，由清理任务按引用判断是否真删
+   */
   app.delete('/:token', async (c) => {
     const user = uploadOwner(c);
     const token = c.req.param('token');
@@ -254,10 +258,11 @@ export function createUploadRoutes(authentication: MiddlewareHandler<AppContext>
     if (!row || row.userId !== user.id) throw new AppError('not_found', '上传会话不存在');
     if (row.uploadId && row.status === 'uploading') {
       await c.env.r2.resumeMultipartUpload(row.r2Key, row.uploadId).abort();
+      await db.delete(draftAttachments).where(eq(draftAttachments.id, row.id));
     } else {
-      await c.env.r2.delete(row.r2Key);
+      await c.env.db.batch(releaseDraftStatements(c.env, [row.id]));
+      await scheduleStorageCleanup(c.env, execCtx(c));
     }
-    await db.delete(draftAttachments).where(eq(draftAttachments.id, row.id));
     return ok(c, { success: true });
   });
 

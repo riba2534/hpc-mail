@@ -3,8 +3,6 @@ import {
   listMessagesQuerySchema,
   markReadRequestSchema,
   MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
-  internalSendMailSchema,
-  sendRequestFingerprint,
   starMessagesRequestSchema,
   markAllReadRequestSchema,
   waitMessagesQuerySchema,
@@ -33,13 +31,7 @@ import {
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import { decodeInlineAttachments, sendMail } from '../../services/outbound.js';
-import {
-  beginIdempotentSend,
-  completeIdempotentSend,
-  failIdempotentSend,
-} from '../../services/idempotency.js';
-import { consumeDraftAttachments, resolveDraftAttachments } from '../../services/upload.js';
+import { handleSend } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -55,44 +47,13 @@ app.get('/', async (c) => {
   return ok(c, await listMessages(c.env, viewerFromKey(key, query), query));
 });
 
-app.post('/', async (c) => {
+app.post('/', (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
-  const req = await parseBody(c, internalSendMailSchema);
-  // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
-  if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
-  const idem = await beginIdempotentSend(
-    c.env,
-    { type: 'api_key', id: key.id },
-    c.req.header('Idempotency-Key'),
-    sendRequestFingerprint(req),
-  );
-  if (idem.kind === 'replay') return ok(c, idem.response, 201);
-  // 过渡：sendMail 尚未接入显示名、replyTo、headers 与内联附件，先按旧形状传地址与 token
-  const tokens = req.attachmentTokens.map((ref) => ref.token);
-  const legacy = { ...req, to: req.to.map((a) => a.address), cc: req.cc.map((a) => a.address), bcc: req.bcc.map((a) => a.address) };
-  try {
-    const attachments = [...decodeInlineAttachments(req.attachments),
-      ...await resolveDraftAttachments(c.env, key.userId, tokens)];
-    const origin = new URL(c.req.url).origin;
-    const summary = await sendMail(
-      c.env,
-      c.executionCtx,
-      { userId: key.userId, role: key.role },
-      legacy,
-      attachments,
-      origin,
-      idem.handle,
-    );
-    try { await completeIdempotentSend(c.env, idem.handle, summary); }
-    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
-    try { await consumeDraftAttachments(c.env, key.userId, tokens); }
-    catch (error) { console.error('已发送邮件的草稿回收延迟:', error); }
-    return ok(c, summary, 201);
-  } catch (error) {
-    await failIdempotentSend(c.env, idem.handle, error);
-    throw error;
-  }
+  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, (req) => {
+    // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
+    if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
+  });
 });
 
 /** 标记已读/未读——Agent 处理完邮件后维护状态用（需 mail.write） */

@@ -34,8 +34,22 @@ export function encodeBodyBase64(s: string): string {
   return foldBase64(bytesToBase64(new TextEncoder().encode(s)));
 }
 
+/** base64 分段解码进同一块缓冲区：整串 atob 会多出一份与附件等长的二进制字符串 */
+export function base64ToBytes(b64: string): Uint8Array {
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  const out = new Uint8Array(Math.floor(((b64.length - padding) * 3) / 4));
+  const step = 64 * 1024;
+  let offset = 0;
+  for (let i = 0; i < b64.length; i += step) {
+    const binary = atob(b64.slice(i, i + step));
+    for (let j = 0; j < binary.length; j++) out[offset + j] = binary.charCodeAt(j);
+    offset += binary.length;
+  }
+  return out;
+}
+
 /** RFC 2047 encoded-word 不超过 75 字符，且每段都包含完整 UTF-8 字符。 */
-function encodeHeaderWords(value: string): string {
+export function encodeHeaderWords(value: string): string {
   const encoder = new TextEncoder();
   const words: string[] = [];
   let part = '';
@@ -54,6 +68,37 @@ function encodeHeaderWords(value: string): string {
   return words.join(' ');
 }
 
+/**
+ * 地址头里的一个 mailbox。mimetext 把任何显示名都写成 base64 encoded-word（纯 ASCII 也编码，
+ * 垃圾邮件规则会因「不必要的 base64」扣分），所以 To/Cc/Reply-To 自己组装：
+ * ASCII 显示名一律写成带引号的 quoted-string（转义 \ 与 "，逗号、括号等特殊字符因此不会被拆成多个地址），
+ * 含非 ASCII 的写成 encoded-word。地址已严格校验、名称不含控制字符与尖括号，拼出的头不会被改写结构。
+ */
+export function formatMailbox(address: string, name: string): string {
+  if (!name) return address;
+  const phrase = /^[\x20-\x7e]+$/.test(name) ? `"${name.replace(/["\\]/g, '\\$&')}"` : encodeHeaderWords(name);
+  return `${phrase} <${address}>`;
+}
+
+export function formatAddressHeader(header: 'To' | 'Cc' | 'Reply-To', list: { address: string; name: string }[]): string {
+  return `${header}: ${list.map((item) => formatMailbox(item.address, item.name)).join(', ')}`;
+}
+
+/** 头部取值里最长的不可折行片段（UTF-8 字节）：折行只能落在空白处，更长的片段无法满足 998 字节行限 */
+export const MAX_HEADER_TOKEN_BYTES = 997;
+
+export function hasUnfoldableToken(value: string): boolean {
+  return value.split(/[ \t]+/).some((token) => new TextEncoder().encode(token).length > MAX_HEADER_TOKEN_BYTES);
+}
+
+/**
+ * 非结构化头（X-*、Comments、Keywords、Organization、Thread-Topic）的取值：含非 ASCII、
+ * 疑似 encoded-word（=?，原样写出会被收件端当成编码解释）或无法折行的超长片段时整体写成 encoded-word。
+ */
+export function encodeUnstructuredValue(value: string): string {
+  return /[^\x20-\x7e\t]|=\?/.test(value) || hasUnfoldableToken(value) ? encodeHeaderWords(value) : value;
+}
+
 /** mimetext 不折行 Subject/References；发送前统一修复顶层头，不改 MIME 正文。 */
 export function foldMimeHeaders(raw: string): string {
   const boundary = raw.indexOf('\r\n\r\n');
@@ -65,9 +110,11 @@ export function foldMimeHeaders(raw: string): string {
     const name = header.slice(0, colon + 1);
     const value = header.slice(colon + 1).trim().replace(
       /=\?utf-8\?B\?([A-Za-z0-9+/=]+)\?=/gi,
-      (_word, encoded: string) => encodeHeaderWords(
-        new TextDecoder().decode(Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0))),
-      ),
+      (word, encoded: string) => {
+        // 结构化头里形似 encoded-word 却解不开的文本（如 URL 片段）原样保留，不能让整封信组装失败
+        try { return encodeHeaderWords(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(base64ToBytes(encoded))); }
+        catch { return word; }
+      },
     );
     const lines: string[] = [];
     let line = name;
