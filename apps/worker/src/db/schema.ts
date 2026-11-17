@@ -20,7 +20,11 @@ export const users = sqliteTable('users', {
     .default('active'),
   /** 强一致鉴权版本：改密/禁用时原子 +1，旧 JWT 立即失效 */
   authVersion: integer('auth_version').notNull().default(0),
-  /** 是否已把旧 KV uepoch 惰性迁入 D1；避免版本 0 用户每请求读取 KV */
+  /**
+   * 已废弃：曾标记旧 KV uepoch 是否已惰性迁入 D1。0030 迁移把存量全部置 1，当前代码不再读取；
+   * 列保留（迁移只增不删），建户时显式写 1，回滚到上一版本时可直接走其快路径。
+   * 不改列默认值：SQLite 改默认值要整表重建
+   */
   authVersionMigrated: integer('auth_version_migrated', { mode: 'boolean' }).notNull().default(false),
   inviteId: integer('invite_id'),
   /** 头像 R2 key（null 表示无头像）；随每次上传变化，用于 URL 版本号防缓存 */

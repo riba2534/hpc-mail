@@ -225,7 +225,7 @@ describe('R04 全站限流桶不被单个用户打满', () => {
     expect((await readCounter(env, 'auth-global', 'instance', minute)).count).toBe(before + 1);
   });
 
-  it('/api 慢路径（鉴权版本待迁移）同样不推高 auth-global', async () => {
+  it('/api 旧标记（auth_version_migrated=0）的用户走同一路径，同样不推高 auth-global', async () => {
     await awayFromMinuteBoundary();
     const minute = minuteWindow(1);
     const hot = await seedUser('p0-auth-slow', { migrated: false });

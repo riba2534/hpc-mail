@@ -119,22 +119,29 @@ describe('JWT 鉴权单次往返', () => {
     expect(await authCount(id)).toBe(counted);
   });
 
-  it('未迁移鉴权版本走慢路径完成迁移，计数不重复；只存在于 KV 的会话不再迁入', async () => {
+  it('旧标记 auth_version_migrated=0 的用户与其他用户同走单 batch 路径：不读 KV、不回写标记、只计一次；只存在于 KV 的会话不迁入', async () => {
     const id = await seedUser('perf-auth-legacy', { migrated: false });
     const kvOnly = crypto.randomUUID();
     await env.kv.put(`sess:${kvOnly}`, JSON.stringify({ userId: id, createdAt: Date.now() }));
-    const kvJwt = await signToken(env.jwt_secret, { sub: id, sid: kvOnly, epoch: 0, uepoch: 0 });
+    // KV 里残留的旧用户版本（换库前同 id 的别人）不再被采信
+    await env.kv.put(`uepoch:${id}`, '7');
+    const kvJwt = await signToken(env.jwt_secret, { sub: id, sid: kvOnly, uepoch: 0 });
     expect((await request('/api/auth/me', bearer(kvJwt))).status).toBe(401);
     expect(await createDb(env).select().from(sessions).where(eq(sessions.id, kvOnly)).get()).toBeUndefined();
 
     const { jwt } = await tokenFor(id);
     const before = await authCount(id);
-    expect((await request('/api/auth/me', bearer(jwt))).status).toBe(200);
+    const probe = new Hono<{ Bindings: typeof env }>();
+    probe.use('*', requireAuth as never);
+    probe.get('/probe', (c) => c.json({ ok: true }));
+    const recorded = recordingEnv();
+    expect((await probe.request('/probe', bearer(jwt), recorded.env, createExecutionContext())).status).toBe(200);
+    expect(recorded.batches()).toBe(1);
+    expect(recorded.prepared).toHaveLength(4);
     expect(await authCount(id)).toBe(before + 1);
-    expect((await createDb(env).select().from(users).where(eq(users.id, id)).get())!.authVersionMigrated).toBe(true);
-    // 迁移完成后的下一次请求走快路径，同样只计一次
-    expect((await request('/api/auth/me', bearer(jwt))).status).toBe(200);
-    expect(await authCount(id)).toBe(before + 2);
+    expect((await createDb(env).select().from(users).where(eq(users.id, id)).get())!.authVersionMigrated).toBe(false);
+    await env.kv.delete(`sess:${kvOnly}`);
+    await env.kv.delete(`uepoch:${id}`);
   });
 
   it('超过每分钟上限返回 rate_limited', async () => {

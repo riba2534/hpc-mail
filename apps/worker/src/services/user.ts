@@ -7,7 +7,6 @@ import { hashPassword } from '../lib/password.js';
 import type { Env, ExecCtx } from '../types.js';
 import { revokeAllApiKeysQuery } from './api-key.js';
 import { avatarUrl } from './avatar.js';
-import { mirrorUserEpoch } from './session.js';
 import { getSettingsFresh } from './setting.js';
 
 type UserRow = typeof users.$inferSelect;
@@ -107,7 +106,7 @@ export async function createUser(env: Env, req: CreateUserRequest): Promise<Admi
   const passwordHash = await hashPassword(req.password);
   const [row] = await db
     .insert(users)
-    .values({ username: req.username, passwordHash, role: req.role, status: 'active' })
+    .values({ username: req.username, passwordHash, role: req.role, status: 'active', authVersionMigrated: true })
     .returning();
   return serialize(row!, [], 0);
 }
@@ -121,7 +120,6 @@ export async function updateUser(
   actingUserId: number,
   id: number,
   req: UpdateUserRequest,
-  ctx?: ExecCtx | null,
 ): Promise<{ user: AdminUser; revokedApiKeys: number }> {
   const db = createDb(env);
   const target = await db.select().from(users).where(eq(users.id, id)).get();
@@ -173,7 +171,7 @@ export async function updateUser(
   try {
     const update = db.update(users).set({ ...patch,
       ...(req.mailboxPolicy !== undefined || req.role !== undefined ? { mailboxPolicyRevision: sql`${users.mailboxPolicyRevision} + 1` } : {}),
-      ...(bumpEpoch ? { authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true } : {}),
+      ...(bumpEpoch ? { authVersion: sql`${users.authVersion} + 1` } : {}),
     }).where(and(eq(users.id, id),
       req.mailboxPolicy === undefined ? undefined : eq(users.mailboxPolicyRevision, req.expectedMailboxPolicyRevision!),
       domainsRevision === undefined ? undefined : sql`COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ${domainsRevision}`,
@@ -192,7 +190,6 @@ export async function updateUser(
     throw error;
   }
   if (!row) throw new AppError('conflict', '用户或域名配置已改变，请刷新后重试');
-  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion, ctx);
 
   const count = await db
     .select({ apiKeyCount: apiKeyCountSql })
@@ -250,5 +247,4 @@ export async function deleteUser(env: Env, actingUserId: number, id: number, ctx
     if (ctx) ctx.waitUntil(removal);
     else await removal;
   }
-  // 用户行已删除，鉴权中间件会立即拒绝旧 token；KV 兼容版本不再需要额外 bump。
 }

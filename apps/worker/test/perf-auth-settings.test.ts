@@ -94,18 +94,13 @@ function tracedEnv(kvOverrides: Partial<Record<KvMethod, (...args: unknown[]) =>
   };
 }
 
-/** 收集 waitUntil 的执行上下文，不等待其中的任务（模拟永不完成的 KV 写） */
+/** 收集 waitUntil 的执行上下文，不等待其中的任务 */
 function collectingCtx() {
   const pending: Promise<unknown>[] = [];
   const ctx = { waitUntil: (promise: Promise<unknown>) => { pending.push(promise); }, passThroughOnException() {}, props: {} };
   return { ctx: ctx as unknown as ExecutionContext, pending };
 }
 
-const never = () => new Promise<never>(() => {});
-const within = <T>(promise: Promise<T>, ms = 3000): Promise<T> => Promise.race([
-  promise,
-  new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${ms}ms 内未返回`)), ms)),
-]);
 
 async function request(path: string, init: RequestInit, target: Env = env, ctx: ExecutionContext = createExecutionContext()) {
   const response = await app.request(path, init, target, ctx);
@@ -157,21 +152,17 @@ describe('settings 只用 isolate 内存缓存与 D1', () => {
     await env.kv.delete('setting-cache');
   });
 
-  it('updateSettings 后同 isolate 立即可见；旧 KV 缓存的删除不阻塞，也不因失败报错', async () => {
+  it('updateSettings 后同 isolate 立即可见，不读写 KV（旧版 KV 设置缓存已无读者）', async () => {
     invalidateSettingsMemory();
     const before = await getSettings(env);
-    const hanging = tracedEnv({ delete: never });
-    await within(updateSettings(hanging.env, { site: { ...before.site, title: 'Perf Updated Title' } }));
-    expect(hanging.kvCalls).toContain('delete:setting-cache');
-    expect((await getSettings(env)).site.title).toBe('Perf Updated Title');
-
-    // 有 ctx 时删除交给 waitUntil；删除失败不影响更新结果
-    const failing = tracedEnv({ delete: () => Promise.reject(new Error('kv down')) });
+    const traced = tracedEnv();
     const { ctx, pending } = collectingCtx();
-    await updateSettings(failing.env, { site: before.site }, ctx);
-    expect(pending).toHaveLength(1);
-    await expect(Promise.all(pending)).resolves.toBeDefined();
+    await updateSettings(traced.env, { site: { ...before.site, title: 'Perf Updated Title' } }, ctx);
+    expect((await getSettings(env)).site.title).toBe('Perf Updated Title');
+    await updateSettings(traced.env, { site: before.site });
     expect((await getSettings(env)).site.title).toBe(before.site.title);
+    expect(traced.kvCalls).toEqual([]);
+    expect(pending).toEqual([]);
   });
 
   it('失效前发出、失效后才返回的读取不回填缓存', async () => {
@@ -269,52 +260,66 @@ describe('/v1 鉴权往返', () => {
   });
 });
 
-describe('会话 KV 兼容写不阻塞响应', () => {
-  it('有 ctx 时登录不等待会话 KV 写入：KV put 永不完成或失败，响应照常返回', async () => {
+describe('会话与鉴权版本只写 D1，不碰 KV', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const claimsOf = (token: string) =>
+    JSON.parse(atob(token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/'))) as Record<string, unknown>;
+
+  it('登录只写 D1 会话行：寿命与 JWT 同为 7 天，令牌不再带 epoch，全程 0 次 KV', async () => {
     const password = 'perf-login-pass-1';
-    const id = await seedUser('perf-login-hang', { password });
-    for (const put of [never, () => Promise.reject(new Error('kv down'))]) {
-      const traced = tracedEnv({ put });
-      const { ctx, pending } = collectingCtx();
-      const response = await within(request('/api/auth/login', json({ username: 'perf-login-hang', password }), traced.env, ctx));
-      expect(response.status).toBe(200);
-      const body = (await response.json()) as { data: { token: string; user: { id: number } } };
-      expect(body.data.user.id).toBe(id);
-      expect(traced.kvCalls.some((call) => call.startsWith('put:sess:'))).toBe(true);
-      expect(pending.length).toBeGreaterThanOrEqual(1);
-    }
-    const rows = await createDb(env).select().from(sessions).where(eq(sessions.userId, id)).all();
-    expect(rows).toHaveLength(2);
+    const id = await seedUser('perf-login-d1', { password });
+    const traced = tracedEnv();
+    const { ctx, pending } = collectingCtx();
+    const startedAt = Date.now();
+    const response = await request('/api/auth/login', json({ username: 'perf-login-d1', password }), traced.env, ctx);
+    expect(response.status).toBe(200);
+    const { token } = ((await response.json()) as { data: { token: string } }).data;
+    expect(traced.kvCalls).toEqual([]);
+    expect(pending).toEqual([]);
+    const claims = claimsOf(token);
+    expect(claims).not.toHaveProperty('epoch');
+    expect(Object.keys(claims).sort()).toEqual(['exp', 'iat', 'sid', 'sub', 'uepoch']);
+    const [row] = await createDb(env).select().from(sessions).where(eq(sessions.userId, id)).all();
+    const ttl = row!.expiresAt.getTime() - row!.createdAt.getTime();
+    expect(ttl).toBe(7 * DAY_MS);
+    expect(Number(claims.exp) * 1000 - row!.expiresAt.getTime()).toBeLessThan(5000);
+    expect(row!.createdAt.getTime()).toBeGreaterThanOrEqual(startedAt - 1000);
+    expect((await request('/api/auth/me', bearer(token))).status).toBe(200);
   });
 
-  it('有 ctx 时注销、改密同样不等待 KV；D1 状态照常生效', async () => {
+  it('改密与注销同样只改 D1：旧令牌立即失效，0 次 KV', async () => {
     const password = 'perf-logout-pass-1';
-    const id = await seedUser('perf-logout-hang', { password });
-    const login = await request('/api/auth/login', json({ username: 'perf-logout-hang', password }));
+    const id = await seedUser('perf-logout-d1', { password });
+    const login = await request('/api/auth/login', json({ username: 'perf-logout-d1', password }));
     const { token } = ((await login.json()) as { data: { token: string } }).data;
 
-    const hanging = tracedEnv({ put: never, delete: never });
-    const changed = await within(request('/api/auth/password',
+    const traced = tracedEnv();
+    const changed = await request('/api/auth/password',
       { ...json({ oldPassword: password, newPassword: 'perf-logout-pass-2' }), method: 'PUT', headers: { ...json({}).headers as Record<string, string>, Authorization: `Bearer ${token}` } },
-      hanging.env, collectingCtx().ctx));
+      traced.env, collectingCtx().ctx);
     expect(changed.status).toBe(200);
-    expect(hanging.kvCalls).toEqual(expect.arrayContaining([`put:uepoch:${id}`]));
     expect((await createDb(env).select().from(users).where(eq(users.id, id)).get())!.authVersion).toBe(1);
     const { token: renewed } = ((await changed.json()) as { data: { token: string } }).data;
     expect((await request('/api/auth/me', bearer(token))).status).toBe(401);
 
-    const logout = await within(request('/api/auth/logout', { method: 'POST', ...bearer(renewed) }, hanging.env, collectingCtx().ctx));
+    const logout = await request('/api/auth/logout', { method: 'POST', ...bearer(renewed) }, traced.env, collectingCtx().ctx);
     expect(logout.status).toBe(200);
-    expect(hanging.kvCalls.some((call) => call.startsWith('delete:sess:'))).toBe(true);
     expect((await request('/api/auth/me', bearer(renewed))).status).toBe(401);
+    expect(traced.kvCalls).toEqual([]);
   });
 
-  it('无 ctx 直调时仍等 KV 写完再返回', async () => {
-    const id = await seedUser('perf-session-await');
-    let written = false;
-    const slow = tracedEnv({ put: async () => { await new Promise((resolve) => setTimeout(resolve, 20)); written = true; } });
-    await createSession(slow.env, id);
-    expect(written).toBe(true);
+  it('带旧 epoch 声明的令牌（上一版本签发）仍按 sub/sid/uepoch 校验通过', async () => {
+    const id = await seedUser('perf-legacy-epoch-claim');
+    const sid = await createSession(env, id);
+    const legacy = await signToken(env.jwt_secret, { sub: id, sid, uepoch: 0 });
+    // 手工拼一个带 epoch:0 的旧令牌：签名口径与 signToken 相同
+    const parts = legacy.split('.');
+    const payload = { ...claimsOf(legacy), epoch: 0 };
+    const payloadB64 = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.jwt_secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${parts[0]}.${payloadB64}`)));
+    const sigB64 = btoa(String.fromCharCode(...signature)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+    expect((await request('/api/auth/me', bearer(`${parts[0]}.${payloadB64}.${sigB64}`))).status).toBe(200);
   });
 });
 

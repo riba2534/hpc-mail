@@ -1,5 +1,5 @@
 import type { CreateInviteRequest, Invite } from '@hpc-mail/shared';
-import { and, desc, eq, gt, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { desc, eq, isNotNull } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { invites, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
@@ -88,25 +88,4 @@ export async function revokeInvite(env: Env, id: number): Promise<void> {
   const row = await db.select({ id: invites.id }).from(invites).where(eq(invites.id, id)).get();
   if (!row) throw new AppError('not_found', '邀请码不存在');
   await db.update(invites).set({ status: 'revoked' }).where(eq(invites.id, id));
-}
-
-/** 原子校验并消费邀请码：单条件 UPDATE，失败即 invite_invalid，返回 invite id */
-export async function consumeInvite(env: Env, code: string): Promise<number> {
-  const db = createDb(env);
-  const now = new Date();
-  const updated = await db
-    .update(invites)
-    .set({ usedCount: sql`${invites.usedCount} + 1` })
-    .where(
-      and(
-        eq(invites.code, code),
-        eq(invites.status, 'active'),
-        lt(invites.usedCount, invites.maxUses),
-        or(isNull(invites.expiresAt), gt(invites.expiresAt, now)),
-      ),
-    )
-    .returning({ id: invites.id })
-    .get();
-  if (!updated) throw new AppError('invite_invalid', '邀请码无效或已用尽');
-  return updated.id;
 }

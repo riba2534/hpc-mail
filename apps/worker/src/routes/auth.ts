@@ -44,7 +44,7 @@ app.post('/login', async (c) => {
 
 app.post('/register', async (c) => {
   const req = await parseBody(c, registerRequestSchema);
-  const result = await register(c.env, req, clientIp(c), execCtx(c));
+  const result = await register(c.env, req, clientIp(c));
   return ok(c, result, 201);
 });
 
@@ -68,7 +68,7 @@ app.delete('/avatar', requireAuth, async (c) => {
 app.put('/password', requireAuth, async (c) => {
   const user = c.get('user')!;
   const req = await parseBody(c, changePasswordRequestSchema);
-  const result = await changePassword(c.env, user, req, execCtx(c));
+  const result = await changePassword(c.env, user, req);
   if (result.revokedApiKeys) {
     await logAdminAction(c.env, user, 'apikey.revoke_all', user.username, `修改密码时吊销 ${result.revokedApiKeys} 个 API Key`, clientIp(c));
   }
@@ -96,7 +96,7 @@ app.post('/2fa/disable', requireAuth, async (c) => {
 app.post('/logout', requireAuth, async (c) => {
   const sid = c.get('sessionId');
   if (!sid) throw new AppError('unauthorized', '会话不存在');
-  await logout(c.env, sid, execCtx(c));
+  await logout(c.env, sid);
   return ok(c, { success: true });
 });
 
