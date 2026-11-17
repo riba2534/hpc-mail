@@ -9,8 +9,7 @@ export interface ApiErrorInit {
   httpStatus?: number | null;
   requestId?: string;
   cause?: unknown;
-  /** 错误信封的改正建议与结构化补充（如 delivery_failed 的发件行与逐收件人结果） */
-  fix?: string;
+  /** 错误信封的结构化补充（如 delivery_failed 的发件行与逐收件人结果） */
   details?: ApiErrorDetails;
 }
 
@@ -18,7 +17,6 @@ export class ApiError extends Error {
   readonly code: ApiErrorCode;
   readonly httpStatus: number | null;
   readonly requestId?: string;
-  readonly fix?: string;
   readonly details?: ApiErrorDetails;
 
   constructor(message: string, init: ApiErrorInit) {
@@ -27,7 +25,6 @@ export class ApiError extends Error {
     this.code = init.code;
     this.httpStatus = init.httpStatus ?? null;
     this.requestId = init.requestId;
-    this.fix = init.fix;
     this.details = init.details;
   }
 

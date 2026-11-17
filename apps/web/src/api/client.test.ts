@@ -44,13 +44,13 @@ describe('api client（新信封）', () => {
     expect(error).toMatchObject({ code: 'forbidden', httpStatus: 403, requestId: 'req-1', forbidden: true });
   });
 
-  it('错误信封的 fix 与 details 一并保留（delivery_failed 的发件行与逐收件人结果）', async () => {
+  it('错误信封的 details 一并保留（delivery_failed 的发件行与逐收件人结果）', async () => {
     const details = { messageId: 9, recipientOutcomes: [{ address: 'a@example.com', status: 'failed', error: 'rejected' }] };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
       error: { code: 'delivery_failed', message: '全部收件人投递失败', fix: '修正后换新 Key 重发', details }, requestId: 'req-2',
     }, 422)));
     const error = await api.post('/messages/send', {}).catch((reason: unknown) => reason);
-    expect(error).toMatchObject({ code: 'delivery_failed', httpStatus: 422, fix: '修正后换新 Key 重发', details });
+    expect(error).toMatchObject({ code: 'delivery_failed', httpStatus: 422, details });
   });
 
   it('401 时清除本地 token', async () => {
