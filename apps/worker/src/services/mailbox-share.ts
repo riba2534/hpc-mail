@@ -257,13 +257,14 @@ export async function shareMailboxes(
   return boxIds.flatMap((id) => grants.get(id) ?? []);
 }
 
+/** 返回被操作邮箱的地址，供管理审计写明对象 */
 export async function revokeMailboxShare(
   env: Env,
   actorId: number,
   mailboxId: number,
   userId: number,
   isAdmin = false,
-): Promise<void> {
+): Promise<{ address: string }> {
   const db = createDb(env);
   const box = await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId)).get();
   assertManageableMailbox(box, actorId, isAdmin);
@@ -273,6 +274,7 @@ export async function revokeMailboxShare(
       sql`EXISTS (SELECT 1 FROM mailboxes WHERE id = ${mailboxId} AND user_id = ${box.userId})`))
     .run();
   if ((result.meta.changes ?? 0) === 0) throw new AppError('not_found', '该用户不在共享名单中');
+  return { address: box.address };
 }
 
 /** 登录用户被分享、且所有者仍启用的邮箱。 */

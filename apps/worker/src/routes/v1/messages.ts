@@ -7,9 +7,9 @@ import {
   markAllReadRequestSchema,
   waitMessagesQuerySchema,
 } from '@hpc-mail/shared';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
-import { messageViewer, mutationViewer } from '../../lib/message-viewer.js';
+import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer } from '../../lib/message-viewer.js';
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
 import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
@@ -44,7 +44,7 @@ app.get('/', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const query = parseQuery(c, listMessagesQuerySchema);
-  return ok(c, await listMessages(c.env, viewerFromKey(key, query), query));
+  return ok(c, await listMessages(c.env, viewerFromKey(key, query, c), query));
 });
 
 app.post('/', (c) => {
@@ -100,7 +100,9 @@ app.post('/restore', async (c) => {
 app.post('/purge', async (c) => {
   requireScope(c, 'mail.write');
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewer(c, c.get('apiKey')!, req.scope), req.ids, execCtx(c));
+  const viewer = mutationViewer(c, c.get('apiKey')!, req.scope);
+  const purged = await purgeMessages(c.env, viewer, req.ids, execCtx(c));
+  await auditUnclaimedPurge(c, viewer, req.ids, purged);
   return ok(c, { purged, changed: purged });
 });
 
@@ -189,8 +191,11 @@ function waitForPoll(signal: AbortSignal, milliseconds: number): Promise<void> {
 function viewerFromKey(
   key: { userId: number; role: Viewer['role'] },
   query: { scope?: Viewer['scope']; userId?: number },
+  c: Context<AppContext>,
 ): Viewer {
-  return { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId };
+  const viewer: Viewer = { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId };
+  auditUserScopeRead(c, viewer);
+  return viewer;
 }
 
 app.get('/:id/thread', async (c) => {

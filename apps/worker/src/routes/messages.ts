@@ -27,7 +27,7 @@ import {
   UNREAD_COUNT_CAP,
   type Viewer,
 } from '../services/message.js';
-import { messageViewer, mutationViewer } from '../lib/message-viewer.js';
+import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
 import { pageHead } from '../lib/pagination.js';
 import { translateMessage } from '../services/translate.js';
@@ -50,8 +50,11 @@ function mutationViewerOf(c: Context<AppContext>, bodyScope?: 'mine' | 'unclaime
 function viewerFromListQuery(
   user: { id: number; role: Viewer['role'] },
   query: { scope?: Viewer['scope']; userId?: number },
+  c: Context<AppContext>,
 ): Viewer {
-  return { userId: user.id, role: user.role, scope: query.scope, targetUserId: query.userId };
+  const viewer: Viewer = { userId: user.id, role: user.role, scope: query.scope, targetUserId: query.userId };
+  auditUserScopeRead(c, viewer);
+  return viewer;
 }
 
 /**
@@ -61,7 +64,7 @@ function viewerFromListQuery(
 app.get('/', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  const page = await listMessages(c.env, viewerFromListQuery(user, query), query);
+  const page = await listMessages(c.env, viewerFromListQuery(user, query, c), query);
   if (query.cursor !== undefined || query.afterId !== undefined) return ok(c, page);
   const body: MessageListPage = { ...page, head: await pageHead(page) };
   return ok(c, body);
@@ -106,7 +109,9 @@ app.post('/restore', async (c) => {
 /** 永久删除（回收站里彻底删） */
 app.post('/purge', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids, execCtx(c));
+  const viewer = mutationViewerOf(c, req.scope);
+  const purged = await purgeMessages(c.env, viewer, req.ids, execCtx(c));
+  await auditUnclaimedPurge(c, viewer, req.ids, purged);
   return ok(c, { purged, changed: purged });
 });
 
@@ -129,7 +134,7 @@ app.get('/unread-count', async (c) => {
 app.get('/sync', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  return ok(c, await syncMessages(c.env, viewerFromListQuery(user, query), query));
+  return ok(c, await syncMessages(c.env, viewerFromListQuery(user, query, c), query));
 });
 
 /** 写信收件人自动补全：近期联系人 */

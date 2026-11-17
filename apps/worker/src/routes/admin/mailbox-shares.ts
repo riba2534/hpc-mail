@@ -40,8 +40,9 @@ app.delete('/:mailboxId/grantees/:userId', async (c) => {
   const acting = c.get('user')!;
   const mailboxId = parseId(c.req.param('mailboxId'));
   const userId = parseId(c.req.param('userId'));
-  await revokeMailboxShare(c.env, acting.id, mailboxId, userId, true);
-  await logAdminAction(c.env, acting, 'mailbox.unshare', `mailbox#${mailboxId}`, `user#${userId}`, clientIp(c));
+  const { address } = await revokeMailboxShare(c.env, acting.id, mailboxId, userId, true);
+  // target 写地址（与 mailbox.share、过户一致），按地址就能查到这只邮箱的全部共享变更
+  await logAdminAction(c.env, acting, 'mailbox.unshare', address, `移除共享 user#${userId}（mailbox#${mailboxId}）`, clientIp(c));
   return ok(c, { success: true });
 });
 
