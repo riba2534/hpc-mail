@@ -9,6 +9,7 @@ import {
 import { AppError } from '../lib/errors.js';
 import { createDb } from '../db/client.js';
 import { isAiModelConfigured } from './ai-provider.js';
+import { anyHostedSql } from './domain-occupancy.js';
 import { settings as settingsTable } from '../db/schema.js';
 import type { Env, ExecCtx } from '../types.js';
 
@@ -107,6 +108,16 @@ export function isTranslationReady(settings: Pick<Settings, 'translation' | 'ai_
   return settings.translation.enabled && isAiModelConfigured(settings.ai_model);
 }
 
+/** domains 的 CAS 没有写入：区分「被用户托管」和「revision 已变化」，给出可操作的原因 */
+async function domainsWriteConflict(env: Env, listed: string): Promise<AppError> {
+  const hosted = await env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))')
+    .bind(listed).all<{ domain: string }>();
+  if (hosted.results.length) {
+    return new AppError('conflict', `${hosted.results.map((row) => row.domain).join('、')} 已被用户托管，不能加为系统域名`);
+  }
+  return new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
+}
+
 /** 写设置：逐 key 校验后落库并失效缓存 */
 export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx?: ExecCtx | null): Promise<void> {
   const db = createDb(env);
@@ -115,7 +126,7 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
   const loadCurrent = async () => (fresh ??= await getSettingsFresh(env));
 
   const next: Partial<Pick<Settings, 'ai_model' | 'translation'>> = {};
-  let domains: { value: string; expected: number } | undefined;
+  let domains: { value: string; expected: number; listed: string } | undefined;
   for (const key of Object.keys(SETTING_SCHEMAS) as SettingKey[]) {
     const incoming = patch[key];
     if (incoming === undefined) continue;
@@ -130,16 +141,9 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
       next.translation = parsed.data as Settings['translation'];
       writes.push({ key, value: JSON.stringify(next.translation) });
     } else if (key === 'domains') {
-      const current = await loadCurrent();
-      const expected = patch.expectedDomainsRevision ?? current.domains.revision ?? 0;
-      // 用户托管的域名由其所有者管理，不能同时登记为系统域名
-      const listed = (parsed.data as Settings['domains']).list.map((entry) => entry.domain);
-      const hosted = await env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))')
-        .bind(JSON.stringify(listed)).all<{ domain: string }>();
-      if (hosted.results.length) {
-        throw new AppError('conflict', `${hosted.results.map((row) => row.domain).join('、')} 已被用户托管，不能加为系统域名`);
-      }
-      domains = { value: JSON.stringify({ ...parsed.data as object, revision: expected + 1 }), expected };
+      const expected = patch.expectedDomainsRevision ?? (await loadCurrent()).domains.revision ?? 0;
+      const listed = JSON.stringify((parsed.data as Settings['domains']).list.map((entry) => entry.domain));
+      domains = { value: JSON.stringify({ ...parsed.data as object, revision: expected + 1 }), expected, listed };
     } else writes.push({ key, value: JSON.stringify(parsed.data) });
   }
   // 翻译启用依赖模型配置：任一项在本次提交里时，按合并后的结果校验（验证码 AI 兜底未配置模型时只走正则，不拦）。
@@ -152,12 +156,15 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     }
   }
   if (domains) {
+    // 用户托管的域名由其所有者管理，不能同时登记为系统域名。检查写在这条 CAS 里，
+    // 与托管域名创建（hosted-domain.ts）互相守卫，两边交错时只有先执行的一方写入成功
     const result = await env.db.prepare(`INSERT INTO settings (key, value)
-      SELECT 'domains', ? WHERE ? = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
+      SELECT 'domains', ?1 WHERE ?2 = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
+        AND NOT ${anyHostedSql('?3')}
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ? RETURNING key`)
-      .bind(domains.value, domains.expected, domains.expected).first();
-    if (!result) throw new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
+      WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ?2 RETURNING key`)
+      .bind(domains.value, domains.expected, domains.listed).first();
+    if (!result) throw await domainsWriteConflict(env, domains.listed);
   }
   for (const w of writes) {
     await db.insert(settingsTable).values(w)

@@ -10,7 +10,7 @@ import { syncDueHostedDomains, syncHostedDomain } from '../src/services/hosted-d
 import { handleInbound } from '../src/services/inbound.js';
 import { sendMail } from '../src/services/outbound.js';
 import { createSession } from '../src/services/session.js';
-import { updateSettings } from '../src/services/setting.js';
+import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
 
 const app = createApp();
@@ -174,6 +174,30 @@ async function receive(address: string, label: string, runtimeEnv: Env = runtime
   return { rejected, stored };
 }
 
+/** 在第一条匹配 pattern 的 SQL 执行前插入并发写入，用来确定性地复现交错 */
+function beforeStatement(base: Env, pattern: RegExp, hook: () => Promise<void>): Env {
+  let triggered = false;
+  const wrap = (statement: D1PreparedStatement, intercept: boolean): D1PreparedStatement => new Proxy(statement, {
+    get(target, property) {
+      if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args), intercept);
+      const method = Reflect.get(target, property);
+      if (typeof method !== 'function') return method;
+      return async (...args: unknown[]) => {
+        if (intercept && !triggered && ['first', 'all', 'run', 'raw'].includes(String(property))) {
+          triggered = true;
+          await hook();
+        }
+        return method.apply(target, args);
+      };
+    },
+  });
+  return { ...base, db: new Proxy(base.db, { get(target, property) {
+    if (property === 'prepare') return (query: string) => wrap(target.prepare(query), pattern.test(query));
+    const method = Reflect.get(target, property);
+    return typeof method === 'function' ? method.bind(target) : method;
+  } }) };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -299,6 +323,56 @@ describe('添加托管域名', () => {
       expectedDomainsRevision: settings.domains.revision,
     });
     expect((await errorOf(response, 409)).message).toContain('已被用户托管');
+  });
+
+  it('托管创建与管理员加系统域名交错：占位语句里的守卫拒绝托管，不建 zone', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const domain = f.domain('race');
+    // 托管创建已读过系统列表（此时不含该域名），在占位语句执行前，管理员把它加为系统域名
+    const racing = beforeStatement(runtime, /INSERT INTO hosted_domains/i, async () => {
+      const current = await getSettingsFresh(env);
+      await updateSettings(env, {
+        domains: { list: [...current.domains.list, { domain, public: false, perUserLimit: 0 }] },
+        expectedDomainsRevision: current.domains.revision ?? 0,
+      });
+    });
+    expect((await errorOf(await call('POST', '/hosted-domains', owner.jwt, { domain }, racing), 409)).message).toContain('系统域名');
+    expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, domain)).get()).toBeUndefined();
+    expect(cf.calls.filter((entry) => entry === 'POST /zones')).toHaveLength(0);
+    expect((await getSettingsFresh(env)).domains.list.map((entry) => entry.domain)).toContain(domain);
+  });
+
+  it('管理员加系统域名与托管创建交错：域名列表 CAS 里的守卫拒绝写入，revision 不变', async () => {
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const admin = await f.actor('admin', 'admin');
+    const domain = f.domain('race');
+    const settings = await data<{ domains: { revision: number } }>(await call('GET', '/admin/settings', admin.jwt));
+    // 管理员的请求已通过校验，在 CAS 执行前，用户把同一域名占位为托管域名
+    const racing = beforeStatement(runtime, /INSERT INTO settings \(key, value\)\s+SELECT 'domains'/i, async () => {
+      await db.insert(hostedDomains).values({ domain, userId: owner.id, status: 'pending' });
+    });
+    const response = await call('PUT', '/admin/settings', admin.jwt, {
+      domains: { list: [{ domain: `${f.prefix}-system.test`, public: true, perUserLimit: 0 }, { domain, public: false, perUserLimit: 0 }] },
+      expectedDomainsRevision: settings.domains.revision,
+    }, racing);
+    expect((await errorOf(response, 409)).message).toContain('已被用户托管');
+    const after = await getSettingsFresh(env);
+    expect(after.domains.list.map((entry) => entry.domain)).not.toContain(domain);
+    expect(after.domains.revision).toBe(settings.domains.revision);
+  });
+
+  it('只有 revision 变化时仍返回原来的并发修改提示', async () => {
+    const f = await fixture();
+    const admin = await f.actor('admin', 'admin');
+    const settings = await data<{ domains: { revision: number } }>(await call('GET', '/admin/settings', admin.jwt));
+    const response = await call('PUT', '/admin/settings', admin.jwt, {
+      domains: { list: [{ domain: `${f.prefix}-system.test`, public: true, perUserLimit: 0 }] },
+      expectedDomainsRevision: settings.domains.revision + 1,
+    });
+    expect((await errorOf(response, 409)).message).toContain('已被其他请求修改');
   });
 });
 
@@ -607,6 +681,48 @@ describe('托管域名的过户与删除', () => {
     cf.fetchMock.mockImplementation(original);
     await syncDueHostedDomains(runtime);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, hosted.id)).get()).toBeUndefined();
+  });
+});
+
+describe('托管域名的 Cloudflare 调用序列基准', () => {
+  // 系统域名接入会在 cloudflare.ts、定时任务与互斥守卫上改动共享代码；这里锁住托管域名从添加、生效到删除
+  // 对 Cloudflare 的完整调用序列，任何改动导致托管行为变化都会在这里显式暴露
+  it('添加 → NS 生效后补齐 → 删除', async () => {
+    const cf = fakeCloudflare({ dnssec: [] });
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const domain = f.domain('golden');
+    const created = await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain }), 201);
+    const zoneId = cf.zoneByName(domain)!.id;
+    const afterCreate = [...cf.calls];
+    cf.calls.length = 0;
+
+    cf.zones.get(zoneId)!.status = 'active';
+    await syncHostedDomain(runtime, created.id);
+    const afterActivate = [...cf.calls];
+    cf.calls.length = 0;
+
+    await data(await call('DELETE', `/hosted-domains/${created.id}`, owner.jwt));
+    const afterDelete = [...cf.calls];
+
+    const z = `/zones/${zoneId}`;
+    expect({ afterCreate, afterActivate, afterDelete }).toEqual({
+      // 先确认账户里没有同名 zone，建 zone 后预先接入 catch-all 与发信（Email Routing 要等 zone 生效）
+      afterCreate: [
+        'GET /zones', 'POST /zones',
+        `GET ${z}/email/routing/rules/catch_all`, `PUT ${z}/email/routing/rules/catch_all`,
+        `GET ${z}/email/sending/subdomains`, `POST ${z}/email/sending/subdomains`,
+        `GET ${z}/email/sending/subdomains/sub-${zoneId}/dns/status`,
+      ],
+      // 生效后开启 Email Routing、复核 catch-all，并补齐发信 DNS
+      afterActivate: [
+        `GET ${z}`, `GET ${z}/email/routing`, `POST ${z}/email/routing/dns`,
+        `GET ${z}/email/routing/rules/catch_all`,
+        `GET ${z}/email/sending/subdomains/sub-${zoneId}/dns/status`, `POST ${z}/email/sending/subdomains/sub-${zoneId}/dns`,
+      ],
+      // 删除先撤发信接入，再删 zone
+      afterDelete: [`DELETE ${z}/email/sending/subdomains/sub-${zoneId}`, `DELETE ${z}`],
+    });
   });
 });
 

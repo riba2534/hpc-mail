@@ -15,6 +15,7 @@ import {
   type CloudflareCredentials,
 } from './cloudflare.js';
 import { hasDnssec } from './domain-check.js';
+import { systemDomainListedSql } from './domain-occupancy.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 import { getSettings, getSettingsFresh } from './setting.js';
 
@@ -210,8 +211,9 @@ function createZoneError(error: unknown): AppError {
 
 /** 占位守卫未通过：读回各项条件，给出具体原因 */
 async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: Settings['hosted_domains']): Promise<AppError> {
-  const [hosted, used, owned, pending, totalPending, user] = await env.db.batch([
+  const [hosted, listed, used, owned, pending, totalPending, user] = await env.db.batch([
     env.db.prepare('SELECT user_id FROM hosted_domains WHERE domain = ?').bind(domain),
+    env.db.prepare(`SELECT ${systemDomainListedSql('?1')} AS listed`).bind(domain),
     env.db.prepare(`SELECT (EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
       OR EXISTS (SELECT 1 FROM messages WHERE domain = ?1)) AS used`).bind(domain),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status <> 'deleting'").bind(viewer.id),
@@ -224,6 +226,7 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
   if (holder) {
     return new AppError('conflict', Number(holder.user_id) === viewer.id ? '你已经添加过该域名' : '该域名已被其他用户托管');
   }
+  if (Number(first<{ listed: number }>(listed)?.listed)) return new AppError('conflict', '该域名已是本站的系统域名');
   if (Number(first<{ used: number }>(used)?.used)) {
     return new AppError('conflict', '本站已有该域名的历史地址或邮件，不能作为托管域名添加');
   }
@@ -248,6 +251,7 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
 export async function createHostedDomain(env: Env, viewer: Viewer, domain: string, ctx?: ExecCtx | null, ip = ''): Promise<HostedDomain> {
   const settings = await getSettingsFresh(env);
   const creds = requireCredentials(env, settings);
+  // 快速失败；与管理员同时把它加为系统域名的竞态由下面占位语句里的守卫兜住
   if (settings.domains.list.some((entry) => entry.domain === domain)) {
     throw new AppError('conflict', '该域名已是本站的系统域名');
   }
@@ -255,6 +259,7 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
   const reserved = await env.db.prepare(`INSERT INTO hosted_domains (domain, user_id, status)
     SELECT ?1, ?2, 'pending'
     WHERE NOT EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ?1)
+      AND NOT ${systemDomainListedSql('?1')}
       AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
       AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?1)
       AND (?3 = 1 OR ?4 = 0 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status <> 'deleting') < ?4)
