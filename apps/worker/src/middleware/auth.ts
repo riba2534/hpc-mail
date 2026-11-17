@@ -1,15 +1,10 @@
 import { DEFAULT_SETTINGS, SETTING_SCHEMAS } from '@hpc-mail/shared';
 import type { Context, MiddlewareHandler } from 'hono';
 import { AppError } from '../lib/errors.js';
+import { bearerToken } from '../lib/http.js';
 import { verifyToken, type JwtClaims } from '../lib/jwt.js';
 import { limitSessionRequest } from '../services/rate-limit.js';
 import type { AppContext, AuthUser, Env } from '../types.js';
-
-function bearer(c: { req: { header: (k: string) => string | undefined } }): string | null {
-  const header = c.req.header('Authorization') || '';
-  const match = header.match(/^Bearer\s+(.+)$/i);
-  return match ? match[1]!.trim() : null;
-}
 
 /** sessions + users 合并读出的鉴权所需列（不含密码哈希、TOTP 密钥与恢复码） */
 interface AuthRow {
@@ -35,7 +30,7 @@ interface AuthRow {
  * 不缓存会话或用户状态：改密/禁用仍即时生效。
  */
 export const requireAuth: MiddlewareHandler<AppContext> = async (c, next) => {
-  const token = bearer(c);
+  const token = bearerToken(c);
   if (!token) throw new AppError('unauthorized', '缺少访问令牌');
 
   const claims = await verifyToken(c.env.jwt_secret, token);

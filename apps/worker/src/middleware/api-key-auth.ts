@@ -8,7 +8,7 @@ import {
 import type { Context, MiddlewareHandler } from 'hono';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { execCtx, routeLabel } from '../lib/http.js';
+import { bearerToken, clientIp, execCtx, routeLabel } from '../lib/http.js';
 import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { writeApiRequestLog } from '../services/api-request-log.js';
@@ -19,11 +19,6 @@ import type { AppContext, Env } from '../types.js';
 const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
 const LAST_USED_THROTTLE_MS = 60_000;
 const AUDIT_PATH_MAX = 256;
-
-function clientIp(c: Context<AppContext>): string {
-  const value = c.req.header('CF-Connecting-IP') || '';
-  return (value.split(',')[0] ?? '').trim().toLowerCase() || 'unknown';
-}
 
 /** api_keys LEFT JOIN users 读出的鉴权所需列 */
 interface ApiKeyRecord {
@@ -69,8 +64,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   const startedAt = Date.now();
   c.set('apiStartedAt', startedAt);
 
-  const header = c.req.header('Authorization') || '';
-  const token = header.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? '';
+  const token = bearerToken(c);
   const keyHash = KEY_PATTERN.test(token) ? await sha256Hex(token) : null;
   const { settings, record } = await loadSettingsAndKey(c.env, keyHash);
   // API 关闭优先于 Key 校验
@@ -94,7 +88,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   };
 
   // key 已定位：从这里起的拒绝（状态/过期/IP/限流）都进审计，安全监控最需要这些
-  const ip = clientIp(c);
+  const ip = clientIp(c).toLowerCase();
   let statusCode = 200;
   let admitted = false;
   try {

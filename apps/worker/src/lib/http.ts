@@ -38,6 +38,11 @@ export function execCtx(c: Context<AppContext>): ExecCtx | null {
   }
 }
 
+/** Authorization: Bearer 后的令牌；缺失或格式不对时为空串 */
+export function bearerToken(c: { req: { header: (name: string) => string | undefined } }): string {
+  return (c.req.header('Authorization') || '').match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? '';
+}
+
 /** 取客户端 IP（部署在 Cloudflare 后，仅信任 CF-Connecting-IP） */
 export function clientIp(c: Context<AppContext>): string {
   const value = c.req.header('CF-Connecting-IP') || '';
