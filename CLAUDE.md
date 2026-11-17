@@ -63,6 +63,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 - **邮箱共享**：用户可通过 `/api/mailboxes/shares` 共享自己的邮箱，管理员通过 `/api/admin/mailbox-shares` 管理全站任意已认领邮箱；接收人可为启用中的用户或管理员，不能包含所有者。共享只授权未删除来信，所有者禁用时隐藏，角色变化保留，释放/过户时撤销；不参与通知归属。
 - **共享邮件的已读状态属于所有者**：成员的已读/未读操作、全部已读都不生效，未读数与 `unread=1` 筛选也不含共享邮件；前端按已读样式显示共享邮件。
 - **验证链接**：入站时由 `services/link-extract.ts` 提取到 `messages.verification_link`（宁缺毋滥，与提码同一开关，不回填历史）；前端比对链接域名与发件域，不一致时提示。
+- **发件认证结果**（`lib/auth-results.ts` → `messages.auth`）：只信 Cloudflare 加在最上方、authserv-id 为 `mx.cloudflare.net` 的 Authentication-Results，最上方那条不是它就不往下找；ARC-Authentication-Results 不采信。NULL 是「未知」（历史邮件、站内互投、没带头），不是失败。Claude 账号事实（`claude-facts.ts`）只认 DKIM 通过、签名域等于或为白名单发件域的父域、`aligned`（From/To/Subject 头不重复）且收件地址在 To 头里的来信，防伪造和正版信重投；2026-11 之前按旧口径归纳的事实不回溯。收件详情的 `extractedText`、`risk`（`lib/agent-text.ts`）在读取时由完整正文惰性计算，不落库、不进收件链路。
 - **AI 只走管理后台配置的 OpenAI 兼容模型**（`settings.ai_model`，如 DeepSeek），不再使用 Workers AI binding。验证码兜底（仅在命中验证码关键词且正则未识别时调用）与邮件翻译共用 `services/ai-provider.ts`；DeepSeek 必须带 `thinking: {type: 'disabled'}`（否则慢且贵）；workerd 的 fetch 不支持 `redirect: 'error'`，用 `manual` 并把 3xx 当失败。apiKey 回显为 `SECRET_MASK`，审计不记录。译文缓存在 `message_translations`，必须随 `purgeStatements` 一起删除（永久删除、保留期清理、释放并清空历史共用这条路径）。
 - **`cloudflare:email` 和 `mimetext` 必须在 `outbound.ts` 里动态 `import()`**（静态 import 会让 vitest 的 workerd 加载即崩）；mimetext 用 `mimetext/browser` 入口（避免 nodejs_compat 依赖）。
 
