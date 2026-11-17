@@ -12,9 +12,10 @@ import {
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
   ALLOWED_CUSTOM_HEADERS, MAX_CUSTOM_HEADER_VALUE_BYTES, MAX_CUSTOM_NON_X_HEADERS, MAX_CUSTOM_HEADERS_TOTAL_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_SEND_REQUEST_BYTES, MAX_REPLY_TO, MAX_DISPLAY_NAME_LENGTH,
-  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES,
+  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
+import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
 
 export type Schema = Record<string, unknown>;
 export type Operation = Record<string, unknown>;
@@ -476,6 +477,43 @@ export function mailboxBatchPaths(scopes?: { read: string; write: string }): Pat
       parameters: [query('count', { type: 'integer', minimum: 1, maximum: MAX_BATCH_CLAIM }, 'Number of addresses to allocate.', true),
         query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: only zero-suspension domains, balanced by Claude accounts plus pending claims.', true)],
       description: 'Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy excludes every domain with any historical Claude suspension from both items and pool, regardless of paid status or deprecated thresholds. It balances accounts plus recent pending claims and stops at claim_random.dailyLimit or claim quotas without spilling over to suspended domains. Generate prefixes, then pass strategy=claude on each item for availability and actual claims, including after manual suffix changes. Claims atomically recheck suspension facts; a plan does not reserve eligibility.' }) },
+  };
+}
+/**
+ * 托管域名的查看、添加、立即检测与 DNS 解析：会话与 API Key 两套接口同形，API Key 另需 scope。
+ * 删除、成员上限、成员与过户只在会话接口，由 api-openapi 补在同一路径上。
+ */
+export function hostedDomainPaths(scopes?: { read: string; write: string }): Paths {
+  const audit = scopes ? ' The administration audit log records the actor as “username（API Key #id）”.' : '';
+  return {
+    '/hosted-domains': {
+      get: operation('List hosted domains the caller owns or was granted', array(ref('HostedDomain')), { scope: scopes?.read,
+        description: scopes
+          ? 'Users can host their own registered domains on this site. Each item has role owner or member. Administrator keys also see only their own here; the site-wide list is only in the JWT API GET /api/admin/hosted-domains.'
+          : 'Users can host their own domains on this site. Each item has role owner or member; administrators also see only their own here and use /admin/hosted-domains for all.' }),
+      post: operation('Host a domain', ref('HostedDomain'), { request: 'CreateHostedDomainRequest', scope: scopes?.write, status: 201,
+        description: `${scopes
+          ? 'Returns 403 forbidden while hosted domains are disabled or the site has no Cloudflare credentials; the public GET /api/config reports hostedDomainsEnabled.'
+          : 'Requires /config hostedDomainsEnabled.'} Enter a registered root domain (not a subdomain). The site creates a Cloudflare zone and returns status pending with the two nameServers to set at the registrar; existing DNS records at the old nameservers are not migrated automatically; recreate common records (website, verification and so on) with /hosted-domains/{id}/dns-records, preferably before changing the nameservers. Disable DNSSEC at the registrar first. After the nameservers take effect, receiving (Email Routing catch-all) and sending (Email Sending) are configured automatically; poll GET /hosted-domains/{id}. Mail to any unclaimed address on an active hosted domain is claimed for the owner on arrival. Ordinary users obey hosted_domains.maxPerUser and pending limits; domains already used on this site, system domains and zones already in the site account are rejected with 409. More than ${MAX_HOSTED_CREATES_PER_MINUTE} attempts per user per minute (including attempts Cloudflare rejected; administrators included) return 429 rate_limited. The site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} Cloudflare calls per minute, shared with checks, deletions and DNS records, is charged with the real calls: 2 when the domain is reserved (an exhausted budget returns 429 rate_limited, as does Cloudflare rate limiting) and 5 more for the background preconfiguration.${audit}` }),
+    },
+    '/hosted-domains/{id}': {
+      get: operation('Read a hosted domain and its setup progress', ref('HostedDomain'), { scope: scopes?.read,
+        description: `Owner, member or administrator; otherwise 404.${scopes ? ' Poll it at low frequency while setting up; the scheduled task advances setup about every 5 minutes. Deleting the domain, memberLimit, members and transfer are JWT-only.' : ''}` }),
+    },
+    '/hosted-domains/{id}/check': { post: operation('Check the nameservers and continue setup now', ref('HostedDomain'), { scope: scopes?.write,
+      description: `Owner or administrator. Asks Cloudflare to re-check nameservers while pending, then advances setup. Calls within 15 seconds of the last check return the current state. More than ${MAX_HOSTED_CHECKS_PER_MINUTE} requests per user per minute (including throttled or forbidden ones) return 429 rate_limited. A check that reaches Cloudflare costs 4 calls of the shared site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} calls per minute; an exhausted budget also returns 429 rate_limited. Nothing is charged while hosted domains are disabled or the Worker has no Cloudflare credentials.` }) },
+    '/hosted-domains/{id}/dns-records': {
+      get: operation('List DNS records of a hosted domain', array(ref('HostedDnsRecord')), { scope: scopes?.read,
+        description: `Owner or administrator; members get 403, other users 404. Reads the domain’s Cloudflare zone directly and needs only the Worker’s Cloudflare credentials, not hosted_domains.enabled (403 without them). Works while pending, so records can be added before changing the nameservers, and while suspended. Deleting domains return 409, as do domains still being created. Sorted by name (@ first), type and content, including kind=mail records used for receiving and sending and kind=readonly records this site cannot edit. All four DNS endpoints share a limit of ${MAX_HOSTED_DNS_REQUESTS_PER_MINUTE} requests per user per minute, administrators included. Because every hosted domain uses the site’s Cloudflare token, user actions share a site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} Cloudflare calls per minute with hosted-domain additions (2 when reserved plus 5 for background preconfiguration), immediate checks (4) and deletions (2, counted but never refused): listing records costs 1, adding, updating and deleting records cost 2 each, and only requests that can reach Cloudflare count (not those over the per-user limit, or rejected for permission or domain status). Either limit returns 429 rate_limited.` }),
+      post: operation('Add a DNS record to a hosted domain', ref('HostedDnsRecord'), { request: 'HostedDnsRecordInput', scope: scopes?.write, status: 201,
+        description: `Owner or administrator; on suspended domains only administrators may write (403). DNS only: A, AAAA and CNAME are created with proxied=false. Records that would conflict with mail are rejected with 400 before Cloudflare is called: root MX, root SPF TXT, any record at _dmarc, _domainkey, *._domainkey, cf-bounce or *.cf-bounce, and a CNAME at the root. At most ${MAX_HOSTED_DNS_RECORDS} non-mail records per domain (403). Cloudflare rejecting the value returns 400; an existing record that cannot coexist with the same name returns 409.${audit}` }),
+    },
+    '/hosted-domains/{id}/dns-records/{recordId}': {
+      put: operation('Update a DNS record of a hosted domain', ref('HostedDnsRecord'), { request: 'HostedDnsRecordInput', scope: scopes?.write,
+        description: `Owner or administrator, same domain status rules as adding. Only kind=user records can be changed; mail and readonly records return 403 with their lockedReason. type must equal the existing record type (400; delete and re-add instead). The new name and value follow the same mail-conflict rules as adding. An unknown or malformed recordId returns 404.${audit}` }),
+      delete: operation('Delete a DNS record of a hosted domain', success, { scope: scopes?.write,
+        description: `Owner or administrator, same domain status rules as adding. Only kind=user records can be deleted; mail and readonly records return 403. An unknown or malformed recordId returns 404.${audit}` }),
+    },
   };
 }
 export function uploadPaths(scope?: string): Paths {
