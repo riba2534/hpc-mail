@@ -10,6 +10,7 @@ import { AppError } from '../lib/errors.js';
 import type { Env, ExecCtx } from '../types.js';
 import { beginIdempotentSend, failIdempotentSend, type IdempotencyActor } from './idempotency.js';
 import {
+  attachmentSize,
   decodeInlineAttachments,
   deliveryFailedError,
   releaseDeliveryLeases,
@@ -68,14 +69,18 @@ async function prepareAttachments(
   const { items, tokens } = plan.attachments;
   const decoded = decodeInlineAttachments(items.filter((item) => !isUrlAttachment(item)));
   const stored = await resolveDraftAttachments(se.env, sender.userId, tokens, leaseToken, { draftId: plan.draftId });
-  const used = [...decoded, ...stored].reduce((sum, att) => sum + ('bytes' in att ? att.bytes.byteLength : att.size), 0);
+  const used = [...decoded, ...stored].reduce((sum, att) => sum + attachmentSize(att), 0);
   fetched.push(...await fetchUrlAttachments(se.env, sender.userId, items.filter(isUrlAttachment), {
     selfHosts: se.selfHosts, budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - used,
   }));
-  let inline = 0;
-  let remote = 0;
-  const ordered = items.map((item): DecodedAttachment => (isUrlAttachment(item) ? fetched[remote++]! : decoded[inline++]!));
-  return [...ordered, ...stored];
+  return [...inItemOrder<DecodedAttachment>(items, decoded, fetched), ...stored];
+}
+
+/** attachments[] 的 base64 与 URL 两路分开处理后，按请求里的原顺序合并（发信与保存草稿共用） */
+export function inItemOrder<T>(items: SendAttachmentItem[], inline: T[], remote: T[]): T[] {
+  let i = 0;
+  let r = 0;
+  return items.map((item) => (isUrlAttachment(item) ? remote[r++]! : inline[i++]!));
 }
 
 /**

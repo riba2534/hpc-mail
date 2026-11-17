@@ -90,7 +90,7 @@ export interface StoredAttachment extends AttachmentBase {
 
 export type DecodedAttachment = BytesAttachment | StoredAttachment;
 
-function attachmentSize(attachment: DecodedAttachment): number {
+export function attachmentSize(attachment: DecodedAttachment): number {
   return 'bytes' in attachment ? attachment.bytes.byteLength : attachment.size;
 }
 

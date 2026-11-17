@@ -18,7 +18,6 @@ import {
   type MessageSummary,
   type Page,
   type Role,
-  type SendAttachment,
   type StoredDraftContent,
 } from '@hpc-mail/shared';
 import { and, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
@@ -27,16 +26,15 @@ import { apiKeys, draftAttachments, drafts, idempotencyRecords, messages } from 
 import { runLimited } from '../lib/concurrency.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { base64ToBytes } from '../lib/mime.js';
-import { decodeCursor, encodeCursor } from '../lib/pagination.js';
+import { decodeCursor, toPage } from '../lib/pagination.js';
 import { makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { normalizeIdempotencyKey, type IdempotencyActor } from './idempotency.js';
 import { readMailBody, storeMailBody } from './mail-body.js';
 import { loadMessageSummary } from './message.js';
-import { attachmentDisposition, type Sender } from './outbound.js';
-import { deliverSend, planOf, settledResult, type SendEnvironment } from './send-flow.js';
-import { draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment } from './upload.js';
+import { attachmentDisposition, decodeInlineAttachments, type BytesAttachment, type Sender } from './outbound.js';
+import { deliverSend, inItemOrder, planOf, settledResult, type SendEnvironment } from './send-flow.js';
+import { draftKey, newDraftToken, releaseDraftStatements, releaseDrafts, reserveDraftAttachment } from './upload.js';
 import { fetchUrlAttachments, releaseUrlAttachments } from './url-attachment.js';
 
 type DraftRow = typeof drafts.$inferSelect;
@@ -122,12 +120,8 @@ export async function listDrafts(env: Env, owner: DraftOwner, query: ListDraftsQ
     .where(and(ownedBy(owner), query.status ? eq(drafts.status, query.status) : undefined,
       cursorId ? lt(drafts.id, cursorId) : undefined))
     .orderBy(desc(drafts.id)).limit(query.limit + 1).all();
-  const hasMore = rows.length > query.limit;
-  const page = hasMore ? rows.slice(0, query.limit) : rows;
-  return {
-    items: page.map((row) => toSummary(row.draft, row.apiKeyName)),
-    nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.draft.id) : null,
-  };
+  const page = toPage(rows, query.limit, (row) => row.draft.id);
+  return { items: page.items.map((row) => toSummary(row.draft, row.apiKeyName)), nextCursor: page.nextCursor };
 }
 
 /** 草稿行与它引用的附件合成一次往返 */
@@ -193,12 +187,15 @@ function assertSendable(content: StoredDraftContent, text: string, html: string,
   }
 }
 
-/** 引用已有上传附件前核对：属于本人、已上传完成、没有被其他草稿引用 */
-async function assertUsableTokens(env: Env, userId: number, refs: AttachmentTokenRef[], draftId: number | null): Promise<void> {
+/**
+ * 引用已有上传附件前核对：属于本人、已上传完成、没有被其他草稿引用。返回它们的合计大小（新附件的预算从剩余额度里扣）。
+ */
+async function usableTokenBytes(env: Env, userId: number, refs: AttachmentTokenRef[], draftId: number | null): Promise<number> {
   const tokens = [...new Set(refs.map((ref) => ref.token))];
-  if (!tokens.length) return;
-  const rows = await createDb(env).select({ token: draftAttachments.token, status: draftAttachments.status, draftId: draftAttachments.draftId })
-    .from(draftAttachments).where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, tokens))).all();
+  if (!tokens.length) return 0;
+  const rows = await createDb(env).select({
+    token: draftAttachments.token, status: draftAttachments.status, draftId: draftAttachments.draftId, size: draftAttachments.size,
+  }).from(draftAttachments).where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, tokens))).all();
   const byToken = new Map(rows.map((row) => [row.token, row]));
   for (const token of tokens) {
     const row = byToken.get(token);
@@ -210,23 +207,16 @@ async function assertUsableTokens(env: Env, userId: number, refs: AttachmentToke
       });
     }
   }
-}
-
-/** 已引用附件的合计大小（新附件的预算从剩余额度里扣） */
-async function referencedBytes(env: Env, userId: number, refs: AttachmentTokenRef[]): Promise<number> {
-  if (!refs.length) return 0;
-  const rows = await createDb(env).select({ size: draftAttachments.size }).from(draftAttachments)
-    .where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, [...new Set(refs.map((ref) => ref.token))]))).all();
   return rows.reduce((sum, row) => sum + row.size, 0);
 }
 
 /** base64 附件转存为一份上传附件（同 POST /uploads，计入每人待发送附件配额） */
-async function storeBase64(env: Env, userId: number, item: SendAttachment, bytes: Uint8Array): Promise<string> {
+async function storeBase64(env: Env, userId: number, { filename, mimeType, bytes }: BytesAttachment): Promise<string> {
   const token = newDraftToken();
   const r2Key = draftKey(userId, token);
-  const rowId = await reserveDraftAttachment(env, { userId, token, filename: item.filename, mimeType: item.contentType, size: bytes.byteLength, r2Key });
+  const rowId = await reserveDraftAttachment(env, { userId, token, filename, mimeType, size: bytes.byteLength, r2Key });
   try {
-    await env.r2.put(r2Key, bytes, { httpMetadata: { contentType: item.contentType } });
+    await env.r2.put(r2Key, bytes, { httpMetadata: { contentType: mimeType } });
     await env.db.prepare(`UPDATE draft_attachments SET status = 'ready' WHERE id = ?`).bind(rowId).run();
   } catch (error) {
     await env.db.batch(releaseDraftStatements(env, [rowId])).catch((cause) => console.error('草稿附件转存失败后的清理登记失败:', cause));
@@ -249,25 +239,19 @@ async function materialize(
   if (!items.length) return [];
   const created: { token: string }[] = [];
   try {
-    const stored = new Map<SendAttachment, string>();
-    let total = usedBytes;
-    for (const item of items) {
-      if (isUrlAttachment(item)) continue;
-      let bytes: Uint8Array;
-      try { bytes = base64ToBytes(item.content); } catch { throw new AppError('validation_failed', '附件需为合法 base64'); }
-      total += bytes.byteLength;
-      if (total > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
-      const token = await storeBase64(env, userId, item, bytes);
-      created.push({ token });
-      stored.set(item, token);
-    }
+    // base64 与发信同一解码；合计超限时一个都不转存
+    const decoded = decodeInlineAttachments(items.filter((item) => !isUrlAttachment(item)));
+    const total = decoded.reduce((sum, att) => sum + att.bytes.byteLength, usedBytes);
+    if (total > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
+    for (const att of decoded) created.push({ token: await storeBase64(env, userId, att) });
+    const stored = [...created];
     const fetched = await fetchUrlAttachments(env, userId, items.filter(isUrlAttachment), {
       selfHosts: request.selfHosts, budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - total,
     });
     created.push(...fetched);
-    let remote = 0;
-    return items.map((item) => ({
-      token: isUrlAttachment(item) ? fetched[remote++]!.token : stored.get(item)!,
+    const tokens = inItemOrder<{ token: string }>(items, stored, fetched);
+    return items.map((item, index) => ({
+      token: tokens[index]!.token,
       ...(item.contentId ? { contentId: item.contentId } : {}),
       ...(item.disposition ? { disposition: item.disposition } : {}),
     }));
@@ -286,8 +270,7 @@ function attachmentRefStatements(env: Env, userId: number, draftId: number, toke
   const keep = unique.length ? `AND token NOT IN (${unique.map(() => '?').join(', ')})` : '';
   const stale = `user_id = ? AND draft_id = ? ${keep}`;
   return [
-    env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM draft_attachments WHERE ${stale}`).bind(userId, draftId, ...unique),
-    env.db.prepare(`DELETE FROM draft_attachments WHERE ${stale}`).bind(userId, draftId, ...unique),
+    ...releaseDrafts(env, stale, [userId, draftId, ...unique]),
     ...(unique.length ? [env.db.prepare(`UPDATE draft_attachments SET draft_id = ? WHERE user_id = ? AND (draft_id IS NULL OR draft_id = ?)
       AND token IN (${unique.map(() => '?').join(', ')})`).bind(draftId, userId, draftId, ...unique)] : []),
   ];
@@ -329,8 +312,7 @@ async function prepare(
   if (sendable) assertSendable({ ...content, attachmentTokens: kept }, text, html, replacesAttachments ? input.attachments : []);
   let created: AttachmentTokenRef[] = [];
   if (replacesAttachments) {
-    await assertUsableTokens(env, userId, kept, draftId);
-    created = await materialize(env, userId, input.attachments ?? [], await referencedBytes(env, userId, kept), request);
+    created = await materialize(env, userId, input.attachments ?? [], await usableTokenBytes(env, userId, kept, draftId), request);
   }
   let body: Prepared['body'] = null;
   if (input.text !== undefined || input.html !== undefined) {
@@ -505,8 +487,7 @@ export async function deleteDraft(env: Env, owner: DraftOwner, id: number): Prom
   const released = `user_id = ? AND draft_id = ? AND NOT EXISTS (SELECT 1 FROM drafts WHERE id = ?)`;
   const [deleted] = await env.db.batch([
     env.db.prepare(`DELETE FROM drafts WHERE id = ? AND user_id = ? AND status <> 'sending' RETURNING id`).bind(id, userId),
-    env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM draft_attachments WHERE ${released}`).bind(userId, id, id),
-    env.db.prepare(`DELETE FROM draft_attachments WHERE ${released}`).bind(userId, id, id),
+    ...releaseDrafts(env, released, [userId, id, id]),
     ...bodyCleanupStatement(env, row.bodyR2Key),
   ]);
   if (!deleted?.results.length) {
