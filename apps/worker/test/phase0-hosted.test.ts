@@ -37,7 +37,7 @@ describe('定时任务分工', () => {
     }
 
     const every5 = await scheduledSteps(false);
-    expect(every5).toEqual(['inbound.repair', 'notification.repair', 'notification.process', 'purge.recover', 'outbound.stale', 'claude_facts.harvest',
+    expect(every5).toEqual(['notification.repair', 'notification.process', 'purge.recover', 'outbound.stale', 'claude_facts.harvest',
       'storage.leases', 'storage.links', 'bodies.offload', 'storage.cleanup', 'system_domains.onboarding', 'hosted_domains.sync', 'delivery_events.subscriptions',
       'webhooks.process']);
   });
