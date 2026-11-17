@@ -415,6 +415,6 @@ hpc '/messages/batch' -X POST -H 'Content-Type: application/json' -H "Idempotenc
 
 - 逐项处理，与单发完全相同：各自校验、带 `replyToMessageId`/`forwardAttachmentsFrom` 的项另需 `mail.read`、各自幂等、URL 附件、各自占用每日外发配额。最多 4 项同时进行。
 - 响应总是 HTTP 200 加 `{items, succeeded, failed}`，`items` 按 `index`（请求里的下标，从 0 起）排序。每项 `ok`、`httpStatus`（单发时会得到的状态）、`idempotencyKey`（本项实际用的键，没有时省略），成功时 `message` 与单发 201 的 `data` 相同（部分收件人失败也算 `ok`，仍要看 `status` 与 `recipientOutcomes`），失败时 `error` 与单发的错误对象相同。全部失败也是 200，看 `failed`。
-- 配额中途用完时，之后的项得到 429 `rate_limited`，前面已发出的不受影响；只重试失败的项。
+- 配额中途用完时，之后的项得到 429 `rate_limited`，前面已发出的不受影响；只重试失败的项。站点所在 Cloudflare 账户的每日发信上限用尽时，外部收件人被明确拒收，相应的项是 422 `delivery_failed`（`recipientOutcomes` 写明原因）。
 - 幂等：项里的 `idempotencyKey` 优先；没有时，请求头 `Idempotency-Key: K` 为第 i 项派生 `K:i`。网络错误或 5xx 后用同一个头、同一请求体整批重试，已完成的项原样重放，没开始的项继续发送；派生后的键超过 128 字符的项返回 400。改了某一项的内容就会得到该项的 409 `idempotency_mismatch`。
 - 整体失败只有几种：`items` 缺失、为空或超过 20 项（400），Key 没有 `mail.send`（403），请求体超过 16 MiB 或各项 base64 附件合计超过 10 MiB（413）。这些情况一封都没发。
