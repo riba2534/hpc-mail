@@ -28,8 +28,8 @@ beforeEach(async () => {
 });
 afterEach(() => { vi.restoreAllMocks(); });
 
-async function seedUser(name: string, targets: string[], status: 'active' | 'disabled' = 'active') {
-  const [user] = await db.insert(users).values({ username: name, passwordHash: 'x', role: 'user', status }).returning({ id: users.id });
+async function seedUser(name: string, targets: string[], status: 'active' | 'disabled' = 'active', role: 'user' | 'admin' = 'user') {
+  const [user] = await db.insert(users).values({ username: name, passwordHash: 'x', role, status }).returning({ id: users.id });
   const prefs: UserNotifyPrefs = { ...DEFAULT_USER_NOTIFY_PREFS, forward: { enabled: true, addresses: targets } };
   await updateUserNotifyPrefs(env, user!.id, { forward: prefs.forward });
   return { id: user!.id, prefs };
@@ -48,8 +48,15 @@ function mail(ownerIds: number[], toAddress = `fq-${++sequence}@quota.test`): Fo
   };
 }
 
-async function setRelayQuota(relayDaily: number, relayPerUserDaily: number) {
-  await updateSettings(env, { quota: { dailyOutbound: 0, dailyRecipients: 0, relayDaily, relayPerUserDaily } });
+/** 已认领地址的来信：地址归 owner，归属人快照只有 owner */
+async function claimedMail(ownerId: number): Promise<ForwardMail> {
+  const item = mail([ownerId]);
+  await db.insert(mailboxes).values({ address: item.toAddress, domain: item.domain, userId: ownerId });
+  return item;
+}
+
+async function setRelayQuota(relayDaily: number, relayPerUserDaily: number, relayUnclaimedDaily = 0) {
+  await updateSettings(env, { quota: { dailyOutbound: 0, dailyRecipients: 0, relayDaily, relayPerUserDaily, relayUnclaimedDaily } });
 }
 
 const count = async (scope: string, subject: string) => (await readCounter(env, scope, subject, dayWindow())).count;
@@ -66,7 +73,7 @@ describe('转发中转配额（R06）', () => {
     await setRelayQuota(2, 0);
     const owner = await seedUser('fq-site', ['t1@ext.test', 't2@ext.test', 't3@ext.test']);
     const relay = relayEnv();
-    await forwardReceivedMail(relay.env, mail([owner.id]), [owner.prefs]);
+    await forwardReceivedMail(relay.env, await claimedMail(owner.id), [owner.prefs]);
     expect(relay.sent.map((item) => item.to).sort()).toEqual(['t1@ext.test', 't2@ext.test']);
     expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(2);
     // 第三个目标被拒时，按人计数占到的一格退回
@@ -80,13 +87,13 @@ describe('转发中转配额（R06）', () => {
     expect(relay.sent[0]!.raw).toMatch(/^Auto-Submitted: auto-forwarded\r$/m);
 
     // 已满后再来的中转请求不推高计数
-    await forwardReceivedMail(relay.env, mail([owner.id]), [owner.prefs]);
+    await forwardReceivedMail(relay.env, await claimedMail(owner.id), [owner.prefs]);
     expect(relay.sent).toHaveLength(2);
     expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(2);
 
     // 原生 forward 成功不占中转额度
     const native = { headers: new Headers(), forward: vi.fn(async () => {}) } as unknown as ForwardableEmailMessage;
-    const nativeMail = mail([owner.id]);
+    const nativeMail = await claimedMail(owner.id);
     await forwardReceivedMail(relay.env, nativeMail, [owner.prefs], native);
     expect(native.forward).toHaveBeenCalledTimes(3);
     expect(relay.sent).toHaveLength(2);
@@ -95,38 +102,106 @@ describe('转发中转配额（R06）', () => {
     expect(nativeRows.map((row) => [row.status, row.forwardMode])).toEqual([['succeeded', 'native'], ['succeeded', 'native'], ['succeeded', 'native']]);
 
     await setRelayQuota(0, 0);
-    await forwardReceivedMail(relay.env, mail([owner.id]), [owner.prefs]);
+    await forwardReceivedMail(relay.env, await claimedMail(owner.id), [owner.prefs]);
     expect(relay.sent).toHaveLength(5);
     expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(5);
   });
 
-  it('按归属人日上限：用尽的人跳过、其他人不受影响；同一目标多位归属人时由还有额度的人计入，全部用尽才跳过', async () => {
+  it('按归属人日上限：已认领地址用尽的人跳过、其他人不受影响', async () => {
     await setRelayQuota(0, 1);
     const a = await seedUser('fq-user-a', ['fq-a@ext.test']);
     const b = await seedUser('fq-user-b', ['fq-b@ext.test']);
     const relay = relayEnv();
-    await forwardReceivedMail(relay.env, mail([a.id]), [a.prefs]);
-    await forwardReceivedMail(relay.env, mail([a.id]), [a.prefs]);
-    await forwardReceivedMail(relay.env, mail([b.id]), [b.prefs]);
+    await forwardReceivedMail(relay.env, await claimedMail(a.id), [a.prefs]);
+    await forwardReceivedMail(relay.env, await claimedMail(a.id), [a.prefs]);
+    await forwardReceivedMail(relay.env, await claimedMail(b.id), [b.prefs]);
     expect(relay.sent.map((item) => item.to)).toEqual(['fq-a@ext.test', 'fq-b@ext.test']);
     expect(await count(FORWARD_RELAY_USER_SCOPE, String(a.id))).toBe(1);
     expect((await forwardRows(a.id)).map((row) => [row.status, row.mode, row.error])).toEqual([
       ['skipped', '', '今日中转转发额度已用尽'], ['succeeded', 'relay', ''],
     ]);
+  });
 
-    const c = await seedUser('fq-user-c', ['fq-shared@ext.test']);
-    const d = await seedUser('fq-user-d', ['fq-shared@ext.test']);
-    await bumpCounter(env, FORWARD_RELAY_USER_SCOPE, String(c.id), dayWindow());
-    const shared = relayEnv();
-    await forwardReceivedMail(shared.env, mail([c.id, d.id]), [c.prefs, d.prefs]);
-    expect(shared.sent.map((item) => item.to)).toEqual(['fq-shared@ext.test']);
-    expect([await count(FORWARD_RELAY_USER_SCOPE, String(c.id)), await count(FORWARD_RELAY_USER_SCOPE, String(d.id))]).toEqual([1, 1]);
-    await forwardReceivedMail(shared.env, mail([c.id, d.id]), [c.prefs, d.prefs]);
-    expect(shared.sent).toHaveLength(1);
-    expect([await count(FORWARD_RELAY_USER_SCOPE, String(c.id)), await count(FORWARD_RELAY_USER_SCOPE, String(d.id))]).toEqual([1, 1]);
-    for (const owner of [c, d]) {
-      expect((await forwardRows(owner.id)).map((row) => row.status)).toEqual(['skipped', 'succeeded']);
-    }
+  /** 未认领地址按每位管理员各计一份时，外部来信能把全站中转额度按管理员人数成倍耗掉（N2） */
+  it('未认领地址（站内互投）：全体管理员共用一个计数，不按人叠加，也不占个人额度', async () => {
+    await setRelayQuota(0, 1, 3);
+    const a1 = await seedUser('fq-unclaimed-a1', ['un-a1@ext.test', 'un-shared@ext.test'], 'active', 'admin');
+    const a2 = await seedUser('fq-unclaimed-a2', ['un-a2@ext.test', 'un-shared@ext.test'], 'active', 'admin');
+    const relay = relayEnv();
+    await forwardReceivedMail(relay.env, mail([a1.id, a2.id]), [a1.prefs, a2.prefs]);
+    expect(relay.sent.map((item) => item.to).sort()).toEqual(['un-a1@ext.test', 'un-a2@ext.test', 'un-shared@ext.test']);
+    expect(await count(FORWARD_RELAY_SCOPE, 'unclaimed')).toBe(3);
+    expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(3);
+    expect([await count(FORWARD_RELAY_USER_SCOPE, String(a1.id)), await count(FORWARD_RELAY_USER_SCOPE, String(a2.id))]).toEqual([0, 0]);
+
+    // 共用额度用尽：再来的信全部跳过，计数不再累加，已占的域名与目标计数退回
+    const domainBefore = await count('fwd-domain', 'quota.test');
+    await forwardReceivedMail(relay.env, mail([a1.id, a2.id]), [a1.prefs, a2.prefs]);
+    expect(relay.sent).toHaveLength(3);
+    expect(await count(FORWARD_RELAY_SCOPE, 'unclaimed')).toBe(3);
+    expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(3);
+    expect(await count('fwd-domain', 'quota.test')).toBe(domainBefore);
+    expect((await forwardRows(a1.id)).filter((row) => row.status === 'skipped').map((row) => row.error))
+      .toEqual(['未认领地址今日中转转发额度已用尽', '未认领地址今日中转转发额度已用尽']);
+
+    // 快照只有一人、但地址不归他（收信后才被别人认领）：按未认领计
+    const other = await seedUser('fq-unclaimed-later', ['un-later@ext.test']);
+    await setRelayQuota(0, 1, 0);
+    const later = mail([a1.id]);
+    await db.insert(mailboxes).values({ address: later.toAddress, domain: later.domain, userId: other.id });
+    await forwardReceivedMail(relay.env, later, [a1.prefs]);
+    expect(await count(FORWARD_RELAY_SCOPE, 'unclaimed')).toBe(5);
+    expect(await count(FORWARD_RELAY_USER_SCOPE, String(a1.id))).toBe(0);
+  });
+
+  it('未认领地址（入站收件）：同样计入共用计数', async () => {
+    await setRelayQuota(0, 1, 1);
+    await updateSettings(env, { code_extract: { enabled: false, aiEnabled: false } });
+    const admin = await seedUser('fq-unclaimed-inbound', ['un-inbound@ext.test'], 'active', 'admin');
+    const address = 'fq-unclaimed-inbound@quota-inbound.test';
+    const relay = relayEnv();
+    const forward = vi.fn(async () => { throw new Error('destination not verified'); });
+    const raw = ['From: Sender <sender@example.net>', `To: ${address}`, 'Subject: fq unclaimed', 'Message-ID: <fq-unclaimed@example.net>',
+      'Content-Type: text/plain; charset=utf-8', '', 'hello', ''].join('\r\n');
+    const ctx = createExecutionContext();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await handleInbound({ raw: new Response(raw).body!, headers: new Headers(), to: address, from: 'sender@example.net', forward,
+      setReject: vi.fn() } as unknown as ForwardableEmailMessage, relay.env, ctx);
+    await waitOnExecutionContext(ctx);
+    // 本文件之前用例的管理员同样是归属人：共用额度 1，只中转出去一封
+    expect(forward).toHaveBeenCalled();
+    expect(relay.sent).toHaveLength(1);
+    expect(await count(FORWARD_RELAY_SCOPE, 'unclaimed')).toBe(1);
+    expect(await count(FORWARD_RELAY_USER_SCOPE, String(admin.id))).toBe(0);
+  });
+
+  /** 中转被跳过时域名与目标计数、中转抛错时中转额度一度不退（N4） */
+  it('中转因额度跳过时退还域名与目标计数；中转抛错时退还中转额度', async () => {
+    await setRelayQuota(1, 0);
+    const owner = await seedUser('fq-refund', ['fq-refund@ext.test']);
+    const relay = relayEnv();
+    const refundMail = async (local: string, domain: string) => {
+      const item = mail([owner.id], `${local}@${domain}`);
+      await db.insert(mailboxes).values({ address: item.toAddress, domain: item.domain, userId: owner.id });
+      return item;
+    };
+    await forwardReceivedMail(relay.env, await refundMail('r1', 'refund.test'), [owner.prefs]);
+    await forwardReceivedMail(relay.env, await refundMail('r2', 'refund.test'), [owner.prefs]);
+    expect(relay.sent).toHaveLength(1);
+    expect(await count('fwd-domain', 'refund.test')).toBe(1);
+    expect(await count('fwd-target', 'fq-refund@ext.test')).toBe(1);
+    expect(await count(FORWARD_RELAY_USER_SCOPE, String(owner.id))).toBe(1);
+
+    await setRelayQuota(0, 0);
+    const failing = { ...env, email: { send: async () => { throw new Error('send rejected'); } } } as unknown as Env;
+    await forwardReceivedMail(failing, await refundMail('r3', 'refund-fail.test'), [owner.prefs]);
+    expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(1);
+    expect(await count(FORWARD_RELAY_USER_SCOPE, String(owner.id))).toBe(1);
+    // 发送尝试过，域名与目标计数照算
+    expect(await count('fwd-domain', 'refund-fail.test')).toBe(1);
+    expect((await forwardRows(owner.id)).map((row) => [row.status, row.mode, row.error])).toEqual([
+      ['failed', 'relay', 'send rejected'], ['skipped', '', '全站今日中转转发额度已用尽'], ['succeeded', 'relay', ''],
+    ]);
   });
 
   it('域名或目标的日计数已满时跳过，两个计数都不再累加', async () => {

@@ -23,7 +23,6 @@ import {
   processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases, purgeOrphanAttachments,
 } from './storage-cleanup.js';
 import { FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE } from './forwarding.js';
-import { LOGIN_ACCOUNT_SCOPE } from './auth.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 import { releaseDraftStatements } from './upload.js';
@@ -256,7 +255,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
     ], minuteWindow(1) - 120);
-    await purgeCounters(env, ['login-fail', LOGIN_ACCOUNT_SCOPE], minuteWindow(15) - 8);
+    await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });
 }
