@@ -891,7 +891,7 @@ export function composeOperation(op: 'reply' | 'forward'): Operation {
     errorDescriptions: { ...SEND_ERROR_DESCRIPTIONS,
       400: 'validation_failed (unknown fields, empty body, invalid recipients, In-Reply-To/References in reply headers, or no recipient left to reply to), header_not_allowed, or from_required: the default sender (the address the source was received at) is not one you can send from, so give from.',
       403: 'forbidden: the API key lacks mail.send or mail.read, or the explicit from is not allowed (fix points to GET /identities).',
-      404: `source_unavailable (details.source is ${op}): the source message does not exist or is not visible to you${reply ? '' : ', or one of its attachments is gone'}.`,
+      404: `source_unavailable (details.source is ${op}): the source message does not exist or is not visible to you${reply ? '' : ', or one of its attachments is gone'}. not_found: the sender mailboxId given in from does not exist.`,
     },
     description: `${reply
       ? 'Replies to the visible message {id}: the server picks the recipients, adds Re: to the subject, sets In-Reply-To/References and by default quotes the original below your text.'
