@@ -309,10 +309,31 @@ export const hostedDomains = sqliteTable(
     memberLimit: integer('member_limit').notNull().default(0),
     checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
     activatedAt: integer('activated_at', { mode: 'timestamp_ms' }),
+    /** 核对租约到期时间：定时巡检与「立即检测」领取后才核对，同一域名不会被并发核对；处理完清空 */
+    syncLeaseUntil: integer('sync_lease_until', { mode: 'timestamp_ms' }),
+    /** 首次确认 Cloudflare 中查不到该 zone 的时间：间隔复核仍查不到才判为已迁走，期间可照常收信 */
+    zoneMissingAt: integer('zone_missing_at', { mode: 'timestamp_ms' }),
     updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
     createdAt: createdAtColumn(),
   },
   (t) => [index('idx_hosted_domains_user').on(t.userId), index('idx_hosted_domains_status').on(t.status, t.checkedAt)],
+);
+
+/**
+ * 托管域名墓碑：删除或过期后保留前所有者与本站分配过的 NS。保留期内其他用户重新添加同名域名前
+ * 要核对公开委派，防止 NS 仍指向本账户时被他人接管来信；迁移 0024 按审计日志回填了此前删除的域名。
+ */
+export const hostedDomainTombstones = sqliteTable(
+  'hosted_domain_tombstones',
+  {
+    domain: text('domain').primaryKey(),
+    userId: integer('user_id').notNull(),
+    nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    /** expire / delete / backfill */
+    reason: text('reason').notNull().default(''),
+    deletedAt: integer('deleted_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  },
+  (t) => [index('idx_hosted_domain_tombstones_deleted').on(t.deletedAt)],
 );
 
 /** 托管域名成员：可在该域名下认领地址，不改变域名归属，也看不到他人地址的邮件 */
