@@ -730,8 +730,8 @@ export async function applyMailPlan(
   }
 
   // S2 catch-all（放在开启 Routing 之前：MX 生效时未匹配地址已经有去处，不会退信）
-  const catchAll = () => write('catchAll.put', {
-    target: zoneId, before: facts.catchAllBefore ?? undefined,
+  const catchAll = (uninterruptible = false) => write('catchAll.put', {
+    target: zoneId, before: facts.catchAllBefore ?? undefined, uninterruptible,
     exec: () => putCatchAllWorker(creds, zoneId, workerName),
     verify: async () => {
       const now = await getCatchAll(creds, zoneId);
@@ -795,7 +795,8 @@ export async function applyMailPlan(
     done.push('routing.enable');
   }
   if (catchAllDeferred) {
-    const result = await catchAll();
+    // 降级路径：Routing 已经开了而 catch-all 还没指向本站，未匹配地址的来信会被拒收，补写这一步同样不被取消或截止时间打断
+    const result = await catchAll(true);
     if (result.kind !== 'done') return fail('catchAll.put', result);
     done.push('catchAll.put');
   }

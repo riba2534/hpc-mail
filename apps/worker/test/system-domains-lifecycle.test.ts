@@ -136,6 +136,80 @@ describe('取消', () => {
     expect(zone.routingEnabled).toBe(false);
   });
 
+  it('catch-all 降级路径（Routing 未开时拒写 catch-all）：开启 Routing 后补写 catch-all 不被取消打断', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('defer');
+    cf = fakeCloudflare({ zones: [{ name: domain }], catchAllRequiresRouting: true });
+    const zone = cf.zoneByName(domain)!;
+    const admin = await actor('lc-admin');
+    // 降级路径里开启 Routing 的请求发出时管理员点了取消
+    cf.onCall({ method: 'POST', path: /\/email\/routing\/dns$/ }, async () => {
+      const row = await env.db.prepare('SELECT id FROM system_domain_onboarding WHERE domain = ?').bind(domain).first<{ id: number }>();
+      expect((await data<SystemDomainOnboarding>(await cancel(admin.jwt, row!.id))).cancelRequested).toBe(true);
+    });
+    const created = await data<SystemDomainOnboarding>(await onboardExisting(admin, zone.id), 201);
+    expect(await task(created.id)).toMatchObject({ state: 'cancelled' });
+    expect(zone.routingEnabled).toBe(true);
+    // Routing 开了，catch-all 也必须已经指向本站，否则未匹配地址的来信全被拒收
+    expect(zone.catchAll).toMatchObject({ enabled: true, actions: [{ type: 'worker', value: ['hpc-cloud-mail'] }] });
+    expect(cf.writes().some((w) => w.includes('/email/sending/'))).toBe(false);
+  });
+
+  it('删了 MX、Routing 后来在台账之外开起来了：取消时不误报「MX 已删除」', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('manual');
+    cf = fakeCloudflare({ zones: [{ name: domain, records: [{ type: 'MX', name: domain, content: 'mx1.other.example', priority: 10 }] }] });
+    const zone = cf.zoneByName(domain)!;
+    cf.fail({ method: 'POST', path: /\/email\/routing\/dns$/, status: 403, code: 10000, times: 5 });
+    cf.fail({ method: 'POST', path: /\/email\/sending\/subdomains$/, status: 403, code: 10000, times: 5 });
+    const admin = await actor('lc-admin');
+    const created = await data<SystemDomainOnboarding>(await onboardExisting(admin, zone.id), 201);
+    expect(await task(created.id)).toMatchObject({ state: 'blocked', errorCode: 'mx_removed_routing_pending' });
+    // 管理员照提示去 Cloudflare 手动开启 Email Routing
+    zone.routingEnabled = true;
+    for (const n of [1, 2, 3]) cf.record(zone, { type: 'MX', name: domain, content: `route${n}.mx.cloudflare.net`, priority: n * 10 });
+    cf.record(zone, { type: 'TXT', name: domain, content: '"v=spf1 include:_spf.mx.cloudflare.net ~all"' });
+    await makeDue(created.id);
+    expect(await syncDueOnboarding(runtime)).toBe(1);
+    expect(await task(created.id)).toMatchObject({ state: 'blocked', errorCode: 'cf_permission', steps: { routing: { state: 'ready' } } });
+    const cancelled = await data<SystemDomainOnboarding>(await cancel(admin.jwt, created.id));
+    expect(cancelled).toMatchObject({ state: 'cancelled', errorCode: '' });
+    expect(cancelled.lastError).not.toContain('收不到信');
+  });
+
+  it('处理中取消、随后写回待确认（预检发现需确认项）：取消不被 next_check_at=NULL 吞掉，定时任务照常收尾', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('ask');
+    cf = fakeCloudflare({ zones: [{ name: domain, catchAll: { enabled: true, actions: [{ type: 'worker', value: ['legacy-worker'] }] } }] });
+    const zoneId = cf.zoneByName(domain)!.id;
+    const admin = await actor('lc-admin');
+    const id = await insertTask({ domain, createdBy: admin.id, state: 'configuring', zoneId, zoneStatus: 'active' });
+    cf.onCall({ method: 'GET', path: /\/catch_all$/ }, async () => {
+      expect((await data<SystemDomainOnboarding>(await cancel(admin.jwt, id))).cancelRequested).toBe(true);
+    });
+    expect(await syncDueOnboarding(runtime)).toBe(1);
+    expect(await task(id)).toMatchObject({ state: 'needs_confirmation', cancelRequested: true });
+    expect(await syncDueOnboarding(runtime)).toBe(1);
+    expect((await task(id)).state).toBe('cancelled');
+  });
+
+  it('不可中断段里 Routing 返回 2008 写回待确认时已请求取消：定时任务照常收尾并保留 MX 告警', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('race');
+    cf = fakeCloudflare({ zones: [{ name: domain, records: [{ type: 'MX', name: domain, content: 'mx1.other.example', priority: 10 }] }] });
+    const zone = cf.zoneByName(domain)!;
+    const admin = await actor('lc-admin');
+    cf.onCall({ method: 'POST', path: /\/email\/routing\/dns$/ }, async () => {
+      const row = await env.db.prepare('SELECT id FROM system_domain_onboarding WHERE domain = ?').bind(domain).first<{ id: number }>();
+      expect((await data<SystemDomainOnboarding>(await cancel(admin.jwt, row!.id))).cancelRequested).toBe(true);
+      cf!.record(zone, { type: 'MX', name: domain, content: 'mx.sneaky.example', priority: 5 });
+    });
+    const created = await data<SystemDomainOnboarding>(await onboardExisting(admin, zone.id), 201);
+    expect(await task(created.id)).toMatchObject({ state: 'needs_confirmation', errorCode: 'mx_conflict', cancelRequested: true });
+    expect(await syncDueOnboarding(runtime)).toBe(1);
+    expect(await task(created.id)).toMatchObject({ state: 'cancelled', errorCode: 'mx_removed_routing_pending' });
+  });
+
   it('本任务新建、从未激活的 zone：勾选删除时取消删除 zone 并审计，不勾选保留；取消时已激活则保留', async () => {
     const f = await resetSystemDomains();
     cf = fakeCloudflare();
