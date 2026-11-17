@@ -15,6 +15,7 @@ import {
   type CloudflareCredentials, type ZoneDeleteGuard,
 } from './cloudflare.js';
 import { hasDnssec } from './domain-check.js';
+import { delegationBlock, tombstoneStatement } from './hosted-tombstone.js';
 import { systemDomainListedSql } from './domain-occupancy.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
@@ -325,12 +326,17 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
  * 从不接管账户里已有的同名 zone；建 zone 失败释放占位。能在 NS 生效前做的配置随后在后台尝试。
  */
 export async function createHostedDomain(env: Env, viewer: Viewer, domain: string, ctx?: ExecCtx | null, ip = ''): Promise<HostedDomain> {
+  // 公开委派预检与读取设置并行（查 RDAP/DoH，不走 Cloudflare API）；先处理下面的快速失败再看它的结论
+  const delegation = delegationBlock(env, viewer, domain);
+  delegation.catch(() => undefined);
   const settings = await getSettingsFresh(env);
   const creds = requireCredentials(env, settings);
   // 快速失败；与管理员同时把它加为系统域名的竞态由下面占位语句里的守卫兜住
   if (settings.domains.list.some((entry) => entry.domain === domain)) {
     throw new AppError('conflict', '该域名已是本站的系统域名');
   }
+  const blocked = await delegation;
+  if (blocked) throw blocked;
   const cfg = settings.hosted_domains;
   // 个人计数、占位与全站计数在同一个 batch：超过个人上限或全站额度不够的请求不占位、不占全站额度，
   // 也不会走到 Cloudflare。全站计数只认本次占到的那一行（created_at 写入本次请求的时间戳以区分已有占位）
@@ -500,8 +506,10 @@ async function preconfigure(env: Env, creds: CloudflareCredentials, id: number):
 /** 删除 zone 与记录（只用于从未生效的 pending 域名，没有地址和邮件） */
 async function dropPending(env: Env, creds: CloudflareCredentials, row: HostedRow, reason: string): Promise<void> {
   if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain, await zoneGuard(env, row));
-  const [removed] = await env.db.batch([
-    env.db.prepare("DELETE FROM hosted_domains WHERE id = ? AND status = 'pending' AND activated_at IS NULL").bind(row.id),
+  const guard = "id = ? AND status = 'pending' AND activated_at IS NULL";
+  const [, removed] = await env.db.batch([
+    tombstoneStatement(env, 'expire', guard, [row.id]),
+    env.db.prepare(`DELETE FROM hosted_domains WHERE ${guard}`).bind(row.id),
     env.db.prepare('DELETE FROM hosted_domain_members WHERE domain_id = ?1 AND NOT EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1)').bind(row.id),
   ]);
   if (removed?.meta.changes) await logAdminAction(env, SYSTEM_ACTOR, 'hosted_domain.expire', row.domain, reason);
@@ -555,9 +563,13 @@ async function teardown(env: Env, creds: CloudflareCredentials, row: HostedRow):
     return;
   }
   // 删除中的域名拒收、不可认领；进行中的收件仍可能晚到，留到该域没有邮件和地址时再删记录，下一轮继续清理
-  await env.db.prepare(`DELETE FROM hosted_domains WHERE id = ?1 AND status = 'deleting'
-    AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?2) AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?2)`)
-    .bind(row.id, row.domain).run();
+  // 墓碑与删除同一守卫、同一 batch：记录真正删掉时才留下前所有者与 NS
+  const guard = `id = ? AND status = 'deleting'
+    AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?) AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?)`;
+  await env.db.batch([
+    tombstoneStatement(env, 'delete', guard, [row.id, row.domain, row.domain]),
+    env.db.prepare(`DELETE FROM hosted_domains WHERE ${guard}`).bind(row.id, row.domain, row.domain),
+  ]);
 }
 
 /**

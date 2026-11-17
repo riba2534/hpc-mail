@@ -29,7 +29,7 @@ describe('定时任务分工', () => {
   it('每日维护只跑维护步骤，5 分钟任务不跑维护步骤（16:00 两个 cron 同时触发时不重复）', async () => {
     const daily = await scheduledSteps(true);
     expect(daily).toEqual(expect.arrayContaining(['claude_facts.catchup', 'idempotency.cleanup', 'counters', 'retention', 'trash',
-      'attachments.orphans']));
+      'attachments.orphans', 'hosted_domains.tombstones']));
     for (const regular of ['notification.repair', 'notification.process', 'purge.recover', 'outbound.stale', 'claude_facts.harvest',
       'storage.leases', 'storage.links', 'storage.cleanup', 'hosted_domains.sync']) {
       expect(daily).not.toContain(regular);

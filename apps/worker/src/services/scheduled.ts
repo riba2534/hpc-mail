@@ -19,6 +19,7 @@ import {
   HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
 } from './hosted-domain.js';
 import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
+import { purgeHostedTombstones } from './hosted-tombstone.js';
 import {
   processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases, purgeOrphanAttachments,
 } from './storage-cleanup.js';
@@ -247,6 +248,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
   // 附件行指向已不存在的邮件（附件写入前邮件被永久删除等）：登记对象清理并删行
   await step(report, 'attachments.orphans', () => purgeOrphanAttachments(env));
+  // 托管域名墓碑过了保留期：前所有者的优先权到期，NS 委派预检只看仍在的托管记录与墓碑
+  await step(report, 'hosted_domains.tombstones', () => purgeHostedTombstones(env));
   // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组
   await step(report, 'counters', async () => {
     await purgeCounters(env, [
