@@ -1,5 +1,5 @@
 import { DRAFT_ATTACHMENT_TTL_HOURS } from '@hpc-mail/shared';
-import { and, eq, inArray, isNotNull, lt, notInArray, type SQL } from 'drizzle-orm';
+import { and, eq, exists, inArray, isNotNull, lt, notInArray, or, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import {
   apiRateLimits,
@@ -23,6 +23,9 @@ import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js'
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** 幂等记录保留：已完成与结果已落在发件行上的 2 天，失败的 7 天 */
+const IDEMPOTENCY_SETTLED_RETENTION_MS = 2 * DAY_MS;
+const IDEMPOTENCY_FAILED_RETENTION_MS = 7 * DAY_MS;
 /** Claude 地址事实归纳窗口：5 分钟一次扫最近 1 小时，每日再扫最近 3 天，重叠窗口兜住漏跑 */
 const CLAUDE_FACTS_WINDOW_MS = 60 * 60 * 1000;
 const CLAUDE_FACTS_CATCHUP_MS = 3 * DAY_MS;
@@ -147,10 +150,20 @@ async function step(report: StepReport[], name: string, task: () => Promise<numb
   }
 }
 
-/** 每 5 分钟：通知补录与投递、清理台账；每日额外：审计日志 90 天 + 过期限流窗口 + 邮件保留策略 */
+/**
+ * 每 5 分钟（maintenance=false）：通知补录与投递、清理台账；
+ * 每日（maintenance=true）：审计日志 90 天 + 过期限流窗口 + 邮件保留策略。
+ * 16:00 两个 cron 同时触发，每日那次只跑维护步骤，常规步骤由同时刻的 5 分钟 cron 负责，不重复执行。
+ */
 export async function runScheduled(env: Env, maintenance = true): Promise<void> {
   const started = Date.now();
   const report: StepReport[] = [];
+  if (maintenance) await runMaintenance(env, report);
+  else await runRegular(env, report);
+  console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
+}
+
+async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'notification.repair', () => repairUnqueuedNotifications(env));
   await step(report, 'notification.process', async () => (await processNotificationJobs(env)).processed);
   // Recover a metadata purge interrupted between reservation and transaction completion.
@@ -164,8 +177,6 @@ export async function runScheduled(env: Env, maintenance = true): Promise<void> 
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
-  if (maintenance) await runMaintenance(env, report);
-  console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
 }
 
 async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
@@ -192,10 +203,19 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     (await db.delete(apiRateLimits).where(lt(apiRateLimits.windowStart, staleWindow)).run()).meta.changes ?? 0);
   await step(report, 'sessions.cleanup', async () =>
     (await db.delete(sessions).where(lt(sessions.expiresAt, new Date())).run()).meta.changes ?? 0);
-  await step(report, 'idempotency.cleanup', async () => (await db
-    .delete(idempotencyRecords)
-    .where(and(lt(idempotencyRecords.createdAt, new Date(Date.now() - 2 * DAY_MS)), eq(idempotencyRecords.status, 'completed')))
-    .run()).meta.changes ?? 0);
+  // 幂等记录：已完成的；失败的（失败时一定没有外发，保留 7 天便于排查）；
+  // 以及仍是 pending、但绑定的发件行已终态的（回填结果失败时留下，结果以发件行为准）
+  await step(report, 'idempotency.cleanup', async () => {
+    const settledBefore = new Date(Date.now() - IDEMPOTENCY_SETTLED_RETENTION_MS);
+    const settledMessage = db.select({ id: messages.id }).from(messages).where(and(
+      eq(messages.id, idempotencyRecords.messageId), inArray(messages.status, ['sent', 'delivered', 'failed'])));
+    return (await db.delete(idempotencyRecords).where(or(
+      and(eq(idempotencyRecords.status, 'completed'), lt(idempotencyRecords.createdAt, settledBefore)),
+      and(eq(idempotencyRecords.status, 'failed'),
+        lt(idempotencyRecords.createdAt, new Date(Date.now() - IDEMPOTENCY_FAILED_RETENTION_MS))),
+      and(eq(idempotencyRecords.status, 'pending'), lt(idempotencyRecords.createdAt, settledBefore), exists(settledMessage)),
+    )).run()).meta.changes ?? 0;
+  });
   await step(report, 'retention', () => runRetention(env));
   // 回收站：软删除超过 7 天硬删
   await step(report, 'trash', async () => {
@@ -217,6 +237,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, 'api-user', minuteWindow(1) - 120);
     await purgeCounters(env, 'api-global', minuteWindow(1) - 120);
     await purgeCounters(env, 'api-wait', minuteWindow(1) - 120);
+    await purgeCounters(env, 'api-reject', minuteWindow(1) - 120);
     await purgeCounters(env, 'auth-user', minuteWindow(1) - 120);
     await purgeCounters(env, 'auth-global', minuteWindow(1) - 120);
     await purgeCounters(env, HOSTED_DNS_RATE_SCOPE, minuteWindow(1) - 120);
