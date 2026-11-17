@@ -73,6 +73,12 @@ export function parseId(value: string | undefined): number {
   return id;
 }
 
+/** 托管域名 DNS 记录 ID：Cloudflare 记录 ID 为 32 位十六进制，格式不对按记录不存在处理 */
+export function parseRecordId(value: string | undefined): string {
+  if (!value || !/^[0-9a-f]{32}$/.test(value)) throw new AppError('not_found', '解析记录不存在');
+  return value;
+}
+
 /** 显式布尔查询不能因拼写或客户端类型差异静默退回 false。 */
 export function parseBooleanFlag(value: string | undefined): boolean {
   if (value === undefined || value === '' || value === '0' || value === 'false') return false;
