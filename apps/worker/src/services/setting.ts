@@ -7,6 +7,7 @@ import {
   type UpdateSettingsRequest,
 } from '@hpc-mail/shared';
 import { AppError } from '../lib/errors.js';
+import { sameSecretTarget } from '../lib/http.js';
 import { createDb } from '../db/client.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { anyHostedSql } from './domain-occupancy.js';
@@ -108,21 +109,13 @@ export function isTranslationReady(settings: Pick<Settings, 'translation' | 'ai_
   return settings.translation.enabled && isAiModelConfigured(settings.ai_model);
 }
 
-function originOf(url: string): string {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return '';
-  }
-}
-
 /**
- * apiKey 为 SECRET_MASK 表示沿用已存密钥，只能发往原来的接口：baseUrl 换了源（协议、主机或端口）时
+ * apiKey 为 SECRET_MASK 表示沿用已存密钥，只能发往原来的接口：baseUrl 的源或路径变了（末尾斜杠除外）时
  * 必须重新填写，否则管理员会话失窃后改个地址就能把已存密钥外带出去（清空地址不会发出密钥，允许）。保存设置与测试接口共用。
  */
 export function resolveMaskedAiKey(saved: Settings['ai_model'], baseUrl: string, apiKey: string): string {
   if (apiKey !== SECRET_MASK) return apiKey;
-  if (saved.apiKey && baseUrl && originOf(baseUrl) !== originOf(saved.baseUrl)) {
+  if (saved.apiKey && baseUrl && !sameSecretTarget(baseUrl, saved.baseUrl)) {
     throw new AppError('validation_failed', '接口地址已更换，请重新填写 API Key');
   }
   return saved.apiKey;

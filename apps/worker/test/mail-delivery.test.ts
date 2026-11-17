@@ -437,6 +437,30 @@ describe('收发件功能与故障恢复', () => {
     expect(rows[0]!.recipientOutcomes[0]?.status).toBe('failed');
   });
 
+  it('超长 HTML 中转转发：纯文本只含开头并在末尾说明截断，HTML 完整转发；普通邮件不加说明', async () => {
+    const receiver = await seedUser('functional-long-relay', 'user');
+    await updateUserNotifyPrefs(env, receiver.userId, { forward: { enabled: true, addresses: ['long-relay@example.net'] } });
+    const mime = (subject: string, body: string) => ['From: sender@example.net', 'To: functional-long-relay@hpc.email',
+      `Subject: ${subject}`, 'MIME-Version: 1.0', 'Content-Type: text/html; charset=utf-8', '', body, ''].join('\r\n');
+    const { customEnv, captured } = captureEnv();
+    for (const [subject, body] of [
+      ['functional-long-relay', `<p>START ${'word '.repeat(120_000)}</p><p>END-OF-MAIL</p>`],
+      ['functional-short-relay', '<p>short body</p>'],
+    ]) {
+      const ctx = createExecutionContext();
+      await handleInbound(incoming('functional-long-relay@hpc.email', mime(subject!, body!), vi.fn(async () => { throw new Error('unverified'); })), customEnv, ctx);
+      await waitOnExecutionContext(ctx);
+    }
+    expect(captured).toHaveLength(2);
+    const [long, short] = captured.map((entry) => entry.mail);
+    expect(long.text).toContain('START');
+    expect(long.text).not.toContain('END-OF-MAIL');
+    expect(long.text.trimEnd()).toMatch(/纯文本版本只包含开头部分，完整内容请查看 HTML 版本）$/);
+    expect(long.html).toContain('END-OF-MAIL');
+    expect(short.text).toContain('short body');
+    expect(short.text).not.toContain('纯文本版本只包含开头部分');
+  });
+
   it('SMTP 中转的大内联图片转独立链接，正文 CID 一同替换', async () => {
     const receiver = await seedUser('functional-large-relay', 'user');
     await updateUserNotifyPrefs(env, receiver.userId, { forward: { enabled: true, addresses: ['large-relay@example.net'] } });

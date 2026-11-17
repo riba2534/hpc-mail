@@ -49,8 +49,13 @@ export const HOSTED_CREATE_RATE_SCOPE = 'hosted_create';
 export const HOSTED_CHECK_RATE_SCOPE = 'hosted_check';
 export const MAX_HOSTED_CREATES_PER_MINUTE = 5;
 export const MAX_HOSTED_CHECKS_PER_MINUTE = 10;
-/** 计入全站额度的 Cloudflare 调用数：添加先按名称查 zone 再创建；检测在等待 NS 时 2 次，生效后补齐配置约 4 次 */
+/**
+ * 计入全站额度的 Cloudflare 调用数（按调用序列基准用例核实）：添加先按名称查 zone 再创建 2 次，建好后后台预配置
+ * catch-all 与发信 5 次；删除撤发信接入、删 zone 2 次；检测在等待 NS 时 2 次，生效后补齐配置约 4 次。
+ */
 const CREATE_CF_CALLS = 2;
+const PRECONFIGURE_CF_CALLS = 5;
+const TEARDOWN_CF_CALLS = 2;
 const CHECK_CF_CALLS = 4;
 const SITE_BUSY = '当前域名操作较多，请稍后再试';
 
@@ -74,6 +79,13 @@ async function runDetached(ctx: ExecCtx | null | undefined, label: string, task:
   const guarded = task().catch((error) => console.error(`${label}失败:`, error));
   if (ctx) ctx.waitUntil(guarded);
   else await guarded;
+}
+
+/** 用户操作触发的后台调用（预配置、删除）只计入全站额度，不因额度拒绝；计数失败不影响任务本身 */
+async function recordSiteCalls(env: Env, calls: number): Promise<void> {
+  if (!cloudflareCredentials(env)) return;
+  await counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', minuteWindow(1), calls).run()
+    .catch((error) => console.error('记录 Cloudflare 调用额度失败:', error));
 }
 
 // ---------------------------------------------------------------------------
@@ -263,8 +275,8 @@ function createZoneError(error: unknown): AppError {
 }
 
 /** 占位守卫未通过：读回各项条件，给出具体原因 */
-async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: Settings['hosted_domains']): Promise<AppError> {
-  const [hosted, listed, used, owned, pending, totalPending, user] = await env.db.batch([
+async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: Settings['hosted_domains'], window: number): Promise<AppError> {
+  const [hosted, listed, used, owned, pending, totalPending, user, site] = await env.db.batch([
     env.db.prepare('SELECT user_id FROM hosted_domains WHERE domain = ?').bind(domain),
     env.db.prepare(`SELECT ${systemDomainListedSql('?1')} AS listed`).bind(domain),
     env.db.prepare(`SELECT (EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
@@ -273,6 +285,8 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(viewer.id),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE status = 'pending'"),
     env.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 'active'").bind(viewer.id),
+    env.db.prepare(`SELECT count AS n FROM rate_counters WHERE scope = ? AND subject = 'all' AND "window" = ?`)
+      .bind(HOSTED_DNS_SITE_RATE_SCOPE, window),
   ]);
   const first = <T>(result: D1Result | undefined) => result?.results?.[0] as T | undefined;
   const holder = first<{ user_id: number }>(hosted);
@@ -294,6 +308,9 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
   if (Number(first<{ n: number }>(totalPending)?.n) >= cfg.maxPendingTotal) {
     return new AppError('rate_limited', '当前等待生效的域名较多，请稍后再试');
   }
+  if (Number(first<{ n: number }>(site)?.n ?? 0) + CREATE_CF_CALLS > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) {
+    return new AppError('rate_limited', SITE_BUSY);
+  }
   return new AppError('conflict', '域名状态已改变，请刷新后重试');
 }
 
@@ -309,13 +326,16 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
     throw new AppError('conflict', '该域名已是本站的系统域名');
   }
   const cfg = settings.hosted_domains;
-  // 个人计数与占位同一个 batch：超过个人上限的请求不占位，也不会走到 Cloudflare
+  // 个人计数、占位与全站计数在同一个 batch：超过个人上限或全站额度不够的请求不占位、不占全站额度，
+  // 也不会走到 Cloudflare。全站计数只认本次占到的那一行（created_at 写入本次请求的时间戳以区分已有占位）
   const window = minuteWindow(1);
+  const reservedAt = Date.now();
   const [userCount, reservation] = await env.db.batch([
     counterStatement(env, HOSTED_CREATE_RATE_SCOPE, String(viewer.id), window),
-    env.db.prepare(`INSERT INTO hosted_domains (domain, user_id, status)
-    SELECT ?1, ?2, 'pending'
+    env.db.prepare(`INSERT INTO hosted_domains (domain, user_id, status, created_at)
+    SELECT ?1, ?2, 'pending', ?11
     WHERE (SELECT count FROM rate_counters WHERE scope = ?7 AND subject = ?8 AND "window" = ?9) <= ?10
+      AND COALESCE((SELECT count FROM rate_counters WHERE scope = ?12 AND subject = 'all' AND "window" = ?9), 0) + ?13 <= ?14
       AND NOT EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ?1)
       AND NOT ${systemDomainListedSql('?1')}
       AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
@@ -326,22 +346,19 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
       AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active')
     RETURNING id`)
       .bind(domain, viewer.id, viewer.role === 'admin' ? 1 : 0, cfg.maxPerUser, cfg.maxPendingPerUser, cfg.maxPendingTotal,
-        HOSTED_CREATE_RATE_SCOPE, String(viewer.id), window, MAX_HOSTED_CREATES_PER_MINUTE),
+        HOSTED_CREATE_RATE_SCOPE, String(viewer.id), window, MAX_HOSTED_CREATES_PER_MINUTE,
+        reservedAt, HOSTED_DNS_SITE_RATE_SCOPE, CREATE_CF_CALLS, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE),
+    counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, CREATE_CF_CALLS, 0, {
+      sql: 'EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ? AND user_id = ? AND zone_id IS NULL AND created_at = ?)',
+      params: [domain, viewer.id, reservedAt],
+    }),
   ]);
   if ((counterResult(userCount)?.count ?? 1) > MAX_HOSTED_CREATES_PER_MINUTE) {
     throw new AppError('rate_limited', '添加域名过于频繁，请稍后再试');
   }
   const reserved = reservation?.results?.[0] as { id: number } | undefined;
-  if (!reserved) throw await reservationError(env, viewer, domain, cfg);
+  if (!reserved) throw await reservationError(env, viewer, domain, cfg, window);
   const id = Number(reserved.id);
-  // 占好位才计入全站额度（占位仍在才计）；超限时释放占位
-  const site = counterResult(await counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, CREATE_CF_CALLS, 0, {
-    sql: "EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND zone_id IS NULL AND status = 'pending')", params: [id],
-  }).all());
-  if ((site?.count ?? 0) > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) {
-    await env.db.prepare('DELETE FROM hosted_domains WHERE id = ? AND zone_id IS NULL').bind(id).run();
-    throw new AppError('rate_limited', SITE_BUSY);
-  }
 
   let zone;
   try {
@@ -376,7 +393,10 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
   }
   await logAdminAction(env, viewer, 'hosted_domain.create', domain, `zone ${zone.id}，NS ${(zone.name_servers ?? []).join(' / ')}`, ip);
   // catch-all 与发信接入不一定要求 zone 已激活，先尝试；Email Routing 要等 NS 生效后由定时任务补齐
-  await runDetached(ctx, '托管域名预配置', () => preconfigure(env, creds, id));
+  await runDetached(ctx, '托管域名预配置', async () => {
+    await recordSiteCalls(env, PRECONFIGURE_CF_CALLS);
+    await preconfigure(env, creds, id);
+  });
   return getHostedDomain(env, viewer, id);
 }
 
@@ -618,19 +638,21 @@ export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number
 
 /** 用户点「立即检测」：等待 NS 时请 Cloudflare 立即复查，再核对并推进开通 */
 export async function checkHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
-  // 全站计数的条件与下面实际触发核对的一致：所有者或管理员、未暂停或删除、过了节流间隔
+  // 全站计数的条件与下面实际触发核对的一致：功能开着且有凭据、所有者或管理员、未暂停或删除、过了节流间隔
+  const settings = await getSettings(env);
   const { row, access } = await meterHostedCall(env, viewer, id, {
     scope: HOSTED_CHECK_RATE_SCOPE, limit: MAX_HOSTED_CHECKS_PER_MINUTE, calls: CHECK_CF_CALLS,
     eligible: {
-      sql: `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
+      sql: `? = 1 AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
         AND status NOT IN ('suspended', 'deleting') AND COALESCE(checked_at, 0) <= ?)`,
-      params: [id, viewer.id, viewer.role === 'admin' ? 1 : 0, Date.now() - CHECK_THROTTLE_MS],
+      params: [hostedDomainsAvailable(env, settings) ? 1 : 0, id, viewer.id, viewer.role === 'admin' ? 1 : 0,
+        Date.now() - CHECK_THROTTLE_MS],
     },
     userBusy: '检测过于频繁，请稍后再试',
     siteBusy: SITE_BUSY,
   });
   requireManage(access);
-  requireCredentials(env, await getSettings(env));
+  requireCredentials(env, settings);
   const recent = row.checkedAt && Date.now() - row.checkedAt.getTime() < CHECK_THROTTLE_MS;
   if (!recent && row.status !== 'suspended' && row.status !== 'deleting') {
     await syncHostedDomain(env, id, { activationCheck: row.status === 'pending' });
@@ -668,7 +690,11 @@ export async function deleteHostedDomain(env: Env, viewer: Viewer, id: number, c
       throw new AppError('conflict', '域名归属已改变，请刷新后重试');
     }
   }
-  await runDetached(ctx, '托管域名删除', () => syncHostedDomain(env, id));
+  // 删除只计入全站额度、不因额度拒绝
+  await runDetached(ctx, '托管域名删除', async () => {
+    await recordSiteCalls(env, TEARDOWN_CF_CALLS);
+    await syncHostedDomain(env, id);
+  });
 }
 
 export async function listHostedDomainMembers(env: Env, viewer: Viewer, id: number): Promise<HostedDomainMember[]> {

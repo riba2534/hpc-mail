@@ -13,7 +13,7 @@ import {
   extractCodeByRegex,
   resolveVerificationCode,
 } from '../src/services/code-extract.js';
-import { HTML_TO_TEXT_MAX_CHARS, htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
+import { convertHtmlToText, HTML_TO_TEXT_MAX_CHARS, htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -358,11 +358,36 @@ describe('htmlToText', () => {
     expect(text).not.toContain('TAIL');
   });
 
+  it('开头的超大内嵌图片不占截断额度：后面的验证码仍能转换出来', () => {
+    const image = 'A'.repeat(600 * 1024);
+    for (const html of [
+      `<p>hi</p><img src="data:image/png;base64,${image}"><p>Your code is 913472</p>`,
+      `<img src='data:image/png;base64,${image}' alt=x><p>Your code is 913472</p>`,
+      `<img src=data:image/png;base64,${image}><p>Your code is 913472</p>`,
+      `<div style="background:url(data:image/png;base64,${image})">Your code is 913472</div>`,
+    ]) {
+      const converted = convertHtmlToText(html);
+      expect(converted.text).toContain('Your code is 913472');
+      expect(converted.text).not.toContain('AAAA');
+      expect(converted.truncated).toBe(false);
+    }
+  });
+
+  it('截断落在标签中间时丢掉残缺的标签；截断与实体留下的孤立代理字符去掉', () => {
+    const cut = convertHtmlToText(`<p>start</p><div ${'a="x" '.repeat(100_000)}>tail</div>`);
+    expect(cut).toEqual({ text: 'start', truncated: true });
+
+    // 截断点正好在表情的代理对中间
+    const emoji = htmlToText(`<p>${'a'.repeat(HTML_TO_TEXT_MAX_CHARS - 4)}${'😀'.repeat(8)}</p>`);
+    expect(emoji).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    expect(htmlToText('<p>a&#xD800;b &#xDE00;c 😀</p>')).toBe('ab c 😀');
+  });
+
   it('病态 HTML 耗时线性：没有 > 的长串、没闭合的 <style>、大量 <header> 不再平方退化', () => {
     // 修复前每种在 256KB 上耗时 1～12 秒（收件解析在 SMTP Ack 前同步执行，会耗尽 CPU）
     const size = 256 * 1024;
     const started = Date.now();
-    for (const unit of ['<a ', '<b ', '<style>', '<style ', '<header>x', '</style  ']) {
+    for (const unit of ['<a ', '<b ', '<style>', '<style ', '<header>x', '</style  ', '="a', "='", 'data:', '= ']) {
       htmlToText(unit.repeat(Math.ceil(size / unit.length)));
       htmlToText(`${unit.repeat(Math.ceil(size / unit.length))}<br>`);
     }

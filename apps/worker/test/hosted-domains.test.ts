@@ -731,25 +731,54 @@ describe('添加与立即检测的 Cloudflare 调用额度', () => {
     expect(cf.calls).toHaveLength(MAX_HOSTED_CREATES_PER_MINUTE * 2 + 2);
   });
 
-  it('添加：占位被拒的请求不占全站额度；全站额度用尽时 429 并释放占位，不调用 Cloudflare', async () => {
+  it('添加与删除按实际 Cloudflare 调用数计入全站额度；占位被拒的不计；额度不够时 429、不占位也不计数', async () => {
     const cf = fakeCloudflare();
     const f = await fixture();
     const owner = await f.actor('owner');
     const rival = await f.actor('rival');
+    // 一次成功添加：查 zone、建 zone，加后台预配置 catch-all 与发信，共 7 次
     const taken = await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain('taken') }), 201);
     expect(taken.status).toBe('pending');
+    expect(cf.calls).toHaveLength(7);
     const afterCreate = await siteCalls();
-    expect(afterCreate).toBe(2);
+    expect(afterCreate).toBe(cf.calls.length);
 
     await errorOf(await call('POST', '/hosted-domains', rival.jwt, { domain: f.domain('taken') }), 409);
+    // 自己已有的占位（建 zone 超时留下、还没有 zone_id）：重复添加被拒，也不计
+    const stuck = await f.actor('stuck');
+    await db.insert(hostedDomains).values({ domain: f.domain('stuck'), userId: stuck.id, status: 'pending' });
+    expect((await errorOf(await call('POST', '/hosted-domains', stuck.jwt, { domain: f.domain('stuck') }), 409)).message).toContain('已经添加过');
     expect(await siteCalls()).toBe(afterCreate);
 
+    // 剩余额度不够一次添加：拒绝、不占位、不调用 Cloudflare，也不再推高计数
     await bumpCounter(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', minuteWindow(1), MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - afterCreate - 1);
     const callsBefore = cf.calls.length;
     const busy = await errorOf(await call('POST', '/hosted-domains', rival.jwt, { domain: f.domain('busy') }), 429);
     expect(busy).toMatchObject({ code: 'rate_limited' });
     expect(cf.calls).toHaveLength(callsBefore);
+    expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - 1);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, f.domain('busy'))).get()).toBeUndefined();
+
+    // 删除：撤发信接入、删 zone，共 2 次；额度满时照常执行，只计数
+    await data(await call('DELETE', `/hosted-domains/${taken.id}`, owner.jwt));
+    expect(cf.calls.slice(callsBefore)).toHaveLength(2);
+    expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE + 1);
+    expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, taken.id)).get()).toBeUndefined();
+  });
+
+  it('功能关闭或缺凭据时立即检测 403，不占全站额度', async () => {
+    fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const created = await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain('off') }), 201);
+    await db.update(hostedDomains).set({ checkedAt: new Date(Date.now() - 60_000) }).where(eq(hostedDomains.id, created.id));
+    const base = await siteCalls();
+    await updateSettings(env, { hosted_domains: { enabled: false, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 } });
+    for (let i = 0; i < 5; i++) await errorOf(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt), 403);
+    expect(await siteCalls()).toBe(base);
+    await updateSettings(env, { hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 } });
+    await errorOf(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt, undefined, env), 403);
+    expect(await siteCalls()).toBe(base);
   });
 
   it(`立即检测：每人每分钟 ${MAX_HOSTED_CHECKS_PER_MINUTE} 次（被节流、无权限的也计）；只有真正核对的才占全站额度`, async () => {
