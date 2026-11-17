@@ -369,9 +369,9 @@ admin_checks() {
   ' >/dev/null || fail "全站共享邮箱所有者或成员状态缺失"
   curl -fsS --get "$BASE_URL/api/mailboxes/share-users" --data-urlencode "q=$ADMIN_USERNAME" \
     -H "Authorization: Bearer $ADMIN_TOKEN" | jq --argjson userId "$admin_id" -e '
-      .data.items[0].id == $userId and .data.items[0].role == "admin" and
+      .data.items[0].id == $userId and
       (.data.items | length) <= 20 and (.data.hasMore | type == "boolean") and
-      (.data.items[0] | keys | sort) == ["id", "role", "username"]
+      (.data.items[0] | keys | sort) == ["id", "username"]
     ' >/dev/null || fail "共享成员搜索未正确返回管理员候选"
 
   step "管理员登出后旧 token 失效"

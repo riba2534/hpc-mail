@@ -197,9 +197,11 @@ function handle(req, body) {
   if (path === '/api/admin/settings/domain-claude-stats') return json(200, { data: [{ domain: 'a.test', suspended: 0, risk: null }] });
   if (path === '/api/mailboxes/random-plan') return json(200, { data: { strategy: 'claude', items: [], pool: ['a.test'], shortfall: 10 } });
   if (path === '/api/mailboxes/availability') return json(200, { data: { available: true } });
-  if (path === '/api/admin/users/search' || path === '/api/mailboxes/share-users') {
+  if (path === '/api/admin/users/search') {
     return json(200, { data: { items: [{ id: ADMIN.id, username: ADMIN.username, role: 'admin' }], hasMore: false } });
   }
+  // 共享成员搜索不返回角色（防止借搜索枚举谁是管理员），与线上接口一致
+  if (path === '/api/mailboxes/share-users') return json(200, { data: { items: [{ id: ADMIN.id, username: ADMIN.username }], hasMore: false } });
   if (path === '/api/admin/mailboxes/0/transfer') return error(400, 'validation_failed');
   if (path === '/api/admin/users') return json(200, { data: [{ id: 1, mailboxPolicy: null, mailboxPolicyRevision: 0 }] });
   return error(404, 'not_found');
