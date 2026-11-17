@@ -1,8 +1,8 @@
-import { Hono, type Context } from 'hono';
+import { canaryRequestSchema, type CanaryRequest } from '@hpc-mail/shared';
+import { Hono } from 'hono';
 import { bytesToHex } from '../lib/crypto.js';
-import { normalizeDomain } from '../lib/email-address.js';
 import { AppError } from '../lib/errors.js';
-import { ok } from '../lib/http.js';
+import { ok, parseBody } from '../lib/http.js';
 import { getDomains } from '../services/domain.js';
 import {
   CANARY_RATE_LIMIT, CANARY_RATE_SCOPE, buildId, isCanaryNonce, pickCanaryDomains, readCanaryReceipt,
@@ -25,29 +25,10 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-/** 可选 body `{fromDomain, toDomain}`；空 body 等于都不指定 */
-async function readCanaryRequest(c: Context<AppContext>): Promise<{ fromDomain?: string; toDomain?: string }> {
-  const text = await c.req.text();
-  if (!text.trim()) return {};
-  let body: unknown;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    throw new AppError('validation_failed', '请求体须为 JSON');
-  }
-  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new AppError('validation_failed', '请求体须为 JSON 对象');
-  const pick = (key: 'fromDomain' | 'toDomain') => {
-    const value = (body as Record<string, unknown>)[key];
-    if (value === undefined || value === null) return undefined;
-    if (typeof value !== 'string') throw new AppError('validation_failed', `${key} 须为字符串`);
-    return normalizeDomain(value);
-  };
-  return { fromDomain: pick('fromDomain'), toDomain: pick('toDomain') };
-}
-
 /** 经 send_email 真实外发一封金丝雀：canary@A → canary@B，外发失败返回 502（不重试） */
 app.post('/canary', async (c) => {
-  const requested = await readCanaryRequest(c);
+  // body 可选：空 body 等于收发域名都不指定（Hono 缓存了已读的正文，parseBody 可再次读取）
+  const requested: CanaryRequest = (await c.req.text()).trim() ? await parseBody(c, canaryRequestSchema) : {};
   const { fromDomain, toDomain } = pickCanaryDomains(await getDomains(c.env, await getSettingsFresh(c.env)), requested);
   // 校验通过才计数：参数错误不占全站额度
   const usage = await bumpCounter(c.env, CANARY_RATE_SCOPE, 'site', minuteWindow(1));
