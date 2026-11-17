@@ -48,7 +48,7 @@ import { useStarMutation } from '@/features/inbox/use-star';
 import { cn } from '@/lib/cn';
 import { attachmentIcon } from './attachment-icon';
 import { countRemoteImages } from './count-remote-images';
-import { downloadWithAuth } from './download';
+import { downloadWithAuth, openOrDownloadWithAuth } from './download';
 import { EmailHtml } from '@/lib/email-html';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
@@ -239,13 +239,18 @@ export function MessagePage() {
     }
   };
 
-  // 附件同样走 JWT 下载（签名 URL 只留给正文内嵌图）；带上详情的可见性范围，管理员审计视图才能下载
-  const downloadAttachment = async (attachment: MessageDetail['attachments'][number]) => {
+  // 附件同样走 JWT（签名 URL 只留给正文内嵌图）：图片与 PDF 在新标签页打开，其余下载。
+  // 带上详情的可见性范围，管理员审计视图才能取到
+  const openAttachment = async (attachment: MessageDetail['attachments'][number]) => {
     if (downloadingId !== null) return;
     setDownloadingId(attachment.id);
     const qs = mailViewParams(view ?? {}).toString();
     try {
-      await downloadWithAuth(`/api/attachments/${attachment.id}${qs ? `?${qs}` : ''}`, attachment.filename || `attachment-${attachment.id}`);
+      await openOrDownloadWithAuth(
+        `/api/attachments/${attachment.id}${qs ? `?${qs}` : ''}`,
+        attachment.filename || `attachment-${attachment.id}`,
+        attachment.mimeType,
+      );
     } catch (error) {
       toast({ title: '附件下载失败', description: (error as Error).message, variant: 'error' });
     } finally {
@@ -556,10 +561,10 @@ export function MessagePage() {
                     <li key={attachment.id}>
                       <button
                         type="button"
-                        title={`下载 ${attachment.filename}`}
+                        title={attachment.filename}
                         aria-busy={downloadingId === attachment.id}
                         disabled={downloadingId !== null}
-                        onClick={() => void downloadAttachment(attachment)}
+                        onClick={() => void openAttachment(attachment)}
                         className="flex w-full items-center gap-3 rounded-md border border-line px-3 py-2 text-left text-sm transition-colors hover:bg-surface-hover disabled:cursor-wait"
                       >
                         <Icon className="size-5 shrink-0 text-ink-tertiary" aria-hidden />
