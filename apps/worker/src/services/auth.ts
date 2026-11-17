@@ -6,6 +6,7 @@ import type {
   RegisterRequest,
   SessionUser,
 } from '@hpc-mail/shared';
+import { RESERVED_USERNAMES } from '@hpc-mail/shared';
 import { and, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { users } from '../db/schema.js';
@@ -29,64 +30,75 @@ import { getSettings } from './setting.js';
 
 const LOGIN_WINDOW_MINUTES = 15;
 const MAX_FAILURES = 5;
-/** 同一用户名 15 分钟内跨 IP 的失败上限：超过后只要求等到窗口结束，不永久锁定 */
-const MAX_ACCOUNT_FAILURES = 20;
 const REGISTER_WINDOW_SECONDS = 60 * 60;
 const MAX_REGISTER_PER_WINDOW = 10;
 
 const LOGIN_FAIL_SCOPE = 'login-fail';
-/** 账号级登录失败计数（只按用户名，跨 IP），15 分钟窗口 */
-export const LOGIN_ACCOUNT_SCOPE = 'login-acct';
 const REGISTER_SCOPE = 'reg';
 
+/** IPv6 地址展开成 8 组数值（末尾点分 IPv4 折成两组）；不是合法 IPv6 时为 null */
+function ipv6Groups(value: string): number[] | null {
+  let text = value;
+  const dotted = /(?:^|:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
+  if (dotted) {
+    const octets = dotted.slice(1, 5).map(Number);
+    if (octets.some((octet) => octet > 255)) return null;
+    const tail = `${((octets[0]! << 8) | octets[1]!).toString(16)}:${((octets[2]! << 8) | octets[3]!).toString(16)}`;
+    text = `${text.slice(0, text.length - dotted[0].length)}${dotted[0].startsWith(':') ? ':' : ''}${tail}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...Array<string>(missing).fill('0'), ...tail];
+  if (!groups.every((group) => /^[0-9a-f]{1,4}$/.test(group))) return null;
+  return groups.map((group) => Number.parseInt(group, 16));
+}
+
 /**
- * 计数用的 IP：IPv6 按 /64 聚合（一户通常分到整段 /64，按单个地址计数换个地址就绕过），
- * IPv4 映射地址按 IPv4，其余原样。
+ * 计数用的 IP：IPv6 按 /64 聚合（一户通常分到整段 /64，按单个地址计数换个地址就绕过）；
+ * IPv4 映射地址（::ffff:1.2.3.4，含十六进制写法 ::ffff:102:304）按 IPv4；::/64 里只有回环、未指定与
+ * 已废弃的 IPv4 兼容地址，不属于哪一户，按完整地址各自成桶；无法解析的原样。
  */
 export function ipBucket(ip: string): string {
   const value = ip.trim().toLowerCase();
   if (!value.includes(':')) return value;
-  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(value);
-  if (mapped) return mapped[1]!;
-  const halves = value.split('::');
-  if (halves.length > 2) return value;
-  const head = halves[0] ? halves[0].split(':') : [];
-  const tail = halves[1] ? halves[1].split(':') : [];
-  const missing = 8 - head.length - tail.length;
-  if (halves.length === 1 ? missing !== 0 : missing < 1) return value;
-  const groups = [...head, ...Array<string>(missing).fill('0'), ...tail];
-  if (!groups.every((group) => /^[0-9a-f]{1,4}$/.test(group))) return value;
-  return `${groups.slice(0, 4).map((group) => Number.parseInt(group, 16).toString(16)).join(':')}::/64`;
+  const groups = ipv6Groups(value);
+  if (!groups) return value;
+  const hex = (list: number[]) => list.map((group) => group.toString(16)).join(':');
+  if (groups.slice(0, 4).every((group) => group === 0)) {
+    if (groups[4] === 0 && groups[5] === 0xffff) {
+      return [groups[6]! >> 8, groups[6]! & 0xff, groups[7]! >> 8, groups[7]! & 0xff].join('.');
+    }
+    return hex(groups);
+  }
+  return `${hex(groups.slice(0, 4))}::/64`;
 }
 
 interface LoginCounters {
   pair: CounterLimit;
   ip: CounterLimit;
-  account: CounterLimit;
 }
 
 /**
- * 登录失败计数的三个维度：(用户名|IP)、IP、用户名。
+ * 登录失败计数的两个维度：(用户名|IP) 与 IP。
  *
- * (用户名|IP) 维度的 key 里**掺入了 IP**：按纯用户名硬锁时，攻击者对任意已知用户名
- * （seed 出来的 admin 用户名基本可猜）每 15 分钟发 5 次错误密码，就能让该账号持续无法登录，
- * 受害者换 IP 也没用。掺 IP 后攻击者只能锁住自己，防爆破由 IP 维度（同一 IP 对任意账号累计）兜住。
- * 只按用户名的账号维度上限放宽到 MAX_ACCOUNT_FAILURES，挡住换 IP 对单个账号的猜测，
- * 代价是攻击者能让该账号最多等一个窗口。
+ * 不按纯用户名计：攻击者对任意已知用户名（seed 出来的 admin 用户名基本可猜）换几个 IP 打满失败上限，
+ * 就能让该账号连正确口令也登不上，受害者换 IP 也没用——限流在校验口令之前。掺 IP 后攻击者只能锁住自己，
+ * 防爆破由 IP 维度（同一 IP 或同一 /64 对任意账号累计）兜住。
  */
 async function loginCounters(username: string, ip: string): Promise<LoginCounters> {
   const window = minuteWindow(LOGIN_WINDOW_MINUTES);
-  const name = username.toLowerCase();
   const bucket = ipBucket(ip);
-  const [pairHash, ipHash, accountHash] = await Promise.all([
-    sha256Hex(`id:${name}|${bucket}`),
+  const [pairHash, ipHash] = await Promise.all([
+    sha256Hex(`id:${username.toLowerCase()}|${bucket}`),
     sha256Hex(`ip:${bucket}`),
-    sha256Hex(`acct:${name}`),
   ]);
   return {
     pair: { scope: LOGIN_FAIL_SCOPE, subject: `u:${pairHash}`, window, limit: MAX_FAILURES },
     ip: { scope: LOGIN_FAIL_SCOPE, subject: `i:${ipHash}`, window, limit: MAX_FAILURES },
-    account: { scope: LOGIN_ACCOUNT_SCOPE, subject: accountHash, window, limit: MAX_ACCOUNT_FAILURES },
   };
 }
 
@@ -97,28 +109,36 @@ export function loginRetryAfterSeconds(nowMs = Date.now()): number {
 }
 
 /**
- * 先占一次失败名额再校验口令：三个维度各自守卫递增，任一已满就退回其他维度、直接拒绝。
+ * 先占一次失败名额再校验口令：两个维度各自守卫递增，任一已满就退回另一维度、直接拒绝。
  * 先读后写时并发请求都读到同一个旧计数，单个 IP 并发即可远超上限。
  */
 async function reserveLoginAttempt(env: Env, username: string, ip: string): Promise<LoginCounters> {
   const counters = await loginCounters(username, ip);
-  const [pairFull, ipFull, accountFull] = await reserveCounters(env, [counters.pair, counters.ip, counters.account]);
+  const [pairFull, ipFull] = await reserveCounters(env, [counters.pair, counters.ip]);
   if (pairFull || ipFull) throw new AppError('rate_limited', '登录尝试过于频繁，请稍后再试');
-  if (accountFull) throw new AppError('rate_limited', '该账号登录失败次数过多，请稍后再试');
   return counters;
 }
 
+/** 与猜口令无关的失败退回本次占位；退回失败只记日志，不盖掉原本的错误 */
+async function releaseLoginAttempt(env: Env, counters: LoginCounters): Promise<void> {
+  try {
+    await releaseCounters(env, [counters.pair, counters.ip]);
+  } catch (error) {
+    console.error('登录占位退回失败:', error);
+  }
+}
+
 /**
- * 登录成功：(用户名|IP) 维度清零，IP 与账号维度只退回本次占位——之前的失败照算，
+ * 登录成功：(用户名|IP) 维度清零，IP 维度只退回本次占位——之前的失败照算，
  * 否则用自己的账号登录一次就能清空 IP 维度，再对其他用户名继续猜。
  */
 async function settleLoginSuccess(env: Env, counters: LoginCounters): Promise<void> {
-  const { pair } = counters;
+  const { pair, ip } = counters;
   await env.db.batch([
     // 置回 0 而不是删行（清理任务会按窗口回收）
     env.db.prepare('UPDATE rate_counters SET count = 0 WHERE scope = ? AND subject = ? AND "window" = ?')
       .bind(pair.scope, pair.subject, pair.window),
-    ...[counters.ip, counters.account].map((item) => counterStatement(env, item.scope, item.subject, item.window, -1)),
+    counterStatement(env, ip.scope, ip.subject, ip.window, -1),
   ]);
 }
 
@@ -193,30 +213,28 @@ export async function login(
 ): Promise<LoginResponse> {
   const counters = await reserveLoginAttempt(env, req.username, ip);
   const db = createDb(env);
-  let user = await db.select().from(users).where(eq(users.username, req.username)).get();
-  if (user && !user.authVersionMigrated) {
-    await getUserEpoch(env, user.id);
-    user = await db.select().from(users).where(eq(users.id, user.id)).get();
-  }
-  const valid = user ? await verifyPassword(req.password, user.passwordHash) : false;
-  // 口令或验证码错误时占位保留，记作一次失败
-  if (!user || !valid) throw new AppError('bad_credentials', '用户名或密码错误');
-  if (user.status !== 'active') {
-    await releaseCounters(env, [counters.pair, counters.ip, counters.account]);
-    throw new AppError('user_disabled', '账号已被禁用');
-  }
-
+  let user: typeof users.$inferSelect | undefined;
+  let token: string;
+  let issuing = false;
   try {
-    await verifyLoginTwoFactor(env, user, req.totp);
-  } catch (e) {
-    // 仅「需要验证码」的提示不计失败
-    if (e instanceof AppError && e.code === 'totp_required') {
-      await releaseCounters(env, [counters.pair, counters.ip, counters.account]);
+    user = await db.select().from(users).where(eq(users.username, req.username)).get();
+    if (user && !user.authVersionMigrated) {
+      await getUserEpoch(env, user.id);
+      user = await db.select().from(users).where(eq(users.id, user.id)).get();
     }
-    throw e;
+    const valid = user ? await verifyPassword(req.password, user.passwordHash) : false;
+    if (!user || !valid) throw new AppError('bad_credentials', '用户名或密码错误');
+    if (user.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
+    await verifyLoginTwoFactor(env, user, req.totp);
+    issuing = true;
+    token = await issueToken(env, user, ctx);
+  } catch (error) {
+    // 猜错口令或两步验证码记作一次失败、占位保留：口令已对时只剩 6 位验证码要猜，同样靠这里的上限防爆破。
+    // 停用、需要验证码、读库或签发异常（含签发时凭据恰好被改）与猜测无关，退回本次占位
+    const wrongGuess = !issuing && error instanceof AppError && error.code === 'bad_credentials';
+    if (!wrongGuess) await releaseLoginAttempt(env, counters);
+    throw error;
   }
-
-  const token = await issueToken(env, user, ctx);
   await settleLoginSuccess(env, counters);
   const previousIp = user.lastLoginIp;
   await db
@@ -272,6 +290,8 @@ export async function register(env: Env, req: RegisterRequest, ip: string, ctx?:
   const mode = settings.register_mode;
   if (mode === 'closed') throw new AppError('registration_closed', '注册已关闭');
 
+  // 保留用户名按「已存在」处理，不额外暴露保留名单
+  if (RESERVED_USERNAMES.includes(req.username)) throw new AppError('conflict', '用户名已存在');
   const db = createDb(env);
   const existing = await db.select({ id: users.id }).from(users).where(eq(users.username, req.username)).get();
   if (existing) throw new AppError('conflict', '用户名已存在');

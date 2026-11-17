@@ -12,7 +12,7 @@ const SETTINGS = {
   api: { enabled: true },
   security: { require2fa: false },
   retention: { unclaimedDays: 90, allMessagesDays: 0 },
-  quota: { dailyOutbound: 0, dailyRecipients: 0, relayDaily: 300, relayPerUserDaily: 50 },
+  quota: { dailyOutbound: 0, dailyRecipients: 0, relayDaily: 300, relayPerUserDaily: 50, relayUnclaimedDaily: 50 },
   mailbox_policy: { perUserLimit: 5, reservedLocalParts: ['admin', 'root'] },
   ai_model: { baseUrl: 'https://api.deepseek.com', apiKey: '******', model: 'deepseek-flash' },
   translation: { enabled: true, dailyCharsPerUser: 200000 },
@@ -277,22 +277,27 @@ describe('SettingsPage 域名托管', () => {
 });
 
 describe('SettingsPage 转发中转配额', () => {
-  it('显示中转全站与每人上限，越界按范围截断，随外发配额一起保存', async () => {
+  it('显示中转全站、每人与未认领地址上限，越界按范围截断，随外发配额一起保存', async () => {
     mocks.update.mockClear();
     const { client } = mount();
     const site = await screen.findByRole('spinbutton', { name: /转发中转全站每日上限/ });
     const perUser = screen.getByRole('spinbutton', { name: /转发中转每人每日上限/ });
+    const unclaimed = screen.getByRole('spinbutton', { name: /未认领地址转发中转每日上限/ });
     expect(site).toHaveValue(300);
     expect(perUser).toHaveValue(50);
-    expect(screen.getAllByText(/原生转发不计入/)).toHaveLength(2);
+    expect(unclaimed).toHaveValue(50);
+    expect(screen.getAllByText(/原生转发不计入/)).toHaveLength(3);
 
     fireEvent.change(site, { target: { value: '200000' } });
     expect(site).toHaveValue(100000);
     fireEvent.change(perUser, { target: { value: '0' } });
+    fireEvent.change(unclaimed, { target: { value: '20' } });
     fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
     await waitFor(() =>
       expect(mocks.update).toHaveBeenCalledWith(
-        expect.objectContaining({ quota: { dailyOutbound: 0, dailyRecipients: 0, relayDaily: 100000, relayPerUserDaily: 0 } }),
+        expect.objectContaining({
+          quota: { dailyOutbound: 0, dailyRecipients: 0, relayDaily: 100000, relayPerUserDaily: 0, relayUnclaimedDaily: 20 },
+        }),
       ),
     );
     client.clear();

@@ -19,15 +19,17 @@ import {
   HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
 } from './hosted-domain.js';
 import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
+import { purgeHostedTombstones } from './hosted-tombstone.js';
+import { CANARY_RATE_SCOPE, writeCronHeartbeat } from './ops-probe.js';
 import {
   processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases, purgeOrphanAttachments,
 } from './storage-cleanup.js';
 import { FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE } from './forwarding.js';
-import { LOGIN_ACCOUNT_SCOPE } from './auth.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 import { releaseDraftStatements } from './upload.js';
 import { markStaleOutbound } from './outbound-recovery.js';
+import { offloadMailBodies } from './body-offload.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -168,13 +170,15 @@ async function step(report: StepReport[], name: string, task: () => Promise<numb
  * 每 5 分钟（maintenance=false）：通知补录与投递、清理台账；
  * 每日（maintenance=true）：审计日志 90 天 + 过期限流窗口 + 邮件保留策略。
  * 16:00 两个 cron 同时触发，每日那次只跑维护步骤，常规步骤由同时刻的 5 分钟 cron 负责，不重复执行。
+ * 每次结束检查 cron 心跳，build 变化才写（含失败步骤），供部署后确认 scheduled 已在新版本上运行。
  */
-export async function runScheduled(env: Env, maintenance = true): Promise<void> {
+export async function runScheduled(env: Env, maintenance = true, cron = maintenance ? 'maintenance' : 'regular'): Promise<void> {
   const started = Date.now();
   const report: StepReport[] = [];
   if (maintenance) await runMaintenance(env, report);
   else await runRegular(env, report);
   console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
+  await writeCronHeartbeat(env, cron, report.filter((item) => item.failed).map((item) => item.step));
 }
 
 async function runRegular(env: Env, report: StepReport[]): Promise<void> {
@@ -191,6 +195,8 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'claude_facts.harvest', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_WINDOW_MS));
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
+  // 历史正文分批搬到 R2（放在清理之前：本轮没被引用的对象登记后同一轮就能回收）
+  await step(report, 'bodies.offload', () => offloadMailBodies(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
 }
@@ -247,7 +253,10 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
   // 附件行指向已不存在的邮件（附件写入前邮件被永久删除等）：登记对象清理并删行
   await step(report, 'attachments.orphans', () => purgeOrphanAttachments(env));
-  // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组
+  // 托管域名墓碑过了保留期：前所有者的优先权到期，NS 委派预检只看仍在的托管记录与墓碑
+  await step(report, 'hosted_domains.tombstones', () => purgeHostedTombstones(env));
+  // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组。
+  // auth-user/auth-global/api-user/api-global 已由 Rate Limiting binding 计数，只剩升级前写入的旧行待回收
   await step(report, 'counters', async () => {
     await purgeCounters(env, [
       OUTBOUND_QUOTA_SCOPE, 'fwd-domain', 'fwd-target', FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, 'ai-extract', TRANSLATE_CHARS_SCOPE,
@@ -255,8 +264,9 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
+      CANARY_RATE_SCOPE,
     ], minuteWindow(1) - 120);
-    await purgeCounters(env, ['login-fail', LOGIN_ACCOUNT_SCOPE], minuteWindow(15) - 8);
+    await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });
 }

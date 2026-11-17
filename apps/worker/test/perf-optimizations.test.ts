@@ -3,10 +3,7 @@ import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import PostalMime from 'postal-mime';
 import { Hono } from 'hono';
-import {
-  MAX_AUTH_USER_REQUESTS_PER_MINUTE,
-  MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
-} from '@hpc-mail/shared';
+import { MAX_WAIT_POLLS_PER_USER_PER_MINUTE } from '@hpc-mail/shared';
 import { createApp, isApiPath } from '../src/app.js';
 import worker from '../src/index.js';
 import { createDb } from '../src/db/client.js';
@@ -26,6 +23,8 @@ import { minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { runScheduled } from '../src/services/scheduled.js';
 import { createSession } from '../src/services/session.js';
 import { getSettings, invalidateSettingsMemory, updateSettings } from '../src/services/setting.js';
+import type { Env } from '../src/types.js';
+import { fakeRateLimits } from './fake-rate-limits.js';
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -49,9 +48,9 @@ async function tokenFor(userId: number, uepoch = 0) {
   return { sid, jwt: await signToken(env.jwt_secret, { sub: userId, sid, epoch: 0, uepoch }) };
 }
 
-async function request(path: string, init: RequestInit = {}) {
+async function request(path: string, init: RequestInit = {}, target: Env = env) {
   const ctx = createExecutionContext();
-  const response = await app.request(path, init, env, ctx);
+  const response = await app.request(path, init, target, ctx);
   await waitOnExecutionContext(ctx);
   return response;
 }
@@ -74,19 +73,18 @@ function recordingEnv() {
 
 const bearer = (token: string, extra: Record<string, string> = {}) => ({ headers: { Authorization: `Bearer ${token}`, 'CF-Connecting-IP': '203.0.113.9', ...extra } });
 const errorCode = async (response: Response) => ((await response.json()) as { error: { code: string } }).error.code;
-const authCount = async (userId: number) => (await readCounter(env, 'auth-user', String(userId), minuteWindow(1))).count;
-
 describe('JWT 鉴权单次往返', () => {
-  it('有效会话一次 batch 完成鉴权，限流计数各加一', async () => {
+  it('有效会话鉴权通过后，用户桶与全站桶各过一次限流', async () => {
     const id = await seedUser('perf-auth-fast');
     const { jwt } = await tokenFor(id);
-    const before = await authCount(id);
-    const response = await request('/api/auth/me', bearer(jwt));
+    const { env: target, fakes } = fakeRateLimits();
+    const response = await request('/api/auth/me', bearer(jwt), target);
     expect(response.status).toBe(200);
-    expect(await authCount(id)).toBe(before + 1);
+    expect(fakes.rl_auth_user.calls).toEqual([String(id)]);
+    expect(fakes.rl_auth_global.calls).toEqual(['instance']);
   });
 
-  it('快路径只发一次 D1 batch（会话+用户+设置+两条计数），不读密码哈希等敏感列', async () => {
+  it('快路径只发一次只读 D1 batch（会话+用户、设置），不为限流写库，不读密码哈希等敏感列', async () => {
     const id = await seedUser('perf-auth-roundtrip');
     const { jwt } = await tokenFor(id);
     const probe = new Hono<{ Bindings: typeof env }>();
@@ -96,27 +94,30 @@ describe('JWT 鉴权单次往返', () => {
     const response = await probe.request('/probe', bearer(jwt), recorded.env, createExecutionContext());
     expect(response.status).toBe(200);
     expect(recorded.batches()).toBe(1);
-    expect(recorded.prepared).toHaveLength(4);
+    expect(recorded.prepared).toHaveLength(2);
+    expect(recorded.prepared.every((sql) => /^\s*SELECT/i.test(sql))).toBe(true);
     expect(recorded.prepared.join('\n')).not.toMatch(/password_hash|totp_secret|totp_recovery_codes/);
   });
 
   it('撤销会话、禁用账号、改密（版本号变化）立即失效且不计数', async () => {
     const id = await seedUser('perf-auth-revoke');
     const { sid, jwt } = await tokenFor(id);
-    expect((await request('/api/auth/me', bearer(jwt))).status).toBe(200);
-    const counted = await authCount(id);
+    const { env: target, fakes } = fakeRateLimits();
+    expect((await request('/api/auth/me', bearer(jwt), target)).status).toBe(200);
+    const counted = fakes.rl_auth_user.calls.length;
+    expect(counted).toBe(1);
 
     await createDb(env).update(users).set({ authVersion: 1 }).where(eq(users.id, id));
-    const bumped = await request('/api/auth/me', bearer(jwt));
+    const bumped = await request('/api/auth/me', bearer(jwt), target);
     expect(bumped.status).toBe(401);
     await createDb(env).update(users).set({ authVersion: 0, status: 'disabled' }).where(eq(users.id, id));
-    const disabled = await request('/api/auth/me', bearer(jwt));
+    const disabled = await request('/api/auth/me', bearer(jwt), target);
     expect(await errorCode(disabled)).toBe('user_disabled');
     await createDb(env).update(users).set({ status: 'active' }).where(eq(users.id, id));
     await createDb(env).update(sessions).set({ revokedAt: new Date() }).where(eq(sessions.id, sid));
-    const revoked = await request('/api/auth/me', bearer(jwt));
+    const revoked = await request('/api/auth/me', bearer(jwt), target);
     expect(revoked.status).toBe(401);
-    expect(await authCount(id)).toBe(counted);
+    expect(fakes.rl_auth_user.calls).toHaveLength(counted);
   });
 
   it('未迁移鉴权版本走慢路径完成迁移，计数不重复；只存在于 KV 的会话不再迁入', async () => {
@@ -128,24 +129,21 @@ describe('JWT 鉴权单次往返', () => {
     expect(await createDb(env).select().from(sessions).where(eq(sessions.id, kvOnly)).get()).toBeUndefined();
 
     const { jwt } = await tokenFor(id);
-    const before = await authCount(id);
-    expect((await request('/api/auth/me', bearer(jwt))).status).toBe(200);
-    expect(await authCount(id)).toBe(before + 1);
+    const { env: target, fakes } = fakeRateLimits();
+    expect((await request('/api/auth/me', bearer(jwt), target)).status).toBe(200);
+    expect(fakes.rl_auth_user.calls).toEqual([String(id)]);
     expect((await createDb(env).select().from(users).where(eq(users.id, id)).get())!.authVersionMigrated).toBe(true);
     // 迁移完成后的下一次请求走快路径，同样只计一次
-    expect((await request('/api/auth/me', bearer(jwt))).status).toBe(200);
-    expect(await authCount(id)).toBe(before + 2);
+    expect((await request('/api/auth/me', bearer(jwt), target)).status).toBe(200);
+    expect(fakes.rl_auth_user.calls).toEqual([String(id), String(id)]);
   });
 
   it('超过每分钟上限返回 rate_limited', async () => {
     const id = await seedUser('perf-auth-limit');
     const { jwt } = await tokenFor(id);
-    const minute = minuteWindow(1);
-    for (const window of [minute, minute + 1]) {
-      await env.db.prepare('INSERT INTO rate_counters (scope, subject, "window", count, units) VALUES (?, ?, ?, ?, 0)')
-        .bind('auth-user', String(id), window, MAX_AUTH_USER_REQUESTS_PER_MINUTE).run();
-    }
-    expect(await errorCode(await request('/api/auth/me', bearer(jwt)))).toBe('rate_limited');
+    const { env: target, fakes } = fakeRateLimits();
+    fakes.rl_auth_user.fill(String(id));
+    expect(await errorCode(await request('/api/auth/me', bearer(jwt), target))).toBe('rate_limited');
   });
 
   it('require2fa 直接读 D1 设置：未绑定账号只能访问豁免路径', async () => {
@@ -199,19 +197,6 @@ describe('/v1 鉴权写入合并', () => {
     expect((await createDb(env).select().from(apiKeys).where(eq(apiKeys.id, k.keyId)).get())!.lastUsedAt!.getTime()).toBeGreaterThan(Date.now() - 5000);
   });
 
-  it('Key 级超限时不计入用户总桶、不刷新 last_used', async () => {
-    const k = await key('perf-v1-key-limit', 1);
-    const minute = minuteWindow(1);
-    expect((await request('/v1/status', bearer(k.key))).status).toBe(200);
-    await createDb(env).update(apiKeys).set({ lastUsedAt: new Date(0) }).where(eq(apiKeys.id, k.keyId));
-    const limited = await request('/v1/status', bearer(k.key));
-    expect(await errorCode(limited)).toBe('rate_limited');
-    if (minuteWindow(1) === minute) {
-      expect((await readCounter(env, 'api-user', String(k.id), minute)).count).toBe(1);
-      expect((await createDb(env).select().from(apiKeys).where(eq(apiKeys.id, k.keyId)).get())!.lastUsedAt!.getTime()).toBe(0);
-    }
-  });
-
   it('wait 命中时只计 1 次轮询；预占超出上限立即拒绝且只计 1 次', async () => {
     const id = await seedUser('perf-v1-wait');
     const created = await createApiKey(env, id, { name: 'wait', scopes: ['mail.read'], rateLimit: 120, allowedIps: [] });
@@ -236,8 +221,8 @@ describe('/v1 鉴权写入合并', () => {
 
 describe('入口路由与可观测性', () => {
   it('/api、/v1 只匹配精确路径或子路径', () => {
-    for (const path of ['/api', '/api/', '/api/config', '/v1', '/v1/status']) expect(isApiPath(path)).toBe(true);
-    for (const path of ['/api-keys', '/apis', '/v1beta', '/v10/status', '/inbox']) expect(isApiPath(path)).toBe(false);
+    for (const path of ['/api', '/api/', '/api/config', '/v1', '/v1/status', '/mcp']) expect(isApiPath(path)).toBe(true);
+    for (const path of ['/api-keys', '/apis', '/v1beta', '/v10/status', '/inbox', '/mcpx', '/mcp/x']) expect(isApiPath(path)).toBe(false);
   });
 
   it('/api-keys 前端路由交给静态资源；API 响应带 Server-Timing', async () => {

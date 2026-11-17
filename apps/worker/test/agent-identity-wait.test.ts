@@ -52,7 +52,7 @@ async function actor(username: string, role: 'admin' | 'user' = 'user') {
   return { id: user!.id, jwt, key: await keyFor(jwt, [...API_SCOPES]) };
 }
 async function keyFor(jwt: string, scopes: ApiScope[]) {
-  return (await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `k-${scopes.join('-') || 'none'}`, scopes, rateLimit: 600 })), 201)).key;
+  return (await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `k-${scopes.join('-') || 'none'}`.slice(0, 64), scopes, rateLimit: 600 })), 201)).key;
 }
 async function own(userId: number, address: string) {
   return (await db.insert(mailboxes).values({ address, domain: address.split('@')[1]!, userId }).returning().get())!;
@@ -114,13 +114,15 @@ describe('发件身份 GET /v1/identities 与 /api/identities', () => {
     expect(error.docs).toBe('http://localhost/references/errors.md#forbidden-sender');
   });
 
-  it('管理员列出全部系统域名（可用任意前缀），别人的邮箱不列出；admin all=1 列表每项带 canSend', async () => {
+  it('管理员 domains 先列全部系统域名（可用任意前缀），别人的邮箱不列出；admin all=1 列表每项带 canSend', async () => {
     const admin = await actor('w2-identity-admin', 'admin');
     const other = await actor('w2-identity-other');
     const mine = await own(admin.id, 'admin-box@w2.example');
     await own(other.id, 'other-box@w2.example');
     const identities = await data<SendIdentities>(await request('/v1/identities', auth(admin.key)));
-    expect(identities.domains).toEqual(SYSTEM_DOMAINS.map((domain) => ({ domain, kind: 'system', anyLocalPart: true })));
+    // 本文件其他用例造的托管域名、旧域名排在系统域名之后，完整口径见 identity-wait-review.test.ts
+    expect(identities.domains.slice(0, SYSTEM_DOMAINS.length)).toEqual(SYSTEM_DOMAINS.map((domain) => ({ domain, kind: 'system', anyLocalPart: true })));
+    expect(identities.domains.slice(SYSTEM_DOMAINS.length).every((entry) => entry.kind !== 'system')).toBe(true);
     expect(identities.identities.map((item) => item.address)).toEqual([mine.address]);
     const all = await data<Mailbox[]>(await request('/v1/mailboxes?all=1', auth(admin.key)));
     expect(all.length).toBeGreaterThan(1);

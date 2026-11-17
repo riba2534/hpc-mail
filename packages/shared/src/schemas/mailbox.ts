@@ -96,11 +96,11 @@ export interface Mailbox {
 
 /**
  * 不能用作发件身份的原因：hosted_sending_not_ready 托管域名的发信尚未就绪；
- * hosted_domain_unavailable 托管域名已暂停、迁走或删除中；shared_readonly 别人共享给我的邮箱只能读不能发。
+ * hosted_domain_unavailable 托管域名已暂停、迁走或删除中；shared_readonly 别人共享给我的邮箱只能读不能发（普通用户）。
  */
 export type SendIdentityBlockReason = 'hosted_sending_not_ready' | 'hosted_domain_unavailable' | 'shared_readonly';
 
-/** 一个具体的发件地址：自己认领的（kind=owned）或共享给我的（kind=shared，恒不能发信） */
+/** 一个具体的发件地址：自己认领的（kind=owned）或共享给我的（kind=shared：普通用户恒不能发；管理员可用 mailboxId 发，按域名状态判定） */
 export interface SendIdentity {
   kind: 'owned' | 'shared';
   mailboxId: number;
@@ -113,13 +113,14 @@ export interface SendIdentity {
 }
 
 /**
- * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"）：
- * kind=system 管理员可用的系统域名；kind=hosted 调用者作为所有者、已生效且发信就绪的托管域名，
- * 发出时自动把该地址认领给所有者（不占全站每人认领上限），成员与共享不适用。
+ * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"），与发信的实际放行规则一致：
+ * 管理员得到 system 系统域名、hosted 发信已就绪的托管域名、legacy 已从系统列表移除但仍有存量邮箱的旧域名；
+ * 普通用户只得到自己作为所有者、已生效且发信就绪的托管域名（hosted），发出时自动把该地址认领给所有者
+ * （不占全站每人认领上限），成员与共享不适用。
  */
 export interface SendIdentityDomain {
   domain: string;
-  kind: 'system' | 'hosted';
+  kind: 'system' | 'hosted' | 'legacy';
   anyLocalPart: true;
 }
 

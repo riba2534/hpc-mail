@@ -50,6 +50,8 @@ function fakeCloudflare(opts: { dnssec?: string[]; existing?: string[]; createEr
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     const method = (init?.method ?? 'GET').toUpperCase();
+    // 他人添加前的公开委派预检：RDAP 默认查不到，DoH 的 NS 默认为空（委派已知且不指向本站）
+    if (url.hostname === 'rdap.org') return json({ errorCode: 404 }, 404);
     if (url.hostname === 'cloudflare-dns.com') {
       const name = url.searchParams.get('name') ?? '';
       const answer = url.searchParams.get('type') === 'DS' && opts.dnssec?.includes(name) ? [{ name, type: 43, data: '2371 13 2 ABC' }] : [];

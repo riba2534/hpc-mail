@@ -1,7 +1,7 @@
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { HostedDomain } from '@hpc-mail/shared';
+import type { CreatedApiKey, HostedDomain } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, hostedDomainMembers, hostedDomains, mailboxes, messages, users } from '../src/db/schema.js';
@@ -176,9 +176,9 @@ async function seed(cf: ReturnType<typeof fakeCloudflare>, userId: number, domai
 
 const rowOf = async (id: number) => (await db.select().from(hostedDomains).where(eq(hostedDomains.id, id)).get())!;
 
-async function call(method: string, path: string, token: string, body?: unknown) {
+async function call(method: string, path: string, token: string, body?: unknown, prefix: '/api' | '/v1' = '/api') {
   const ctx = createExecutionContext();
-  const response = await app.request(`/api${path}`, { method,
+  const response = await app.request(`${prefix}${path}`, { method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   }, runtime, ctx);
@@ -587,6 +587,25 @@ describe('重新接入（R15）', () => {
     expect((await errorOf(await call('POST', `/hosted-domains/${foreign.id}/reconnect`, owner.jwt), 409)).message).toContain('不能接管');
     expect(cf.calls.slice(before)).not.toContain('POST /zones');
     expect(await rowOf(foreign.id)).toMatchObject({ status: 'moved', zoneId: foreign.zoneId, syncLeaseUntil: null });
+  });
+
+  it('/v1 用 domain.write 的 Key 重新接入，审计记为 API Key；只有 domain.read 的 Key 403', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    await updateSettings(env, { api: { enabled: true }, security: { require2fa: false } });
+    const owner = await f.actor('owner');
+    const key = async (scopes: string[]) => (await data<CreatedApiKey>(await call('POST', '/api-keys', owner.jwt,
+      { name: `reconnect-${scopes.join('-')}`, scopes, rateLimit: 600 }), 201));
+    const reader = await key(['domain.read']);
+    const writer = await key(['domain.read', 'domain.write']);
+    const domain = f.domain();
+    cf.ready(f.domain('elsewhere'));
+    const row = await seed(cf, owner.id, domain, { status: 'moved', zoneStatus: 'missing', zoneMissingAt: new Date(Date.now() - DAY) }, { absent: true });
+    expect((await errorOf(await call('POST', `/hosted-domains/${row.id}/reconnect`, reader.key, undefined, '/v1'), 403)).code).toBe('forbidden');
+    expect((await data<HostedDomain>(await call('POST', `/hosted-domains/${row.id}/reconnect`, writer.key, undefined, '/v1'))).status).toBe('pending');
+    const audit = await db.select().from(adminAuditLogs)
+      .where(and(eq(adminAuditLogs.action, 'hosted_domain.reconnect'), eq(adminAuditLogs.target, domain))).get();
+    expect(audit?.actorName).toBe(`${owner.username}（API Key #${writer.id}）`);
   });
 
   it('只接受 moved；其他人 404；正在核对时直接返回当前状态', async () => {

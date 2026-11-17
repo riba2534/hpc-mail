@@ -7,6 +7,7 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { attachments, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { readMailBody } from '../src/services/mail-body.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 
@@ -55,7 +56,11 @@ async function source(values: Partial<typeof messages.$inferInsert> & { address:
     createdAt: new Date('2026-11-01T08:30:00Z'), ...values,
   }).returning().get())!;
 }
-const row = async (id: number) => (await db.select().from(messages).where(eq(messages.id, id)).get())!;
+/** 发件行与完整正文（正文在 R2，D1 只留搜索文本） */
+const row = async (id: number) => {
+  const found = (await db.select().from(messages).where(eq(messages.id, id)).get())!;
+  return { ...found, ...(await readMailBody(env, found)) };
+};
 const copyFor = async (address: string, messageId: string) => db.select().from(messages)
   .where(and(eq(messages.address, address), eq(messages.messageId, messageId), eq(messages.direction, 'inbound'))).get();
 

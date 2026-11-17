@@ -13,16 +13,26 @@ import {
 import type { Context } from 'hono';
 import { AppError } from '../lib/errors.js';
 import { ok, parseBody } from '../lib/http.js';
+import { beginIdempotentSend, failIdempotentSend, type IdempotencyActor } from '../services/idempotency.js';
 import {
-  beginIdempotentSend,
-  completeIdempotentSend,
-  failIdempotentSend,
-  type IdempotencyActor,
-} from '../services/idempotency.js';
-import { decodeInlineAttachments, deliveryFailedError, sendMail, type Sender, type SendMailInput } from '../services/outbound.js';
+  decodeInlineAttachments,
+  deliveryFailedError,
+  releaseDeliveryLeases,
+  sendMail,
+  type Sender,
+  type SendMailInput,
+} from '../services/outbound.js';
 import { composeForward, composeReply, fromRequiredError } from '../services/reply-forward.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
 import type { AppContext } from '../types.js';
+
+/** 首次响应与同 Key 重放共用：全部收件人被明确拒收为 422，其余（含部分失败、结果未确认的 unknown）为 201 */
+function sendResult(c: Context<AppContext>, summary: MessageSummary): Response {
+  if (summary.status === 'failed') {
+    throw deliveryFailedError(summary.id, summary.recipientOutcomes ?? [], summary.errorDetail || '全部收件人投递失败');
+  }
+  return ok(c, summary, 201);
+}
 
 /** 解析前拦下超大请求体：JSON 解析、幂等哈希、base64 解码会同时持有好几份内容 */
 function assertRequestSize(c: Context<AppContext>): void {
@@ -40,8 +50,8 @@ interface SendPlan {
 }
 
 /**
- * 发信的公共流程：占幂等键 → 准备请求与附件 → sendMail → 回填结果与回收草稿。
- * 重放直接返回首次结果；占键之后的任何失败都释放或标记幂等记录。
+ * 发信的公共流程：占幂等键 → 准备请求与附件 → sendMail → 回收草稿。重放直接返回首次结果；
+ * 投递开始前的任何失败都按错误类型删除或标记幂等记录并释放租约。
  */
 async function runSend(
   c: Context<AppContext>,
@@ -51,14 +61,9 @@ async function runSend(
   prepare: () => Promise<SendPlan>,
 ): Promise<Response> {
   const idem = await beginIdempotentSend(c.env, actor, c.req.header('Idempotency-Key'), fingerprint);
-  if (idem.kind === 'replay') {
-    // 全部收件人失败的结果重放时与首次一样是 422；部分失败、unknown 等仍是 201
-    const replay = idem.response;
-    if (replay.status === 'failed') {
-      throw deliveryFailedError(replay.id, replay.recipientOutcomes ?? [], replay.errorDetail || '全部收件人投递失败');
-    }
-    return ok(c, replay, 201);
-  }
+  if (idem.kind === 'replay') return sendResult(c, idem.response);
+  // 本次发送引用的草稿与原附件都登记在这个租约下，投递结束时释放
+  const leaseToken = crypto.randomUUID();
   let summary: MessageSummary;
   let tokens: string[] = [];
   try {
@@ -67,29 +72,27 @@ async function runSend(
     // 两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端与大文件），合并后送 sendMail
     const attachments = [
       ...decodeInlineAttachments(plan.attachments.inline),
-      ...await resolveDraftAttachments(c.env, sender.userId, plan.attachments.tokens),
+      ...await resolveDraftAttachments(c.env, sender.userId, plan.attachments.tokens, leaseToken),
     ];
     try {
-      summary = await sendMail(c.env, c.executionCtx, sender, plan.req, attachments, new URL(c.req.url).origin, idem.handle);
+      summary = await sendMail(c.env, c.executionCtx, sender, plan.req, attachments, new URL(c.req.url).origin, idem.handle, leaseToken);
     } catch (error) {
       // 发信鉴权里只有发件身份会报 forbidden
       if (plan.defaultFromAddress && error instanceof AppError && error.code === 'forbidden') throw fromRequiredError(plan.defaultFromAddress);
       throw error;
     }
   } catch (error) {
-    // 全部失败（422）时幂等键已绑定发件行，这里不会动它，重放由发件行推出同样的结果
-    await failIdempotentSend(c.env, idem.handle, error);
+    // 投递开始后 sendMail 不再抛错（全部失败也返回结果）；这里是投递前的异常，幂等记录按错误类型删除或标 failed，租约随之释放
+    await Promise.all([failIdempotentSend(c.env, idem.handle, error), releaseDeliveryLeases(c.env, leaseToken)]);
     throw error;
   }
-  // 邮件已发出：结果缓存与草稿回收失败都不能翻转请求结果（前端会提示重发，token 又还在，收件人就收到两封）。
-  // 草稿回收失败留给 24h 的草稿清理兜底；两者互不依赖，并行写
-  await Promise.all([
-    completeIdempotentSend(c.env, idem.handle, summary)
-      .catch((error) => console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error)),
-    consumeDraftAttachments(c.env, sender.userId, tokens)
-      .catch((error) => console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', error)),
-  ]);
-  return ok(c, summary, 201);
+  // 全部失败不回收草稿：同一 token 修正后可以再发。其余结果下邮件可能已发出，草稿回收失败不能翻转请求结果
+  // （前端会提示重发，token 又还在，收件人就收到两封），留给 24h 的草稿清理兜底
+  if (summary.status !== 'failed' && tokens.length) {
+    await consumeDraftAttachments(c.env, sender.userId, tokens)
+      .catch((error) => console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', error));
+  }
+  return sendResult(c, summary);
 }
 
 /**
