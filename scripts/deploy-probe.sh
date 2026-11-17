@@ -3,23 +3,26 @@
 #   canary     经 POST /api/internal/canary 真实外发一封金丝雀信（send_email → MX → Email Routing → email handler），
 #              轮询 GET /api/internal/canary/:nonce，直到 received 且由本次 build 处理
 #   heartbeat  轮询 GET /api/internal/health，直到 scheduled 写的 cron 心跳来自本次 build
+#              （只比对 build：心跳在 build 不变时不刷新 at，同一提交重跑部署时看到的是上次的心跳，属于接受的取舍）
 # 用法:
 #   BASE_URL=https://your-domain.example CANARY_TOKEN=xx BUILD_SHA=<commit> ./scripts/deploy-probe.sh canary|heartbeat
 # CANARY_TOKEN = hex(HMAC-SHA256(JWT_SECRET, "hpc-canary-v1"))，令牌错误时端点一律 404：
 #   printf '%s' 'hpc-canary-v1' | openssl dgst -sha256 -hmac "$JWT_SECRET" -hex | awk '{print $NF}'
+# 金丝雀须显式启用（会真实外发邮件，Workers Free 计划的 send_email 只能发往已验证地址）：
+#   CANARY_FROM_DOMAIN 与 CANARY_TO_DOMAIN 都设置时启用，收发域名须在系统域名列表内；
+#   或 DEPLOY_CANARY=on，由服务端按字母序取系统域名的前两个；DEPLOY_CANARY=off 一律跳过。
 # 可选：
-#   DEPLOY_CANARY=off                    跳过金丝雀（如 Workers Free 计划 send_email 只能发往已验证地址）
-#   SYSTEM_DOMAIN_COUNT=0                没有系统域名时跳过金丝雀（全新部署的合法状态）
-#   CANARY_FROM_DOMAIN/CANARY_TO_DOMAIN  指定收发域名，须在系统域名列表内；默认由服务端按字母序取前两个
-#   CANARY_TIMEOUT（默认 180 秒）、HEARTBEAT_TIMEOUT（默认 420 秒）、PROBE_POLL_INTERVAL（默认 10 秒）
+#   CANARY_TIMEOUT（默认 180 秒）、HEARTBEAT_TIMEOUT（默认 600 秒）、PROBE_POLL_INTERVAL（默认 10 秒）、
+#   PROBE_CURL_TIMEOUT（单个请求超时，默认 30 秒）
 set -euo pipefail
 
 : "${BASE_URL:?需要 BASE_URL}"
 : "${CANARY_TOKEN:?需要 CANARY_TOKEN}"
 : "${BUILD_SHA:?需要 BUILD_SHA}"
 CANARY_TIMEOUT=${CANARY_TIMEOUT:-180}
-HEARTBEAT_TIMEOUT=${HEARTBEAT_TIMEOUT:-420}
+HEARTBEAT_TIMEOUT=${HEARTBEAT_TIMEOUT:-600}
 POLL_INTERVAL=${PROBE_POLL_INTERVAL:-10}
+CURL_TIMEOUT=${PROBE_CURL_TIMEOUT:-30}
 
 fail() { echo "::error::$1"; exit 1; }
 summary() { [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
@@ -29,7 +32,7 @@ summary() { [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "$@" >> "$GITHUB_
 internal() {
   local path=$1 response
   shift
-  response=$(curl -sS --max-time 30 -w '\n%{http_code}' -H "X-Canary-Token: $CANARY_TOKEN" "$@" "$BASE_URL$path" 2>/dev/null) || response=$'\n000'
+  response=$(curl -sS --max-time "$CURL_TIMEOUT" -w '\n%{http_code}' -H "X-Canary-Token: $CANARY_TOKEN" "$@" "$BASE_URL$path" 2>/dev/null) || response=$'\n000'
   HTTP_STATUS=$(tail -n 1 <<< "$response")
   HTTP_BODY=$(sed '$d' <<< "$response")
 }
@@ -37,10 +40,20 @@ internal() {
 # 只信 JSON 字段；响应不是 JSON（如边缘错误页）时返回空串
 field() { jq -r "$1 // empty" <<< "$HTTP_BODY" 2>/dev/null || true; }
 
+# 已发起的外发请求数：服务端全站每分钟限 2 次（校验通过即计数，外发失败也算），补发与重试共用这个额度
+POSTS=0
+
 send_canary() {
   local body
   body=$(jq -nc '{fromDomain: (env.CANARY_FROM_DOMAIN // ""), toDomain: (env.CANARY_TO_DOMAIN // "")} | with_entries(select(.value != ""))')
-  internal /api/internal/canary -X POST -H 'Content-Type: application/json' --data-binary "$body"
+  while :; do
+    internal /api/internal/canary -X POST -H 'Content-Type: application/json' --data-binary "$body"
+    POSTS=$((POSTS + 1))
+    # 网络错误或 5xx 重试一次；结果不明的那次可能已经发出，所以只重试一次
+    [[ "$HTTP_STATUS" == 000 || "$HTTP_STATUS" == 5?? ]] && [ "$POSTS" -lt 2 ] || break
+    echo "::warning::金丝雀外发返回 HTTP $HTTP_STATUS，${POLL_INTERVAL}s 后重试一次"
+    sleep "$POLL_INTERVAL"
+  done
   case "$HTTP_STATUS" in
     2??) ;;
     404) fail "金丝雀端点返回 404：令牌与线上 jwt_secret 不符，或线上版本还没有该端点" ;;
@@ -51,18 +64,21 @@ send_canary() {
   echo "已外发金丝雀 $(field '.data.from') → $(field '.data.to')（nonce $nonce，外发 build $(field '.data.build')）"
 }
 
+canary_enabled() {
+  case "${DEPLOY_CANARY:-}" in
+    off) return 1 ;;
+    on) return 0 ;;
+  esac
+  [ -n "${CANARY_FROM_DOMAIN:-}" ] && [ -n "${CANARY_TO_DOMAIN:-}" ]
+}
+
 probe_canary() {
-  if [ "${DEPLOY_CANARY:-on}" = "off" ]; then
-    echo '::notice::DEPLOY_CANARY=off，跳过收件金丝雀'
-    summary '- 收件金丝雀：已按 DEPLOY_CANARY=off 跳过'
+  if ! canary_enabled; then
+    echo '::notice::收件金丝雀未启用：设置 Variable CANARY_FROM_DOMAIN 与 CANARY_TO_DOMAIN（或 DEPLOY_CANARY=on）后启用'
+    summary '- 收件金丝雀：未启用，已跳过'
     return 0
   fi
-  if [ "${SYSTEM_DOMAIN_COUNT:-}" = "0" ]; then
-    echo '::notice::尚未配置系统域名，跳过收件金丝雀（在管理后台添加域名后的下一次部署开始验证）'
-    summary '- 收件金丝雀：尚未配置系统域名，已跳过'
-    return 0
-  fi
-  local started=$SECONDS deadline=$((SECONDS + CANARY_TIMEOUT)) sends=1 received build
+  local started=$SECONDS deadline=$((SECONDS + CANARY_TIMEOUT)) received build
   send_canary
   while :; do
     sleep "$POLL_INTERVAL"
@@ -75,13 +91,12 @@ probe_canary() {
       return 0
     fi
     if [ "$received" = "true" ]; then
-      # 发布切换期间收件可能落在旧版本上；全站每分钟限 2 封，只补发一次
-      if [ "$sends" -ge 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      # 发布切换期间收件可能落在旧版本上；全站每分钟限 2 封，额度没被重试用掉时补发一次
+      if [ "$POSTS" -ge 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
         fail "金丝雀由旧版本 build ${build:-未知} 收件，新版本 email handler 未得到验证"
       fi
       echo "::warning::金丝雀由旧版本 build ${build:-未知} 收件（发布切换中），补发一次"
       send_canary
-      sends=$((sends + 1))
       continue
     fi
     [ "$SECONDS" -lt "$deadline" ] || fail "${CANARY_TIMEOUT}s 内未收到金丝雀（nonce $nonce，最后一次查询 HTTP $HTTP_STATUS）：检查 send_email、收件域名的 Email Routing catch-all 与 email handler 日志"
@@ -107,7 +122,7 @@ probe_heartbeat() {
       return 0
     fi
     [ "$SECONDS" -lt "$deadline" ] || fail "${HEARTBEAT_TIMEOUT}s 内没有等到新版本的 cron 心跳（最近一次 build ${cron_build:-无}，时间 $(field '.data.cron.at')）"
-    echo "等待新版本 cron 心跳…（当前 ${cron_build:-无}，已等 $((SECONDS - started))s）"
+    echo "等待新版本 cron 心跳…（当前 build ${cron_build:-无}，时间 $(field '.data.cron.at')，已等 $((SECONDS - started))s）"
     sleep "$POLL_INTERVAL"
   done
 }

@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
  * smoke.sh 与 deploy-probe.sh 的本地自检：起一个模拟线上接口的 HTTP 桩，按场景执行脚本并检查退出码与输出。
- * 覆盖：管理员未开/已开两步验证、站点强制两步验证、发布切换期首页引用旧资源的重试、
- * 金丝雀正常/旧版本收件补发/超时/令牌错误/跳过、cron 心跳等待与超时。
+ * 覆盖：管理员未开/已开两步验证（含用 ADMIN_TOTP_SECRET 登录）、管理员凭据与线上不符、站点强制两步验证、
+ * 发布切换期首页引用旧资源的重试、请求挂住时单请求超时、金丝雀显式启用/外发重试/旧版本收件补发/超时/令牌错误、
+ * cron 心跳等待与超时。
  * 需要 bash、curl、jq（CI runner 自带）。用法：node scripts/check-deploy-scripts.mjs
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,15 +20,30 @@ const ADMIN = { id: 1, username: 'site-admin', password: 'p"a\\ss word $1 ok' };
 const SMOKE_USER = { id: 2, username: 'ci-smoke', password: '0123456789abcdef0123456789abcdef' };
 const BUILD = 'b'.repeat(40);
 const CANARY_TOKEN = 'c'.repeat(64);
+const TOTP_SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
+
+/** 独立实现的 RFC 6238（SHA-1、6 位、30 秒），用来核对 smoke.sh 算出的验证码 */
+function totp(secret, step) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const bitsText = [...secret].map((ch) => alphabet.indexOf(ch).toString(2).padStart(5, '0')).join('');
+  const key = Buffer.from(bitsText.match(/.{8}/g).map((byte) => parseInt(byte, 2)));
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(step));
+  const hash = createHmac('sha1', key).update(counter).digest();
+  const offset = hash[19] & 15;
+  return String((hash.readUInt32BE(offset) & 0x7fffffff) % 1e6).padStart(6, '0');
+}
+const totpValid = (code) => [-1, 0, 1].some((w) => totp(TOTP_SECRET, Math.floor(Date.now() / 30000) + w) === code);
 
 let S; // 当前场景状态
 const reset = (overrides = {}) => {
   S = {
-    adminTotp: false, require2fa: false, oldHomepages: 0, userCanAdmin: false,
-    heartbeatAfter: 1, heartbeatOk: true,
-    sessions: new Map(), hits: [], homepageHits: 0, sends: [], canaryPolls: 0, healthPolls: 0,
+    adminTotp: false, adminLoginError: null, require2fa: false, oldHomepages: 0, userCanAdmin: false,
+    heartbeatAfter: 1, heartbeatOk: true, hangs: {},
+    sessions: new Map(), hits: [], homepageHits: 0, sends: [], canaryPolls: 0, healthPolls: 0, logins: [],
     ...overrides,
-    canary: { receiveAfter: 1, staleSends: 0, never: false, status: 200, ...overrides.canary },
+    // statuses：依次作为每次外发的响应状态，用完后返回 200
+    canary: { receiveAfter: 1, staleSends: 0, never: false, statuses: [], ...overrides.canary },
   };
 };
 
@@ -86,10 +103,15 @@ function handle(req, body) {
   if (path === '/api/auth/register') return error(403, 'forbidden');
 
   if (path === '/api/auth/login') {
-    const { username, password } = JSON.parse(body || '{}');
+    const login = JSON.parse(body || '{}');
+    S.logins.push(login);
+    const { username, password, totp: code } = login;
+    if (username === ADMIN.username && S.adminLoginError) return error(...S.adminLoginError);
     const account = [ADMIN, SMOKE_USER].find((a) => a.username === username && a.password === password);
     if (!account) return error(401, 'bad_credentials');
-    if (account === ADMIN && S.adminTotp) return error(401, 'totp_required');
+    // 与 worker 一致：未开两步验证时忽略 totp 字段；开了则缺码 totp_required、错码 bad_credentials
+    if (account === ADMIN && S.adminTotp && !code) return error(401, 'totp_required');
+    if (account === ADMIN && S.adminTotp && !totpValid(code)) return error(401, 'bad_credentials');
     const token = `tok-${account.username}-${S.sessions.size}`;
     S.sessions.set(token, account);
     return json(200, { data: { token } });
@@ -104,7 +126,8 @@ function handle(req, body) {
     if (req.headers['x-canary-token'] !== CANARY_TOKEN) return error(404, 'not_found');
     if (path === '/api/internal/canary' && req.method === 'POST') {
       S.sends.push(JSON.parse(body || '{}'));
-      if (S.canary.status !== 200) return error(S.canary.status, 'send_failed');
+      const status = S.canary.statuses.shift() ?? 200;
+      if (status !== 200) return error(status, 'send_failed');
       const nonce = String(S.sends.length).padStart(32, '0');
       return json(200, { data: { nonce, from: 'canary@a.test', to: 'canary@b.test', build: BUILD, sentAt: 'now' } });
     }
@@ -152,6 +175,13 @@ const server = createServer((req, res) => {
   let body = '';
   req.on('data', (chunk) => { body += chunk; });
   req.on('end', () => {
+    // hangs：路径 → 剩余次数，命中时不响应，模拟线上挂住的连接
+    const path = new URL(req.url, 'http://stub').pathname;
+    if (S.hangs[path] > 0) {
+      S.hangs[path] -= 1;
+      S.hits.push({ method: req.method, path, user: null, hung: true });
+      return;
+    }
     const [status, headers, payload] = handle(req, body);
     res.writeHead(status, headers).end(payload);
   });
@@ -159,26 +189,31 @@ const server = createServer((req, res) => {
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const BASE_URL = `http://127.0.0.1:${server.address().port}`;
 
-function run(script, args, env) {
+// 脚本超过 limitMs 没结束就强杀并记为 timeout：挂住本身就是要抓的缺陷
+function run(script, args, env, limitMs = 20000) {
   return new Promise((resolve) => {
     const child = spawn('bash', [script, ...args], {
       env: { PATH: process.env.PATH, HOME: process.env.HOME, BASE_URL, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, limitMs);
     child.stdout.on('data', (d) => { output += d; });
     child.stderr.on('data', (d) => { output += d; });
-    child.on('close', (status) => resolve({ status, output }));
+    child.on('close', (status) => { clearTimeout(timer); resolve({ status: timedOut ? 'timeout' : status, output }); });
   });
 }
 
-const smoke = (env = {}) => run(SMOKE, [], {
+const smoke = (env = {}, limitMs) => run(SMOKE, [], {
   ADMIN_USERNAME: ADMIN.username, ADMIN_PASSWORD: ADMIN.password, SMOKE_PASSWORD: SMOKE_USER.password,
   SMOKE_ASSET_RETRY_INTERVAL: '0', ...env,
-});
-const probe = (mode, env = {}) => run(PROBE, [mode], {
+}, limitMs);
+const probe = (mode, env = {}, limitMs) => run(PROBE, [mode], {
   CANARY_TOKEN, BUILD_SHA: BUILD, PROBE_POLL_INTERVAL: '0', ...env,
-});
+}, limitMs);
+// 金丝雀须显式启用；默认用 DEPLOY_CANARY=on（由服务端选域名）
+const canary = (env = {}, limitMs) => probe('canary', { DEPLOY_CANARY: 'on', ...env }, limitMs);
 const adminHits = () => S.hits.filter((h) => h.user === ADMIN.username && h.path !== '/api/auth/me' && h.path !== '/api/auth/logout');
 
 const cases = [];
@@ -192,19 +227,67 @@ test('smoke：管理员未开两步验证时执行全部检查', async () => {
   assert.match(r.output, /普通用户无法访问管理接口/);
   assert.match(r.output, /管理员登出后旧 token 失效/);
   assert.match(r.output, /冒烟全部通过（27 项）/);
+  assert.doesNotMatch(r.output, /::(error|warning)::/, '成功路径不应有错误或告警');
   assert.ok(adminHits().some((h) => h.path === '/api/admin/settings'), '管理员检查应已执行');
   assert.equal(S.sessions.size, 0, '两个会话都应已登出');
 });
 
-test('smoke：管理员 totp_required 时跳过管理员检查，普通用户检查照常', async () => {
+test('smoke：管理员 totp_required 且未配种子时跳过管理员检查，普通用户检查照常', async () => {
   reset({ adminTotp: true });
   const r = await smoke();
   assert.equal(r.status, 0, r.output);
-  assert.match(r.output, /::notice::管理员已开启两步验证（totp_required）/);
+  assert.match(r.output, /::notice::管理员已开启两步验证且未配置 ADMIN_TOTP_SECRET/);
   assert.match(r.output, /普通用户邮件、域名、邮箱与通知接口可读/);
   assert.doesNotMatch(r.output, /当前用户为 admin/);
   assert.deepEqual(adminHits(), []);
   assert.ok(S.hits.some((h) => h.user === 'ci-smoke' && h.path === '/api/admin/settings'), '应校验普通用户越权被拒');
+});
+
+test('smoke：配置 ADMIN_TOTP_SECRET 时算出验证码完成管理员登录，种子与验证码不进日志', async () => {
+  reset({ adminTotp: true });
+  // 小写、带空格的种子也要能用（Authenticator 常见的展示格式）
+  let r = await smoke({ ADMIN_TOTP_SECRET: TOTP_SECRET.toLowerCase().replace(/(.{4})/g, '$1 ') });
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /冒烟全部通过（27 项）/);
+  assert.ok(adminHits().some((h) => h.path === '/api/admin/settings'), '管理员检查应已执行');
+  assert.ok(!r.output.toUpperCase().includes(TOTP_SECRET), '种子不能出现在输出里');
+  const adminLogin = S.logins.find((l) => l.username === ADMIN.username);
+  assert.ok(totpValid(adminLogin.totp), '应提交当前有效的验证码');
+  assert.ok(!r.output.includes(adminLogin.totp), '验证码不能出现在输出里');
+  // 管理员没开两步验证时多带的 totp 被忽略，照常登录
+  reset();
+  r = await smoke({ ADMIN_TOTP_SECRET: TOTP_SECRET });
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /冒烟全部通过（27 项）/);
+});
+
+test('smoke：管理员密码或种子与线上不符时告警并跳过管理员检查，不判失败', async () => {
+  reset();
+  let r = await smoke({ ADMIN_PASSWORD: 'wrong-password-xx' });
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /::warning::管理员登录被拒（bad_credentials）：ADMIN_PASSWORD 与线上不符/);
+  assert.match(r.output, /冒烟账号登出后旧 token 失效/);
+  assert.deepEqual(adminHits(), []);
+  reset({ adminTotp: true });
+  r = await smoke({ ADMIN_TOTP_SECRET: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' });
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /::warning::管理员登录被拒（bad_credentials）：ADMIN_PASSWORD 或 ADMIN_TOTP_SECRET 与线上不符/);
+  assert.deepEqual(adminHits(), []);
+});
+
+test('smoke：管理员登录的其他错误、冒烟账号登录失败、普通用户越权都判失败', async () => {
+  reset({ adminLoginError: [403, 'user_disabled'] });
+  let r = await smoke();
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.output, /管理员登录未返回 token: HTTP 403/);
+  reset();
+  r = await smoke({ SMOKE_PASSWORD: 'wrong' });
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.output, /冒烟账号登录失败/);
+  reset({ userCanAdmin: true });
+  r = await smoke();
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.output, /普通用户访问 \/api\/admin\/settings 未返回 403/);
 });
 
 test('smoke：站点强制两步验证时校验拦截并跳过数据接口', async () => {
@@ -238,74 +321,89 @@ test('smoke：旧资源持续 404 时重试 5 次后失败', async () => {
   assert.equal(S.homepageHits, 1 + 1 + 5);
 });
 
-test('smoke：管理员密码错误、冒烟账号密码错误、普通用户越权都判失败', async () => {
-  reset();
-  let r = await smoke({ ADMIN_PASSWORD: 'wrong-password-xx' });
-  assert.equal(r.status, 1, r.output);
-  assert.match(r.output, /管理员登录未返回 token: HTTP 401/);
-  reset();
-  r = await smoke({ SMOKE_PASSWORD: 'wrong' });
-  assert.equal(r.status, 1, r.output);
-  assert.match(r.output, /冒烟账号登录失败/);
-  reset({ userCanAdmin: true });
-  r = await smoke();
-  assert.equal(r.status, 1, r.output);
-  assert.match(r.output, /普通用户访问 \/api\/admin\/settings 未返回 403/);
+test('smoke：请求挂住时按单请求超时失败，不拖住整个步骤', async () => {
+  for (const path of ['/sw.js', '/api/auth/login', '/api/admin/settings']) {
+    reset({ hangs: { [path]: Infinity } });
+    const r = await smoke({ SMOKE_CURL_TIMEOUT: '1' }, 8000);
+    assert.notEqual(r.status, 'timeout', `${path} 挂住时冒烟没有按时结束\n${r.output}`);
+    assert.notEqual(r.status, 0, r.output);
+    assert.match(r.output, /::error::冒烟失败/, r.output);
+  }
 });
 
-test('probe canary：新版本收件即通过，默认不指定域名', async () => {
-  reset({ canary: { receiveAfter: 3, staleSends: 0 } });
-  const r = await probe('canary');
+test('probe canary：未显式启用时跳过并 notice，不外发', async () => {
+  reset();
+  for (const env of [{}, { CANARY_FROM_DOMAIN: 'a.test' }, { CANARY_TO_DOMAIN: 'b.test' }, { DEPLOY_CANARY: 'off', CANARY_FROM_DOMAIN: 'a.test', CANARY_TO_DOMAIN: 'b.test' }]) {
+    const r = await probe('canary', env);
+    assert.equal(r.status, 0, r.output);
+    assert.match(r.output, /::notice::收件金丝雀未启用：设置 Variable CANARY_FROM_DOMAIN 与 CANARY_TO_DOMAIN（或 DEPLOY_CANARY=on）后启用/);
+  }
+  assert.equal(S.sends.length, 0);
+});
+
+test('probe canary：设置收发域名或 DEPLOY_CANARY=on 时启用，新版本收件即通过', async () => {
+  reset({ canary: { receiveAfter: 3 } });
+  let r = await probe('canary', { CANARY_FROM_DOMAIN: 'a.test', CANARY_TO_DOMAIN: 'b.test' });
   assert.equal(r.status, 0, r.output);
   assert.match(r.output, /金丝雀已由新版本收件/);
+  assert.deepEqual(S.sends, [{ fromDomain: 'a.test', toDomain: 'b.test' }]);
+  reset();
+  r = await canary();
+  assert.equal(r.status, 0, r.output);
   assert.deepEqual(S.sends, [{}]);
 });
 
-test('probe canary：可指定收发域名', async () => {
-  reset();
-  const r = await probe('canary', { CANARY_FROM_DOMAIN: 'a.test' });
+test('probe canary：外发遇 5xx 或网络错误重试一次，4xx 与重试用尽判失败', async () => {
+  reset({ canary: { statuses: [502] } });
+  let r = await canary();
   assert.equal(r.status, 0, r.output);
-  assert.deepEqual(S.sends, [{ fromDomain: 'a.test' }]);
+  assert.match(r.output, /::warning::金丝雀外发返回 HTTP 502，0s 后重试一次/);
+  assert.equal(S.sends.length, 2);
+  reset({ canary: { statuses: [502, 503] } });
+  r = await canary();
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.output, /金丝雀外发失败: HTTP 503/);
+  assert.equal(S.sends.length, 2);
+  reset({ canary: { statuses: [400] } });
+  r = await canary();
+  assert.equal(r.status, 1, r.output);
+  assert.equal(S.sends.length, 1, '4xx 不重试');
+  reset({ hangs: { '/api/internal/canary': 1 } });
+  r = await canary({ PROBE_CURL_TIMEOUT: '1' }, 8000);
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /金丝雀外发返回 HTTP 000/);
+  assert.equal(S.sends.length, 1);
 });
 
-test('probe canary：旧版本收件时补发一次，仍是旧版本则失败', async () => {
-  reset({ canary: { receiveAfter: 1, staleSends: 1 } });
-  let r = await probe('canary');
+test('probe canary：旧版本收件时补发一次，仍是旧版本或额度已被重试用掉则失败', async () => {
+  reset({ canary: { staleSends: 1 } });
+  let r = await canary();
   assert.equal(r.status, 0, r.output);
   assert.match(r.output, /::warning::金丝雀由旧版本 build a+ 收件/);
   assert.equal(S.sends.length, 2);
-  reset({ canary: { receiveAfter: 1, staleSends: 2 } });
-  r = await probe('canary');
+  reset({ canary: { staleSends: 2 } });
+  r = await canary();
+  assert.equal(r.status, 1, r.output);
+  assert.equal(S.sends.length, 2);
+  // 第一次外发 502 重试后成功，全站每分钟 2 次额度已用完，旧版本收件不再补发
+  reset({ canary: { statuses: [502], staleSends: 2 } });
+  r = await canary();
   assert.equal(r.status, 1, r.output);
   assert.equal(S.sends.length, 2);
 });
 
-test('probe canary：超时、外发失败、令牌错误判失败', async () => {
+test('probe canary：收件超时、令牌错误判失败', async () => {
   reset({ canary: { never: true } });
-  let r = await probe('canary', { CANARY_TIMEOUT: '1', PROBE_POLL_INTERVAL: '0.2' });
+  let r = await canary({ CANARY_TIMEOUT: '1', PROBE_POLL_INTERVAL: '0.2' });
   assert.equal(r.status, 1, r.output);
   assert.match(r.output, /1s 内未收到金丝雀/);
-  reset({ canary: { status: 502 } });
-  r = await probe('canary');
-  assert.equal(r.status, 1, r.output);
-  assert.match(r.output, /金丝雀外发失败: HTTP 502/);
   reset();
-  r = await probe('canary', { CANARY_TOKEN: 'd'.repeat(64) });
+  r = await canary({ CANARY_TOKEN: 'd'.repeat(64) });
   assert.equal(r.status, 1, r.output);
   assert.match(r.output, /令牌与线上 jwt_secret 不符/);
 });
 
-test('probe canary：DEPLOY_CANARY=off 或没有系统域名时跳过', async () => {
-  reset();
-  let r = await probe('canary', { DEPLOY_CANARY: 'off' });
-  assert.equal(r.status, 0, r.output);
-  r = await probe('canary', { SYSTEM_DOMAIN_COUNT: '0' });
-  assert.equal(r.status, 0, r.output);
-  assert.match(r.output, /尚未配置系统域名，跳过收件金丝雀/);
-  assert.equal(S.sends.length, 0);
-});
-
-test('probe heartbeat：等到新版本心跳；有失败步骤只告警；超时失败', async () => {
+test('probe heartbeat：等到新版本心跳；有失败步骤只告警；超时与挂住都按时失败', async () => {
   reset({ heartbeatAfter: 3 });
   let r = await probe('heartbeat');
   assert.equal(r.status, 0, r.output);
@@ -318,6 +416,10 @@ test('probe heartbeat：等到新版本心跳；有失败步骤只告警；超�
   r = await probe('heartbeat', { HEARTBEAT_TIMEOUT: '1', PROBE_POLL_INTERVAL: '0.2' });
   assert.equal(r.status, 1, r.output);
   assert.match(r.output, /1s 内没有等到新版本的 cron 心跳/);
+  reset({ hangs: { '/api/internal/health': Infinity } });
+  r = await probe('heartbeat', { HEARTBEAT_TIMEOUT: '2', PROBE_CURL_TIMEOUT: '1' }, 8000);
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.output, /2s 内没有等到新版本的 cron 心跳/);
 });
 
 try {
@@ -327,5 +429,6 @@ try {
   }
   console.log(`部署脚本自检通过（${cases.length} 组用例）`);
 } finally {
+  server.closeAllConnections();
   server.close();
 }

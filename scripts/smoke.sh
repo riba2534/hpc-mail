@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# 部署后线上冒烟：公开端点 + 冒烟账号（普通用户）+ 管理员（未开两步验证时）
+# 部署后线上冒烟：公开端点 + 冒烟账号（普通用户）+ 管理员（能登录时）
 # 用法:
 #   BASE_URL=https://your-domain.example ADMIN_USERNAME=xx ADMIN_PASSWORD=xx SMOKE_PASSWORD=xx ./scripts/smoke.sh
 # SMOKE_PASSWORD 是冒烟账号 ci-smoke 的密码：hex(HMAC-SHA256(JWT_SECRET, "ci-smoke-password-v1")) 的前 32 位，
-#   部署流程由 apps/worker/scripts/seed-smoke.mjs 创建该账号。
-# 管理员开了两步验证时登录返回 totp_required，管理员专属检查跳过（打印 notice，不算失败），
-#   普通用户检查照常由冒烟账号完成。
-# 可选：SMOKE_ASSET_RETRY_INTERVAL（静态资源重试间隔，默认 10 秒）
-set -euo pipefail
+#   部署流程由 apps/worker/scripts/seed-smoke.mjs 创建该账号；它登录失败判冒烟失败。
+# 管理员登录不了时只跳过管理员专属检查、不判失败（普通用户检查照常由冒烟账号完成）：
+#   - 开了两步验证（totp_required）且没给 ADMIN_TOTP_SECRET：打印 notice；
+#   - 密码或两步验证码不对（bad_credentials，如站长在网页改了密码而 CI secret 没跟上）：打印 warning。
+# 可选：ADMIN_TOTP_SECRET（管理员 TOTP 种子，base32；给了就算出当前验证码完成登录，需要 node）、
+#   SMOKE_ASSET_RETRY_INTERVAL（静态资源重试间隔，默认 10 秒）、SMOKE_CURL_TIMEOUT（单个请求超时，默认 30 秒）
+set -Eeuo pipefail
+# 请求超时、连接错误等让命令直接失败退出时，也留下一条能定位的错误
+trap 'code=$?; echo "::error::冒烟失败: 第 $LINENO 行命令退出码 $code（多为请求超时或连接错误）"' ERR
 
 : "${BASE_URL:?需要 BASE_URL}"
 : "${ADMIN_USERNAME:?需要 ADMIN_USERNAME}"
@@ -16,6 +20,10 @@ set -euo pipefail
 SMOKE_USERNAME=ci-smoke
 ASSET_RETRIES=5
 ASSET_RETRY_INTERVAL=${SMOKE_ASSET_RETRY_INTERVAL:-10}
+CURL_TIMEOUT=${SMOKE_CURL_TIMEOUT:-30}
+
+# 每个请求都有上限：线上挂住的连接不能把冒烟拖到 job 超时（那样自动回滚也来不及跑）
+curl() { command curl --max-time "$CURL_TIMEOUT" "$@"; }
 
 PASS=0
 step() { PASS=$((PASS + 1)); echo "[$PASS] $1"; }
@@ -30,13 +38,37 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 登录：结果写入 LOGIN_STATUS / LOGIN_BODY。凭据经环境变量交给 jq、经 stdin 交给 curl，不出现在命令行参数里
+# 登录：login <用户名> <密码> [两步验证码]，结果写入 LOGIN_STATUS / LOGIN_BODY。
+# 凭据经环境变量交给 jq、经 stdin 交给 curl，不出现在命令行参数里
 login() {
   local response
-  response=$(LOGIN_USERNAME="$1" LOGIN_PASSWORD="$2" jq -n '{username: env.LOGIN_USERNAME, password: env.LOGIN_PASSWORD}' |
+  response=$(LOGIN_USERNAME="$1" LOGIN_PASSWORD="$2" LOGIN_TOTP="${3:-}" jq -n '
+    {username: env.LOGIN_USERNAME, password: env.LOGIN_PASSWORD} + (if env.LOGIN_TOTP == "" then {} else {totp: env.LOGIN_TOTP} end)' |
     curl -sS -w '\n%{http_code}' -X POST "$BASE_URL/api/auth/login" -H 'Content-Type: application/json' --data-binary @-)
   LOGIN_STATUS=$(tail -n 1 <<< "$response")
   LOGIN_BODY=$(sed '$d' <<< "$response")
+}
+
+# 按 ADMIN_TOTP_SECRET 算当前 TOTP（RFC 6238：SHA-1、6 位、30 秒，同 worker src/lib/totp.ts）。
+# 种子只经环境变量交给 node，不进命令行参数，也不打印
+totp_now() {
+  node -e '
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let bits = 0, value = 0;
+    const key = [];
+    for (const ch of (process.env.ADMIN_TOTP_SECRET || "").toUpperCase()) {
+      const index = alphabet.indexOf(ch);
+      if (index === -1) continue;
+      value = (value << 5) | index;
+      bits += 5;
+      if (bits >= 8) { key.push((value >>> (bits - 8)) & 255); bits -= 8; }
+    }
+    const counter = Buffer.alloc(8);
+    counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30000)));
+    const hash = require("node:crypto").createHmac("sha1", Buffer.from(key)).update(counter).digest();
+    const code = (hash.readUInt32BE(hash[hash.length - 1] & 15) & 0x7fffffff) % 1000000;
+    process.stdout.write(String(code).padStart(6, "0"));
+  '
 }
 
 # 登出后旧 token 必须立即失效
@@ -207,7 +239,7 @@ user_checks() {
   USER_TOKEN=""
 }
 
-# ---------- 管理员（未开两步验证时） ----------
+# ---------- 管理员（能登录时） ----------
 
 admin_checks() {
   local list domains first_domain dlist settings claude_stats claude_plan claude_probe suspended_domain
@@ -335,20 +367,29 @@ admin_checks() {
 }
 
 step "管理员真实登录"
-login "$ADMIN_USERNAME" "$ADMIN_PASSWORD"
+admin_totp=""
+[ -z "${ADMIN_TOTP_SECRET:-}" ] || admin_totp=$(totp_now) || fail "按 ADMIN_TOTP_SECRET 计算两步验证码失败"
+login "$ADMIN_USERNAME" "$ADMIN_PASSWORD" "$admin_totp"
 ADMIN_TOKEN=$(jq -r '.data.token // empty' <<< "$LOGIN_BODY" 2>/dev/null || true)
 if [ -z "$ADMIN_TOKEN" ]; then
-  # totp_required 只在密码正确后返回，说明管理员凭据有效、只是开了两步验证
-  if [ "$LOGIN_STATUS" = "401" ] && jq -e '.error.code == "totp_required"' <<< "$LOGIN_BODY" >/dev/null 2>&1; then
-    echo "::notice::管理员已开启两步验证（totp_required），跳过管理员专属检查；普通用户检查由 $SMOKE_USERNAME 完成"
-  else
-    fail "管理员登录未返回 token: HTTP $LOGIN_STATUS $LOGIN_BODY"
-  fi
+  # 管理员凭据与线上不同步属于配置问题而非本次发布引入，只跳过管理员检查，不触发回滚
+  case "$LOGIN_STATUS:$(jq -r '.error.code // empty' <<< "$LOGIN_BODY" 2>/dev/null || true)" in
+    401:totp_required)
+      # 只在密码正确后返回：管理员凭据有效、只是开了两步验证
+      echo "::notice::管理员已开启两步验证且未配置 ADMIN_TOTP_SECRET，跳过管理员专属检查；普通用户检查由 $SMOKE_USERNAME 完成" ;;
+    401:bad_credentials)
+      if [ -n "$admin_totp" ]; then
+        echo "::warning::管理员登录被拒（bad_credentials）：ADMIN_PASSWORD 或 ADMIN_TOTP_SECRET 与线上不符，跳过管理员专属检查，请同步 CI secret"
+      else
+        echo "::warning::管理员登录被拒（bad_credentials）：ADMIN_PASSWORD 与线上不符（站长可能在网页改了密码），跳过管理员专属检查，请同步 CI secret"
+      fi ;;
+    *) fail "管理员登录未返回 token: HTTP $LOGIN_STATUS $LOGIN_BODY" ;;
+  esac
 fi
 
 user_checks
 
-# 走到这里时管理员令牌为空只可能是 totp_required
+# 管理员令牌为空说明上面已按 totp_required / bad_credentials 跳过
 [ -z "$ADMIN_TOKEN" ] || admin_checks
 
 echo "冒烟全部通过（$PASS 项）"
