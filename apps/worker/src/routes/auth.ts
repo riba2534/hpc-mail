@@ -12,7 +12,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { clientIp, execCtx, ok, parseBody } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
 import { logAdminAction } from '../services/audit.js';
-import { changePassword, login, logout, register } from '../services/auth.js';
+import { changePassword, login, loginRetryAfterSeconds, logout, register } from '../services/auth.js';
 import { avatarUrl, deleteAvatar, uploadAvatar } from '../services/avatar.js';
 import { disableTwoFactor, enableTwoFactor, setupTwoFactor } from '../services/twofa.js';
 import type { AppContext, AuthUser } from '../types.js';
@@ -33,8 +33,13 @@ function sessionUserOf(user: AuthUser, overrideAvatarUrl?: string | null): Sessi
 
 app.post('/login', async (c) => {
   const req = await parseBody(c, loginRequestSchema);
-  const result = await login(c.env, req, clientIp(c), execCtx(c));
-  return ok(c, result);
+  try {
+    return ok(c, await login(c.env, req, clientIp(c), execCtx(c)));
+  } catch (error) {
+    // 登录失败计数按固定 15 分钟窗口重置，告诉调用方要等多久
+    if (error instanceof AppError && error.code === 'rate_limited') c.header('Retry-After', String(loginRetryAfterSeconds()));
+    throw error;
+  }
 });
 
 app.post('/register', async (c) => {
