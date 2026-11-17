@@ -13,6 +13,8 @@ export const API_SCOPES = [
   'mail.send',
   'mailbox.read',
   'mailbox.write',
+  'domain.read',
+  'domain.write',
 ] as const;
 export type ApiScope = (typeof API_SCOPES)[number];
 

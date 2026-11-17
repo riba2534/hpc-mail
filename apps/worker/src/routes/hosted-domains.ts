@@ -3,8 +3,7 @@ import {
   updateHostedDomainRequestSchema,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { AppError } from '../lib/errors.js';
-import { clientIp, execCtx, ok, parseBody, parseId } from '../lib/http.js';
+import { clientIp, execCtx, ok, parseBody, parseId, parseRecordId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   checkHostedDomain, createHostedDomain, deleteHostedDomain, getHostedDomain, listHostedDomainMembers, listMyHostedDomains,
@@ -12,12 +11,6 @@ import {
 } from '../services/hosted-domain.js';
 import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../services/hosted-dns.js';
 import type { AppContext } from '../types.js';
-
-/** Cloudflare 记录 ID 为 32 位十六进制，格式不对按记录不存在处理 */
-function parseRecordId(value: string | undefined): string {
-  if (!value || !/^[0-9a-f]{32}$/.test(value)) throw new AppError('not_found', '解析记录不存在');
-  return value;
-}
 
 /** 托管域名（JWT）：所有者与管理员管理，成员只读并可退出共享；没有权限的域名一律 404 */
 const app = new Hono<AppContext>();
