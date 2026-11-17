@@ -29,7 +29,7 @@ import {
   type Column,
   type SQL,
 } from 'drizzle-orm';
-import { union } from 'drizzle-orm/sqlite-core';
+import { union, unionAll } from 'drizzle-orm/sqlite-core';
 import { createDb, type Db } from '../db/client.js';
 import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, stars, users } from '../db/schema.js';
 import { signAttachment } from '../lib/crypto.js';
@@ -166,14 +166,20 @@ function domainCondition(scope: Scope, domain: string): SQL {
   return scope === 'unclaimed' ? eq(messages.domain, domain) : sql`+${messages.domain} = ${domain}`;
 }
 
-/** 分享给 userId、且认领人仍启用的地址 */
-function sharedAddressQuery(db: Db, userId: number) {
+/**
+ * mailboxes 按域名收窄时写成一元 +domain，不让它参与选索引：始终按 user_id（或共享关系）只读调用者自己的邮箱行，
+ * 不会改走 idx_mailboxes_domain 读出全站该域的认领行
+ */
+const mailboxOnDomain = (domain: string | undefined) => (domain ? sql`+${mailboxes.domain} = ${domain}` : undefined);
+
+/** 分享给 userId、且认领人仍启用的地址；给了 domain 时只取该域的 */
+function sharedAddressQuery(db: Db, userId: number, domain?: string) {
   return db
     .select({ address: mailboxes.address })
     .from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
     .innerJoin(users, eq(users.id, mailboxes.userId))
-    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active')));
+    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active'), mailboxOnDomain(domain)));
 }
 
 /**
@@ -199,14 +205,18 @@ function scopeCondition(db: Db, scope: Scope, access: ScopeAccess = 'owned'): SQ
 }
 
 /**
- * 只用于已限定「inbound + 未删除」的查询：可见地址集合 = 认领 ∪ 分享，用 UNION 代替 OR。
+ * 只用于已限定「inbound + 未删除」的查询（wait）：可见地址集合 = 认领 ∪ 分享，用 UNION ALL 代替 OR。
  * 分享分支本身要求 inbound + 未删除，外层条件已覆盖，语义与 scopeCondition 一致；
- * 去掉 OR 后规划器才能按地址逐个走 idx_messages_visible，而不是扫全站未删除邮件。
+ * 去掉 OR 后地址集合是唯一的 IN 条件，INDEXED BY 才能逐个地址取数，而不是扫全站未删除邮件。
+ * 邮箱不能共享给自己的所有者，两支不相交，不需要 UNION 去重的临时 B 树（每个地址省一行读取）。
+ * 给了 domain 时在子查询里先收窄到该域的地址，逐地址探查的次数只随该域的可见地址数增长。
  */
-function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess): SQL {
-  if (scope === 'unclaimed' || access === 'owned') return scopeCondition(db, scope, access);
-  const owned = db.select({ address: mailboxes.address }).from(mailboxes).where(eq(mailboxes.userId, scope.ownerId));
-  return inArray(messages.address, union(owned, sharedAddressQuery(db, scope.ownerId)));
+function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess, domain?: string): SQL {
+  if (scope === 'unclaimed') return scopeCondition(db, scope, access);
+  const owned = db.select({ address: mailboxes.address }).from(mailboxes)
+    .where(and(eq(mailboxes.userId, scope.ownerId), mailboxOnDomain(domain)));
+  if (access === 'owned') return inArray(messages.address, owned);
+  return inArray(messages.address, unionAll(owned, sharedAddressQuery(db, scope.ownerId, domain)));
 }
 
 /**
@@ -440,7 +450,7 @@ const PENDING_ATTACHMENTS_GRACE_MS = 2 * 60_000;
  * 调用方超时后可从它继续。hasCode 与返回的 verificationCode 同一口径；AI 可能稍后补码的新邮件、
  * 附件尚未落库（pending）的新邮件都不计入已检查，下一次轮询再判定——游标推过去调用方就再也看不到它。
  * address（多个地址）与 domain 在 SQL 里收窄，不参与「跳过」；include=body 时命中项返回与详情相同的结构，
- * 可见性已由本查询的范围条件确定，整行与附件、星标合成一次 batch，不再走详情的可见性校验。
+ * 读整行时带上本查询的同一组范围条件复核，与附件、星标合成一次 batch，不再走详情的可见性校验。
  */
 export async function findNextMessage(
   env: Env,
@@ -451,7 +461,7 @@ export async function findNextMessage(
   const db = createDb(env);
   const scope = resolveScope(viewer);
   const conditions: SQL[] = [
-    inboxScopeCondition(db, scope, shareAccess(viewer, scope)),
+    inboxScopeCondition(db, scope, shareAccess(viewer, scope), input.domain),
     eq(messages.direction, 'inbound'),
     isNull(messages.deletedAt),
     gt(messages.id, input.afterId),
@@ -459,11 +469,16 @@ export async function findNextMessage(
   if (input.address) conditions.push(inArray(messages.address, input.address));
   if (input.domain) conditions.push(domainCondition(scope, input.domain));
   const filtered = Boolean(input.from || input.subjectContains || input.hasCode);
-  // 指定地址时逐个地址按 id 取：多地址的 IN 会让规划器为省排序改沿 idx_messages_live 扫全站 afterId 之后的邮件，
-  // 没有新信的轮询（最常见）每次都要读完这段；逐地址读取量只随这几个地址的新信增长
+  // 指定地址、或范围是自己/某用户的可见地址（domain 已并进地址子查询）时，逐个地址按 id 取：
+  // 否则规划器为省排序沿 idx_messages_live 扫全站 afterId 之后的邮件，没有新信的轮询（最常见）每次都要读完这段。
+  // 逐地址的读取量约为调用方的邮箱行数 + 每个可见地址两行（物化与探查）+ 这些地址的新信；原计划物化地址子查询
+  // 同样要读邮箱行和每个地址一行，所以地址再多也只比原计划的下限多每地址一行（至多约 1.5 倍），且不再随全站新信增长，
+  // 不设地址数上限、不回退。
+  // 未认领范围的地址集合不可枚举：只给 domain 时交给规划器走 idx_messages_domain（该域的新信），什么都不给时仍按 id 扫全站新信
+  const byAddress = Boolean(input.address) || scope !== 'unclaimed';
   const rows = await db
     .select(waitColumns)
-    .from(input.address ? MESSAGES_BY_ADDRESS : MESSAGES)
+    .from(byAddress ? MESSAGES_BY_ADDRESS : MESSAGES)
     .where(and(...conditions))
     .orderBy(asc(messages.id))
     .limit(filtered ? WAIT_SCAN_BATCH : 1)
@@ -490,10 +505,11 @@ export async function findNextMessage(
       continue;
     }
     if (input.include === 'body') {
+      // 两次读取之间被删除、移入回收站或失去可见性（共享撤销、释放、过户）的不再以详情返回：
+      // 它已不在等待范围内，游标越过它继续往后找
       const [[full], attRows, starRows] = await db.batch([
-        db.select().from(messages).where(eq(messages.id, row.id)), ...detailExtras(db, viewer.userId, row.id),
+        db.select().from(messages).where(and(eq(messages.id, row.id), ...conditions)), ...detailExtras(db, viewer.userId, row.id),
       ]);
-      // 两次读取之间被永久删除：等同不存在，继续往后找
       if (!full) { scannedThroughId = row.id; continue; }
       return { message: await buildDetail(env, full, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
     }

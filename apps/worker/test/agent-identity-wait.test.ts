@@ -113,13 +113,15 @@ describe('发件身份 GET /v1/identities 与 /api/identities', () => {
     expect(error.docs).toBe('http://localhost/references/errors.md#forbidden-sender');
   });
 
-  it('管理员列出全部系统域名（可用任意前缀），别人的邮箱不列出；admin all=1 列表每项带 canSend', async () => {
+  it('管理员 domains 先列全部系统域名（可用任意前缀），别人的邮箱不列出；admin all=1 列表每项带 canSend', async () => {
     const admin = await actor('w2-identity-admin', 'admin');
     const other = await actor('w2-identity-other');
     const mine = await own(admin.id, 'admin-box@w2.example');
     await own(other.id, 'other-box@w2.example');
     const identities = await data<SendIdentities>(await request('/v1/identities', auth(admin.key)));
-    expect(identities.domains).toEqual(SYSTEM_DOMAINS.map((domain) => ({ domain, kind: 'system', anyLocalPart: true })));
+    // 本文件其他用例造的托管域名、旧域名排在系统域名之后，完整口径见 identity-wait-review.test.ts
+    expect(identities.domains.slice(0, SYSTEM_DOMAINS.length)).toEqual(SYSTEM_DOMAINS.map((domain) => ({ domain, kind: 'system', anyLocalPart: true })));
+    expect(identities.domains.slice(SYSTEM_DOMAINS.length).every((entry) => entry.kind !== 'system')).toBe(true);
     expect(identities.identities.map((item) => item.address)).toEqual([mine.address]);
     const all = await data<Mailbox[]>(await request('/v1/mailboxes?all=1', auth(admin.key)));
     expect(all.length).toBeGreaterThan(1);
