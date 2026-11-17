@@ -3,7 +3,7 @@ import { AlertCircle, LogOut, RefreshCw } from 'lucide-react';
 import { Navigate, useLocation } from 'react-router-dom';
 import { ApiError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
-import { clearAuthToken } from '@/lib/auth-token';
+import { clearAuthToken, tokenIdentity } from '@/lib/auth-token';
 import { CurrentUserContext, useAuthToken, useSessionQuery } from '@/lib/use-session';
 import { lazyWithReload } from './chunk-reload';
 import { FullScreenLoader } from './page-loader';
@@ -63,9 +63,10 @@ export function AuthGuard() {
     );
   }
 
+  // 换账户时整个外壳重挂；同一账户换发 token（改密）保留外壳与页面状态
   return (
     <CurrentUserContext.Provider value={user}>
-      <AppShell key={token} />
+      <AppShell key={tokenIdentity(token)} />
     </CurrentUserContext.Provider>
   );
 }

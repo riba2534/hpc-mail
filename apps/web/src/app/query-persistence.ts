@@ -4,7 +4,9 @@ import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { inboxListQuery, parseInboxFilters } from '@/features/inbox/inbox-query';
 import type { MessageListData } from '@/features/inbox/message-cache';
-import { getAuthRevision, getAuthToken, subscribeAuthToken } from '@/lib/auth-token';
+import { getAuthRevision, getAuthToken, readTokenClaims, subscribeAuthToken } from '@/lib/auth-token';
+
+export { readTokenClaims };
 
 /**
  * 首屏查询的按用户持久化：再次打开时先用上次的数据渲染外壳与收件箱，挂载后照常在后台刷新。
@@ -64,23 +66,6 @@ interface StoredEntry {
 function storage(): Storage | null {
   try {
     return globalThis.localStorage ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 读 JWT payload 的 sub/exp。只用来挑选缓存 key（以及跳过明显已过期 token 的恢复），
- * 不验签、不做鉴权判断：会话是否有效始终以 /auth/me 为准。
- */
-export function readTokenClaims(token: string | null): { sub: number; exp?: number } | null {
-  const payload = token?.split('.')[1];
-  if (!payload) return null;
-  try {
-    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-    const claims: unknown = JSON.parse(atob(base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=')));
-    if (!isObject(claims) || typeof claims.sub !== 'number' || !Number.isSafeInteger(claims.sub)) return null;
-    return { sub: claims.sub, exp: typeof claims.exp === 'number' ? claims.exp : undefined };
   } catch {
     return null;
   }
