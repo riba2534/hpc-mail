@@ -82,7 +82,7 @@ export async function assertHostedSendable(env: Env, settings: Settings, domain:
     .from(hostedDomains).where(eq(hostedDomains.domain, domain)).get();
   if (hostedSendBlock(row)) {
     throw new AppError('validation_failed', '该域名的发信尚未生效或已停用', {
-      fix: '先调 GET /v1/identities，从 canSend=true 的地址里选一个作为 from；托管域名要等发信就绪后才能使用',
+      fix: '先调 GET /v1/identities（网页会话用 /api/identities），从 canSend=true 的地址里选一个作为 from；托管域名要等发信就绪后才能使用',
       docs: '/references/errors.md#forbidden-sender',
     });
   }

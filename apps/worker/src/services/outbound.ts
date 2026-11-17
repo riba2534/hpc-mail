@@ -225,7 +225,7 @@ async function releaseOutboundQuota(
 }
 
 const FORBIDDEN_SENDER: AppErrorHints = {
-  fix: '先调 GET /v1/identities，从 canSend=true 的地址里选一个作为 from；共享给你的邮箱只能读，不能发信',
+  fix: '先调 GET /v1/identities（网页会话用 /api/identities），从 canSend=true 的地址里选一个作为 from；共享给你的邮箱只能读，不能发信',
   docs: '/references/errors.md#forbidden-sender',
 };
 

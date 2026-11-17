@@ -20,7 +20,7 @@ export const DEFAULT_ERROR_HINTS: Partial<Record<ErrorCode, AppErrorHints>> = {
     docs: `${ERRORS_DOC}#idempotency_mismatch`,
   },
   send_in_progress: {
-    fix: '不要换 Key 重发：用 GET /v1/messages?direction=outbound 查看发送结果，稍后用同一个 Key 重试可拿到原结果',
+    fix: '不要换 Key 重发：用 GET /v1/messages?direction=outbound（网页会话用 /api/messages）查看发送结果，稍后用同一个 Key 重试可拿到原结果',
     docs: `${ERRORS_DOC}#send_in_progress`,
   },
   source_unavailable: {
@@ -36,7 +36,7 @@ export const DEFAULT_ERROR_HINTS: Partial<Record<ErrorCode, AppErrorHints>> = {
     docs: `${ERRORS_DOC}#delivery_failed`,
   },
   payload_too_large: {
-    fix: '大附件先用 POST /v1/uploads 上传，再在 attachmentTokens 里引用 token',
+    fix: '大附件先用 POST /v1/uploads（网页会话用 /api/uploads）上传，再在 attachmentTokens 里引用 token',
     docs: `${ERRORS_DOC}#payload_too_large`,
   },
   rate_limited: {

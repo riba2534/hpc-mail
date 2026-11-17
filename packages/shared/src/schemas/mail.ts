@@ -341,7 +341,7 @@ function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
   if (inlineAttachmentBytes(v.attachments) > MAX_INLINE_ATTACHMENT_TOTAL_BYTES) {
     const params: IssueErrorParams = {
       errorCode: 'payload_too_large',
-      fix: '大文件先用 POST /v1/uploads 上传拿到 token，再放进 attachmentTokens 引用',
+      fix: '大文件先用 POST /v1/uploads（网页会话用 /api/uploads）上传拿到 token，再放进 attachmentTokens 引用',
       docs: '/references/errors.md#payload_too_large',
     };
     ctx.addIssue({
