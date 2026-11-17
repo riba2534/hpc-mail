@@ -68,7 +68,7 @@ beforeEach(() => {
   vi.mocked(messageApi.detail).mockClear();
   clicked.length = 0;
   fetchMock.mockReset();
-  fetchMock.mockImplementation(async () => new Response(new Blob(['%PDF']), { status: 200 }));
+  fetchMock.mockImplementation(async () => new Response('%PDF', { status: 200 }));
   vi.stubGlobal('fetch', fetchMock);
   URL.createObjectURL = vi.fn(() => 'blob:attachment');
   URL.revokeObjectURL = vi.fn();
@@ -137,7 +137,7 @@ describe('MessagePage attachment preview', () => {
     // 在点击的同步阶段打开，fetch 还没返回：等返回后再 window.open 会被浏览器当作弹窗拦截
     expect(open).toHaveBeenCalledWith('', '_blank');
     expect(tab.location.href).toBe('');
-    respond(new Response(new Blob(['png-bytes'], { type: 'application/octet-stream' }), { status: 200 }));
+    respond(new Response('png-bytes', { status: 200, headers: { 'Content-Type': 'application/octet-stream' } }));
     await waitFor(() => expect(tab.location.href).toBe('blob:attachment'));
     expect(fetchMock.mock.calls[0]![0]).toBe('/api/attachments/10');
     expect(vi.mocked(URL.createObjectURL).mock.calls[0]![0]).toMatchObject({ type: 'image/png' });

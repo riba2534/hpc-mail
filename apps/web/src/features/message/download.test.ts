@@ -18,7 +18,7 @@ beforeEach(() => {
   localStorage.setItem('token', 'session-jwt');
   tab = { location: { href: '' }, close: vi.fn(), closed: false, opener: window };
   fetchMock.mockReset();
-  fetchMock.mockImplementation(async () => new Response(new Blob(['bytes']), { status: 200 }));
+  fetchMock.mockImplementation(async () => new Response('bytes', { status: 200 }));
   vi.stubGlobal('fetch', fetchMock);
   URL.createObjectURL = vi.fn(() => 'blob:file');
   URL.revokeObjectURL = vi.fn();
