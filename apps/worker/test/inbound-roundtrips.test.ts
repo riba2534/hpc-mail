@@ -290,9 +290,10 @@ describe('收件链路 Ack 前往返', () => {
 
   it('同一封 HTML 信只做一次整段 htmlToText，提码、摘要、AI 兜底与通知正文共用', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
+    // 通知端点返回 503：Webhook 不自动重试，任务停在 failed 并保留载荷（成功后载荷会清空），便于核对正文
     const fetchMock = vi.fn(async (input: string | URL | Request) => String(input).includes('/chat/completions')
       ? Response.json({ choices: [{ message: { content: '{"code":""}' } }] })
-      : Response.json({ ok: true }));
+      : new Response('unavailable', { status: 503 }));
     vi.stubGlobal('fetch', fetchMock);
     await settingsFor({
       code_extract: { enabled: true, aiEnabled: true },

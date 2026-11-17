@@ -13,9 +13,11 @@ import { verifyToken, type JwtClaims } from '../lib/jwt.js';
 import { getUserEpoch, sessionValidFor } from '../services/session.js';
 import { getSettings } from '../services/setting.js';
 import {
+  andGuards,
   bumpCounter,
   counterResult,
   counterStatement,
+  counterWithinGuard,
   minuteWindow,
   type CounterValue,
 } from '../services/rate-counter.js';
@@ -48,6 +50,7 @@ interface AuthRow {
  *
  * 快路径把「会话行、用户行、security 设置、两条限流计数」合进一个 D1 batch（单次往返）。
  * 计数语句带守卫：只有会话有效、用户启用且鉴权版本一致时才递增，与原先「校验通过后再计数」等价。
+ * 全站桶另加「该用户本窗口未超限」：单个用户超限后的请求只推高自己的桶，不会把全站打满。
  * 会话行缺失（旧 KV 会话待惰性迁移）或用户鉴权版本尚未迁入 D1 时，走原有慢路径。
  * 不缓存会话或用户状态：改密/禁用仍即时生效。
  */
@@ -64,10 +67,19 @@ export const requireAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   await next();
 };
 
-function assertWithinRate(userRate: CounterValue, globalRate: CounterValue): void {
+/**
+ * 全站桶的递增守卫：本用户本窗口未超限才计入。须排在同一 batch 里 auth-user 递增之后，
+ * 读到的才是含本次请求的值。
+ */
+function userWithinGuard(userId: number, minute: number) {
+  return counterWithinGuard('auth-user', String(userId), minute, MAX_AUTH_USER_REQUESTS_PER_MINUTE);
+}
+
+/** 全站桶为 null 表示守卫未通过（本用户已超限，未计入全站），此时已由用户桶判定拒绝 */
+function assertWithinRate(userRate: CounterValue, globalRate: CounterValue | null): void {
   if (
     userRate.count > MAX_AUTH_USER_REQUESTS_PER_MINUTE ||
-    globalRate.count > MAX_AUTH_GLOBAL_REQUESTS_PER_MINUTE
+    (globalRate?.count ?? 0) > MAX_AUTH_GLOBAL_REQUESTS_PER_MINUTE
   ) {
     throw new AppError('rate_limited', '请求过于频繁，请稍后重试');
   }
@@ -101,7 +113,7 @@ async function fastAuth(c: Context<AppContext>, claims: JwtClaims): Promise<Auth
       FROM sessions s LEFT JOIN users u ON u.id = ? WHERE s.id = ?`).bind(claims.sub, claims.sid),
     db.prepare(`SELECT value FROM settings WHERE key = 'security'`),
     counterStatement(c.env, 'auth-user', String(claims.sub), minute, 1, 0, guard),
-    counterStatement(c.env, 'auth-global', 'instance', minute, 1, 0, guard),
+    counterStatement(c.env, 'auth-global', 'instance', minute, 1, 0, andGuards(guard, userWithinGuard(claims.sub, minute))),
   ]);
   const row = authResult?.results?.[0] as AuthRow | undefined;
   if (!row) return null;
@@ -115,13 +127,11 @@ async function fastAuth(c: Context<AppContext>, claims: JwtClaims): Promise<Auth
   if (row.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
   if (claims.uepoch !== Number(row.auth_version)) throw new AppError('unauthorized', '会话已失效');
 
-  const minuteNow = minuteWindow(1);
-  // 守卫与读取同处一个事务，正常必有返回；防御性兜底按原路径单独计数
+  // 守卫与读取同处一个事务，用户桶正常必有返回；防御性兜底按原路径单独计数。
+  // 全站桶无返回只可能是本用户已超限，不再补计，否则超限请求又会推高全站桶
   const userRate = counterResult(userRateResult)
-    ?? (await bumpCounter(c.env, 'auth-user', String(row.id), minuteNow));
-  const globalRate = counterResult(globalRateResult)
-    ?? (await bumpCounter(c.env, 'auth-global', 'instance', minuteNow));
-  assertWithinRate(userRate, globalRate);
+    ?? (await bumpCounter(c.env, 'auth-user', String(row.id), minuteWindow(1)));
+  assertWithinRate(userRate, counterResult(globalRateResult));
 
   const authUser: AuthUser = {
     id: row.id,
@@ -164,12 +174,13 @@ async function slowAuth(c: Context<AppContext>, claims: JwtClaims): Promise<Auth
   const authVersion = row.authVersionMigrated ? row.authVersion : await getUserEpoch(c.env, row.id);
   if (claims.uepoch !== authVersion) throw new AppError('unauthorized', '会话已失效');
 
+  // 两条计数合进一个 batch：全站桶排在用户桶之后，守卫读到含本次请求的用户计数
   const minute = minuteWindow(1);
-  const [userRate, globalRate] = await Promise.all([
-    bumpCounter(c.env, 'auth-user', String(row.id), minute),
-    bumpCounter(c.env, 'auth-global', 'instance', minute),
+  const [userRateResult, globalRateResult] = await c.env.db.batch([
+    counterStatement(c.env, 'auth-user', String(row.id), minute),
+    counterStatement(c.env, 'auth-global', 'instance', minute, 1, 0, userWithinGuard(row.id, minute)),
   ]);
-  assertWithinRate(userRate, globalRate);
+  assertWithinRate(counterResult(userRateResult) ?? { count: 1, units: 0 }, counterResult(globalRateResult));
 
   const authUser: AuthUser = {
     id: row.id,

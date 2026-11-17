@@ -85,8 +85,11 @@ describe('independent safety review regressions', () => {
     const db = createDb(env);
     const user = await seed('second-review-notification-lease');
     await updateUserNotifyPrefs(env, user!.id, { pushdeer: { enabled: true, endpoint: '', pushkey: 'PDU_SYNTHETIC_TEST' } });
+    // 手动重试会复核源邮件仍在，任务须指向真实存在的邮件
+    const [source] = await db.insert(messages).values({ direction: 'inbound', address: 'lease@hpc.email', domain: 'hpc.email',
+      fromAddress: 'from@example.net', subject: 'lease', preview: 'body', status: 'received' }).returning({ id: messages.id });
     const ids = await enqueueMailNotifications(env, null, { ownerIds: [user!.id], text: 'body', message: {
-      id: 9011, address: 'lease@hpc.email', fromAddress: 'from@example.net', fromName: '', subject: 'lease',
+      id: source!.id, address: 'lease@hpc.email', fromAddress: 'from@example.net', fromName: '', subject: 'lease',
       verificationCode: '', preview: 'body', createdAt: new Date().toISOString(),
     } });
     let releaseFirst!: (response: Response) => void;
