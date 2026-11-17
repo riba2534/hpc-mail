@@ -1,4 +1,4 @@
-import type { Page } from '@hpc-mail/shared';
+import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, type Page } from '@hpc-mail/shared';
 import { sha256Hex } from './crypto.js';
 import { AppError } from './errors.js';
 
@@ -19,6 +19,12 @@ export function decodeCursor(cursor: string | undefined): number | null {
     throw new AppError('validation_failed', 'cursor 无效：请原样传回上一页响应的 nextCursor，首页不带 cursor');
   }
   return id;
+}
+
+/** 查询参数 limit 的每页条数：整数夹到 1–MAX_PAGE_SIZE，缺省或不是整数时用 DEFAULT_PAGE_SIZE */
+export function pageLimit(raw: string | undefined): number {
+  const value = Number(raw);
+  return Number.isInteger(value) ? Math.min(MAX_PAGE_SIZE, Math.max(1, value)) : DEFAULT_PAGE_SIZE;
 }
 
 /** 分页模式的请求：游标解出的 id（首页为 null）与每页条数 */

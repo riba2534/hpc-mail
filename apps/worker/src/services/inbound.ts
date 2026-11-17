@@ -200,7 +200,7 @@ async function receiveInbound(
 ): Promise<InboundResult> {
   const parseStarted = Date.now();
   // 设置读取（isolate 内存缓存未命中时直读 D1）与原文缓冲、解析重叠，提码前才等待
-  const settingsReady = getSettings(env, ctx);
+  const settingsReady = getSettings(env);
 
   // 先缓冲原始 .eml（stream 只能读一次），解析与幂等摘要共用这一份字节。
   const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());

@@ -152,7 +152,7 @@ export const messages = sqliteTable(
   ],
 );
 
-/** 强一致会话表。KV 仅在过渡期双写，鉴权以本表为准。 */
+/** 强一致会话表，鉴权唯一真源（不再写 KV 镜像）。 */
 export const sessions = sqliteTable(
   'sessions',
   {
@@ -594,7 +594,7 @@ export const adminAuditLogs = sqliteTable(
   (t) => [index('idx_admin_audit_created').on(t.createdAt)],
 );
 
-/** Long-lived delivery links keep an independent R2 reference after sent-mail deletion. */
+/** 外发的大附件链接：发件删除后仍独立引用 R2 对象（承诺 90 天有效）。 */
 export const externalAttachmentLinks = sqliteTable('external_attachment_links', {
   attachmentId: integer('attachment_id').primaryKey(),
   r2Key: text('r2_key').notNull(),
@@ -604,7 +604,7 @@ export const externalAttachmentLinks = sqliteTable('external_attachment_links', 
   expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
 }, (t) => [index('idx_external_links_expiry').on(t.expiresAt), index('idx_external_links_r2').on(t.r2Key)]);
 
-/** Durable garbage references survive failed R2 cleanup. */
+/** R2 清理台账：删除失败的对象留在这里由 cron 重试。 */
 export const storageCleanupJobs = sqliteTable('storage_cleanup_jobs', {
   r2Key: text('r2_key').primaryKey(),
   createdAt: createdAtColumn(),
@@ -634,7 +634,7 @@ export const notificationJobs = sqliteTable('notification_jobs', {
   // 通知健康页按 (用户, 通道) 取最新一条
   index('idx_notification_user_channel').on(t.userId, t.channel, t.id)]);
 
-/** Temporary references protect delivery objects while sending or copying metadata. */
+/** 投递期间的临时租约：发送或复制元数据时保护对象不被清理。 */
 export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
   r2Key: text('r2_key').notNull(),
   token: text('token').notNull(),

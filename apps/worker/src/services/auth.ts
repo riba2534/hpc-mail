@@ -33,8 +33,9 @@ const MAX_FAILURES = 5;
 const REGISTER_WINDOW_SECONDS = 60 * 60;
 const MAX_REGISTER_PER_WINDOW = 10;
 
-const LOGIN_FAIL_SCOPE = 'login-fail';
-const REGISTER_SCOPE = 'reg';
+/** 登录失败计数（15 分钟窗口）与按 IP 的注册计数（60 分钟窗口），scheduled 按各自窗口回收 */
+export const LOGIN_FAIL_SCOPE = 'login-fail';
+export const REGISTER_SCOPE = 'reg';
 
 /** IPv6 地址展开成 8 组数值（末尾点分 IPv4 折成两组）；不是合法 IPv6 时为 null */
 function ipv6Groups(value: string): number[] | null {
@@ -131,14 +132,16 @@ async function releaseLoginAttempt(env: Env, counters: LoginCounters): Promise<v
 /**
  * 登录成功：(用户名|IP) 维度清零，IP 维度只退回本次占位——之前的失败照算，
  * 否则用自己的账号登录一次就能清空 IP 维度，再对其他用户名继续猜。
+ * 与记录本次登录时间和 IP 合进同一个 batch。
  */
-async function settleLoginSuccess(env: Env, counters: LoginCounters): Promise<void> {
+async function settleLoginSuccess(env: Env, counters: LoginCounters, userId: number, clientIp: string): Promise<void> {
   const { pair, ip } = counters;
   await env.db.batch([
     // 置回 0 而不是删行（清理任务会按窗口回收）
     env.db.prepare('UPDATE rate_counters SET count = 0 WHERE scope = ? AND subject = ? AND "window" = ?')
       .bind(pair.scope, pair.subject, pair.window),
     counterStatement(env, ip.scope, ip.subject, ip.window, -1),
+    env.db.prepare('UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?').bind(Date.now(), clientIp, userId),
   ]);
 }
 
@@ -205,7 +208,7 @@ async function verifyLoginTwoFactor(
 }
 
 /** 记录已用的 TOTP 时间步；时间步不大于已记录值（重放）时返回 false */
-export async function consumeTotpStep(env: Env, userId: number, step: number): Promise<boolean> {
+async function consumeTotpStep(env: Env, userId: number, step: number): Promise<boolean> {
   const result = await env.db.prepare(`UPDATE users SET totp_last_step = ?
     WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)`).bind(step, userId, step).run();
   return (result.meta.changes ?? 0) === 1;
@@ -250,12 +253,8 @@ export async function login(
     if (!wrongGuess) await releaseLoginAttempt(env, counters);
     throw error;
   }
-  await settleLoginSuccess(env, counters);
   const previousIp = user.lastLoginIp;
-  await db
-    .update(users)
-    .set({ lastLoginAt: new Date(), lastLoginIp: ip })
-    .where(eq(users.id, user.id));
+  await settleLoginSuccess(env, counters, user.id, ip);
 
   // 新 IP 登录飞书告警：与上次登录 IP 不同则异步推送（走登录用户自己的个人飞书，不阻塞登录）
   if (ctx && previousIp && previousIp !== ip) {

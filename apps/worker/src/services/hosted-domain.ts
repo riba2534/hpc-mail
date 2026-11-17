@@ -6,12 +6,12 @@ import {
 import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
-import { runDetached } from '../lib/background.js';
 import { runLimited } from '../lib/concurrency.js';
 import { chunk, d1Statement } from '../lib/d1.js';
 import { AppError, errorText } from '../lib/errors.js';
 import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
+import { runDetached } from '../lib/http.js';
 import { logAdminAction } from './audit.js';
 import { subscribeHostedDomainEvents } from './event-subscriptions.js';
 import {

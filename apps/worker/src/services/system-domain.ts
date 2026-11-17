@@ -17,9 +17,9 @@ import {
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { systemDomainOnboarding, users, type OnboardingAcceptance, type OnboardingChangeEvent } from '../db/schema.js';
-import { runDetached } from '../lib/background.js';
 import { AppError, errorText } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
+import { runDetached } from '../lib/http.js';
 import { logAdminAction } from './audit.js';
 import {
   CloudflareApiError, cloudflareCredentials, createZone, deleteZone, findZone, getZone, isOutcomeUnknown, isTransientCloudflareError,

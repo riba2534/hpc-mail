@@ -1,16 +1,31 @@
-import { constantTimeEqual } from './password.js';
-
 const encoder = new TextEncoder();
+
+/** 常量时间比较两个字节序列 */
+export function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
+  let mismatch = left.length ^ right.length;
+  const length = Math.max(left.length, right.length);
+  for (let i = 0; i < length; i++) {
+    mismatch |= (left[i] ?? 0) ^ (right[i] ?? 0);
+  }
+  return mismatch === 0;
+}
+
+/** base64url（无填充）：JWT 与密码哈希共用 */
+export function bytesToBase64url(input: ArrayBuffer | Uint8Array): string {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+export function base64urlToBytes(value: string): Uint8Array {
+  let normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  while (normalized.length % 4) normalized += '=';
+  return Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0));
+}
 
 export function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-export function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.length % 2 ? `0${hex}` : hex;
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  return out;
 }
 
 export async function sha256Hex(input: string | Uint8Array): Promise<string> {

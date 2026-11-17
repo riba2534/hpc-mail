@@ -2,6 +2,7 @@ import {
   API_SCOPES, MAX_API_KEYS_PER_USER, MAX_DRAFT_ATTACHMENT_BYTES_PER_USER, MAX_DRAFT_ATTACHMENTS_PER_USER, MAX_HOSTED_DNS_RECORDS,
   MAX_SEND_REQUEST_BYTES, MULTIPART_PART_BYTES, type ApiErrorDetails, type ErrorCode, type SuppressedRecipient, type SystemDomainPrecheck,
 } from '@hpc-mail/shared';
+import { missingScopeHints } from '../lib/errors.js';
 
 /**
  * 两份 OpenAPI 的示例数据。成功示例按响应 schema 由这里的组件示例拼出（见 openapi-common 的 exampleOf），
@@ -181,9 +182,7 @@ export const ERROR_EXAMPLES = {
   RateLimitedSession: { code: 'rate_limited', message: '请求过于频繁，请稍后重试' },
   RateLimitedApiKey: { code: 'rate_limited', message: 'API 调用频率超限' },
   ForbiddenAdmin: { code: 'forbidden', message: '需要管理员权限' },
-  ForbiddenScopeIdentities: { code: 'forbidden', message: '需要 API scope: mail.send 或 mailbox.read',
-    fix: '这把 Key 需要 mail.send 或 mailbox.read 其中之一：在网页「API Key」页面加上，或换用带其中一个 scope 的 Key（GET /v1/me 可查看当前 scopes）',
-    docs: '/references/errors.md#forbidden-scope' },
+  ForbiddenScopeIdentities: { code: 'forbidden', ...missingScopeHints(['mail.send', 'mailbox.read']) },
   InvalidJson: { code: 'validation_failed', message: '请求体不是合法 JSON' },
   InvalidCursor: { code: 'validation_failed', message: 'cursor 无效：请原样传回上一页响应的 nextCursor，首页不带 cursor' },
   MissingUserId: { code: 'validation_failed', message: '查看指定用户邮件需要 userId' },
@@ -306,18 +305,14 @@ export const ERROR_EXAMPLES = {
   WebhookEndpointLimit: { code: 'forbidden', message: '每个用户最多 10 个 Webhook 端点' },
   WebhookUrlInvalid: { code: 'validation_failed', message: 'Webhook 地址不能指向本站' },
   WebhookNotRetryable: { code: 'conflict', message: '只有投递失败的记录可以重试' },
+  // fix/docs 与按错误码补的默认建议相同时不重复写（usedExamples 会补上）
   AttachmentUrlForbidden: { code: 'attachment_url_forbidden', message: '附件地址不允许：内网、回环、链路本地或保留地址',
-    fix: '只能引用公网可访问的 https 地址；内网或本站的文件先下载，再用 POST /v1/uploads（网页会话用 /api/uploads）上传后写进 attachmentTokens',
-    docs: '/references/errors.md#attachment_url_forbidden', details: { url: 'https://169.254.169.254/latest/meta-data/' } },
+    details: { url: 'https://169.254.169.254/latest/meta-data/' } },
   AttachmentUrlFetchFailed: { code: 'attachment_url_fetch_failed', message: '附件拉取失败：HTTP 404',
-    fix: '确认地址能公开访问（预签名链接未过期、不需要登录），或先下载再用 POST /v1/uploads（网页会话用 /api/uploads）上传后写进 attachmentTokens',
-    docs: '/references/errors.md#attachment_url_fetch_failed', details: { url: 'https://files.example.com/report.pdf' } },
+    details: { url: 'https://files.example.com/report.pdf' } },
   NotFoundDraft: { code: 'not_found', message: '草稿不存在' },
-  DraftStateConflict: { code: 'draft_state_conflict', message: '草稿正在发送，不能修改',
-    fix: '先 GET /drafts/:id 读取草稿当前的 status 与 version：发送中的等它结束；已发送的结果看 messageId；版本变了就基于最新内容重新修改',
-    docs: '/references/errors.md#draft_state_conflict', details: { draftStatus: 'sending', draftVersion: 4 } },
-  DraftLimitReached: { code: 'draft_limit_reached', message: '未发送的草稿最多 100 份',
-    fix: '未发送的草稿已达上限：先发送或删除不需要的草稿（GET /drafts 列出），再创建', docs: '/references/errors.md#draft_limit_reached' },
+  DraftStateConflict: { code: 'draft_state_conflict', message: '草稿正在发送，不能修改', details: { draftStatus: 'sending', draftVersion: 4 } },
+  DraftLimitReached: { code: 'draft_limit_reached', message: '未发送的草稿最多 100 份' },
   DraftIncomplete: { code: 'validation_failed', message: '草稿还不能发送：至少需要一个收件人',
     fix: '补全 from、收件人、主题与正文后再安排定时发送；只想保存时不要带 sendAt', docs: '/references/drafts.md#安排定时发送' },
   DraftSendInProgress: { code: 'send_in_progress', message: '草稿正在发送，请稍后用 GET /drafts/:id 查看结果，不要重复发送' },
@@ -331,9 +326,7 @@ export function scopeExampleName(scope: string): ScopeExampleName {
   return `ForbiddenScope${scope.split(/[._-]/).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('')}`;
 }
 const SCOPE_EXAMPLES: Record<string, ErrorExample> = Object.fromEntries(API_SCOPES.map(scope => [scopeExampleName(scope), {
-  code: 'forbidden', message: `需要 API scope: ${scope}`,
-  fix: `这把 Key 缺少 scope ${scope}：在网页「API Key」页面给它加上，或换用带该 scope 的 Key（GET /v1/me 可查看当前 scopes）`,
-  docs: '/references/errors.md#forbidden-scope',
+  code: 'forbidden', ...missingScopeHints([scope]),
 }]));
 
 /** 按名字取失败示例（含按 scope 生成的 403）；不存在时返回 undefined */

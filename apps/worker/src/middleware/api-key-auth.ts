@@ -7,8 +7,8 @@ import {
 } from '@hpc-mail/shared';
 import type { Context, MiddlewareHandler } from 'hono';
 import { sha256Hex } from '../lib/crypto.js';
-import { AppError } from '../lib/errors.js';
-import { execCtx, routeLabel } from '../lib/http.js';
+import { AppError, missingScopeHints } from '../lib/errors.js';
+import { bearerToken, clientIp, execCtx, routeLabel, runDetached } from '../lib/http.js';
 import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { writeApiRequestLog } from '../services/api-request-log.js';
@@ -19,11 +19,6 @@ import type { AppContext, Env } from '../types.js';
 const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
 const LAST_USED_THROTTLE_MS = 60_000;
 const AUDIT_PATH_MAX = 256;
-
-function clientIp(c: Context<AppContext>): string {
-  const value = c.req.header('CF-Connecting-IP') || '';
-  return (value.split(',')[0] ?? '').trim().toLowerCase() || 'unknown';
-}
 
 /** api_keys LEFT JOIN users 读出的鉴权所需列 */
 interface ApiKeyRecord {
@@ -68,10 +63,8 @@ async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ s
  */
 export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   const startedAt = Date.now();
-  c.set('apiStartedAt', startedAt);
 
-  const header = c.req.header('Authorization') || '';
-  const token = header.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? '';
+  const token = bearerToken(c);
   const keyHash = KEY_PATTERN.test(token) ? await sha256Hex(token) : null;
   const { settings, record } = await loadSettingsAndKey(c.env, keyHash);
   // API 关闭优先于 Key 校验
@@ -95,7 +88,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   };
 
   // key 已定位：从这里起的拒绝（状态/过期/IP/限流）都进审计，安全监控最需要这些
-  const ip = clientIp(c);
+  const ip = clientIp(c).toLowerCase();
   let statusCode = 200;
   let admitted = false;
   try {
@@ -139,7 +132,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     throw err;
   } finally {
     // 审计日志不阻塞响应；无 ExecutionContext（单测直调）时同步写入
-    const audit = writeApiRequestLog(c.env, admitted, {
+    await runDetached(execCtx(c), 'API 审计日志写入', () => writeApiRequestLog(c.env, admitted, {
       apiKeyId: row.id,
       requestId: c.get('requestId') ?? '',
       method: c.req.method,
@@ -148,10 +141,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
       statusCode,
       ip,
       durationMs: Math.max(0, Date.now() - startedAt),
-    }).catch((e: unknown) => console.error('api audit log failed:', e));
-    const ctx = execCtx(c);
-    if (ctx) ctx.waitUntil(audit);
-    else await audit;
+    }));
   }
 };
 
@@ -161,24 +151,22 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
  */
 async function touchLastUsed(c: Context<AppContext>, record: ApiKeyRecord, ip: string, now: number): Promise<void> {
   if (record.last_used_at !== null && Number(record.last_used_at) >= now - LAST_USED_THROTTLE_MS) return;
-  const write = c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
+  await runDetached(execCtx(c), 'API Key last_used 更新', () => c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
     WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`)
-    .bind(now, ip, record.id, now - LAST_USED_THROTTLE_MS).run()
-    .then(() => undefined, (e: unknown) => console.error('api key last_used update failed:', e));
-  const ctx = execCtx(c);
-  if (ctx) ctx.waitUntil(write);
-  else await write;
+    .bind(now, ip, record.id, now - LAST_USED_THROTTLE_MS).run());
 }
 
 /** 校验 scope（v1 路由内调用） */
 export function requireScope(c: Context<AppContext>, scope: ApiScope): void {
+  requireAnyScope(c, [scope]);
+}
+
+/** Key 带其中任一 scope 即可（如 /identities：mail.send 或 mailbox.read）；没有 Key 时同样拒绝 */
+export function requireAnyScope(c: Context<AppContext>, scopes: readonly ApiScope[]): void {
   const apiKey = c.get('apiKey');
-  if (!apiKey || !apiKey.scopes.includes(scope)) {
-    throw new AppError('forbidden', `需要 API scope: ${scope}`, {
-      fix: `这把 Key 缺少 scope ${scope}：在网页「API Key」页面给它加上，或换用带该 scope 的 Key（GET /v1/me 可查看当前 scopes）`,
-      docs: '/references/errors.md#forbidden-scope',
-    });
-  }
+  if (apiKey && scopes.some((scope) => apiKey.scopes.includes(scope))) return;
+  const { message, ...hints } = missingScopeHints(scopes);
+  throw new AppError('forbidden', message, hints);
 }
 
 /** Key 限定范围；null 表示不限（含不经过 API Key 的请求） */
@@ -210,7 +198,7 @@ export function restrictionAllowsDomain(restriction: KeyRestriction, domain: str
 }
 
 /** 已知认领行时的判定：id 在 mailboxIds 或 domain 在 domains 中 */
-export function restrictionAllowsMailbox(restriction: KeyRestriction, mailbox: { id: number; domain: string }): boolean {
+function restrictionAllowsMailbox(restriction: KeyRestriction, mailbox: { id: number; domain: string }): boolean {
   return restriction.mailboxIds.includes(mailbox.id) || restrictionAllowsDomain(restriction, mailbox.domain);
 }
 
@@ -241,6 +229,20 @@ export function assertKeyCanUseMailbox(c: Context<AppContext>, mailbox: { id: nu
   }
 }
 
+/** 按 id 确认邮箱都在 Key 范围内（一次查询，不限范围的 Key 不查库）；不存在的放过，交给调用方按原口径报错 */
+export async function assertKeyCanUseMailboxIds(c: Context<AppContext>, ids: readonly number[]): Promise<void> {
+  if (!keyRestriction(c) || !ids.length) return;
+  const { results } = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id IN (SELECT value FROM json_each(?))')
+    .bind(JSON.stringify(ids)).all<{ id: number; domain: string; address: string }>();
+  for (const box of results) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
+}
+
+/** 限定了范围的 Key 只看得到范围内的邮箱（列表按认领行 id 与域名收窄；不限范围时原样返回） */
+export function filterWithinKey<T extends { domain: string }>(c: Context<AppContext>, list: T[], idOf: (item: T) => number): T[] {
+  const restriction = keyRestriction(c);
+  return restriction ? list.filter((item) => restrictionAllowsMailbox(restriction, { id: idOf(item), domain: item.domain })) : list;
+}
+
 /**
  * 发件地址在 Key 范围内：from 解析后的 mailboxId 或 localPart+domain。发件邮箱不存在时放过，交给发信流程按原口径报 404。
  */
@@ -249,12 +251,7 @@ export async function assertKeyCanUseSender(
   from: { mailboxId?: number; localPart?: string; domain?: string },
 ): Promise<void> {
   if (!keyRestriction(c)) return;
-  if (from.mailboxId !== undefined) {
-    const box = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id = ?')
-      .bind(from.mailboxId).first<{ id: number; domain: string; address: string }>();
-    if (box) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
-    return;
-  }
+  if (from.mailboxId !== undefined) return assertKeyCanUseMailboxIds(c, [from.mailboxId]);
   if (from.localPart && from.domain) await assertKeyCanUseAddress(c, `${from.localPart}@${from.domain}`);
 }
 

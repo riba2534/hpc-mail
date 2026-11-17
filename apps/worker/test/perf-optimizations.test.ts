@@ -173,7 +173,7 @@ describe('settings 读取缓存', () => {
     invalidateSettingsMemory();
     await env.kv.delete('setting-cache');
     const ctx = createExecutionContext();
-    const first = await getSettings(env, ctx);
+    const first = await getSettings(env);
     await waitOnExecutionContext(ctx);
     expect(await env.kv.get('setting-cache')).toBeNull();
     await env.db.prepare("INSERT INTO settings (key, value) VALUES ('site', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")

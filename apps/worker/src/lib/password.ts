@@ -1,30 +1,11 @@
+import { base64urlToBytes, bytesToBase64url, constantTimeEqual } from './crypto.js';
+
+export { constantTimeEqual };
 const encoder = new TextEncoder();
 const PBKDF2_VERSION = 'pbkdf2-sha256';
 // Cloudflare Workers 拒绝超过 100000 次迭代的 PBKDF2 请求
 const PBKDF2_ITERATIONS = 100000;
 const PBKDF2_KEY_BYTES = 32;
-
-function bytesToBase64url(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-}
-
-function base64urlToBytes(value: string): Uint8Array {
-  let normalized = value.replace(/-/g, '+').replace(/_/g, '/');
-  while (normalized.length % 4) normalized += '=';
-  return Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0));
-}
-
-/** 常量时间比较两个字节序列 */
-export function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
-  let mismatch = left.length ^ right.length;
-  const length = Math.max(left.length, right.length);
-  for (let i = 0; i < length; i++) {
-    mismatch |= (left[i] ?? 0) ^ (right[i] ?? 0);
-  }
-  return mismatch === 0;
-}
 
 async function derivePbkdf2(
   password: string,

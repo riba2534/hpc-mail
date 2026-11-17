@@ -6,39 +6,23 @@ import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '.
 import { AppError } from '../../lib/errors.js';
 import { pageRequestOf } from '../../lib/pagination.js';
 import {
-  apiKeyAuth, assertKeyCanUseDomain, assertKeyCanUseMailbox, assertKeyUnrestricted, keyRestriction, requireScope,
-  restrictionAllowsMailbox,
+  apiKeyAuth, assertKeyCanUseDomain, assertKeyCanUseMailboxIds, assertKeyUnrestricted, filterWithinKey, keyRestriction, requireScope,
 } from '../../middleware/api-key-auth.js';
 import { planRandomDomains } from '../../services/claim-plan.js';
 import {
   checkAvailability, checkAvailabilityBatch, claimMailbox, claimMailboxes, listMailboxes, releaseMailbox, updateMailbox,
 } from '../../services/mailbox.js';
 import { listSharedMailboxes } from '../../services/mailbox-share.js';
-import type { Context } from 'hono';
 import { auditActorOf } from '../../services/audit.js';
 import type { AppContext } from '../../types.js';
 
 const app = new Hono<AppContext>();
 app.use('*', apiKeyAuth);
 
-/** 限定了范围的 Key 只看得到范围内的邮箱 */
-function withinKey<T extends { domain: string }>(c: Context<AppContext>, list: T[], idOf: (item: T) => number): T[] {
-  const restriction = keyRestriction(c);
-  return restriction ? list.filter((item) => restrictionAllowsMailbox(restriction, { id: idOf(item), domain: item.domain })) : list;
-}
-
-/** 改名、释放前确认邮箱在 Key 范围内；邮箱不存在交给服务层按原口径报 404 */
-async function assertMailboxInKey(c: Context<AppContext>, id: number): Promise<void> {
-  if (!keyRestriction(c)) return;
-  const box = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id = ?')
-    .bind(id).first<{ id: number; domain: string; address: string }>();
-  if (box) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
-}
-
 app.get('/shared', async (c) => {
   requireScope(c, 'mailbox.read');
   const key = c.get('apiKey')!;
-  return ok(c, withinKey(c, await listSharedMailboxes(c.env, key.userId), (box) => box.mailboxId));
+  return ok(c, filterWithinKey(c, await listSharedMailboxes(c.env, key.userId), (box) => box.mailboxId));
 });
 
 app.get('/', async (c) => {
@@ -94,7 +78,7 @@ app.put('/:id', async (c) => {
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, updateMailboxRequestSchema);
-  await assertMailboxInKey(c, id);
+  await assertKeyCanUseMailboxIds(c, [id]);
   return ok(c, await updateMailbox(c.env, key.userId, id, req.displayName, key.role === 'admin', auditActorOf(c)));
 });
 
@@ -102,7 +86,7 @@ app.delete('/:id', async (c) => {
   requireScope(c, 'mailbox.write');
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
-  await assertMailboxInKey(c, id);
+  await assertKeyCanUseMailboxIds(c, [id]);
   const result = await releaseMailbox(c.env, key.userId, id, key.role === 'admin',
     parseBooleanFlag(c.req.query('deleteHistory')), execCtx(c), auditActorOf(c));
   return ok(c, { success: true, ...result });

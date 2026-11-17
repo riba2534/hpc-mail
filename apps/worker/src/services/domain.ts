@@ -57,7 +57,8 @@ export async function getVisibleDomains(
   ];
 }
 
-const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ');
+/** 可认领、可收发的托管域名状态，写成 SQL 的 IN 列表 */
+export const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ');
 
 /** 托管域名站内投递：已生效或被暂停（由收件方拒收）走站内，等待 NS、已迁走或删除中按真实 DNS 外发 */
 const INTERNAL_HOSTED_STATUSES: readonly string[] = [...HOSTED_DOMAIN_USABLE_STATUSES, 'suspended'];
@@ -86,16 +87,6 @@ export async function assertHostedSendable(env: Env, settings: Settings, domain:
       docs: '/references/errors.md#forbidden-sender',
     });
   }
-}
-
-/** 域名是否对普通用户公开。 */
-export function isDomainPublic(settings: Settings, domain: string): boolean {
-  return settings.domains.list.some((e) => e.domain === domain && e.public);
-}
-
-/** 该域名下每个普通用户的认领上限（0=不限，仅受全局上限约束）。 */
-export function domainPerUserLimit(settings: Settings, domain: string): number {
-  return settings.domains.list.find((e) => e.domain === domain)?.perUserLimit ?? 0;
 }
 
 /**
