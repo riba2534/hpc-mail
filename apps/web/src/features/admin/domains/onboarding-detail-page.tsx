@@ -14,7 +14,6 @@ import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { CopyButton } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -22,7 +21,7 @@ import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/cn';
 import { formatDateTime, formatRelativeTime } from '@/lib/format';
 import { OnboardConfirmDialog } from './onboard-confirm-dialog';
-import { CheckDetail, DNSSEC_LABEL, OnboardingStateBadge, STEP_LABEL, STEP_STATE_META } from './system-domain-meta';
+import { CheckDetail, DNSSEC_LABEL, NameServerList, OnboardingStateBadge, STEP_LABEL, STEP_STATE_META } from './system-domain-meta';
 import { storeOnboarding, systemDomainApi, systemDomainKeys, useSystemDomainOnboarding } from './system-domains-api';
 
 const TERMINAL: ReadonlySet<SystemDomainOnboardingState> = new Set(SYSTEM_DOMAIN_ONBOARDING_TERMINAL_STATES);
@@ -168,14 +167,7 @@ export function OnboardingDetailPage() {
           {task.nameServers.length > 0 ? (
             <>
               <p className="text-[13px] text-ink-secondary">到注册商把 {task.domain} 的 NS 改为：</p>
-              <ul className="flex flex-col gap-1.5">
-                {task.nameServers.map((ns) => (
-                  <li key={ns} className="flex items-center gap-2">
-                    <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">{ns}</code>
-                    <CopyButton value={ns} label={`复制 ${ns}`} size="sm" />
-                  </li>
-                ))}
-              </ul>
+              <NameServerList nameServers={task.nameServers} />
               {task.originalNameServers.length > 0 && (
                 <p className="text-xs text-ink-tertiary">原 NS：{task.originalNameServers.join(' / ')}{task.originalRegistrar ? `（${task.originalRegistrar}）` : ''}</p>
               )}

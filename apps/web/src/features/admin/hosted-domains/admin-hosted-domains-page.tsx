@@ -168,9 +168,12 @@ export function AdminHostedDomainsPage() {
     mutationFn: ({ domain, kind }: PendingAction) =>
       kind === 'suspend' ? adminHostedDomainApi.suspend(domain.id) : adminHostedDomainApi.resume(domain.id),
     onSuccess: (updated, { kind }) => {
+      // 各列表已就地替换；只有按状态筛选的列表可能因此移出这一行，只重拉这些
       storeHostedDomain(queryClient, updated);
-      // 状态变化可能让它移出当前筛选
-      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.hostedDomains });
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.admin.hostedDomains,
+        predicate: (query) => Boolean((query.queryKey[2] as { status?: string } | undefined)?.status),
+      });
       toast({ title: kind === 'suspend' ? `已暂停 ${updated.domain}` : `已恢复 ${updated.domain}`, variant: 'success' });
       setPendingAction(null);
     },

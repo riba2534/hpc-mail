@@ -8,6 +8,7 @@ import type {
   SystemDomainStepState,
 } from '@hpc-mail/shared';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
+import { CopyButton } from '@/components/ui/copy-button';
 import { cn } from '@/lib/cn';
 
 export const ONBOARDING_STATE_META: Record<SystemDomainOnboardingState, { label: string; tone: BadgeTone }> = {
@@ -115,5 +116,19 @@ export function CheckDetail({ check }: { check: SystemDomainCheck }) {
         </ul>
       )}
     </div>
+  );
+}
+
+/** Cloudflare 分配的名称服务器：逐个可复制（添加外部域名弹窗与接入详情共用） */
+export function NameServerList({ nameServers }: { nameServers: readonly string[] }) {
+  return (
+    <ul className="flex flex-col gap-1.5">
+      {nameServers.map((ns) => (
+        <li key={ns} className="flex items-center gap-2">
+          <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">{ns}</code>
+          <CopyButton value={ns} label={`复制 ${ns}`} size="sm" />
+        </li>
+      ))}
+    </ul>
   );
 }
