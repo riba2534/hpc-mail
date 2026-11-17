@@ -78,7 +78,7 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 ## key-restricted
 
-这把 Key 限定了可用的邮箱或域名（HTTP 403 `forbidden`），请求涉及的地址、邮箱或域名不在范围内。`GET /v1/me` 的 `key.allowedMailboxIds`、`key.allowedDomains` 列出范围；只限定了邮箱的 Key 不能认领新地址。列表、等待、未读数等读取只返回范围内的邮件，不会报这个错。换用覆盖该地址的 Key，或请用户在网页「API Key」页面调整范围。
+这把 Key 限定了可用的邮箱或域名（HTTP 403 `forbidden`），请求涉及的地址、邮箱或域名不在范围内。`GET /v1/me` 的 `key.allowedMailboxIds`、`key.allowedDomains` 列出范围；只限定了邮箱的 Key 不能认领新地址。列表、等待、未读数等读取只返回范围内的邮件，不会报这个错；按 id 读取、回复或转发范围外的邮件与不可见一样返回 404。按 id 指定的邮箱在范围外时，错误信息只带 id。换用覆盖该地址的 Key，或请用户在网页「API Key」页面调整范围。
 
 ## reauth_required
 

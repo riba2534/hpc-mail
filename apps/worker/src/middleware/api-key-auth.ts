@@ -240,20 +240,17 @@ export function assertKeyCanUseDomain(c: Context<AppContext>, domain: string): v
   if (restriction && !restrictionAllowsDomain(restriction, domain)) throw restrictedError(`域名 ${domain.trim().toLowerCase()}`);
 }
 
-/** 已知认领行时的判定（免一次查询）：id 在 mailboxIds 或 domain 在 domains 中 */
-export function assertKeyCanUseMailbox(c: Context<AppContext>, mailbox: { id: number; domain: string; address?: string }): void {
-  const restriction = keyRestriction(c);
-  if (restriction && !restrictionAllowsMailbox(restriction, mailbox)) {
-    throw restrictedError(mailbox.address ? ` ${mailbox.address}` : `邮箱 #${mailbox.id}`);
-  }
-}
-
-/** 按 id 确认邮箱都在 Key 范围内（一次查询，不限范围的 Key 不查库）；不存在的放过，交给调用方按原口径报错 */
+/**
+ * 按 id 确认邮箱都在 Key 范围内（一次查询，不限范围的 Key 不查库）；不存在的放过，交给调用方按原口径报错。
+ * 错误只带调用方给的 id、不带地址：id 可以逐个枚举，带出地址就泄露了范围外（包括别人的）邮箱
+ */
 export async function assertKeyCanUseMailboxIds(c: Context<AppContext>, ids: readonly number[]): Promise<void> {
-  if (!keyRestriction(c) || !ids.length) return;
-  const { results } = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id IN (SELECT value FROM json_each(?))')
-    .bind(JSON.stringify(ids)).all<{ id: number; domain: string; address: string }>();
-  for (const box of results) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
+  const restriction = keyRestriction(c);
+  if (!restriction || !ids.length) return;
+  const { results } = await c.env.db.prepare('SELECT id, domain FROM mailboxes WHERE id IN (SELECT value FROM json_each(?))')
+    .bind(JSON.stringify(ids)).all<{ id: number; domain: string }>();
+  const outside = results.find((box) => !restrictionAllowsMailbox(restriction, { id: Number(box.id), domain: box.domain }));
+  if (outside) throw restrictedError(`邮箱 #${Number(outside.id)}`);
 }
 
 /** 限定了范围的 Key 只看得到范围内的邮箱（列表按认领行 id 与域名收窄；不限范围时原样返回） */

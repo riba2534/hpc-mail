@@ -12,7 +12,7 @@ import {
 import type { Context } from 'hono';
 import { AppError } from '../lib/errors.js';
 import { ok, parseBody } from '../lib/http.js';
-import { assertKeyCanUseAddress, assertKeyCanUseSender, keyRestriction, requireScope } from '../middleware/api-key-auth.js';
+import { assertKeyCanUseSender, keyRestriction, requireScope } from '../middleware/api-key-auth.js';
 import type { IdempotencyActor } from '../services/idempotency.js';
 import { loadSourceMessage } from '../services/message.js';
 import type { Sender } from '../services/outbound.js';
@@ -55,11 +55,11 @@ export async function authorizeSendContent(
   if (content.replyToMessageId || content.forwardAttachmentsFrom) requireScope(c, 'mail.read');
   if (!keyRestriction(c)) return;
   if (content.from) await assertKeyCanUseSender(c, content.from);
+  // 范围外的来源与不可见一样 404 source_unavailable，不带地址：id 可以逐个枚举
+  const viewer = { userId: key.userId, role: key.role, restrict: keyRestriction(c) ?? undefined };
   const sources = [['reply', content.replyToMessageId], ['forward', content.forwardAttachmentsFrom]] as const;
   for (const [source, id] of sources) {
-    if (!id) continue;
-    const row = await loadSourceMessage(c.env, { userId: key.userId, role: key.role }, id, '引用的原邮件不存在或不可见', source);
-    await assertKeyCanUseAddress(c, row.address);
+    if (id) await loadSourceMessage(c.env, viewer, id, '引用的原邮件不存在或不可见', source);
   }
 }
 
@@ -117,19 +117,23 @@ export async function handleCompose(
   sourceId: number,
 ): Promise<Response> {
   assertRequestSize(c);
+  // 限定了范围的 Key 读原信时，范围外与不可见一样 404 source_unavailable
+  const reader = { ...sender, restrict: keyRestriction(c) ?? undefined };
   if (op === 'reply') {
     const req = await parseBody(c, replyMessageRequestSchema);
     return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () =>
-      composedPlan(c, await composeReply(c.env, sender, sourceId, req), { items: req.attachments, tokens: req.attachmentTokens }));
+      composedPlan(c, await composeReply(c.env, reader, sourceId, req), { items: req.attachments, tokens: req.attachmentTokens }));
   }
   const req = await parseBody(c, forwardMessageRequestSchema);
   return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () =>
-    composedPlan(c, await composeForward(c.env, sender, sourceId, req), { items: [], tokens: [] }));
+    composedPlan(c, await composeForward(c.env, reader, sourceId, req), { items: [], tokens: [] }));
 }
 
-/** 回复/转发算好的请求转成发送内容；限定了范围的 API Key，原信与发件地址都要在范围内（网页会话不受限） */
+/**
+ * 回复/转发算好的请求转成发送内容；限定了范围的 API Key，发件地址要在范围内（网页会话不受限）。
+ * 原信的范围在读取时按可见性判定（范围外 404，见 handleCompose）
+ */
 async function composedPlan(c: Context<AppContext>, composed: ComposedSend, attachments: SendPlan['attachments']): Promise<SendPlan> {
-  await assertKeyCanUseAddress(c, composed.sourceAddress);
   await assertKeyCanUseSender(c, composed.req.from);
   return { req: composed.req, attachments, ...(composed.fromIsDefault ? { defaultFromAddress: composed.sourceAddress } : {}) };
 }

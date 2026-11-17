@@ -15,7 +15,7 @@ import { AppError } from '../lib/errors.js';
 import { escapeHtml, htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { bodyBytes, readMailBody } from './mail-body.js';
-import { loadSourceContent } from './message.js';
+import { loadSourceContent, type SourceViewer } from './message.js';
 import type { SendMailInput } from './outbound.js';
 
 type Source = Awaited<ReturnType<typeof loadSourceContent>>;
@@ -25,7 +25,7 @@ type MailBody = Awaited<ReturnType<typeof readMailBody>>;
 export interface ComposedSend {
   req: SendMailInput;
   fromIsDefault: boolean;
-  /** 来源邮件的收件地址（Key 限定范围接入后要校验） */
+  /** 来源邮件的收件地址（发件身份缺省时用它） */
   sourceAddress: string;
 }
 
@@ -185,7 +185,7 @@ const lower = (address: string) => address.toLowerCase();
  */
 export async function composeReply(
   env: Env,
-  sender: { userId: number; role: Role },
+  sender: SourceViewer,
   sourceId: number,
   req: ReplyMessageRequest,
 ): Promise<ComposedSend> {
@@ -239,7 +239,7 @@ export async function composeReply(
 /** 转发：note 在前，includeOriginal 时附原文；原邮件附件始终带上（沿用 forwardAttachmentsFrom 的规则） */
 export async function composeForward(
   env: Env,
-  sender: { userId: number; role: Role },
+  sender: SourceViewer,
   sourceId: number,
   req: ForwardMessageRequest,
 ): Promise<ComposedSend> {

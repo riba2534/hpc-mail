@@ -29,7 +29,7 @@ shell 示例复用[入口指南](../skill.md)的 `hpc()`、`FROM`、`WORK`。草
 | `DELETE /drafts/:id` | `mail.send` | `{success:true}`，同时释放它的附件 |
 | `POST /drafts/:id/send` | `mail.send` | 与 `POST /messages` 相同：201 发件摘要 / 422 / 4xx；可带 `{expectedVersion}` |
 
-草稿内容带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时，创建、修改与发送都另需 `mail.read`（同直接发信）。只能看到、操作自己的草稿，管理员也一样；别人的草稿 id 返回 404。限定了邮箱或域名范围的 Key 只能看到、操作它自己创建的草稿，发件地址与引用的来源邮件都要在范围内（否则 403，见[错误码](errors.md#key-restricted)）。
+草稿内容带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时，创建、修改与发送都另需 `mail.read`（同直接发信）。只能看到、操作自己的草稿，管理员也一样；别人的草稿 id 返回 404。限定了邮箱或域名范围的 Key 只能看到、操作它自己创建的草稿，发件地址要在范围内（否则 403，见[错误码](errors.md#key-restricted)）；引用范围外的来源邮件与不可见一样返回 404 `source_unavailable`。
 
 草稿摘要字段：`id,status,version,from,to,cc,bcc,subject,preview,attachmentCount,sendAt,messageId,errorDetail,createdVia,apiKeyName,createdAt,updatedAt,sentAt`；详情另有 `replyTo,text,html,headers,replyToMessageId,forwardAttachmentsFrom,attachments`。`createdVia` 为 `api` 时 `apiKeyName` 是创建它的 Key 名称。`from` 是解析后的形式：`{mailboxId}` 或 `{localPart,domain,displayName?}`。
 

@@ -933,6 +933,13 @@ function isVisible(viewer: Viewer, scope: Scope, row: VisibilityRow, facts: Visi
   return viewer.role === 'admin' && viewer.scope === undefined && !facts.claimed;
 }
 
+/** 读来源邮件的身份：发件人，限定了范围的 API Key 另带 restrict（范围外与不可见一样 404） */
+export interface SourceViewer {
+  userId: number;
+  role: Role;
+  restrict?: AddressRestriction;
+}
+
 /**
  * 发信引用的来源邮件（转发附件、回复线程头）：与详情同一可见口径——发件人自己的 mine 范围
  * （认领 + 共享来的未删除收件），管理员另含未认领地址；不按角色整体放行，管理员也拿不到
@@ -942,13 +949,13 @@ function isVisible(viewer: Viewer, scope: Scope, row: VisibilityRow, facts: Visi
  */
 export async function loadSourceMessage(
   env: Env,
-  sender: { userId: number; role: Role },
+  sender: SourceViewer,
   id: number,
   unavailableMessage: string,
   source: 'reply' | 'forward',
 ) {
   const db = createDb(env);
-  const viewer: Viewer = { userId: sender.userId, role: sender.role };
+  const viewer: Viewer = { userId: sender.userId, role: sender.role, restrict: sender.restrict };
   const scope = resolveScope(viewer);
   const row = await db
     .select({
@@ -975,12 +982,12 @@ export async function loadSourceMessage(
  */
 export function loadSourceContent(
   env: Env,
-  sender: { userId: number; role: Role },
+  sender: SourceViewer,
   id: number,
   unavailableMessage: string,
   source: 'reply' | 'forward',
 ): Promise<MessageRow> {
-  return loadVisible(env, { userId: sender.userId, role: sender.role }, id,
+  return loadVisible(env, { userId: sender.userId, role: sender.role, restrict: sender.restrict }, id,
     () => new AppError('source_unavailable', unavailableMessage, { details: { source } }));
 }
 

@@ -195,16 +195,28 @@ describe('限定到邮箱的 Key', () => {
     expect((await data<{ deleted: number }>(await request('/v1/messages/delete', json(key, { ids: [inHidden.id] })))).deleted).toBe(0);
 
     const send = (body: Record<string, unknown>) => request('/v1/messages', json(key, { to: [allowed.address], subject: 's', text: 't', ...body }));
-    expect((await send({ from: { mailboxId: hidden.id } })).status).toBe(403);
+    // 按 id 指定的邮箱在范围外：403，错误里只有 id、不带地址
+    const byId = await errorOf(await send({ from: { mailboxId: hidden.id } }), 403);
+    expect(byId.message).not.toContain(hidden.address);
     expect((await send({ from: hidden.address })).status).toBe(403);
-    expect((await send({ from: allowed.address, replyToMessageId: inHidden.id })).status).toBe(403);
-    expect((await send({ from: allowed.address, forwardAttachmentsFrom: inHidden.id })).status).toBe(403);
+    // 引用范围外的来源与不可见一样 404 source_unavailable，不带出地址（A2）
+    for (const body of [{ replyToMessageId: inHidden.id }, { forwardAttachmentsFrom: inHidden.id }]) {
+      const error = await errorOf(await send({ from: allowed.address, ...body }), 404);
+      expect(error.code).toBe('source_unavailable');
+      expect(error.message).not.toContain(hidden.address);
+    }
     expect((await send({ from: { mailboxId: allowed.id }, replyToMessageId: inAllowed.id })).status).toBe(201);
-    // 回复、转发端点：原信或发件地址在范围外 403
-    expect((await errorOf(await request(`/v1/messages/${inHidden.id}/reply`, json(key, { text: 'x' })), 403)).docs).toContain('#key-restricted');
-    // 发件地址在范围内也不行：原信本身在范围外
-    expect((await request(`/v1/messages/${inHidden.id}/reply`, json(key, { text: 'x', from: allowed.address }))).status).toBe(403);
-    expect((await request(`/v1/messages/${inHidden.id}/forward`, json(key, { to: [allowed.address], note: 'x' }))).status).toBe(403);
+    // 回复、转发端点：原信在范围外与不可见一样 404，发件地址在范围内也不行；发件地址在范围外 403
+    for (const [path, body] of [
+      [`/v1/messages/${inHidden.id}/reply`, { text: 'x' }],
+      [`/v1/messages/${inHidden.id}/reply`, { text: 'x', from: allowed.address }],
+      [`/v1/messages/${inHidden.id}/forward`, { to: [allowed.address], note: 'x' }],
+      ['/v1/drafts', { replyToMessageId: inHidden.id, from: allowed.address }],
+    ] as const) {
+      const error = await errorOf(await request(path, json(key, body)), 404);
+      expect(error.code).toBe('source_unavailable');
+      expect(error.message).not.toContain(hidden.address);
+    }
     expect((await request(`/v1/messages/${inAllowed.id}/reply`, json(key, { text: 'x', from: hidden.address }))).status).toBe(403);
 
     const boxes = await data<{ id: number }[]>(await request('/v1/mailboxes', { headers: auth(key) }));
