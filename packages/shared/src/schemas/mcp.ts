@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { MAX_PAGE_SIZE, MAX_WAIT_ADDRESSES, MESSAGE_DIRECTIONS } from '../constants.js';
-import { emailAddressSchema, internalSendMailSchema, listMessagesQuerySchema, waitMessagesQuerySchema } from './mail.js';
+import {
+  emailAddressSchema, internalSendMailSchema, listMessagesQuerySchema, replyMessageRequestSchema, waitMessagesQuerySchema,
+} from './mail.js';
 import { claimMailboxRequestSchema } from './mailbox.js';
 
 /**
@@ -25,6 +27,7 @@ const idempotencyKey = z.string().min(1).max(128).regex(/^[\x21-\x7e]+$/, 'idemp
 
 const messageId = z.number().int().positive();
 const sendShape = internalSendMailSchema.shape;
+const replyShape = replyMessageRequestSchema.shape;
 const waitShape = waitMessagesQuerySchema.shape;
 const listShape = listMessagesQuerySchema.shape;
 const flag = (description: string) => z.boolean().optional().describe(description);
@@ -44,15 +47,14 @@ export const mcpToolInputSchemas = {
   send_email: z.object({ ...sendShape, idempotencyKey, response_format: responseFormat }),
   reply_email: z.object({
     messageId: messageId.describe('要回复的邮件 id'),
-    from: sendShape.from.optional().describe('发件身份，写法同 send_email；默认用原邮件所在的地址'),
-    text: sendShape.text,
-    html: sendShape.html,
-    replyAll: z.boolean().default(false).describe('true 时把原邮件的其他收件人（To、Cc，去掉自己）放进抄送'),
-    cc: sendShape.cc.optional(),
-    bcc: sendShape.bcc.optional(),
-    attachments: sendShape.attachments.optional(),
-    attachmentTokens: sendShape.attachmentTokens.optional(),
-    headers: sendShape.headers,
+    replyAll: replyShape.replyAll.describe('true 时把原邮件的其他收件人（To、Cc，去掉自己的地址）放进抄送，不带原 Bcc'),
+    quote: replyShape.quote.describe('默认 true：正文后附原邮件引用（发件人、时间、主题与 > 引用的原文）'),
+    from: replyShape.from.describe('发件身份，写法同 send_email；默认用原邮件的收件地址'),
+    text: replyShape.text,
+    html: replyShape.html,
+    attachments: replyShape.attachments,
+    attachmentTokens: replyShape.attachmentTokens,
+    headers: replyShape.headers,
     idempotencyKey,
     response_format: responseFormat,
   }),

@@ -40,14 +40,14 @@ import {
   sanitizeFilename,
   sanitizeMimeType,
 } from '../lib/mime.js';
-import { makePreview } from '../lib/text.js';
+import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
 import { assertHostedSendable, getRoutableDomains } from './domain.js';
 import { HOSTED_SEND_CLAIM_SQL, resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
-import { getUserNotifyPrefs } from './notify-prefs.js';
+import { loadNotifyOwners } from './notify-prefs.js';
 import { bumpCounter, dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { attachmentKey, getExt, sha256Hex16 } from './storage.js';
@@ -90,7 +90,7 @@ export interface StoredAttachment extends AttachmentBase {
 
 export type DecodedAttachment = BytesAttachment | StoredAttachment;
 
-function attachmentSize(attachment: DecodedAttachment): number {
+export function attachmentSize(attachment: DecodedAttachment): number {
   return 'bytes' in attachment ? attachment.bytes.byteLength : attachment.size;
 }
 
@@ -400,6 +400,9 @@ async function loadForwardedAttachments(
   }));
 }
 
+/** 请求自带字节的附件同时上传几个（字节已在内存里，并发不增加占用） */
+const ATTACHMENT_UPLOAD_CONCURRENCY = 4;
+
 async function persistAttachments(
   env: Env,
   db: Db,
@@ -436,12 +439,19 @@ async function persistAttachments(
         r2Key, token: leaseToken, expiresAt: new Date(Date.now() + DELIVERY_LEASE_MS),
       }))).onConflictDoNothing();
     }
-    for (let index = 0; index < rows.length; index++) {
+    // 有界并发上传；任一失败后不再开始新的，等进行中的结束再抛错，清理登记才覆盖全部写过的对象
+    const uploads = rows.flatMap((row, index) => {
       const att = atts[index]!;
-      if (!('bytes' in att)) continue;
-      await env.r2.put(rows[index]!.r2Key, att.bytes, { httpMetadata: { contentType: att.mimeType } });
-      uploadedKeys.push(rows[index]!.r2Key);
-    }
+      return 'bytes' in att ? [{ r2Key: row.r2Key, att }] : [];
+    });
+    let failed: { error: unknown } | undefined;
+    await runLimited(uploads, ATTACHMENT_UPLOAD_CONCURRENCY, async ({ r2Key, att }) => {
+      if (failed) return;
+      uploadedKeys.push(r2Key);
+      try { await env.r2.put(r2Key, att.bytes, { httpMetadata: { contentType: att.mimeType } }); }
+      catch (error) { failed ??= { error }; }
+    });
+    if (failed) throw failed.error;
     return await db
       .insert(attachmentsTable)
       .values(rows)
@@ -768,7 +778,9 @@ export async function sendMail(
     ...customHeaders,
   ];
   const outgoingMessageId = `<${crypto.randomUUID()}@${from.domain}>`;
-  const preview = makePreview(text, html);
+  // 摘要与各份正文的 D1 搜索文本共用一次 HTML → 纯文本转换
+  const view = mailText(text, html);
+  const preview = view.preview();
   const size = bodyBytes(text, html) + totalAttachmentBytes;
   const code = settings.code_extract.enabled ? extractCodeByRegex(req.subject, text) : '';
   // 只写站内收件副本；发件记录本身不是「收到的验证邮件」
@@ -782,7 +794,7 @@ export async function sendMail(
   let outbound: typeof messages.$inferSelect | undefined;
   let storedBody: Awaited<ReturnType<typeof storeMailBody>> | undefined;
   try {
-    storedBody = await storeMailBody(env, text, html);
+    storedBody = await storeMailBody(env, text, html, undefined, view);
     outbound = await db.insert(messages).values({
       direction: 'outbound', address: from.address, domain: from.domain,
       fromAddress: from.address, fromName: from.displayName, recipients,
@@ -886,7 +898,7 @@ export async function sendMail(
           const recipient = await resolveDeliveryOwners(env, target);
           if (recipient.rejected) throw new Error(recipient.rejected);
           ownerIds = recipient.ownerIds;
-          body = await storeMailBody(env, text, html);
+          body = await storeMailBody(env, text, html, undefined, view);
           const insertMessage = db.insert(messages).values({
             direction: 'inbound', address: target, domain: getEmailDomain(target),
             fromAddress: from.address, fromName: from.displayName,
@@ -1004,17 +1016,20 @@ export async function sendMail(
     for (const delivery of internalDeliveries) {
       try {
         const ownerIds = delivery.ownerIds;
-        forwarding.push(Promise.all(ownerIds.map(id => getUserNotifyPrefs(env, id))).then(async (prefs) => {
-          if (!prefs.some(pref => pref.forward.enabled && pref.forward.addresses.length)) return;
+        // 归属人状态与偏好读一次（同 SMTP 收件），转发与通知入队共用；读取失败时入队退回逐人读取
+        const ownersReady = loadNotifyOwners(env, ownerIds)
+          .catch((error: unknown) => { console.error('站内收件的通知偏好读取失败:', error); return undefined; });
+        forwarding.push(ownersReady.then(async (owners) => {
+          if (!owners || ![...owners.values()].some(owner => owner.prefs.forward.enabled && owner.prefs.forward.addresses.length)) return;
           await forwardReceivedMail(env, {
             messageId: delivery.messageId, ownerIds,
             fromAddress: from.address, fromName: from.displayName, toAddress: delivery.target,
             domain: getEmailDomain(delivery.target), subject: req.subject, text, html, replyTo: replyToAddresses,
             attachments: await loadForwardAttachments(),
-          }, prefs);
+          }, owners);
         }).catch(error => console.error('站内转发失败:', error)));
         await enqueueMailNotifications(env, null, {
-          ownerIds, message: { id: delivery.messageId, address: delivery.target,
+          ownerIds, owners: await ownersReady, message: { id: delivery.messageId, address: delivery.target,
             fromAddress: from.address, fromName: from.displayName, subject: req.subject,
             verificationCode: code, verificationLink, preview, createdAt: new Date().toISOString() }, text, html,
         });

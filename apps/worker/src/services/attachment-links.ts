@@ -1,14 +1,9 @@
+import { escapeHtml } from '../lib/text.js';
+
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
-}
-
-export function escapeHtml(s: string): string {
-  return s.replace(
-    /[&<>"']/g,
-    (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;'),
-  );
 }
 
 export interface AttachmentLink {

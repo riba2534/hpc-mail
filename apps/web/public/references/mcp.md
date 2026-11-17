@@ -48,7 +48,7 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 | `claim_mailbox` | 认领 `localPart@domain`，可带 `strategy` | `POST /v1/mailboxes` | `mailbox.write` |
 | `release_mailbox` | 按 `mailboxId` 或 `address` 释放；`deleteHistory:true` 永久删除该地址全部邮件 | `DELETE /v1/mailboxes/:id` | `mailbox.write`，按 `address` 另需 `mailbox.read` |
 | `send_email` | 发信，参数与 REST 发信请求体相同，另有 `idempotencyKey` | `POST /v1/messages` | `mail.send`，带 `replyToMessageId` 或 `forwardAttachmentsFrom` 另需 `mail.read` |
-| `reply_email` | 回复：自动填收件人、`Re: ` 主题与线程头 | `GET /v1/messages/:id`、`POST /v1/messages` | `mail.read` 与 `mail.send` |
+| `reply_email` | 回复：服务端按原信填收件人、`Re: ` 主题、线程头与引用 | `POST /v1/messages/:id/reply` | `mail.send` 与 `mail.read` |
 | `search_messages` | 列表与搜索，从新到旧，`cursor` 翻页 | `GET /v1/messages` | `mail.read` |
 | `get_message` | 一封邮件的详情 | `GET /v1/messages/:id` | `mail.read` |
 | `wait_for_message` | 等下一封新来信，可按验证码、发件人、主题过滤 | `GET /v1/messages/wait` | `mail.read` |
@@ -57,7 +57,7 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 
 - 每个工具的 `inputSchema` 由 `tools/list` 返回，字段约束与 REST 相同。开关写 JSON 布尔（`hasCode: true`，不是 `"1"`），`wait_for_message` 的 `address` 可以是一个地址或最多 20 个地址的数组。
 - `send_email` 与 `reply_email` 的 `idempotencyKey` 等同 REST 的 `Idempotency-Key` 头：一次逻辑发信一个，网络错误或超时后用同一个 Key 和相同参数重试，不会重复发送。规则见[发送](mail.md#发送)。
-- `reply_email`：来信回给原信的 `replyTo`，没有时回给发件人；回复自己发出的信时回给原收件人。`from` 默认是收到这封信的本站地址，共享给你的邮箱只读，这时用 `from` 指定自己的地址。`replyAll: true` 把原信其他 To/Cc 放进抄送（去掉自己），不带原 Bcc。回复站外邮件或需要引用原文时用 `send_email` 自己组织。
+- `reply_email`：参数与[回复接口](mail.md#回复和转发)的请求体相同（`replyAll`、`quote`、`from`、`text`、`html`、`attachments`、`attachmentTokens`、`headers`），另加 `messageId`。来信回给原信的 `replyTo`，没有时回给发件人；回复自己发出的信时回给原收件人。`quote` 默认 `true`，正文后附原信引用。`from` 默认是收到这封信的本站地址，共享给你的邮箱只读，这时返回 `from_required`，用 `from` 指定自己的地址。`replyAll: true` 把原信其他 To/Cc 放进抄送（去掉你自己的地址），不带原 Bcc。不接受 `to`、`cc`、`bcc`、`subject`：要自定义收件人或主题，或回复不在本站的邮件，用 `send_email` 自己组织。
 - 除 `get_me` 与 `release_mailbox` 外都有 `response_format`：`concise`（默认）或 `detailed`。
 
 ## 结果与错误

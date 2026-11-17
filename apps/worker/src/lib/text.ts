@@ -1,3 +1,10 @@
+const HTML_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+/** 文本放进 HTML 前转义 & < > " '（附件下载区块、中转与回复转发的引用头部共用） */
+export function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
+}
+
 /**
  * 零宽、软连字符、方向控制等不可见字符：渲染时不占位，却常被反爬插在验证码中间，
  * 换成空格会把码切成两段（`913472` → `91347 2`，提码只剩 5 位），只能直接去掉。

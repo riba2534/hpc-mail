@@ -20,7 +20,7 @@ import {
   getThread,
   listMessages,
   markAllRead,
-  markMessages,
+  markMessagesAndCount,
   purgeMessages,
   restoreMessages,
   starMessages,
@@ -28,7 +28,7 @@ import {
   UNREAD_COUNT_CAP,
   type Viewer,
 } from '../services/message.js';
-import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer } from '../lib/message-viewer.js';
+import { auditUnclaimedPurge, listViewer, messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
 import { conditionalDetailResponse } from '../lib/etag.js';
 import { pageHead } from '../lib/pagination.js';
@@ -49,16 +49,6 @@ function mutationViewerOf(c: Context<AppContext>, bodyScope?: 'mine' | 'unclaime
   return mutationViewer(c, { userId: user.id, role: user.role }, bodyScope);
 }
 
-function viewerFromListQuery(
-  user: { id: number; role: Viewer['role'] },
-  query: { scope?: Viewer['scope']; userId?: number },
-  c: Context<AppContext>,
-): Viewer {
-  const viewer: Viewer = { userId: user.id, role: user.role, scope: query.scope, targetUserId: query.userId };
-  auditUserScopeRead(c, viewer);
-  return viewer;
-}
-
 /**
  * 首页（不带 cursor）附带 head，与 /sync 同一算法；带 afterId 的增量页不是 sync 所描述的首页，同样不带。
  * /v1 列表不返回 head。
@@ -66,7 +56,7 @@ function viewerFromListQuery(
 app.get('/', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  const page = await listMessages(c.env, viewerFromListQuery(user, query, c), query);
+  const page = await listMessages(c.env, listViewer(c, { userId: user.id, role: user.role }, query), query);
   if (query.cursor !== undefined || query.afterId !== undefined) return ok(c, page);
   const body: MessageListPage = { ...page, head: await pageHead(page) };
   return ok(c, body);
@@ -81,10 +71,8 @@ app.post('/send', (c) => {
 app.post('/read', async (c) => {
   const req = await parseBody(c, apiMarkReadRequestSchema);
   const viewer = mutationViewerOf(c, req.scope);
-  const result: MarkReadResult = { changed: await markMessages(c.env, viewer, req.ids, req.isRead) };
-  if (req.includeUnread && (viewer.scope === undefined || viewer.scope === 'mine')) {
-    result.unread = await countUnread(c.env, viewer.userId, viewer.role, UNREAD_COUNT_CAP);
-  }
+  const withUnread = req.includeUnread && (viewer.scope === undefined || viewer.scope === 'mine');
+  const result: MarkReadResult = await markMessagesAndCount(c.env, viewer, req.ids, req.isRead, withUnread ? UNREAD_COUNT_CAP : undefined);
   return ok(c, result);
 });
 
@@ -141,7 +129,7 @@ app.get('/unread-count', async (c) => {
 app.get('/sync', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  return ok(c, await syncMessages(c.env, viewerFromListQuery(user, query, c), query));
+  return ok(c, await syncMessages(c.env, listViewer(c, { userId: user.id, role: user.role }, query), query));
 });
 
 /** 写信收件人自动补全：近期联系人 */

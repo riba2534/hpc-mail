@@ -2,17 +2,14 @@ import { draftInputSchema, listDraftsQuerySchema, sendDraftRequestSchema, type S
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { AppError } from '../lib/errors.js';
 import { ok, parseBody, parseId, parseQuery } from '../lib/http.js';
-import {
-  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseSender, keyRestriction, requireScope,
-} from '../middleware/api-key-auth.js';
+import { apiKeyAuth, keyRestriction, requireScope } from '../middleware/api-key-auth.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
-  createDraft, deleteDraft, getDraft, listDrafts, referencesSource, sendDraftNow, updateDraft, type DraftActor, type DraftOwner,
+  createDraft, deleteDraft, getDraft, listDrafts, sendDraftNow, updateDraft, type DraftActor, type DraftOwner,
 } from '../services/drafts.js';
-import { loadSourceMessage } from '../services/message.js';
 import type { Sender } from '../services/outbound.js';
 import type { AppContext } from '../types.js';
-import { assertRequestSize, selfHostsOf } from './send-handler.js';
+import { assertRequestSize, authorizeSendContent, sendEnvironment } from './send-handler.js';
 
 /** 当前调用方：网页会话（JWT）或 API Key；草稿始终属于它们背后的用户 */
 function actorOf(c: Context<AppContext>): DraftActor & { sender: Sender; owner: DraftOwner } {
@@ -43,28 +40,9 @@ function requireWrite(c: Context<AppContext>): void {
   if (c.get('apiKey')) requireScope(c, 'mail.send');
 }
 
-/**
- * 草稿内容的授权，与直接发信一致：引用来源邮件（回复、转发附件）时 Key 另需 mail.read；
- * 限定了范围的 Key，发件地址与引用的来源邮件都要在范围内（网页会话不受限）。
- */
+/** 草稿内容的授权与直接发信同一口径（authorizeSendContent），在合并出完整内容后调用 */
 function contentGuard(c: Context<AppContext>) {
-  return async (content: Pick<StoredDraftContent, 'from' | 'replyToMessageId' | 'forwardAttachmentsFrom'>) => {
-    const key = c.get('apiKey');
-    if (!key) return;
-    if (referencesSource(content)) requireScope(c, 'mail.read');
-    if (!keyRestriction(c)) return;
-    if (content.from) await assertKeyCanUseSender(c, content.from);
-    const sources = [['reply', content.replyToMessageId], ['forward', content.forwardAttachmentsFrom]] as const;
-    for (const [source, id] of sources) {
-      if (!id) continue;
-      const row = await loadSourceMessage(c.env, { userId: key.userId, role: key.role }, id, '引用的原邮件不存在或不可见', source);
-      await assertKeyCanUseAddress(c, row.address);
-    }
-  };
-}
-
-function requestEnv(c: Context<AppContext>) {
-  return { origin: new URL(c.req.url).origin, selfHosts: selfHostsOf(c) };
+  return (content: Pick<StoredDraftContent, 'from' | 'replyToMessageId' | 'forwardAttachmentsFrom'>) => authorizeSendContent(c, content);
 }
 
 /**
@@ -84,10 +62,8 @@ export function createDraftRoutes(authentication: MiddlewareHandler<AppContext>)
     requireWrite(c);
     assertRequestSize(c);
     const input = await parseBody(c, draftInputSchema);
-    await contentGuard(c)({
-      from: input.from ?? null, replyToMessageId: input.replyToMessageId ?? null, forwardAttachmentsFrom: input.forwardAttachmentsFrom ?? null,
-    });
-    const result = await createDraft(c.env, actorOf(c), input, requestEnv(c), c.req.header('Idempotency-Key'));
+    await authorizeSendContent(c, input);
+    const result = await createDraft(c.env, actorOf(c), input, sendEnvironment(c), c.req.header('Idempotency-Key'));
     return ok(c, result.draft, result.replayed ? 200 : 201);
   });
 
@@ -101,7 +77,7 @@ export function createDraftRoutes(authentication: MiddlewareHandler<AppContext>)
     assertRequestSize(c);
     const id = parseId(c.req.param('id'));
     const input = await parseBody(c, draftInputSchema);
-    return ok(c, await updateDraft(c.env, actorOf(c), id, input, requestEnv(c), contentGuard(c)));
+    return ok(c, await updateDraft(c.env, actorOf(c), id, input, sendEnvironment(c), contentGuard(c)));
   });
 
   app.delete('/:id', async (c) => {
@@ -119,8 +95,7 @@ export function createDraftRoutes(authentication: MiddlewareHandler<AppContext>)
     const id = parseId(c.req.param('id'));
     const actor = actorOf(c);
     const body = c.req.header('Content-Length') === '0' || c.req.raw.body === null ? {} : await parseBody(c, sendDraftRequestSchema);
-    const summary = await sendDraftNow(c.env, c.executionCtx, actor.sender, id, new URL(c.req.url).origin, contentGuard(c),
-      body.expectedVersion, actor.restrictedKeyId);
+    const summary = await sendDraftNow(sendEnvironment(c), actor.sender, id, contentGuard(c), body.expectedVersion, actor.restrictedKeyId);
     return ok(c, summary, 201);
   });
 

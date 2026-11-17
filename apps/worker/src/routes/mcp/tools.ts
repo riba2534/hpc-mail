@@ -1,6 +1,5 @@
 import { mcpSearchQuery, mcpToolInputSchemas, mcpWaitQuery, type McpToolArgs, type McpToolName } from '@hpc-mail/shared/mcp';
 import {
-  parseMailAddress,
   type ApiErrorBody, type ApiKeySelf, type Mailbox, type MessageDetail, type Page,
   type MessageSummary, type SendIdentities, type WaitMessageResult,
 } from '@hpc-mail/shared';
@@ -91,32 +90,6 @@ function restBody(raw: Record<string, unknown>): Record<string, unknown> {
   return body;
 }
 
-function addressOf(value: string): string | null {
-  return parseMailAddress(value)?.address ?? null;
-}
-
-/**
- * 回复的收件人与主题（PR4b 的回复接口合入前基于现有发信）：来信回给 Reply-To 或发件人，自己发出的信回给原收件人；
- * replyAll 把原信其余的 To/Cc 放进抄送（去掉自己与已在 To 里的），不带原 Bcc。
- */
-export function replyEnvelope(original: MessageDetail, replyAll: boolean) {
-  const to: Array<string | { address: string; name: string }> = original.direction === 'outbound'
-    ? original.recipients.to
-    : original.replyTo?.length ? original.replyTo
-      : [original.fromName ? { address: original.fromAddress, name: original.fromName } : original.fromAddress];
-  const skip = new Set([original.address.toLowerCase(),
-    ...to.map((item) => (typeof item === 'string' ? addressOf(item) : item.address.toLowerCase()))]);
-  const cc: string[] = [];
-  if (replyAll) {
-    for (const item of [...original.recipients.to, ...original.recipients.cc]) {
-      const address = addressOf(item);
-      if (address && !skip.has(address)) { skip.add(address); cc.push(item); }
-    }
-  }
-  const subject = /^re:/i.test(original.subject.trim()) ? original.subject : `Re: ${original.subject}`;
-  return { to, cc, subject };
-}
-
 export const TOOLS: { [N in McpToolName]: ToolDefinition<N> } = {
   get_me: {
     title: '查看当前 Key',
@@ -184,29 +157,21 @@ export const TOOLS: { [N in McpToolName]: ToolDefinition<N> } = {
   },
   reply_email: {
     title: '回复邮件',
-    description: '回复一封邮件（先 GET /v1/messages/:id 读原信，再 POST /v1/messages；需要 mail.read 与 mail.send）。自动填写收件人（原信的 Reply-To，没有时为发件人；回复自己发出的信时为原收件人）、"Re: " 主题与线程头；from 默认是收到这封信的地址，共享给你的只读邮箱不能发信，此时用 from 指定自己的地址。replyAll=true 时把原信其他收件人放进抄送。text 与 html 至少一个，idempotencyKey 同 send_email。',
+    description: '回复一封邮件（POST /v1/messages/:id/reply，需要 mail.send 与 mail.read）。服务端按原信填写收件人（原信的 Reply-To，没有时为发件人；回复自己发出的信时为原收件人）、"Re: " 主题与线程头；quote 默认 true，在正文后附原信引用。from 默认是收到这封信的地址，共享给你的只读邮箱不能发信，此时返回 from_required，用 from 指定自己的地址。replyAll=true 时把原信其他收件人放进抄送（去掉自己的地址），不带原 Bcc。text 与 html 至少一个，idempotencyKey 同 send_email；要自定义收件人或主题改用 send_email 并带 replyToMessageId。',
     annotations: SENDS_MAIL,
     run: async (rest, args, raw) => {
-      const original = await rest<MessageDetail>({ method: 'GET', path: `/v1/messages/${args.messageId}` });
-      const envelope = replyEnvelope(original, args.replyAll);
-      const cc = [...envelope.cc, ...((raw.cc as unknown[] | undefined) ?? [])];
-      const body: Record<string, unknown> = { from: raw.from ?? original.address, to: envelope.to, subject: envelope.subject,
-        replyToMessageId: original.id, ...(cc.length ? { cc } : {}) };
-      for (const key of ['bcc', 'text', 'html', 'attachments', 'attachmentTokens', 'headers'] as const) {
-        if (raw[key] !== undefined) body[key] = raw[key];
-      }
-      return detailed(args.response_format, await rest<MessageSummary>({ method: 'POST', path: '/v1/messages', body,
-        idempotencyKey: args.idempotencyKey }), conciseSent);
+      const { messageId: _id, ...body } = restBody(raw);
+      return detailed(args.response_format, await rest<MessageSummary>({ method: 'POST', path: `/v1/messages/${args.messageId}/reply`,
+        body, idempotencyKey: args.idempotencyKey }), conciseSent);
     },
   },
   search_messages: {
     title: '列出与搜索邮件',
     description: '列出或搜索邮件（GET /v1/messages，需要 mail.read），按 id 从新到旧。q 搜主题、发件人与正文；address、domain、direction、unread、starred 收窄范围；afterId 只取 id 更大的邮件；nextCursor 不为 null 时把它作为 cursor 取下一页。摘要已带 preview、verificationCode 与 verificationLink，多数情况不必再读详情。',
     annotations: READ_ONLY,
-    run: async (rest, args) => {
-      const page = await rest<Page<MessageSummary>>({ method: 'GET', path: '/v1/messages', query: mcpSearchQuery(args) });
-      return args.response_format === 'detailed' ? page as unknown as Result : { items: page.items.map(conciseSummary), nextCursor: page.nextCursor };
-    },
+    run: async (rest, args) => detailed(args.response_format,
+      await rest<Page<MessageSummary>>({ method: 'GET', path: '/v1/messages', query: mcpSearchQuery(args) }),
+      (page) => ({ items: page.items.map(conciseSummary), nextCursor: page.nextCursor })),
   },
   get_message: {
     title: '读取邮件',
@@ -219,11 +184,9 @@ export const TOOLS: { [N in McpToolName]: ToolDefinition<N> } = {
     title: '等待新邮件',
     description: '等待下一封新来信（GET /v1/messages/wait，需要 mail.read），最长 timeout 秒（默认 25，最大 50）。先用 search_messages 取最新一封的 id 作为 afterId，再触发对方发信；命中时返回 id 大于 afterId、符合全部条件的最早一封，超时返回 message=null。无论是否命中，都用返回的 scannedThroughId 作为下一次的 afterId。等验证码时加 hasCode=true，并用 address、from 或 subjectContains 收窄范围；detailed 时命中的邮件带完整正文。',
     annotations: READ_ONLY,
-    run: async (rest, args) => {
-      const found = await rest<WaitMessageResult>({ method: 'GET', path: '/v1/messages/wait', query: mcpWaitQuery(args) });
-      return args.response_format === 'detailed' ? found as unknown as Result
-        : { message: found.message ? conciseSummary(found.message) : null, scannedThroughId: found.scannedThroughId };
-    },
+    run: async (rest, args) => detailed(args.response_format,
+      await rest<WaitMessageResult>({ method: 'GET', path: '/v1/messages/wait', query: mcpWaitQuery(args) }),
+      (found) => ({ message: found.message ? conciseSummary(found.message) : null, scannedThroughId: found.scannedThroughId })),
   },
 };
 

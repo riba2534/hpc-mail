@@ -18,27 +18,24 @@ import {
   type MessageSummary,
   type Page,
   type Role,
-  type SendAttachment,
   type StoredDraftContent,
 } from '@hpc-mail/shared';
 import { and, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { apiKeys, attachments as attachmentsTable, draftAttachments, drafts, idempotencyRecords, messages } from '../db/schema.js';
+import { apiKeys, draftAttachments, drafts, idempotencyRecords, messages } from '../db/schema.js';
+import { runLimited } from '../lib/concurrency.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { base64ToBytes } from '../lib/mime.js';
-import { decodeCursor, encodeCursor } from '../lib/pagination.js';
-import { makePreview } from '../lib/text.js';
+import { decodeCursor, toPage } from '../lib/pagination.js';
+import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
-import { beginIdempotentSend, failIdempotentSend, type IdempotencyActor } from './idempotency.js';
+import { normalizeIdempotencyKey, type IdempotencyActor } from './idempotency.js';
 import { readMailBody, storeMailBody } from './mail-body.js';
-import { summarize } from './message.js';
-import { attachmentDisposition, deliveryFailedError, releaseDeliveryLeases, sendMail, type Sender } from './outbound.js';
-import {
-  consumeDraftAttachments, draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment, resolveDraftAttachments,
-} from './upload.js';
+import { loadMessageSummary } from './message.js';
+import { attachmentDisposition, decodeInlineAttachments, type BytesAttachment, type Sender } from './outbound.js';
+import { deliverSend, inItemOrder, planOf, settledResult, type SendEnvironment } from './send-flow.js';
+import { draftKey, newDraftToken, releaseDraftStatements, releaseDrafts, reserveDraftAttachment } from './upload.js';
 import { fetchUrlAttachments, releaseUrlAttachments } from './url-attachment.js';
-import { emitSendResult } from './webhooks.js';
 
 type DraftRow = typeof drafts.$inferSelect;
 
@@ -68,10 +65,7 @@ export interface DraftActor {
 }
 
 /** 保存草稿时的请求环境：附件下载链接的 origin，URL 附件不能指向的本站主机 */
-export interface DraftRequestEnv {
-  origin: string;
-  selfHosts: string[];
-}
+export type DraftRequestEnv = Pick<SendEnvironment, 'origin' | 'selfHosts'>;
 
 /** 定时发送因 5xx 且确认未外发时最多尝试几次，之后标 failed */
 const MAX_SCHEDULED_ATTEMPTS = 3;
@@ -102,11 +96,6 @@ function conflictMessage(row: Pick<DraftRow, 'status' | 'version'>, action: '修
   return `草稿已被修改（当前版本 ${row.version}），请读取最新内容后再改`;
 }
 
-/** 合并后内容是否引用来源邮件（Key 需另有 mail.read） */
-export function referencesSource(content: Pick<StoredDraftContent, 'replyToMessageId' | 'forwardAttachmentsFrom'>): boolean {
-  return Boolean(content.replyToMessageId || content.forwardAttachmentsFrom);
-}
-
 // ---------- 读取 ----------
 
 function toSummary(row: DraftRow, apiKeyName: string | null): DraftSummary {
@@ -131,12 +120,8 @@ export async function listDrafts(env: Env, owner: DraftOwner, query: ListDraftsQ
     .where(and(ownedBy(owner), query.status ? eq(drafts.status, query.status) : undefined,
       cursorId ? lt(drafts.id, cursorId) : undefined))
     .orderBy(desc(drafts.id)).limit(query.limit + 1).all();
-  const hasMore = rows.length > query.limit;
-  const page = hasMore ? rows.slice(0, query.limit) : rows;
-  return {
-    items: page.map((row) => toSummary(row.draft, row.apiKeyName)),
-    nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.draft.id) : null,
-  };
+  const page = toPage(rows, query.limit, (row) => row.draft.id);
+  return { items: page.items.map((row) => toSummary(row.draft, row.apiKeyName)), nextCursor: page.nextCursor };
 }
 
 /** 草稿行与它引用的附件合成一次往返 */
@@ -202,12 +187,15 @@ function assertSendable(content: StoredDraftContent, text: string, html: string,
   }
 }
 
-/** 引用已有上传附件前核对：属于本人、已上传完成、没有被其他草稿引用 */
-async function assertUsableTokens(env: Env, userId: number, refs: AttachmentTokenRef[], draftId: number | null): Promise<void> {
+/**
+ * 引用已有上传附件前核对：属于本人、已上传完成、没有被其他草稿引用。返回它们的合计大小（新附件的预算从剩余额度里扣）。
+ */
+async function usableTokenBytes(env: Env, userId: number, refs: AttachmentTokenRef[], draftId: number | null): Promise<number> {
   const tokens = [...new Set(refs.map((ref) => ref.token))];
-  if (!tokens.length) return;
-  const rows = await createDb(env).select({ token: draftAttachments.token, status: draftAttachments.status, draftId: draftAttachments.draftId })
-    .from(draftAttachments).where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, tokens))).all();
+  if (!tokens.length) return 0;
+  const rows = await createDb(env).select({
+    token: draftAttachments.token, status: draftAttachments.status, draftId: draftAttachments.draftId, size: draftAttachments.size,
+  }).from(draftAttachments).where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, tokens))).all();
   const byToken = new Map(rows.map((row) => [row.token, row]));
   for (const token of tokens) {
     const row = byToken.get(token);
@@ -219,23 +207,16 @@ async function assertUsableTokens(env: Env, userId: number, refs: AttachmentToke
       });
     }
   }
-}
-
-/** 已引用附件的合计大小（新附件的预算从剩余额度里扣） */
-async function referencedBytes(env: Env, userId: number, refs: AttachmentTokenRef[]): Promise<number> {
-  if (!refs.length) return 0;
-  const rows = await createDb(env).select({ size: draftAttachments.size }).from(draftAttachments)
-    .where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, [...new Set(refs.map((ref) => ref.token))]))).all();
   return rows.reduce((sum, row) => sum + row.size, 0);
 }
 
 /** base64 附件转存为一份上传附件（同 POST /uploads，计入每人待发送附件配额） */
-async function storeBase64(env: Env, userId: number, item: SendAttachment, bytes: Uint8Array): Promise<string> {
+async function storeBase64(env: Env, userId: number, { filename, mimeType, bytes }: BytesAttachment): Promise<string> {
   const token = newDraftToken();
   const r2Key = draftKey(userId, token);
-  const rowId = await reserveDraftAttachment(env, { userId, token, filename: item.filename, mimeType: item.contentType, size: bytes.byteLength, r2Key });
+  const rowId = await reserveDraftAttachment(env, { userId, token, filename, mimeType, size: bytes.byteLength, r2Key });
   try {
-    await env.r2.put(r2Key, bytes, { httpMetadata: { contentType: item.contentType } });
+    await env.r2.put(r2Key, bytes, { httpMetadata: { contentType: mimeType } });
     await env.db.prepare(`UPDATE draft_attachments SET status = 'ready' WHERE id = ?`).bind(rowId).run();
   } catch (error) {
     await env.db.batch(releaseDraftStatements(env, [rowId])).catch((cause) => console.error('草稿附件转存失败后的清理登记失败:', cause));
@@ -258,25 +239,19 @@ async function materialize(
   if (!items.length) return [];
   const created: { token: string }[] = [];
   try {
-    const stored = new Map<SendAttachment, string>();
-    let total = usedBytes;
-    for (const item of items) {
-      if (isUrlAttachment(item)) continue;
-      let bytes: Uint8Array;
-      try { bytes = base64ToBytes(item.content); } catch { throw new AppError('validation_failed', '附件需为合法 base64'); }
-      total += bytes.byteLength;
-      if (total > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
-      const token = await storeBase64(env, userId, item, bytes);
-      created.push({ token });
-      stored.set(item, token);
-    }
+    // base64 与发信同一解码；合计超限时一个都不转存
+    const decoded = decodeInlineAttachments(items.filter((item) => !isUrlAttachment(item)));
+    const total = decoded.reduce((sum, att) => sum + att.bytes.byteLength, usedBytes);
+    if (total > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
+    for (const att of decoded) created.push({ token: await storeBase64(env, userId, att) });
+    const stored = [...created];
     const fetched = await fetchUrlAttachments(env, userId, items.filter(isUrlAttachment), {
       selfHosts: request.selfHosts, budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - total,
     });
     created.push(...fetched);
-    let remote = 0;
-    return items.map((item) => ({
-      token: isUrlAttachment(item) ? fetched[remote++]!.token : stored.get(item)!,
+    const tokens = inItemOrder<{ token: string }>(items, stored, fetched);
+    return items.map((item, index) => ({
+      token: tokens[index]!.token,
       ...(item.contentId ? { contentId: item.contentId } : {}),
       ...(item.disposition ? { disposition: item.disposition } : {}),
     }));
@@ -295,8 +270,7 @@ function attachmentRefStatements(env: Env, userId: number, draftId: number, toke
   const keep = unique.length ? `AND token NOT IN (${unique.map(() => '?').join(', ')})` : '';
   const stale = `user_id = ? AND draft_id = ? ${keep}`;
   return [
-    env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM draft_attachments WHERE ${stale}`).bind(userId, draftId, ...unique),
-    env.db.prepare(`DELETE FROM draft_attachments WHERE ${stale}`).bind(userId, draftId, ...unique),
+    ...releaseDrafts(env, stale, [userId, draftId, ...unique]),
     ...(unique.length ? [env.db.prepare(`UPDATE draft_attachments SET draft_id = ? WHERE user_id = ? AND (draft_id IS NULL OR draft_id = ?)
       AND token IN (${unique.map(() => '?').join(', ')})`).bind(draftId, userId, draftId, ...unique)] : []),
   ];
@@ -311,10 +285,8 @@ function bodyCleanupStatement(env: Env, key: string | null): D1PreparedStatement
 
 interface Prepared {
   content: StoredDraftContent;
-  text: string;
-  html: string;
-  /** 正文有改动时为新写入的正文列 */
-  body: Awaited<ReturnType<typeof storeMailBody>> | null;
+  /** 正文有改动时为新写入的正文列与摘要 */
+  body: (Awaited<ReturnType<typeof storeMailBody>> & { preview: string }) | null;
   /** 本次新转存的附件（保存失败时要释放） */
   created: AttachmentTokenRef[];
   replacesAttachments: boolean;
@@ -338,17 +310,18 @@ async function prepare(
   if (sendable) assertSendable({ ...content, attachmentTokens: kept }, text, html, replacesAttachments ? input.attachments : []);
   let created: AttachmentTokenRef[] = [];
   if (replacesAttachments) {
-    await assertUsableTokens(env, userId, kept, draftId);
-    created = await materialize(env, userId, input.attachments ?? [], await referencedBytes(env, userId, kept), request);
+    created = await materialize(env, userId, input.attachments ?? [], await usableTokenBytes(env, userId, kept, draftId), request);
   }
   let body: Prepared['body'] = null;
   if (input.text !== undefined || input.html !== undefined) {
-    try { body = await storeMailBody(env, text, html); }
+    // 摘要与 D1 搜索文本共用一次 HTML → 纯文本转换
+    const view = mailText(text, html);
+    try { body = { ...await storeMailBody(env, text, html, undefined, view), preview: view.preview() }; }
     catch (error) { await releaseUrlAttachments(env, userId, created); throw error; }
   }
   // 新转存的排在前面，与发信时 attachments 在 attachmentTokens 之前的顺序一致
   const attachmentTokens = replacesAttachments ? [...created, ...kept] : content.attachmentTokens;
-  return { content: { ...content, attachmentTokens }, text, html, body, created, replacesAttachments };
+  return { content: { ...content, attachmentTokens }, body, created, replacesAttachments };
 }
 
 /** 保存失败：释放本次转存的附件与写入的正文对象 */
@@ -371,13 +344,6 @@ function sendAtOf(input: DraftInput): Date | null | undefined {
     });
   }
   return new Date(input.sendAt);
-}
-
-function normalizeIdempotencyKey(value: string | undefined): string | null {
-  const key = value?.trim();
-  if (!key) return null;
-  if (key.length > 128 || !/^[\x21-\x7e]+$/.test(key)) throw new AppError('validation_failed', 'Idempotency-Key 必须是 1-128 位可见 ASCII 字符');
-  return key;
 }
 
 /** 同键已有草稿：同一请求体返回它（当前状态），不同请求体 409 */
@@ -414,7 +380,7 @@ export async function createDraft(
   }
   const sendAt = sendAtOf(input);
   const prepared = await prepare(env, actor.userId, null, { content: EMPTY_CONTENT, text: '', html: '' }, input, Boolean(sendAt), request);
-  const body = prepared.body ?? { bodyText: '', bodyHtml: '', bodyR2Key: null };
+  const body = prepared.body ?? { bodyText: '', bodyHtml: '', bodyR2Key: null, preview: '' };
   const now = Date.now();
   let id: number;
   try {
@@ -426,7 +392,7 @@ export async function createDraft(
       WHERE (SELECT COUNT(*) FROM drafts WHERE user_id = ? AND status <> 'sent') < ?
       RETURNING id`).bind(
       actor.userId, sendAt ? 'scheduled' : 'draft', JSON.stringify(prepared.content), body.bodyText, body.bodyHtml, body.bodyR2Key,
-      makePreview(prepared.text, prepared.html), sendAt ? sendAt.getTime() : null, actor.via, actor.apiKeyId,
+      body.preview, sendAt ? sendAt.getTime() : null, actor.via, actor.apiKeyId,
       sendAt ? actor.apiKeyId : null, sendAt ? 1 : 0, actor.userId, request.origin, storedKey, requestHash, now, now,
       actor.userId, MAX_DRAFTS_PER_USER,
     ).first<{ id: number }>();
@@ -464,9 +430,11 @@ export async function updateDraft(
   await authorize?.(mergeContent(row.content, input));
   const sendAt = sendAtOf(input);
   const status: DraftStatus = sendAt ? 'scheduled' : sendAt === null ? 'draft' : row.status;
-  // 只改部分字段又要保持（或进入）定时状态时，需要原正文一起做完整性校验
-  const needsBody = status === 'scheduled' && (input.text === undefined || input.html === undefined);
-  const current = needsBody ? await readMailBody(env, row) : { bodyText: row.bodyText, bodyHtml: row.bodyHtml };
+  // 原正文要读全文（D1 里可能只是搜索用的截断文本）：只改了 text、html 之一时另一段沿用原文重新落库；
+  // 只改部分字段又要保持（或进入）定时状态时，原正文要一起做完整性校验
+  const keepsPart = input.text === undefined || input.html === undefined;
+  const changesPart = input.text !== undefined || input.html !== undefined;
+  const current = keepsPart && (changesPart || status === 'scheduled') ? await readMailBody(env, row) : row;
   const prepared = await prepare(env, actor.userId, id, { content: row.content, text: current.bodyText, html: current.bodyHtml },
     input, status === 'scheduled', request);
   const db = createDb(env);
@@ -474,7 +442,7 @@ export async function updateDraft(
   const update = db.update(drafts).set({
     status,
     content: prepared.content,
-    ...(prepared.body ? { ...prepared.body, preview: makePreview(prepared.text, prepared.html) } : {}),
+    ...prepared.body,
     version: sql`${drafts.version} + 1`,
     updatedAt: new Date(),
     origin: request.origin,
@@ -519,8 +487,7 @@ export async function deleteDraft(env: Env, owner: DraftOwner, id: number): Prom
   const released = `user_id = ? AND draft_id = ? AND NOT EXISTS (SELECT 1 FROM drafts WHERE id = ?)`;
   const [deleted] = await env.db.batch([
     env.db.prepare(`DELETE FROM drafts WHERE id = ? AND user_id = ? AND status <> 'sending' RETURNING id`).bind(id, userId),
-    env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM draft_attachments WHERE ${released}`).bind(userId, id, id),
-    env.db.prepare(`DELETE FROM draft_attachments WHERE ${released}`).bind(userId, id, id),
+    ...releaseDrafts(env, released, [userId, id, id]),
     ...bodyCleanupStatement(env, row.bodyR2Key),
   ]);
   if (!deleted?.results.length) {
@@ -530,16 +497,6 @@ export async function deleteDraft(env: Env, owner: DraftOwner, id: number): Prom
 }
 
 // ---------- 发送 ----------
-
-async function messageSummaryOf(env: Env, messageId: number): Promise<MessageSummary | null> {
-  const db = createDb(env);
-  const [rows, files] = await db.batch([
-    db.select().from(messages).where(eq(messages.id, messageId)),
-    db.select({ id: attachmentsTable.id }).from(attachmentsTable).where(and(eq(attachmentsTable.messageId, messageId),
-      sql`NOT (${attachmentsTable.disposition} = 'inline' AND ${attachmentsTable.contentId} <> '')`)).limit(1),
-  ]);
-  return rows[0] ? summarize(rows[0], files.length > 0, false) : null;
-}
 
 type SendMode = 'now' | 'scheduled';
 
@@ -587,14 +544,13 @@ async function settle(env: Env, row: Pick<DraftRow, 'id' | 'attempt'>, outcome: 
  * 立即发送把错误原样抛给调用方（与 POST /messages 一致）；定时发送只记到草稿上。
  */
 async function performSend(
-  env: Env,
-  ctx: ExecCtx,
+  se: SendEnvironment,
   row: DraftRow,
   sender: Sender,
-  origin: string,
   mode: SendMode,
   previous: DraftStatus,
 ): Promise<MessageSummary | null> {
+  const { env } = se;
   let summary: MessageSummary;
   try {
     const body = await readMailBody(env, row);
@@ -606,26 +562,9 @@ async function performSend(
       });
     }
     const req: InternalSendMailRequest = parsed.data;
-    const idem = await beginIdempotentSend(env, { type: 'draft', id: row.id }, String(row.attempt), sendRequestFingerprint(req));
-    if (idem.kind === 'replay') {
-      summary = idem.response;
-    } else {
-      const leaseToken = crypto.randomUUID();
-      try {
-        const files = await resolveDraftAttachments(env, row.userId, req.attachmentTokens, leaseToken, { draftId: row.id });
-        summary = await sendMail(env, ctx, sender, req, files, origin, idem.handle, leaseToken);
-      } catch (error) {
-        // 投递开始后 sendMail 不再抛错；这里是投递前的异常，幂等记录按错误类型删除或标 failed，租约随之释放
-        await Promise.all([failIdempotentSend(env, idem.handle, error), releaseDeliveryLeases(env, leaseToken)]);
-        throw error;
-      }
-      // Webhook v2 的 mail.sent / mail.failed：与直接发信一样按发件行最终状态发
-      await emitSendResult(env, row.userId, summary.id, ctx);
-      if (summary.status !== 'failed') {
-        await consumeDraftAttachments(env, row.userId, req.attachmentTokens.map((ref) => ref.token))
-          .catch((error) => console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', error));
-      }
-    }
+    // 附件在保存时已转存为上传附件（draftSendInput 的 attachments 恒为空），发送时没有 URL 要拉取
+    summary = await deliverSend(se, { type: 'draft', id: row.id }, sender, String(row.attempt),
+      sendRequestFingerprint(req), async () => ({ ...planOf(req), draftId: row.id }));
   } catch (error) {
     const outcome = await failureOutcome(env, row, error, mode, previous);
     await settle(env, row, outcome).catch((cause) => console.error('草稿发送结果写回失败:', cause));
@@ -636,9 +575,7 @@ async function performSend(
   const failed = summary.status === 'failed';
   await settle(env, row, { status: failed ? 'failed' : 'sent', messageId: summary.id, errorDetail: summary.errorDetail })
     .catch((error) => console.error('草稿发送结果写回失败（邮件已处理，租约到期后按发件记录恢复）:', error));
-  if (failed && mode === 'now') {
-    throw deliveryFailedError(summary.id, summary.recipientOutcomes ?? [], summary.errorDetail || '全部收件人投递失败');
-  }
+  if (mode === 'now') return settledResult(summary);
   return failed ? null : summary;
 }
 
@@ -647,15 +584,14 @@ async function performSend(
  * authorize 在认领前按草稿内容做 scope 检查（Key 引用来源邮件需 mail.read）；expectedVersion 是审阅时的版本，不一致 409。
  */
 export async function sendDraftNow(
-  env: Env,
-  ctx: ExecCtx,
+  se: SendEnvironment,
   sender: Sender,
   id: number,
-  origin: string,
   authorize?: (content: StoredDraftContent) => void | Promise<void>,
   expectedVersion?: number,
   restrictedKeyId?: number | null,
 ): Promise<MessageSummary> {
+  const { env } = se;
   const db = createDb(env);
   const row = await db.select().from(drafts).where(and(eq(drafts.id, id), ownedBy({ userId: sender.userId, keyId: restrictedKeyId }))).get();
   if (!row) throw notFound();
@@ -666,7 +602,7 @@ export async function sendDraftNow(
       });
     }
     if (current.status === 'sent' && current.messageId) {
-      const summary = await messageSummaryOf(env, current.messageId);
+      const summary = await loadMessageSummary(env, current.messageId);
       if (summary) return summary;
     }
     throw stateConflict(current, current.status === 'sent' ? '草稿已发送，发件记录已不存在' : '草稿状态已变化，请重新读取');
@@ -685,7 +621,7 @@ export async function sendDraftNow(
     if (!current) throw notFound();
     return settled(current);
   }
-  return (await performSend(env, ctx, claimed, sender, origin, 'now', row.status))!;
+  return (await performSend(se, claimed, sender, 'now', row.status))!;
 }
 
 // ---------- 定时派发与恢复 ----------
@@ -722,13 +658,6 @@ function scheduleRevoked(
     if (!allowed) return '安排定时发送的 API Key 已不再覆盖这个发件地址，定时发送已取消，请确认后重新安排';
   }
   return null;
-}
-
-async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    for (let i = next++; i < items.length; i = next++) await task(items[i]!);
-  }));
 }
 
 /**
@@ -809,7 +738,7 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
     status: String(key.status), expiresAt: key.expires_at === null ? null : new Date(Number(key.expires_at)),
     mailboxIds: json(key.allowed_mailbox_ids).map(Number), domains: json(key.allowed_domains).map(String),
   }]));
-  await runPool(due, DISPATCH_CONCURRENCY, async (row) => {
+  await runLimited(due, DISPATCH_CONCURRENCY, async (row) => {
     try {
       const owner = ownerById.get(row.userId);
       const revoked = scheduleRevoked(row, owner, row.scheduledByKeyId !== null ? keyById.get(row.scheduledByKeyId) : undefined, senderOf(row), now);
@@ -819,7 +748,7 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
         return;
       }
       const sender = { userId: row.userId, role: owner!.role };
-      const summary = await performSend(env, ctx, row, sender, env.site_origin ?? row.origin, 'scheduled', 'scheduled');
+      const summary = await performSend({ env, ctx, origin: env.site_origin ?? row.origin, selfHosts: [] }, row, sender, 'scheduled', 'scheduled');
       if (summary) report.sent++;
       else report.failed++;
     } catch (error) {

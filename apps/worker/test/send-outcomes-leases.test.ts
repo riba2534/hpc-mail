@@ -231,6 +231,33 @@ describe('N16 send_email 报错分类', () => {
     const replay = await body(await call(runtime, '/v1/messages', json(owner.key, request, headers)), 422);
     expect(replay.error).toEqual(first.error);
   });
+
+  it('请求自带的附件并发写 R2：一个写失败时不再开始新的、不外发，写过的对象都登记清理', async () => {
+    const owner = await account('x2-att-upload');
+    const { runtime, send } = mailEnv();
+    const attempted: string[] = [];
+    const r2 = new Proxy(env.r2, {
+      get(target, prop) {
+        if (prop !== 'put') return Reflect.get(target, prop, target);
+        return async (key: string, value: unknown, options: unknown) => {
+          if (key.startsWith('att/')) {
+            attempted.push(key);
+            if (attempted.length === 2) throw new Error('R2 unavailable');
+          }
+          return target.put(key, value as ArrayBuffer, options as R2PutOptions);
+        };
+      },
+    });
+    const files = Array.from({ length: 8 }, (_, i) => ({ filename: `f${i}.txt`, contentType: 'text/plain', content: btoa(`file ${i}`) }));
+    const result = await body(await call({ ...runtime, r2 } as Env, '/v1/messages',
+      json(owner.key, { from: owner.address, to: ['r@example.net'], subject: 'x2 upload', text: 'x', attachments: files })), 422);
+    expect(result.error!.message).toContain('R2 unavailable');
+    expect(send).not.toHaveBeenCalled();
+    expect(attempted.length).toBeLessThan(files.length);
+    const queued = await env.db.prepare(`SELECT r2_key FROM storage_cleanup_jobs WHERE r2_key IN (${attempted.map(() => '?').join(', ')})`)
+      .bind(...attempted).all<{ r2_key: string }>();
+    expect(queued.results.map((row) => row.r2_key).sort()).toEqual([...attempted].sort());
+  });
 });
 
 describe('N16 中断外发的 cron 收尾', () => {

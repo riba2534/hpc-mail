@@ -167,6 +167,17 @@ describe('草稿的增删改查与权限', () => {
     await data(await call(`/v1/drafts/${created.id}`, req(me.key, 'PATCH', { html: '<p>short</p>' })));
     const job = await env.db.prepare('SELECT COUNT(*) AS n FROM storage_cleanup_jobs WHERE r2_key = ?').bind(stored!.bodyR2Key).first<{ n: number }>();
     expect(job!.n).toBe(1);
+
+    // 只改一段时另一段按全文沿用：D1 里只有截断的搜索文本（只有 HTML 时还是 HTML 转出的文字），不能当成原文写回
+    const text = '文'.repeat(5000);
+    const longText = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { text, html })), 201);
+    const patched = await data<Draft>(await call(`/v1/drafts/${longText.id}`, req(me.key, 'PATCH', { html: '<p>short</p>' })));
+    expect([patched.text, patched.html]).toEqual([text, '<p>short</p>']);
+    const htmlOnly = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { html })), 201);
+    const retexted = await data<Draft>(await call(`/v1/drafts/${htmlOnly.id}`, req(me.key, 'PATCH', { text: 'plain' })));
+    expect([retexted.text, retexted.html]).toEqual(['plain', html]);
+    const rehtml = await data<Draft>(await call(`/v1/drafts/${htmlOnly.id}`, req(me.key, 'PATCH', { html: '<p>x</p>' })));
+    expect([rehtml.text, rehtml.html]).toEqual(['plain', '<p>x</p>']);
   });
 });
 
@@ -415,6 +426,13 @@ describe('限定范围的 Key（PR4a）', () => {
     expect(denied.message).toContain('限定了可用的邮箱或域名');
     const mine = await data<Draft>(await call('/v1/drafts', req(me.narrowKey, 'POST', complete(me.address, 'n1@hpc.email'))), 201);
     expect((await failure(await call(`/v1/drafts/${mine.id}`, req(me.narrowKey, 'PATCH', { from: me.other })), 403)).code).toBe('forbidden');
+    // 回复、转发引用的来源邮件同样要在范围内
+    const hidden = (await db.insert(messages).values({ direction: 'inbound', address: me.other, domain: 'hpc.email',
+      fromAddress: 'x@ext.test', subject: 'hidden', preview: '', status: 'received' }).returning({ id: messages.id }))[0]!.id;
+    for (const ref of [{ replyToMessageId: hidden }, { forwardAttachmentsFrom: hidden }]) {
+      expect((await failure(await call('/v1/drafts', req(me.narrowKey, 'POST', complete(me.address, 'n1@hpc.email', ref))), 403)).code).toBe('forbidden');
+      expect((await failure(await call(`/v1/drafts/${mine.id}`, req(me.narrowKey, 'PATCH', ref)), 403)).code).toBe('forbidden');
+    }
     const web = await data<Draft>(await call('/api/drafts', req(me.jwt, 'POST', complete(me.other, 'n2@hpc.email'))), 201);
     const listed = await data<Page<DraftSummary>>(await call('/v1/drafts', req(me.narrowKey, 'GET')));
     expect(listed.items.map((item) => item.id)).toEqual([mine.id]);

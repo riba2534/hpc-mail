@@ -28,19 +28,19 @@ export function newDraftToken(): string {
  */
 export async function reserveDraftAttachment(
   env: Env,
-  input: { userId: number; token: string; filename: string; mimeType: string; size: number; r2Key: string; status?: 'uploading' | 'ready' },
+  input: { userId: number; token: string; filename: string; mimeType: string; size: number; r2Key: string },
 ): Promise<number> {
   const inserted = await env.db
     .prepare(
       `INSERT INTO draft_attachments
-        (user_id, token, filename, mime_type, size, r2_key, status)
-       SELECT ?, ?, ?, ?, ?, ?, ?
+        (user_id, token, filename, mime_type, size, r2_key)
+       SELECT ?, ?, ?, ?, ?, ?
        WHERE (SELECT COUNT(*) FROM draft_attachments WHERE user_id = ?) < ?
          AND COALESCE((SELECT SUM(size) FROM draft_attachments WHERE user_id = ?), 0) + ? <= ?
        RETURNING id`,
     )
     .bind(
-      input.userId, input.token, input.filename, input.mimeType, input.size, input.r2Key, input.status ?? 'uploading',
+      input.userId, input.token, input.filename, input.mimeType, input.size, input.r2Key,
       input.userId, MAX_DRAFT_ATTACHMENTS_PER_USER,
       input.userId, input.size, MAX_DRAFT_ATTACHMENT_BYTES_PER_USER,
     )
@@ -125,7 +125,7 @@ export async function resolveDraftAttachments(
  * 删除草稿行并在同一事务里登记清理台账。对象可能已被发出（包括全部失败而保留的）邮件的附件行直接引用，
  * 由 processStorageCleanup 按引用判断是否真删；绑定参数不超过 90 个。
  */
-function releaseDrafts(env: Env, where: string, params: unknown[]): D1PreparedStatement[] {
+export function releaseDrafts(env: Env, where: string, params: unknown[]): D1PreparedStatement[] {
   return [
     env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM draft_attachments WHERE ${where}`).bind(...params),
     env.db.prepare(`DELETE FROM draft_attachments WHERE ${where}`).bind(...params),

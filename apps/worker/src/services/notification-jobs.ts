@@ -18,7 +18,7 @@ import { sendPushDeerNotification } from './pushdeer.js';
 import { dayWindow } from './rate-counter.js';
 import { sendNotifyWebhook, type WebhookMailPayload } from './webhook-notify.js';
 import { mailReceivedDeliveriesStatement, processWebhookDeliveries } from './webhooks.js';
-import { getJson } from './storage.js';
+import { readMailBody } from './mail-body.js';
 
 type Channel = typeof notificationJobs.$inferSelect.channel;
 /** 邮箱转发实际走的通道：native 原生 forward()、relay 中转；跳过或失败前未选定通道为空串 */
@@ -151,13 +151,7 @@ export async function repairUnqueuedNotifications(env: Env, options: { limit?: n
       const body = await env.db.prepare('SELECT body_text, body_html, body_r2_key FROM messages WHERE id = ?')
         .bind(row.id).first<{ body_text: string; body_html: string; body_r2_key: string | null }>();
       if (!body) continue;
-      let text = body.body_text;
-      let html = body.body_html;
-      if (body.body_r2_key) {
-        const full = await getJson<{ text?: string; html?: string }>(env, body.body_r2_key);
-        if (typeof full?.text === 'string') text = full.text;
-        if (typeof full?.html === 'string') html = full.html;
-      }
+      const { bodyText: text, bodyHtml: html } = await readMailBody(env, { bodyText: body.body_text, bodyHtml: body.body_html, bodyR2Key: body.body_r2_key });
       queued += (await enqueueMailNotifications(env, null, { ownerIds: ownerIds as number[],
         message: { id: row.id, address: row.address, fromAddress: row.from_address, fromName: row.from_name,
           subject: row.subject, verificationCode: row.verification_code, verificationLink: row.verification_link ?? '', preview: row.preview,

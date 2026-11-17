@@ -37,7 +37,7 @@ import { ATTACHMENT_BUCKET_SECONDS, sha256Hex, signAttachment } from '../lib/cry
 import { etagMatches } from '../lib/etag.js';
 import { chunk, D1_ID_BATCH, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
-import { countsAsAttachment } from '../lib/attachment-rule.js';
+import { COUNTS_AS_ATTACHMENT, countsAsAttachment } from '../lib/attachment-rule.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
 import { detectPromptInjection, extractReplyText } from '../lib/agent-text.js';
 import { mailText, PREVIEW_LIMIT } from '../lib/text.js';
@@ -324,7 +324,7 @@ function addressCountAtMost(db: Db, ownerId: number, access: ScopeAccess, domain
     .where(and(eq(mailboxes.userId, ownerId), domain === undefined ? undefined : eq(mailboxes.domain, domain)));
   const set = access === 'owned' ? owned.limit(max + 1) : unionAll(owned, db.select({ one: sql`1` }).from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
-    .where(and(eq(mailboxShares.userId, ownerId), domain === undefined ? undefined : sql`+${mailboxes.domain} = ${domain}`)))
+    .where(and(eq(mailboxShares.userId, ownerId), mailboxOnDomain(domain))))
     .limit(max + 1);
   return sql`(SELECT count(*) FROM ${set}) <= ${max}`;
 }
@@ -385,6 +385,20 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
 }
 
 /**
+ * 按 id 读一封邮件的摘要，不做可见性判断、星标按未加星：幂等记录恢复重放结果与草稿重放发送结果共用。
+ * 行与附件标记同一个 batch。
+ */
+export async function loadMessageSummary(env: Env, messageId: number): Promise<MessageSummary | null> {
+  const db = createDb(env);
+  const [rows, files] = await db.batch([
+    db.select().from(messages).where(eq(messages.id, messageId)),
+    db.select({ id: attachmentsTable.id }).from(attachmentsTable)
+      .where(and(eq(attachmentsTable.messageId, messageId), COUNTS_AS_ATTACHMENT)).limit(1),
+  ]);
+  return rows[0] ? summarize(rows[0], files.length > 0, false) : null;
+}
+
+/**
  * 列表、sync、wait 行的附件与星标标记：相关子查询随行取回，不再取页后另查一次（少一次 D1 往返）。
  * 附件口径同 lib/attachment-rule 的 COUNTS_AS_ATTACHMENT（内嵌图不算附件）。单表查询里 drizzle 把选择列中的
  * 列对象输出成不带表名的标识符，子查询里会被解析成内层表，所以外层写全限定名 "messages"."id"、内层用别名
@@ -392,11 +406,19 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
  */
 function flagColumns(userId: number) {
   return {
-    hasAttachments: sql<boolean>`EXISTS (SELECT 1 FROM attachments AS flag_att
-      WHERE flag_att.message_id = "messages"."id" AND NOT (flag_att.disposition = 'inline' AND flag_att.content_id <> ''))`
-      .mapWith(Boolean),
+    hasAttachments: sql<boolean>`${attachmentExists('flag_att')}`.mapWith(Boolean),
     isStarred: starredColumn(userId),
   };
+}
+
+/**
+ * 邮件有算作附件的附件行：COUNTS_AS_ATTACHMENT 的手写形式（内嵌图不算附件），标记列与 hasAttachments 筛选共用。
+ * 外层写全限定名、内层用别名，原因见上；别名按用途区分，EXPLAIN 回归据此分辨是哪一处走了索引。
+ */
+function attachmentExists(alias: 'flag_att' | 'filter_att'): SQL {
+  const att = sql.raw(alias);
+  return sql`EXISTS (SELECT 1 FROM attachments AS ${att}
+    WHERE ${att}.message_id = "messages"."id" AND NOT (${att}.disposition = 'inline' AND ${att}.content_id <> ''))`;
 }
 
 /**
@@ -451,11 +473,8 @@ function listFilterConditions(query: ListMessagesQuery): SQL[] {
     conds.push(sql`((${messages.direction} = 'inbound' and ${inboundAddress}) or ${inRecipients})`);
   }
   if (query.hasCode) conds.push(sql`${messages.verificationCode} <> ''`);
-  if (query.hasAttachments) {
-    // 与列表 hasAttachments（flagColumns）同一口径：带 Content-ID 的内联图不算附件
-    conds.push(sql`exists (select 1 from attachments as filter_att where filter_att.message_id = ${messages.id}
-      and not (filter_att.disposition = 'inline' and filter_att.content_id <> ''))`);
-  }
+  // 与列表 hasAttachments（flagColumns）同一口径：带 Content-ID 的内联图不算附件
+  if (query.hasAttachments) conds.push(attachmentExists('filter_att'));
   return conds;
 }
 
@@ -661,13 +680,14 @@ export async function findNextMessage(
     if (input.include === 'body') {
       // 两次读取之间被删除、移入回收站或失去可见性（共享撤销、释放、过户）的不再以详情返回：
       // 它已不在等待范围内，游标越过它继续往后找
-      const [[full], attRows, starRows] = await db.batch([
-        db.select().from(messages).where(and(eq(messages.id, row.id), eq(messages.direction, 'inbound'), isNull(messages.deletedAt), ...visible)),
-        ...detailExtras(db, viewer.userId, row.id),
+      const [[full], attRows] = await db.batch([
+        db.select({ ...messageColumns, isStarred: starredColumn(viewer.userId) }).from(messages)
+          .where(and(eq(messages.id, row.id), eq(messages.direction, 'inbound'), isNull(messages.deletedAt), ...visible)),
+        attachmentRowsQuery(db, row.id),
       ]);
       if (!full) { scannedThroughId = row.id; continue; }
       const body = await readMailBody(env, full);
-      return { message: await buildDetail(env, full, body, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
+      return { message: await buildDetail(env, full, body, attRows, full.isStarred, attachmentTtlSeconds), scannedThroughId: row.id };
     }
     return { message: summary, scannedThroughId: row.id };
   }
@@ -703,9 +723,11 @@ function unreadCountQuery(db: Db, userId: number, role: Role, cap?: number, rest
     isNull(messages.deletedAt),
     restrictCondition(restrict),
   );
-  if (cap === undefined) return db.select({ value: count() }).from(messages).where(where);
+  // 列名写成 value：markMessagesAndCount 把它放进原生 batch，按列名取结果
+  const value = count().as('value');
+  if (cap === undefined) return db.select({ value }).from(messages).where(where);
   const capped = db.select({ one: sql`1`.as('one') }).from(messages).where(where).limit(cap).as('capped');
-  return db.select({ value: count() }).from(capped);
+  return db.select({ value }).from(capped);
 }
 
 /** 近期联系人：从可见邮件聚合收件人(outbound)与发件人(inbound)地址，供写信自动补全 */
@@ -946,28 +968,18 @@ export async function loadSourceMessage(
 }
 
 /**
- * 回复/转发接口按原信生成收件人、主题与引用：可见口径与错误同 loadSourceMessage（整行与可见性一条语句），
- * 另带完整正文（含 R2 中的大正文）。
+ * 回复/转发接口按原信生成收件人、主题与引用：可见口径与错误同 loadSourceMessage（整行与可见性一条语句）。
+ * 返回 D1 整行，正文列可能只是搜索用的截断文本：要引用原文时调用方另经 readMailBody 读全文。
  */
-export async function loadSourceContent(
+export function loadSourceContent(
   env: Env,
   sender: { userId: number; role: Role },
   id: number,
   unavailableMessage: string,
   source: 'reply' | 'forward',
 ): Promise<MessageRow> {
-  const db = createDb(env);
-  const viewer: Viewer = { userId: sender.userId, role: sender.role };
-  const scope = resolveScope(viewer);
-  const row = await db
-    .select({ ...messageColumns, ...visibilityColumns(viewer, scope) })
-    .from(messages)
-    .where(eq(messages.id, id))
-    .get();
-  if (!row || !isVisible(viewer, scope, row, row)) {
-    throw new AppError('source_unavailable', unavailableMessage, { details: { source } });
-  }
-  return { ...row, ...(await readMailBody(env, row)) };
+  return loadVisible(env, { userId: sender.userId, role: sender.role }, id,
+    () => new AppError('source_unavailable', unavailableMessage, { details: { source } }));
 }
 
 const messageColumns = getTableColumns(messages);
@@ -982,22 +994,21 @@ function starredColumn(userId: number) {
     WHERE flag_star.user_id = ${userId} AND flag_star.message_id = "messages"."id")`.mapWith(Boolean);
 }
 
-/** 线程行：摘要列 + 邮件头 + 附件与星标标记；附件口径同 COUNTS_AS_ATTACHMENT（内嵌图不算附件） */
+/** 线程行：摘要列 + 邮件头 + 附件与星标标记（同列表，见 flagColumns） */
 function threadColumns(userId: number) {
-  return {
-    ...threadSelection,
-    hasAttachments: sql<boolean>`EXISTS (SELECT 1 FROM attachments AS flag_att
-      WHERE flag_att.message_id = "messages"."id" AND NOT (flag_att.disposition = 'inline' AND flag_att.content_id <> ''))`
-      .mapWith(Boolean),
-    isStarred: starredColumn(userId),
-  };
+  return { ...threadSelection, ...flagColumns(userId) };
 }
 
 /**
- * 取一封可见邮件的整行（含正文）与可见性事实，一次往返；不可见与不存在同为 not_found。
- * 翻译等只需要文字内容的读取用它。
+ * 取一封可见邮件的整行（D1 正文列）与可见性事实，一次往返；不可见与不存在抛同一个错误（默认 not_found）。
+ * 翻译、回复/转发的来源邮件等需要文字内容的读取用它，完整正文另经 readMailBody。
  */
-async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
+async function loadVisible(
+  env: Env,
+  viewer: Viewer,
+  id: number,
+  unavailable: () => AppError = () => new AppError('not_found', '邮件不存在'),
+): Promise<MessageRow> {
   const db = createDb(env);
   const scope = resolveScope(viewer);
   const row = await db
@@ -1005,7 +1016,7 @@ async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<Messag
     .from(messages)
     .where(eq(messages.id, id))
     .get();
-  if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
+  if (!row || !isVisible(viewer, scope, row, row)) throw unavailable();
   return row;
 }
 
@@ -1046,12 +1057,9 @@ export async function getMessageContent(
   return { subject: row.subject, ...(await readMailBody(env, row)) };
 }
 
-/** 详情所需的附件全行与当前用户星标，调用方放进同一次 batch */
-function detailExtras(db: Db, userId: number, id: number) {
-  return [
-    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)),
-    db.select({ messageId: stars.messageId }).from(stars).where(and(eq(stars.userId, userId), eq(stars.messageId, id))),
-  ] as const;
+/** 详情所需的附件全行（按 id 有序），调用方与整行（星标随行取回）放进同一次 batch */
+function attachmentRowsQuery(db: Db, id: number) {
+  return db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).orderBy(asc(attachmentsTable.id));
 }
 
 /** 由已确认可见的整行与完整正文（readMailBody）组装详情：附件签名 URL、CID 内联图替换 */
@@ -1141,7 +1149,7 @@ export async function getMessageDetailConditional(
   const [[row], attRows] = await db.batch([
     db.select({ ...messageColumns, ...visibilityColumns(viewer, scope), isStarred: starredColumn(viewer.userId) })
       .from(messages).where(eq(messages.id, id)),
-    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).orderBy(asc(attachmentsTable.id)),
+    attachmentRowsQuery(db, id),
   ]);
   if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
   const etag = await detailEtag(env, viewer, row, attRows, row.isStarred, options.attachmentTtlSeconds);
@@ -1241,9 +1249,31 @@ export async function markMessages(
   ids: number[],
   isRead: boolean,
 ): Promise<number> {
+  return (await markMessagesAndCount(env, viewer, ids, isRead)).changed;
+}
+
+/**
+ * 同 markMessages；给了 unreadCap 时在同一个 batch（同一事务）里接着数标记后调用者自己的未读数
+ * （同 countUnread 口径，封顶），详情页标已读不必再单独请求一次未读数。
+ */
+export async function markMessagesAndCount(
+  env: Env,
+  viewer: Viewer,
+  ids: number[],
+  isRead: boolean,
+  unreadCap?: number,
+): Promise<{ changed: number; unread?: number }> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  return runInChunks(env, ids, (batch) => db.update(messages).set({ isRead }).where(scopedIdsCondition(db, scope, batch, viewer.restrict)));
+  const updates = chunk(ids).map((batch) =>
+    d1Statement(env, db.update(messages).set({ isRead }).where(scopedIdsCondition(db, scope, batch, viewer.restrict))));
+  const count = unreadCap === undefined
+    ? undefined : d1Statement(env, unreadCountQuery(db, viewer.userId, viewer.role, unreadCap, viewer.restrict));
+  const statements = count ? [...updates, count] : updates;
+  if (!statements.length) return { changed: 0 };
+  const results = await env.db.batch<{ value: number }>(statements);
+  const changed = results.slice(0, updates.length).reduce((sum, result) => sum + (result.meta.changes ?? 0), 0);
+  return count ? { changed, unread: Number(results.at(-1)!.results[0]?.value ?? 0) } : { changed };
 }
 
 /**
