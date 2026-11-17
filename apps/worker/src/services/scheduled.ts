@@ -42,8 +42,8 @@ import { cleanupExpiredSuppressions } from './suppression.js';
 import { syncDueOnboarding } from './system-domain.js';
 import { SYSTEM_DOMAIN_CF_SCOPE, SYSTEM_DOMAIN_CF_WINDOW_MINUTES } from './zone-catalog.js';
 
-const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const NINETY_DAYS_MS = 90 * DAY_MS;
 /**
  * 幂等记录保留：已完成的 2 天（按创建时间）；仍是 pending、但发件行已终态的同样保留 2 天（按最后更新时间），
  * 保留期内同 Key 重试仍被拦下，不会当成新请求重发；失败的 7 天。
@@ -173,6 +173,8 @@ async function step(report: StepReport[], name: string, task: () => Promise<numb
 
 /** 草稿定时发送的 cron：每分钟只派发到期的草稿与恢复中断的发送，不跑其他步骤，也不写 cron 心跳（心跳由 5 分钟任务负责） */
 export const DRAFT_DISPATCH_CRON = '* * * * *';
+/** 每日维护的 cron（UTC 16:00）；其余 cron（每 5 分钟）跑常规步骤。与 wrangler.toml 的 crons 一致 */
+export const MAINTENANCE_CRON = '0 16 * * *';
 
 /** 定时发送的精度由它决定：到点后 1 分钟内发出（cron 本身可能再晚几十秒） */
 export async function runDraftDispatch(env: Env, ctx: ExecCtx): Promise<void> {
