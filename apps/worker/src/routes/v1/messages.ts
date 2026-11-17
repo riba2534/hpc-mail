@@ -4,6 +4,7 @@ import {
   markReadRequestSchema,
   MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
   internalSendMailSchema,
+  sendRequestFingerprint,
   starMessagesRequestSchema,
   markAllReadRequestSchema,
   waitMessagesQuerySchema,
@@ -64,25 +65,28 @@ app.post('/', async (c) => {
     c.env,
     { type: 'api_key', id: key.id },
     c.req.header('Idempotency-Key'),
-    req,
+    sendRequestFingerprint(req),
   );
   if (idem.kind === 'replay') return ok(c, idem.response, 201);
+  // 过渡：sendMail 尚未接入显示名、replyTo、headers 与内联附件，先按旧形状传地址与 token
+  const tokens = req.attachmentTokens.map((ref) => ref.token);
+  const legacy = { ...req, to: req.to.map((a) => a.address), cc: req.cc.map((a) => a.address), bcc: req.bcc.map((a) => a.address) };
   try {
     const attachments = [...decodeInlineAttachments(req.attachments),
-      ...await resolveDraftAttachments(c.env, key.userId, req.attachmentTokens)];
+      ...await resolveDraftAttachments(c.env, key.userId, tokens)];
     const origin = new URL(c.req.url).origin;
     const summary = await sendMail(
       c.env,
       c.executionCtx,
       { userId: key.userId, role: key.role },
-      req,
+      legacy,
       attachments,
       origin,
       idem.handle,
     );
     try { await completeIdempotentSend(c.env, idem.handle, summary); }
     catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
-    try { await consumeDraftAttachments(c.env, key.userId, req.attachmentTokens); }
+    try { await consumeDraftAttachments(c.env, key.userId, tokens); }
     catch (error) { console.error('已发送邮件的草稿回收延迟:', error); }
     return ok(c, summary, 201);
   } catch (error) {
@@ -186,7 +190,8 @@ app.get('/wait', async (c) => {
       if (signal.aborted) return empty();
       polls++;
       const found = await findNextMessage(c.env, viewer, {
-        afterId: cursor, address: query.address,
+        // 过渡：多地址、domain 与 include=body 由 wait 增强接入
+        afterId: cursor, address: query.address?.[0],
         from: query.from, subjectContains: query.subjectContains, hasCode: query.hasCode,
       });
       cursor = found.scannedThroughId;

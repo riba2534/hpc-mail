@@ -1,6 +1,7 @@
 import {
   deleteMessagesRequestSchema,
   internalSendMailSchema,
+  sendRequestFingerprint,
   listMessagesQuerySchema,
   markReadRequestSchema,
   markAllReadRequestSchema,
@@ -82,21 +83,24 @@ app.post('/send', async (c) => {
     c.env,
     { type: 'user', id: user.id },
     c.req.header('Idempotency-Key'),
-    req,
+    sendRequestFingerprint(req),
   );
   if (idem.kind === 'replay') return ok(c, idem.response, 201);
+  // 过渡：sendMail 尚未接入显示名、replyTo、headers 与内联附件，先按旧形状传地址与 token
+  const tokens = req.attachmentTokens.map((ref) => ref.token);
+  const legacy = { ...req, to: req.to.map((a) => a.address), cc: req.cc.map((a) => a.address), bcc: req.bcc.map((a) => a.address) };
   let summary: MessageSummary;
   try {
     // 兼容两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端），合并后送 sendMail
     const decoded = decodeInlineAttachments(req.attachments);
-    const fromTokens = await resolveDraftAttachments(c.env, user.id, req.attachmentTokens);
+    const fromTokens = await resolveDraftAttachments(c.env, user.id, tokens);
     const attachments = [...decoded, ...fromTokens];
     const origin = new URL(c.req.url).origin;
     summary = await sendMail(
       c.env,
       c.executionCtx,
       { userId: user.id, role: user.role },
-      req,
+      legacy,
       attachments,
       origin,
       idem.handle,
@@ -112,7 +116,7 @@ app.post('/send', async (c) => {
   // 「发送失败，请重试」，用户一重发、token 又还在，收件人就收到两封。回收失败留给
   // 24h 的草稿清理任务兜底
   try {
-    await consumeDraftAttachments(c.env, user.id, req.attachmentTokens);
+    await consumeDraftAttachments(c.env, user.id, tokens);
   } catch (e) {
     console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', e);
   }

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  type Role,
   API_SCOPES,
   DEFAULT_API_RATE_LIMIT,
   MAX_API_RATE_LIMIT,
@@ -54,6 +55,41 @@ export interface ApiKeySummary {
   createdAt: string;
   /** admin 全站视图返回 */
   ownerUsername?: string;
+}
+
+/**
+ * GET /v1/me：当前 Key 与所属用户的自查信息。只读，任何有效 Key 都能调用（不要求 scope）。
+ */
+export interface ApiKeySelf {
+  key: {
+    id: number;
+    name: string;
+    keyPrefix: string;
+    keySuffix: string;
+    scopes: ApiScope[];
+    /** 本 Key 每分钟请求上限 */
+    rateLimit: number;
+    allowedIps: string[];
+    expiresAt: string | null;
+    createdAt: string;
+  };
+  user: { id: number; username: string; role: Role };
+  limits: {
+    /** 同一用户全部 Key 合计的每分钟请求上限 */
+    userRequestsPerMinute: number;
+    /** /v1/messages/wait 每用户每分钟轮询次数上限 */
+    waitPollsPerMinute: number;
+  };
+  /** 今日（UTC 自然日）外发用量。上限为 0 表示不限；管理员不受外发配额约束（exempt=true，上限按 0 返回） */
+  outbound: {
+    sent: number;
+    recipients: number;
+    dailyLimit: number;
+    dailyRecipientLimit: number;
+    exempt: boolean;
+    /** 下一个 UTC 零点（ISO） */
+    resetsAt: string;
+  };
 }
 
 export interface CreatedApiKey extends ApiKeySummary {

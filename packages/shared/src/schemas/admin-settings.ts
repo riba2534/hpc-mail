@@ -1,5 +1,7 @@
 import { z } from 'zod';
-import { DEFAULT_RESERVED_LOCAL_PARTS, REGISTRATION_MODES } from '../constants.js';
+import {
+  DEFAULT_RELAY_DAILY_LIMIT, DEFAULT_RELAY_PER_USER_DAILY_LIMIT, DEFAULT_RESERVED_LOCAL_PARTS, REGISTRATION_MODES,
+} from '../constants.js';
 import { emailAddressSchema } from './mail.js';
 import { domainSchema } from './mailbox.js';
 
@@ -99,6 +101,10 @@ export const quotaSettingSchema = z.object({
   dailyOutbound: z.number().int().min(0).max(100000),
   /** 普通用户每日外发唯一收件人（站内 + 站外）总数上限 */
   dailyRecipients: z.number().int().min(0).max(1000000),
+  /** 转发中转（no-reply@收件域名 重发）全站每日上限，含管理员（0=不限） */
+  relayDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_DAILY_LIMIT),
+  /** 转发中转按归属人每日上限，含管理员（0=不限） */
+  relayPerUserDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_PER_USER_DAILY_LIMIT),
 });
 
 /** 邮箱认领策略：保留前缀防身份冒充 + 每用户认领上限防囤积（admin 豁免） */
@@ -214,7 +220,10 @@ export const DEFAULT_SETTINGS: Settings = {
   // 保留策略默认关闭（0），避免升级即意外删除历史邮件；管理员按需开启（建议未认领 90 天）
   retention: { unclaimedDays: 0, allMessagesDays: 0 },
   // 外发配额默认对普通用户生效（admin 豁免），防脚本群发
-  quota: { dailyOutbound: 200, dailyRecipients: 500 },
+  quota: {
+    dailyOutbound: 200, dailyRecipients: 500,
+    relayDaily: DEFAULT_RELAY_DAILY_LIMIT, relayPerUserDaily: DEFAULT_RELAY_PER_USER_DAILY_LIMIT,
+  },
   mailbox_policy: {
     perUserLimit: 50,
     reservedLocalParts: [...DEFAULT_RESERVED_LOCAL_PARTS],
@@ -246,7 +255,8 @@ export const updateSettingsRequestSchema = z
   .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',
   });
-export type UpdateSettingsRequest = z.infer<typeof updateSettingsRequestSchema>;
+/** 输入形状：带缺省值的字段可省略（updateSettings 会逐项按 SETTING_SCHEMAS 重新解析补齐） */
+export type UpdateSettingsRequest = z.input<typeof updateSettingsRequestSchema>;
 
 /** 管理员查看的每域 Claude 统计（GET /api/admin/settings/domain-claude-stats），根据历史来信判定 */
 export interface DomainClaudeStats {

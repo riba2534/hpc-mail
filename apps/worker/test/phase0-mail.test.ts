@@ -253,10 +253,10 @@ describe('R09 发信引用来源邮件需要读取权限与可见性', () => {
       for (const [field, message] of Object.entries(unavailable)) {
         const subject = `r09-hidden-${rand()}`;
         expect(await failure(await send(owner.key, owner.localPart, { subject, [field]: source }), 404), `${field}=${source}`)
-          .toEqual({ code: 'source_unavailable', message });
+          .toMatchObject({ code: 'source_unavailable', message });
         expect(await failure(await request('/api/messages/send', json(owner.jwt, {
           from: { localPart: owner.localPart, domain: 'hpc.email' }, to: [`r09-sink-${rand()}@hpc.email`], text: 'body', subject, [field]: source,
-        })), 404), `/api ${field}=${source}`).toEqual({ code: 'source_unavailable', message });
+        })), 404), `/api ${field}=${source}`).toMatchObject({ code: 'source_unavailable', message });
         expect(await outboundCount(subject)).toBe(0);
       }
     }
@@ -265,7 +265,7 @@ describe('R09 发信引用来源邮件需要读取权限与可见性', () => {
     const broken = await mail(owner.address, { subject: 'Broken original' });
     await createDb(env).insert(attachments).values({ messageId: broken, r2Key: `att/${broken}/gone`, filename: 'gone.txt', mimeType: 'text/plain', size: 4 });
     expect(await failure(await send(owner.key, owner.localPart, { subject: `r09-broken-${rand()}`, forwardAttachmentsFrom: broken }), 404))
-      .toEqual({ code: 'source_unavailable', message: '附件「gone.txt」已丢失，无法完整转发' });
+      .toMatchObject({ code: 'source_unavailable', message: '附件「gone.txt」已丢失，无法完整转发' });
     expect(await failure(await request('/v1/messages', json(owner.key, {
       from: { mailboxId: 999_999_999 }, to: [`r09-sink-${rand()}@hpc.email`], subject: `r09-nobox-${rand()}`, text: 'body',
     })), 404)).toEqual({ code: 'not_found', message: '发件邮箱不存在' });

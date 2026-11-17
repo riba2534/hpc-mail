@@ -52,7 +52,7 @@ describe('ComposePage complete delivery',()=>{
     fireEvent.click(await screen.findByRole('button',{name:'继续编辑'}));
     fireEvent.click(screen.getByRole('button',{name:'发送'}));
     await waitFor(()=>expect(mocks.send).toHaveBeenCalledOnce());
-    expect(mocks.send.mock.calls[0]![0]).toMatchObject({from:{mailboxId:10},bcc:['secret@example.com'],html:'<b>saved</b>',attachmentTokens:['saved-token'],replyToMessageId:77,forwardAttachmentsFrom:88});
+    expect(mocks.send.mock.calls[0]![0]).toMatchObject({from:{mailboxId:10},bcc:[{address:'secret@example.com',name:''}],html:'<b>saved</b>',attachmentTokens:[{token:'saved-token'}],replyToMessageId:77,forwardAttachmentsFrom:88});
     expect(localStorage.getItem(draftKeyForUser(1))).toBeNull();
     client.clear();
   });

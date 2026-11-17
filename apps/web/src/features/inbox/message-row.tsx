@@ -9,12 +9,11 @@ import { cn } from '@/lib/cn';
 import { formatRelativeTime } from '@/lib/format';
 
 const OUTBOUND_STATUS: Record<OutboundStatus, { label: string; tone: BadgeTone }> = {
+  pending: { label: '投递中', tone: 'neutral' },
   sent: { label: '已提交', tone: 'neutral' },
   delivered: { label: '已送达', tone: 'positive' },
-  bounced: { label: '退信', tone: 'critical' },
   failed: { label: '失败', tone: 'critical' },
-  complained: { label: '投诉', tone: 'caution' },
-  delayed: { label: '延迟', tone: 'caution' },
+  unknown: { label: '待确认', tone: 'caution' },
 };
 
 /** 回收站保留天数（与后端清理周期一致） */

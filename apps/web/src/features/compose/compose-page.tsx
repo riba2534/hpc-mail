@@ -446,7 +446,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       const owned = new Set((mailboxes ?? []).map((box) => box.address.toLowerCase()));
       syncSentMessage(queryClient, {
         sourceIds: [payload.replyToMessageId, payload.forwardAttachmentsFrom, initial.sourceMessageId].filter((id) => id !== undefined),
-        selfDelivered: [...payload.to, ...payload.cc, ...payload.bcc].some((address) => owned.has(address.toLowerCase())),
+        selfDelivered: [...payload.to, ...payload.cc, ...payload.bcc].some((recipient) => owned.has(recipient.address)),
       });
       // 新收件人会进入往来联系人
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });

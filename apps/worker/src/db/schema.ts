@@ -125,6 +125,8 @@ export const messages = sqliteTable(
     index('idx_messages_purge_token').on(t.purgeToken).where(sql`${t.purgeToken} IS NOT NULL`),
     index('idx_messages_body_r2').on(t.bodyR2Key).where(sql`${t.bodyR2Key} IS NOT NULL`),
     index('idx_messages_raw_r2').on(t.rawR2Key).where(sql`${t.rawR2Key} IS NOT NULL`),
+    // 外发 pending 恢复：定时任务找出超过 1 小时仍未回填结果的发件行，正常时只有正在投递的少数几行
+    index('idx_messages_outbound_pending').on(t.createdAt).where(sql`${t.direction} = 'outbound' AND ${t.status} = 'pending'`),
   ],
 );
 
@@ -473,6 +475,8 @@ export const notificationJobs = sqliteTable('notification_jobs', {
   lastAttemptAt: integer('last_attempt_at', { mode: 'timestamp_ms' }),
   lastError: text('last_error').notNull().default(''),
   lastHttpStatus: integer('last_http_status'),
+  /** 邮箱转发走的通道：native 原生 forward()、relay no-reply 中转；未尝试（跳过）或其他通道为空串 */
+  forwardMode: text('forward_mode', { enum: ['', 'native', 'relay'] }).notNull().default(''),
   dedupeKey: text('dedupe_key').notNull().unique(),
 }, (t) => [index('idx_notification_due').on(t.status, t.nextAttemptAt), index('idx_notification_user').on(t.userId, t.createdAt),
   // 通知健康页按 (用户, 通道) 取最新一条

@@ -1,0 +1,2 @@
+ALTER TABLE `notification_jobs` ADD `forward_mode` text DEFAULT '' NOT NULL;--> statement-breakpoint
+CREATE INDEX `idx_messages_outbound_pending` ON `messages` (`created_at`) WHERE "messages"."direction" = 'outbound' AND "messages"."status" = 'pending';

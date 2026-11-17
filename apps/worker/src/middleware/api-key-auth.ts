@@ -218,6 +218,9 @@ async function writeAudit(env: Env, admitted: boolean, entry: AuditEntry): Promi
 export function requireScope(c: Context<AppContext>, scope: ApiScope): void {
   const apiKey = c.get('apiKey');
   if (!apiKey || !apiKey.scopes.includes(scope)) {
-    throw new AppError('forbidden', `需要 API scope: ${scope}`);
+    throw new AppError('forbidden', `需要 API scope: ${scope}`, {
+      fix: `这把 Key 缺少 scope ${scope}：在网页「API Key」页面给它加上，或换用带该 scope 的 Key（GET /v1/me 可查看当前 scopes）`,
+      docs: '/references/errors.md#forbidden-scope',
+    });
   }
 }

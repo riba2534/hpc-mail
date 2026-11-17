@@ -87,6 +87,42 @@ export interface Mailbox {
   displayName: string;
   messageCount: number;
   createdAt: string;
+  /**
+   * 列表接口返回：该邮箱所在域名当前能否发信（托管域名需发信就绪；系统域名恒为 true）。
+   * 只反映域名状态；用它发信还要求调用者是所有者（管理员不限）。
+   */
+  canSend?: boolean;
+}
+
+/**
+ * 不能用作发件身份的原因：hosted_sending_not_ready 托管域名的发信尚未就绪；
+ * hosted_domain_unavailable 托管域名已暂停、迁走或删除中；shared_readonly 别人共享给我的邮箱只能读不能发。
+ */
+export type SendIdentityBlockReason = 'hosted_sending_not_ready' | 'hosted_domain_unavailable' | 'shared_readonly';
+
+/** 一个具体的发件地址：自己认领的（kind=owned）或共享给我的（kind=shared，恒不能发信） */
+export interface SendIdentity {
+  kind: 'owned' | 'shared';
+  mailboxId: number;
+  address: string;
+  domain: string;
+  displayName: string;
+  canSend: boolean;
+  /** canSend=false 时的原因；可发时为 null */
+  reason: SendIdentityBlockReason | null;
+}
+
+/** 可用任意前缀发信的域名：目前只有管理员在系统域名上（from 写 localPart+domain 或 "Name <任意前缀@域名>"） */
+export interface SendIdentityDomain {
+  domain: string;
+  kind: 'system';
+  anyLocalPart: true;
+}
+
+/** GET /v1/identities 与 GET /api/identities */
+export interface SendIdentities {
+  identities: SendIdentity[];
+  domains: SendIdentityDomain[];
 }
 
 /**
