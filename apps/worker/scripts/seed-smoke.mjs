@@ -3,8 +3,9 @@
 // 密码由 JWT_SECRET 派生：hex(HMAC-SHA256(JWT_SECRET, "ci-smoke-password-v1")) 的前 32 位，
 // CI 冒烟用同一公式算出密码登录，因此不需要再保存一份 secret；轮换 JWT_SECRET 后下次部署自动改密。
 // 不存在则创建；存在且密码对不上则改密并 bump auth_version（旧会话失效）；
-// 已有的同名账号看起来不像冒烟账号（管理员、已禁用、开了两步验证、认领了邮箱、在共享名单里）时拒绝覆盖、
-// 也不改密码，交给管理员确认（这不是部署脚本该替管理员做的决定）。
+// 已有的同名账号看起来不像冒烟账号（管理员、已禁用、开了两步验证、认领了邮箱、持有 API Key、拥有托管域名）时
+// 拒绝覆盖、也不改密码，交给管理员确认（这不是部署脚本该替管理员做的决定）。
+// 共享名单不在此列：任何用户都能把邮箱共享给 ci-smoke，拒绝会让一个普通用户卡住每次部署，所以直接撤销这些共享。
 import { createHmac } from 'node:crypto';
 import { RESERVED_USERNAMES, d1, hashPassword, verifyPassword } from './seed-lib.mjs';
 
@@ -19,7 +20,8 @@ const password = createHmac('sha256', jwtSecret).update('ci-smoke-password-v1').
 
 const [row] = d1(`SELECT u.role, u.status, u.password_hash, u.totp_enabled_at IS NOT NULL AS totp,
   (SELECT COUNT(*) FROM mailboxes m WHERE m.user_id = u.id) AS mailboxes,
-  (SELECT COUNT(*) FROM mailbox_shares s WHERE s.user_id = u.id) AS shares
+  (SELECT COUNT(*) FROM api_keys k WHERE k.user_id = u.id AND k.status <> 'revoked') AS api_keys,
+  (SELECT COUNT(*) FROM hosted_domains h WHERE h.user_id = u.id) AS hosted_domains
 FROM users u WHERE u.username = '${USERNAME}'`);
 
 const problems = row ? [
@@ -27,13 +29,19 @@ const problems = row ? [
   row.status !== 'active' && '已被禁用',
   row.totp && '开启了两步验证',
   row.mailboxes > 0 && `认领了 ${row.mailboxes} 个邮箱`,
-  row.shares > 0 && `在 ${row.shares} 个邮箱的共享名单里`,
+  row.api_keys > 0 && `持有 ${row.api_keys} 个未吊销的 API Key`,
+  row.hosted_domains > 0 && `拥有 ${row.hosted_domains} 个托管域名`,
 ].filter(Boolean) : [];
 
 if (problems.length) {
   console.error(`已存在的 ${USERNAME} 不像部署冒烟账号（${problems.join('、')}），拒绝覆盖，密码未改动。
-它是系统保留用户名，只供 CI 冒烟以普通用户身份登录：请管理员确认来历后删除该账号，或改回无邮箱、无共享、未开两步验证的普通用户。`);
+它是系统保留用户名，只供 CI 冒烟以普通用户身份登录：请管理员确认来历后删除该账号，或改回无邮箱、无 API Key、无托管域名、未开两步验证的普通用户。`);
   process.exit(1);
+}
+
+if (row) {
+  const revoked = d1(`DELETE FROM mailbox_shares WHERE user_id = (SELECT id FROM users WHERE username = '${USERNAME}') RETURNING mailbox_id`);
+  if (revoked.length) console.log(`已撤销共享给 ${USERNAME} 的 ${revoked.length} 个邮箱（冒烟账号不应看到任何邮件）`);
 }
 
 if (!row) {

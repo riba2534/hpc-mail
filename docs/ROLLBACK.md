@@ -49,7 +49,7 @@ secrets 按版本绑定：回滚到旧版本，也会用回该版本当时的 `j
 - 不整表重建。drizzle 修改列时会生成 `__new_<表>` 加拷贝全表，热表上会撞 D1 的执行时限。
 - 索引只增不改名。代码里有 `INDEXED BY` 硬编码索引名，索引不存在时整条语句直接报错。
 
-`apps/worker/scripts/check-migrations.mjs` 在测试阶段按 SQL 词法检查 0021 及之后的迁移，拦截 `DROP TABLE`、`ALTER TABLE … DROP COLUMN` / `RENAME COLUMN` / `RENAME TO`、`__new_` 整表重建，以及删除仍被 `INDEXED BY` 引用的索引。分两次发布的第二次（删除确已无人使用的表或列）在迁移文件里写一行 `-- migration-check: allow <原因>` 豁免，测试输出会列出所有豁免。
+`apps/worker/scripts/check-migrations.mjs` 在测试阶段按 SQL 词法检查迁移（已上线的 0000–0020 按完整文件名白名单豁免，其他文件一律检查），拦截 `DROP TABLE`、`ALTER TABLE … DROP COLUMN` / `RENAME COLUMN` / `RENAME TO`、`__new_` 整表重建，以及删除仍被 `INDEXED BY` 引用的索引。分两次发布的第二次（删除确已无人使用的表或列）在迁移文件里写一行 `-- migration-check: allow <原因>` 豁免，测试输出会列出所有豁免。
 
 ## 恢复 D1 数据（Time Travel）
 
@@ -72,7 +72,8 @@ secrets 按版本绑定：回滚到旧版本，也会用回该版本当时的 `j
 
 - 冒烟账号 `ci-smoke` 是普通用户，由 `apps/worker/scripts/seed-smoke.mjs` 在每次部署前幂等创建。密码由 `JWT_SECRET` 派生，无需另存 secret；轮换 `JWT_SECRET` 后下次部署会自动改密。
 - `ci-smoke` 是系统保留用户名，注册和管理员创建都不能使用，`ADMIN_USERNAME` 也不能用它。
-- 不要给它认领邮箱、加进共享名单、开两步验证、设为管理员或禁用：seed 遇到这样的 `ci-smoke` 会拒绝覆盖、不改密码，部署停在发布之前，按报错提示处理该账号即可。
+- 不要给它认领邮箱、创建 API Key、添加托管域名、开两步验证、设为管理员或禁用：seed 遇到这样的 `ci-smoke` 会拒绝覆盖、不改密码，部署停在发布之前，按报错提示处理该账号即可。
+- 别人共享给 `ci-smoke` 的邮箱不会卡住部署：seed 每次自动撤销这些共享并打印条数（任何用户都能共享给它，冒烟账号不应看到任何邮件）。
 - 冒烟账号登录失败判冒烟失败（触发回滚）。管理员登录不了只跳过管理员专属检查、不判失败：
   - 管理员开了两步验证：配置可选 Secret `ADMIN_TOTP_SECRET`（管理员 TOTP 种子，base32）后，冒烟按它算出当前验证码登录，管理员检查照常执行；没配置时打印 notice 跳过。
   - 返回 `bad_credentials`（站长在网页改了密码而 CI 的 `ADMIN_PASSWORD` 没跟上，或种子不对）：打印 warning 跳过，请尽快同步 secret。

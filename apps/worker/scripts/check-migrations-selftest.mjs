@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 const script = join(dirname(fileURLToPath(import.meta.url)), 'check-migrations.mjs');
 const work = mkdtempSync(join(tmpdir(), 'hpc-check-migrations-'));
 
-// 0000 是已上线的历史迁移（只参与索引重放），0021 起才检查语句
+// 历史迁移按完整文件名白名单豁免语句检查（只参与索引重放）；夹具用真实的历史文件名做基线
 const BASE = [
   'CREATE TABLE `messages` (`id` integer PRIMARY KEY, `address` text, `deleted_at` integer);',
   'CREATE INDEX `idx_messages_address` ON `messages` (`address`,`deleted_at`,`id`);--> statement-breakpoint',
@@ -27,7 +27,7 @@ function run(migrations, sources = SRC) {
   const dir = mkdtempSync(join(work, 'case-'));
   mkdirSync(join(dir, 'migrations'));
   mkdirSync(join(dir, 'src', 'services'), { recursive: true });
-  for (const [name, sql] of Object.entries({ '0000_init.sql': BASE, ...migrations })) writeFileSync(join(dir, 'migrations', name), sql);
+  for (const [name, sql] of Object.entries({ '0000_moaning_maelstrom.sql': BASE, ...migrations })) writeFileSync(join(dir, 'migrations', name), sql);
   for (const [name, text] of Object.entries(sources)) writeFileSync(join(dir, 'src', name), text);
   const result = spawnSync(process.execPath, [script, '--migrations', join(dir, 'migrations'), '--src', join(dir, 'src')], { encoding: 'utf8' });
   return { status: result.status, output: result.stdout + result.stderr };
@@ -103,10 +103,14 @@ try {
     'services/message.ts': 'const q = sql`SELECT 1 FROM messages INDEXED BY idx_messages_missing`;\n',
   });
 
-  // 历史迁移（编号 < 21）只重放索引，不检查语句
-  passes({ '0005_old.sql': 'ALTER TABLE messages DROP COLUMN legacy;\nDROP TABLE old_stuff;' });
+  // 白名单里的历史迁移只重放索引，不检查语句
+  passes({ '0005_acoustic_meteorite.sql': 'ALTER TABLE messages DROP COLUMN legacy;\nDROP TABLE old_stuff;' });
   // 但历史上删掉的索引不能再被引用
-  fails({ '0005_old.sql': 'DROP INDEX idx_messages_address;' }, /INDEXED BY idx_messages_address，但迁移重放后不存在该索引/);
+  fails({ '0005_acoustic_meteorite.sql': 'DROP INDEX idx_messages_address;' }, /INDEXED BY idx_messages_address，但迁移重放后不存在该索引/);
+  // 白名单按完整文件名匹配：编号相同或更小但名字不同、不带编号的文件都要检查
+  for (const name of ['0005b_x.sql', '0005_acoustic_meteorite_v2.sql', '0000_x.sql', 'x.sql', '20_late.sql']) {
+    fails({ [name]: 'DROP TABLE `stars`;' }, new RegExp(`${name.replace('.', '\\.')}：DROP TABLE stars`));
+  }
 
   // 文件级豁免：通过，但输出里列出豁免的文件、原因与语句
   out = passes({ '0022_cleanup.sql': '-- migration-check: allow stars 表已两个版本无人读写\nDROP TABLE `stars`;' });
