@@ -638,19 +638,21 @@ export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number
 
 /** 用户点「立即检测」：等待 NS 时请 Cloudflare 立即复查，再核对并推进开通 */
 export async function checkHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
-  // 全站计数的条件与下面实际触发核对的一致：所有者或管理员、未暂停或删除、过了节流间隔
+  // 全站计数的条件与下面实际触发核对的一致：功能开着且有凭据、所有者或管理员、未暂停或删除、过了节流间隔
+  const settings = await getSettings(env);
   const { row, access } = await meterHostedCall(env, viewer, id, {
     scope: HOSTED_CHECK_RATE_SCOPE, limit: MAX_HOSTED_CHECKS_PER_MINUTE, calls: CHECK_CF_CALLS,
     eligible: {
-      sql: `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
+      sql: `? = 1 AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
         AND status NOT IN ('suspended', 'deleting') AND COALESCE(checked_at, 0) <= ?)`,
-      params: [id, viewer.id, viewer.role === 'admin' ? 1 : 0, Date.now() - CHECK_THROTTLE_MS],
+      params: [hostedDomainsAvailable(env, settings) ? 1 : 0, id, viewer.id, viewer.role === 'admin' ? 1 : 0,
+        Date.now() - CHECK_THROTTLE_MS],
     },
     userBusy: '检测过于频繁，请稍后再试',
     siteBusy: SITE_BUSY,
   });
   requireManage(access);
-  requireCredentials(env, await getSettings(env));
+  requireCredentials(env, settings);
   const recent = row.checkedAt && Date.now() - row.checkedAt.getTime() < CHECK_THROTTLE_MS;
   if (!recent && row.status !== 'suspended' && row.status !== 'deleting') {
     await syncHostedDomain(env, id, { activationCheck: row.status === 'pending' });

@@ -766,6 +766,21 @@ describe('添加与立即检测的 Cloudflare 调用额度', () => {
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, taken.id)).get()).toBeUndefined();
   });
 
+  it('功能关闭或缺凭据时立即检测 403，不占全站额度', async () => {
+    fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const created = await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain('off') }), 201);
+    await db.update(hostedDomains).set({ checkedAt: new Date(Date.now() - 60_000) }).where(eq(hostedDomains.id, created.id));
+    const base = await siteCalls();
+    await updateSettings(env, { hosted_domains: { enabled: false, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 } });
+    for (let i = 0; i < 5; i++) await errorOf(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt), 403);
+    expect(await siteCalls()).toBe(base);
+    await updateSettings(env, { hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 } });
+    await errorOf(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt, undefined, env), 403);
+    expect(await siteCalls()).toBe(base);
+  });
+
   it(`立即检测：每人每分钟 ${MAX_HOSTED_CHECKS_PER_MINUTE} 次（被节流、无权限的也计）；只有真正核对的才占全站额度`, async () => {
     const cf = fakeCloudflare();
     const f = await fixture();
