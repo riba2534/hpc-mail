@@ -22,6 +22,10 @@ import { runScheduled } from '../src/services/scheduled.js';
 import { updateSettings } from '../src/services/setting.js';
 import { expireDeliveryObjectLeases, processStorageCleanup } from '../src/services/storage-cleanup.js';
 import type { Env } from '../src/types.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -178,7 +182,7 @@ describe('新写入：正文全文在 R2，D1 只留搜索文本', () => {
     const sender = await owner('send-html');
     const recipient = await owner('recv-html');
     const html = `<p>Hello SENDMARK</p>${filler(20)}`;
-    await sendMail(env, { waitUntil: () => {} }, sender.viewer, {
+    await sendMail(env, background.ctx, sender.viewer, {
       from: { localPart: sender.localPart, domain: DOMAIN }, to: [recipient.address], cc: [], bcc: [],
       subject: `send-html-${sequence}`, text: 'Hello SENDMARK', html,
     }, [], 'https://hpc.email');

@@ -37,6 +37,10 @@ import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
 import { fakeRateLimits } from './fake-rate-limits.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 const app = createApp();
 const IP = '198.51.100.23';
@@ -582,7 +586,7 @@ describe('R22 幂等发信可以安全重试', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } }) } as Env;
-    await expect(sendMail(faulty, { waitUntil: () => {} }, { userId: user.id, role: 'user' }, req, [], 'https://hpc.email', handle))
+    await expect(sendMail(faulty, background.ctx, { userId: user.id, role: 'user' }, req, [], 'https://hpc.email', handle))
       .rejects.toThrow('injected D1 failure');
     const row = await createDb(env).select().from(messages).where(eq(messages.subject, subject)).get();
     expect(row).toMatchObject({ direction: 'outbound', status: 'failed' });

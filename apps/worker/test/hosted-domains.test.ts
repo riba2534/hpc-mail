@@ -16,6 +16,10 @@ import { sendMail } from '../src/services/outbound.js';
 import { createSession } from '../src/services/session.js';
 import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 const app = createApp();
 const db = createDb(env);
@@ -485,7 +489,7 @@ describe('托管域名的收件与认领', () => {
     const hosted = await activeDomain(cf, owner, domain);
     const box = await data<Mailbox>(await call('POST', '/mailboxes', owner.jwt, { localPart: 'me', domain }), 201);
     await db.update(hostedDomains).set({ sendingStatus: 'unconfigured' }).where(eq(hostedDomains.id, hosted.id));
-    const send = (fromId: number, to: string, userId: number) => sendMail(runtime, { waitUntil: () => {} }, { userId, role: 'user' },
+    const send = (fromId: number, to: string, userId: number) => sendMail(runtime, background.ctx, { userId, role: 'user' },
       { from: { mailboxId: fromId }, to: [to], cc: [], bcc: [], subject: 'hi', text: 'hi' } as never, [], 'https://hpc.email');
     await expect(send(box.id, 'friend@example.org', owner.id)).rejects.toMatchObject({ message: '该域名的发信尚未生效或已停用' });
 
