@@ -98,6 +98,11 @@ export interface LoginResponse {
   user: SessionUser;
 }
 
+/** 改密响应：新会话外加本次吊销的 API Key 数（revokeApiKeys=false 时为 0） */
+export interface ChangePasswordResponse extends LoginResponse {
+  revokedApiKeys: number;
+}
+
 // ---- 管理端用户管理 ----
 
 export const searchUsersQuerySchema = z.object({
