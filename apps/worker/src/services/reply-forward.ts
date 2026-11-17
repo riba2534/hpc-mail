@@ -13,11 +13,12 @@ import { chunk } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { escapeHtml, htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
-import { bodyBytes } from './mail-body.js';
+import { bodyBytes, readMailBody } from './mail-body.js';
 import { loadSourceContent } from './message.js';
 import type { SendMailInput } from './outbound.js';
 
 type Source = Awaited<ReturnType<typeof loadSourceContent>>;
+type MailBody = Awaited<ReturnType<typeof readMailBody>>;
 
 /** 回复/转发准备好的发信请求；fromIsDefault 时发件身份无权使用要改报 from_required */
 export interface ComposedSend {
@@ -66,8 +67,8 @@ interface QuoteSource {
   html: string;
 }
 
-function quoteSource(source: Source, header: string[]): QuoteSource {
-  return { header, text: source.bodyText.trim() ? source.bodyText : htmlToText(source.bodyHtml), html: source.bodyHtml };
+function quoteSource(body: MailBody, header: string[]): QuoteSource {
+  return { header, text: body.bodyText.trim() ? body.bodyText : htmlToText(body.bodyHtml), html: body.bodyHtml };
 }
 
 const TRUNCATED = '（原文过长，已截断）';
@@ -178,7 +179,11 @@ export async function composeReply(
     ? (source.replyTo.length ? source.replyTo.map((address) => ({ address, name: '' })) : [{ address: source.fromAddress, name: source.fromName }])
     : recipients.to.map((address) => ({ address, name: '' }));
   const others = req.replyAll ? (inbound ? [...recipients.to, ...recipients.cc] : recipients.cc) : [];
-  const owners = await ownersOf(env, [source.address, ...others], req.from?.mailboxId);
+  // 认领情况与完整正文（只在引用原文时读 R2）同时取
+  const [owners, body] = await Promise.all([
+    ownersOf(env, [source.address, ...others], req.from?.mailboxId),
+    req.quote ? readMailBody(env, source) : undefined,
+  ]);
   const chosen = chooseFrom(sender, source, req.from, owners);
   const self = new Set([lower(source.address), ...(chosen.fromAddress ? [lower(chosen.fromAddress)] : []),
     ...owners.filter((row) => row.userId === sender.userId).map((row) => row.address)]);
@@ -190,8 +195,8 @@ export async function composeReply(
 
   let text = req.text ?? '';
   let html = req.html ?? '';
-  if (req.quote) {
-    const quote = quoteSource(source, [`发件人：${formatSender(source)}`, `时间：${formatTime(source.createdAt)}`, `主题：${source.subject}`]);
+  if (body) {
+    const quote = quoteSource(body, [`发件人：${formatSender(source)}`, `时间：${formatTime(source.createdAt)}`, `主题：${source.subject}`]);
     ({ text, html } = attachQuote({ text, html }, quote, Boolean(html), 'reply'));
     // 只给了 html 时不生成只有引用、没有回复内容的纯文本部分
     if (!req.text) text = '';
@@ -216,12 +221,15 @@ export async function composeForward(
   req: ForwardMessageRequest,
 ): Promise<ComposedSend> {
   const source = await loadSourceContent(env, sender, sourceId, '转发的原邮件不存在或不可见', 'forward');
-  const owners = await ownersOf(env, [source.address], req.from?.mailboxId);
+  const [owners, body] = await Promise.all([
+    ownersOf(env, [source.address], req.from?.mailboxId),
+    req.includeOriginal ? readMailBody(env, source) : undefined,
+  ]);
   const chosen = chooseFrom(sender, source, req.from, owners);
   const note = req.note ?? '';
   let text = note;
   let html = '';
-  if (req.includeOriginal) {
+  if (body) {
     const recipients = source.recipients ?? { to: [], cc: [], bcc: [] };
     const header = [
       `发件人：${formatSender(source)}`,
@@ -230,8 +238,8 @@ export async function composeForward(
       `收件人：${recipients.to.join(', ')}`,
       ...(recipients.cc.length ? [`抄送：${recipients.cc.join(', ')}`] : []),
     ];
-    ({ text, html } = attachQuote({ text: note, html: note ? textToHtml(note) : '' }, quoteSource(source, header),
-      Boolean(source.bodyHtml), 'forward'));
+    ({ text, html } = attachQuote({ text: note, html: note ? textToHtml(note) : '' }, quoteSource(body, header),
+      Boolean(body.bodyHtml), 'forward'));
   }
   return {
     req: {

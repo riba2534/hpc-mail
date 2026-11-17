@@ -968,19 +968,18 @@ export async function loadSourceMessage(
 }
 
 /**
- * 回复/转发接口按原信生成收件人、主题与引用：可见口径与错误同 loadSourceMessage（整行与可见性一条语句），
- * 另带完整正文（含 R2 中的大正文）。
+ * 回复/转发接口按原信生成收件人、主题与引用：可见口径与错误同 loadSourceMessage（整行与可见性一条语句）。
+ * 返回 D1 整行，正文列可能只是搜索用的截断文本：要引用原文时调用方另经 readMailBody 读全文。
  */
-export async function loadSourceContent(
+export function loadSourceContent(
   env: Env,
   sender: { userId: number; role: Role },
   id: number,
   unavailableMessage: string,
   source: 'reply' | 'forward',
 ): Promise<MessageRow> {
-  const row = await loadVisible(env, { userId: sender.userId, role: sender.role }, id,
+  return loadVisible(env, { userId: sender.userId, role: sender.role }, id,
     () => new AppError('source_unavailable', unavailableMessage, { details: { source } }));
-  return { ...row, ...(await readMailBody(env, row)) };
 }
 
 const messageColumns = getTableColumns(messages);
