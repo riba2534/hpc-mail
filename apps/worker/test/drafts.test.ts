@@ -1,5 +1,5 @@
 import {
-  API_SCOPES, MAX_DRAFTS_PER_USER, type ApiScope, type CreatedApiKey, type Draft, type DraftSummary, type MessageSummary, type Page,
+  MAX_DRAFTS_PER_USER, type ApiScope, type CreatedApiKey, type Draft, type DraftSummary, type MessageSummary, type Page,
   type SingleUploadResult,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
@@ -10,6 +10,7 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { apiKeys, draftAttachments, drafts, idempotencyRecords, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 import { DRAFT_SENDING_LEASE_MS, dispatchDueDrafts, purgeSentDrafts } from '../src/services/drafts.js';
 import { runDraftAttachmentCleanup } from '../src/services/scheduled.js';
 import { createSession } from '../src/services/session.js';
@@ -56,7 +57,7 @@ async function failure(response: Response, status: number) {
   return body.error;
 }
 
-async function account(name: string, scopes: ApiScope[] = [...API_SCOPES], role: 'user' | 'admin' = 'user') {
+async function account(name: string, scopes: ApiScope[] = USER_SCOPES, role: 'user' | 'admin' = 'user') {
   await updateSettings(env, {
     domains: { list: [{ domain: 'hpc.email', public: true, perUserLimit: 0 }] },
     code_extract: { enabled: false, aiEnabled: false },
@@ -64,11 +65,11 @@ async function account(name: string, scopes: ApiScope[] = [...API_SCOPES], role:
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username: name, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username: name, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   await db.insert(mailboxes).values({ address: `${name}@hpc.email`, domain: 'hpc.email', userId: user!.id });
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const created = await data<CreatedApiKey>(await call('/api/api-keys', req(jwt, 'POST', { name: `${name}-agent`, scopes, rateLimit: 600 })), 201);
+  const created = await data<CreatedApiKey>(await call('/api/api-keys', req(jwt, 'POST', { name: `${name}-agent`, scopes, rateLimit: 600, password: TEST_PASSWORD })), 201);
   return { id: user!.id, jwt, key: created.key, keyId: created.id, address: `${name}@hpc.email` };
 }
 
@@ -394,5 +395,42 @@ describe('人审：发送时锁定审阅过的版本', () => {
     const replay = await data<MessageSummary>(await call(`/api/drafts/${created.id}/send`, req(me.jwt, 'POST', { expectedVersion: changed.version })), 201);
     expect(replay.id).toBe(sent.id);
     expect((await failure(await call(`/api/drafts/${created.id}/send`, req(me.jwt, 'POST', { expectedVersion: 'x' })), 400)).code).toBe('validation_failed');
+  });
+});
+
+describe('限定范围的 Key（PR4a）', () => {
+  async function restricted(name: string) {
+    const me = await account(name);
+    const [inScope] = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, me.address));
+    await db.insert(mailboxes).values({ address: `${name}-other@hpc.email`, domain: 'hpc.email', userId: me.id });
+    const created = await data<CreatedApiKey>(await call('/api/api-keys', req(me.jwt, 'POST', {
+      name: `${name}-narrow`, scopes: USER_SCOPES, rateLimit: 600, password: TEST_PASSWORD, allowedMailboxIds: [inScope!.id],
+    })), 201);
+    return { ...me, narrowKey: created.key, narrowKeyId: created.id, other: `${name}-other@hpc.email`, inScopeId: inScope!.id };
+  }
+
+  it('只能用范围内的发件地址；只看得到、改得了自己创建的草稿', async () => {
+    const me = await restricted('draft-narrow');
+    const denied = await failure(await call('/v1/drafts', req(me.narrowKey, 'POST', complete(me.other, 'n1@hpc.email'))), 403);
+    expect(denied.message).toContain('限定了可用的邮箱或域名');
+    const mine = await data<Draft>(await call('/v1/drafts', req(me.narrowKey, 'POST', complete(me.address, 'n1@hpc.email'))), 201);
+    expect((await failure(await call(`/v1/drafts/${mine.id}`, req(me.narrowKey, 'PATCH', { from: me.other })), 403)).code).toBe('forbidden');
+    const web = await data<Draft>(await call('/api/drafts', req(me.jwt, 'POST', complete(me.other, 'n2@hpc.email'))), 201);
+    const listed = await data<Page<DraftSummary>>(await call('/v1/drafts', req(me.narrowKey, 'GET')));
+    expect(listed.items.map((item) => item.id)).toEqual([mine.id]);
+    for (const [method, path] of [['GET', ''], ['DELETE', ''], ['POST', '/send']] as const) {
+      expect((await failure(await call(`/v1/drafts/${web.id}${path}`, req(me.narrowKey, method)), 404)).code, `${method}${path}`).toBe('not_found');
+    }
+    // 不限范围的 Key 照常看到全部
+    expect((await data<Page<DraftSummary>>(await call('/v1/drafts', req(me.key, 'GET')))).items.map((item) => item.id)).toEqual([web.id, mine.id]);
+  });
+
+  it('到点时 Key 已不再覆盖发件地址：取消发送', async () => {
+    const me = await restricted('draft-narrow-cron');
+    const draft = await data<Draft>(await call('/v1/drafts', req(me.narrowKey, 'POST', complete(me.address, 'n3@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await db.update(apiKeys).set({ allowedMailboxIds: [me.inScopeId + 100_000] }).where(eq(apiKeys.id, me.narrowKeyId));
+    await makeDue(draft.id);
+    await dispatch();
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('不再覆盖这个发件地址') });
   });
 });

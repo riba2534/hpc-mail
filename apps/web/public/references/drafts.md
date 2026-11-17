@@ -29,7 +29,7 @@ shell 示例复用[入口指南](../skill.md)的 `hpc()`、`FROM`、`WORK`。草
 | `DELETE /drafts/:id` | `mail.send` | `{success:true}`，同时释放它的附件 |
 | `POST /drafts/:id/send` | `mail.send` | 与 `POST /messages` 相同：201 发件摘要 / 422 / 4xx；可带 `{expectedVersion}` |
 
-草稿内容带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时，创建、修改与发送都另需 `mail.read`（同直接发信）。只能看到、操作自己的草稿，管理员也一样；别人的草稿 id 返回 404。
+草稿内容带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时，创建、修改与发送都另需 `mail.read`（同直接发信）。只能看到、操作自己的草稿，管理员也一样；别人的草稿 id 返回 404。限定了邮箱或域名范围的 Key 只能看到、操作它自己创建的草稿，发件地址与引用的来源邮件都要在范围内（否则 403，见[错误码](errors.md#key-restricted)）。
 
 草稿摘要字段：`id,status,version,from,to,cc,bcc,subject,preview,attachmentCount,sendAt,messageId,errorDetail,createdVia,apiKeyName,createdAt,updatedAt,sentAt`；详情另有 `replyTo,text,html,headers,replyToMessageId,forwardAttachmentsFrom,attachments`。`createdVia` 为 `api` 时 `apiKeyName` 是创建它的 Key 名称。`from` 是解析后的形式：`{mailboxId}` 或 `{localPart,domain,displayName?}`。
 
@@ -75,7 +75,7 @@ jq -n '{sendAt:"2026-11-18T09:00:00+08:00"}' |
 - 安排时草稿必须已是完整的发信请求（有 `from`、收件人、主题和正文），否则 400，`message` 以「草稿还不能发送：」开头并指出缺什么。定时中的草稿仍可修改，修改后同样要保持完整；改内容不改 `sendAt` 时不再检查时间范围。
 - 精度：服务器每分钟检查一次到期的草稿，到点后 1 分钟内发出（定时任务本身可能再晚几十秒）。一次最多发 20 封，积压的下一分钟继续。
 - `PATCH {"sendAt":null}` 取消定时，草稿回到 `draft`；也可以随时用 `POST /drafts/:id/send` 提前发出。
-- 到点复核：安排它的 API Key 已被吊销、禁用或过期，账户改过密码、被重置或禁用（安全状态变化）时，不会发出，草稿标为 `failed`，`errorDetail` 写明原因；确认后重新安排即可。所以 Agent 安排的定时发送不会在用户撤销 Key 之后继续发出。
+- 到点复核：安排它的 API Key 已被吊销、禁用、过期或范围已不再覆盖发件地址，账户改过密码、被重置或禁用（安全状态变化）时，不会发出，草稿标为 `failed`，`errorDetail` 写明原因；确认后重新安排即可。所以 Agent 安排的定时发送不会在用户撤销 Key 之后继续发出。
 - 每日外发配额在实际发送时计算，与直接发信相同；到点时配额已满，草稿标为 `failed`（`errorDetail` 说明），不会自动再试。
 
 ## 发送

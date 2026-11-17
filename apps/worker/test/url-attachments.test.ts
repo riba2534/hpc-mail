@@ -1,4 +1,4 @@
-import { API_SCOPES, type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
+import { type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,6 +6,7 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { attachments, draftAttachments, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import {
@@ -44,11 +45,11 @@ async function account(name: string) {
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username: name, role: 'user', passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username: name, role: 'user', passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   await db.insert(mailboxes).values({ address: `${name}@hpc.email`, domain: 'hpc.email', userId: user!.id });
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await call(env, '/api/api-keys', json(jwt, { name: `${name}-key`, scopes: [...API_SCOPES], rateLimit: 600 })));
+  const key = await data<CreatedApiKey>(await call(env, '/api/api-keys', json(jwt, { name: `${name}-key`, scopes: USER_SCOPES, rateLimit: 600, password: TEST_PASSWORD })));
   return { id: user!.id, key: key.key, address: `${name}@hpc.email` };
 }
 

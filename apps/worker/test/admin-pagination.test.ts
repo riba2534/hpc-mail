@@ -15,6 +15,7 @@ import { listMailboxes } from '../src/services/mailbox.js';
 import { listMailboxShares } from '../src/services/mailbox-share.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -35,6 +36,8 @@ async function actor(username: string, role: 'admin' | 'user'): Promise<Actor> {
   const sid = await createSession(env, user.id);
   const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
   const key = await createApiKey(env, user.id, { name: 'pagination', scopes: ['mailbox.read'], rateLimit: 1000, allowedIps: [] });
+  // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope），才有 all=1 的全站视图
+  if (role === 'admin') await grantLegacyAdminScope(env, key.id);
   return { id: user.id, username, jwt, key: key.key };
 }
 

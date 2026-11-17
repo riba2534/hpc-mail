@@ -10,6 +10,7 @@ import { harvestRecentClaudeFacts } from '../src/services/claude-facts.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -55,12 +56,12 @@ async function actor(username: string) {
     domains: { list: [{ domain: DOMAIN, public: true, perUserLimit: 0 }] },
     code_extract: { enabled: false, aiEnabled: false }, security: { require2fa: false }, api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username, role: 'user', passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username, role: 'user', passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
   const ctx = createExecutionContext();
   const created = await app.request('/api/api-keys', { method: 'POST', headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'auth', scopes: ['mail.read'] satisfies ApiScope[], rateLimit: 600 }) }, env, ctx);
+    body: JSON.stringify({ name: 'auth', scopes: ['mail.read'] satisfies ApiScope[], rateLimit: 600, password: TEST_PASSWORD }) }, env, ctx);
   await waitOnExecutionContext(ctx);
   const key = ((await created.json()) as { data: CreatedApiKey }).data.key;
   return { id: user!.id, jwt, key };

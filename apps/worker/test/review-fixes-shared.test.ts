@@ -1,4 +1,4 @@
-import { API_SCOPES, type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
+import { type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import PostalMime from 'postal-mime';
@@ -9,6 +9,7 @@ import { idempotencyRecords, mailboxes, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 import type { Env } from '../src/types.js';
 
 vi.mock('cloudflare:email', () => ({
@@ -33,12 +34,12 @@ async function account(name: string) {
     code_extract: { enabled: false, aiEnabled: false }, quota: { dailyOutbound: 0, dailyRecipients: 0 },
     security: { require2fa: false }, api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username: name, role: 'user', passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username: name, role: 'user', passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   await db.insert(mailboxes).values({ address: `${name}@hpc.email`, domain: 'hpc.email', userId: user!.id });
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
   const created = await call(env, '/api/api-keys', { method: 'POST', headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'k', scopes: [...API_SCOPES], rateLimit: 600 }) });
+    body: JSON.stringify({ name: 'k', scopes: USER_SCOPES, rateLimit: 600, password: TEST_PASSWORD }) });
   return { key: ((await created.json()) as { data: CreatedApiKey }).data.key, address: `${name}@hpc.email` };
 }
 

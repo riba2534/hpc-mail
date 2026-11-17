@@ -128,7 +128,7 @@ describe('所有者共享与管理员全站共享', () => {
       `/mailboxes/share-users?q=sharing-${sequence}&excludeUserId=${f.owner.id}`, f.owner.jwt));
     expect(result.items.some((item) => item.id === f.admin.id)).toBe(true);
     expect(result.items.some((item) => item.id === f.owner.id)).toBe(false);
-    for (const item of result.items) expect(Object.keys(item).sort()).toEqual(['id', 'role', 'username']);
+    for (const item of result.items) expect(Object.keys(item).sort()).toEqual(['id', 'username']);
     expect((await request('/mailboxes/share-users?q=', f.owner.jwt)).status).toBe(400);
   });
 

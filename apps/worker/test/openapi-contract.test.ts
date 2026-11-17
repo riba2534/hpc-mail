@@ -25,6 +25,7 @@ import draftsDoc from '../../web/public/references/drafts.md?raw';
 import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
 import mcpDoc from '../../web/public/references/mcp.md?raw';
 import notificationsDoc from '../../web/public/references/notifications.md?raw';
+import webhooksDoc from '../../web/public/references/webhooks.md?raw';
 
 const app = createApp();
 const origin = 'https://mail.example';
@@ -34,6 +35,14 @@ const methods = new Set(['get', 'post', 'put', 'delete', 'patch', 'options', 'he
 function operations(namespace: keyof typeof specs) {
   return Object.entries(specs[namespace].paths).flatMap(([path, item]) => Object.keys(item)
     .filter(method => methods.has(method)).map(method => `${method.toUpperCase()} /${namespace}${path}`));
+}
+/** 去掉响应里的 examples（两套认证的示例文案不同），比较其余结构 */
+function withoutExamples(responses: unknown): unknown {
+  return JSON.parse(JSON.stringify(responses, (key, value: unknown) => key === 'examples' ? undefined : value));
+}
+function exampleNames(responses: unknown, status: string): string[] {
+  const content = (responses as Record<string, { content?: Record<string, { examples?: Schema }> }>)[status]?.content;
+  return Object.keys(content?.['application/json']?.examples ?? {});
 }
 function visit(value: unknown, callback: (value: Schema) => void) {
   if (!value || typeof value !== 'object') return;
@@ -148,9 +157,9 @@ describe('OpenAPI routes and public contracts', () => {
     for (const spec of Object.values(specs)) {
       visit(spec, item => {
         if (typeof item.$ref === 'string') {
-          const name = item.$ref.replace('#/components/schemas/', '');
-          expect(item.$ref).toBe(`#/components/schemas/${name}`);
-          expect(spec.components.schemas).toHaveProperty(name);
+          const [, kind, name] = /^#\/components\/(schemas|examples)\/([^/]+)$/.exec(item.$ref) ?? [];
+          expect(kind, item.$ref).toBeDefined();
+          expect(spec.components[kind as 'schemas' | 'examples'], item.$ref).toHaveProperty(name!);
         }
       });
       for (const [path, item] of Object.entries(spec.paths)) {
@@ -162,11 +171,13 @@ describe('OpenAPI routes and public contracts', () => {
     }
   });
 
-  it('keeps operation ids unique across both authentication APIs', () => {
-    const ids = Object.values(specs).flatMap(spec => Object.values(spec.paths).flatMap(item => Object.entries(item)
-      .filter(([method]) => methods.has(method)).map(([, operation]) => operation.operationId)));
-    expect(ids.every(id => typeof id === 'string')).toBe(true);
-    expect(new Set(ids).size).toBe(ids.length);
+  it('keeps operation ids unique within each authentication API', () => {
+    for (const spec of Object.values(specs)) {
+      const ids = Object.values(spec.paths).flatMap(item => Object.entries(item)
+        .filter(([method]) => methods.has(method)).map(([, operation]) => operation.operationId));
+      expect(ids.every(id => typeof id === 'string')).toBe(true);
+      expect(new Set(ids).size).toBe(ids.length);
+    }
   });
 
   it('documents auth boundaries and scopes without granting admin functions to API keys', () => {
@@ -388,7 +399,10 @@ describe('Agent 接口第 1 期反映在 OpenAPI 中', () => {
       const api = specs.api.paths[path]![method]!;
       expect(v1['x-required-scopes'], path).toEqual([scope]);
       expect(api, path).not.toHaveProperty('x-required-scopes');
-      expect(v1.responses, path).toEqual(api.responses);
+      // 两套认证的 401/429 示例文案不同，/v1 另有缺 scope 的 403 示例；除示例外完全同形
+      expect(withoutExamples(v1.responses), path).toEqual(withoutExamples(api.responses));
+      expect(exampleNames(v1.responses, '403'), path).toContain(`ForbiddenScope${scope === 'mailbox.read' ? 'MailboxRead' : 'MailboxWrite'}`);
+      expect(exampleNames(api.responses, '403'), path).toEqual([]);
       expect(v1.requestBody, path).toEqual(api.requestBody);
       expect(v1.parameters, path).toEqual(api.parameters);
     }
@@ -446,7 +460,9 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
       for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
       expect(envelope.required).toEqual(['code', 'message']);
-      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'url', 'draftStatus', 'draftVersion', 'suppressed', 'precheck']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'source', 'url', 'draftStatus', 'draftVersion', 'suppressed', 'precheck']);
+      expect(props(error.details!).source).toMatchObject({ enum: ['reply', 'forward'] });
+      expect(props(error.details!).suppressed).toMatchObject({ type: 'array', items: { $ref: '#/components/schemas/SuppressedRecipient' } });
       expect(error.docs).toMatchObject({ format: 'uri' });
     }
   });
@@ -454,7 +470,12 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
   it('两个发信端点：201 只表示至少一个收件人成功，400/413/422/500 有发信专属说明，/api 与 /v1 一致', () => {
     const v1 = specs.v1.paths['/messages']!.post!;
     const api = specs.api.paths['/messages/send']!.post!;
-    expect(v1.responses).toEqual(api.responses);
+    expect(withoutExamples(v1.responses)).toEqual(withoutExamples(api.responses));
+    for (const operation of [v1, api]) {
+      expect(exampleNames(operation.responses, '404')).toEqual(expect.arrayContaining(['SourceUnavailableReply', 'SourceUnavailableForward']));
+      expect(exampleNames(operation.responses, '422')).toEqual(['DeliveryFailed', 'RecipientSuppressed', 'AttachmentUrlFetchFailed']);
+      expect(exampleNames(operation.responses, '400')).toEqual(expect.arrayContaining(['AttachmentUrlForbidden']));
+    }
     for (const operation of [v1, api]) {
       const responses = operation.responses as Record<string, { description: string }>;
       expect(operation.description).toContain('at least one recipient succeeded');
@@ -507,7 +528,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
 
   it('超过 100 行的参考文件开头有目录', () => {
     const references = { administration: administrationDoc, attachments: attachmentsDoc, auth: authDoc, errors: errorsDoc,
-      mail: mailDoc, mailboxes: mailboxesDoc, mcp: mcpDoc, notifications: notificationsDoc };
+      mail: mailDoc, mailboxes: mailboxesDoc, mcp: mcpDoc, notifications: notificationsDoc, webhooks: webhooksDoc };
     for (const [name, doc] of Object.entries(references)) {
       if (doc.split('\n').length > 100) expect(doc.split('\n').slice(0, 5).join('\n'), name).toContain('## 目录');
     }
@@ -643,6 +664,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     'references/auth-and-http.md': authDoc, 'references/errors.md': errorsDoc, 'references/mail.md': mailDoc,
     'references/mailboxes-and-domains.md': mailboxesDoc, 'references/mcp.md': mcpDoc, 'references/notifications.md': notificationsDoc,
     'references/drafts.md': draftsDoc,
+    'references/webhooks.md': webhooksDoc,
   };
   /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */
   const documentedAsMissing = ['POST /messages/{id}'];
@@ -757,17 +779,59 @@ describe('Agent docs reference only real endpoints and anchors', () => {
   });
 });
 
+describe('PR4b：回复/转发接口与托管域名任意前缀在 OpenAPI 与文档中一致', () => {
+  it('/v1 有 reply/forward，需要 mail.send+mail.read，请求体严格、错误含 from_required；/api 没有', () => {
+    for (const op of ['reply', 'forward'] as const) {
+      const operation = specs.v1.paths[`/messages/{id}/${op}`]!.post!;
+      expect(operation['x-required-scopes']).toEqual(['mail.send', 'mail.read']);
+      const request = (operation.requestBody as { content: Record<string, { schema: Schema }> }).content['application/json']!.schema;
+      const schema = specs.v1.components.schemas[(request.$ref as string).split('/').pop()!]!;
+      expect(schema.additionalProperties).toBe(false);
+      expect(Object.keys(schema.properties as object)).toEqual(op === 'reply'
+        ? ['replyAll', 'text', 'html', 'quote', 'from', 'attachments', 'attachmentTokens', 'headers']
+        : ['to', 'cc', 'bcc', 'note', 'includeOriginal', 'from']);
+      const responses = operation.responses as Record<string, { description: string }>;
+      expect(responses['400']!.description).toContain('from_required');
+      expect(responses['404']!.description).toContain('source_unavailable');
+      expect(responses).toHaveProperty('201');
+      expect(responses).toHaveProperty('422');
+      expect(specs.api.paths).not.toHaveProperty(`/messages/{id}/${op}`);
+    }
+    const reply = specs.v1.components.schemas.ReplyMessageRequest!.properties as Record<string, Schema>;
+    expect(reply.quote!.default).toBe(true);
+    expect(reply.replyAll!.default).toBe(false);
+    expect((specs.v1.components.schemas.ForwardMessageRequest!.properties as Record<string, Schema>).includeOriginal!.default).toBe(true);
+    const errorCode = ((specs.v1.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).code!;
+    expect(errorCode.enum).toContain('from_required');
+  });
+
+  it('identities 的 domains 有 kind=hosted，发信说明写明托管所有者任意前缀；文档同步', () => {
+    for (const spec of Object.values(specs)) {
+      const domains = (spec.components.schemas.SendIdentities!.properties as Record<string, Schema>).domains!;
+      expect(((domains.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual(['system', 'hosted', 'legacy']);
+      expect(spec.components.schemas.SendMailRequest!.description).toContain('owner of a hosted domain');
+    }
+    expect(mailDoc).toContain('POST /v1/messages/:id/reply');
+    expect(mailDoc).toContain('POST /v1/messages/:id/forward');
+    expect(mailDoc).toContain('kind:"hosted"');
+    expect(errorsDoc).toMatch(/^## from_required$/m);
+    expect(skillDoc).toContain('/reply');
+    expect(mailboxesDoc).toContain('kind:"hosted"');
+  });
+});
+
 describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文档', () => {
-  /** /v1 只开放这八个托管域名操作，读写分别要求 domain.read / domain.write */
+  /** /v1 只开放这九个托管域名操作，读写分别要求 domain.read / domain.write */
   const keyOperations: Record<string, Record<string, string>> = {
     '/hosted-domains': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}': { get: 'domain.read' },
     '/hosted-domains/{id}/check': { post: 'domain.write' },
+    '/hosted-domains/{id}/reconnect': { post: 'domain.write' },
     '/hosted-domains/{id}/dns-records': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}/dns-records/{recordId}': { put: 'domain.write', delete: 'domain.write' },
   };
 
-  it('八个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
+  it('九个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
     let checked = 0;
     for (const [path, scopes] of Object.entries(keyOperations)) {
       expect(specs.v1.paths[path]!.parameters, path).toEqual(specs.api.paths[path]!.parameters);
@@ -777,13 +841,15 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
         const api = specs.api.paths[path]![method]!;
         expect(v1['x-required-scopes'], label).toEqual([scope]);
         expect(api, label).not.toHaveProperty('x-required-scopes');
-        expect(v1.responses, label).toEqual(api.responses);
+        // 两套认证的 401/429 示例文案不同，/v1 另有缺 scope 的 403 示例；除示例外完全同形
+        expect(withoutExamples(v1.responses), label).toEqual(withoutExamples(api.responses));
+        expect(exampleNames(v1.responses, '403'), label).toContain(scope === 'domain.read' ? 'ForbiddenScopeDomainRead' : 'ForbiddenScopeDomainWrite');
         expect(v1.requestBody, label).toEqual(api.requestBody);
         expect(v1.parameters, label).toEqual(api.parameters);
         checked++;
       }
     }
-    expect(checked).toBe(8);
+    expect(checked).toBe(9);
   });
 
   it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
@@ -800,7 +866,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     // 两份规格只在认证相关措辞上不同：/v1 写明管理员 Key 的范围与审计记法，/api 保持原说明
     expect(specs.v1.paths['/hosted-domains']!.get!.description).toContain('/api/admin/hosted-domains');
     expect(specs.v1.paths['/hosted-domains/{id}']!.get!.description).toContain('JWT-only');
-    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
+    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/reconnect', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
       ['/hosted-domains/{id}/dns-records/{recordId}', 'put'], ['/hosted-domains/{id}/dns-records/{recordId}', 'delete']] as const) {
       expect(specs.v1.paths[path]![method]!.description, `${method} ${path}`).toContain('API Key #id');
       expect(specs.api.paths[path]![method]!.description, `${method} ${path}`).not.toContain('API Key');

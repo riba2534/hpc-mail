@@ -218,7 +218,7 @@ export function InvitesPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.admin.invites });
       setRevoking(null);
     },
-    onError: () => toast({ title: '作废失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '作废失败' },
   });
 
   const invites = data ?? [];

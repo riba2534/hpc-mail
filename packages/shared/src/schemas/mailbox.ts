@@ -156,9 +156,10 @@ export interface SendIdentity {
 }
 
 /**
- * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"）：目前只对管理员列出，
- * 与管理员发信的实际放行规则一致——system 系统域名；hosted 发信已就绪的托管域名；
- * legacy 已从系统列表移除、但仍有存量邮箱的旧域名。
+ * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"），与发信的实际放行规则一致：
+ * 管理员得到 system 系统域名、hosted 发信已就绪的托管域名、legacy 已从系统列表移除但仍有存量邮箱的旧域名；
+ * 普通用户只得到自己作为所有者、已生效且发信就绪的托管域名（hosted），发出时自动把该地址认领给所有者
+ * （不占全站每人认领上限），成员与共享不适用。
  */
 export interface SendIdentityDomain {
   domain: string;
@@ -247,4 +248,93 @@ export interface SharedMailboxView {
   domain: string;
   displayName: string;
   ownerUsername: string;
+}
+
+/** 管理员批量邮箱接口（/api/admin/mailboxes/batch/*，仅管理员 JWT）单次最多处理的项数 */
+export const MAX_ADMIN_MAILBOX_BATCH = 100;
+
+/** 完整邮箱地址：前缀与域名规则同认领，按小写比较 */
+export const mailboxAddressSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .max(318)
+  .refine((value) => {
+    const at = value.lastIndexOf('@');
+    return at > 0 && localPartSchema.safeParse(value.slice(0, at)).success && domainSchema.safeParse(value.slice(at + 1)).success;
+  }, '邮箱地址格式非法');
+
+const userIdSchema = z.number().int().positive();
+
+/** 同一批里重复的地址会让逐项结果含糊（第二项看到的是第一项的结果），直接拒绝整批 */
+function uniqueAddresses<T extends { address: string }>(items: T[], ctx: z.RefinementCtx) {
+  const seen = new Set<string>();
+  items.forEach((item, index) => {
+    if (seen.has(item.address)) ctx.addIssue({ code: 'custom', message: `地址 ${item.address} 在本批中重复`, path: [index, 'address'] });
+    seen.add(item.address);
+  });
+}
+
+/** 按地址指定已认领邮箱；expectedOwnerId 可选，给了就与当前所有者比对，不一致的项不处理 */
+const adminBatchMailboxRefSchema = z.object({
+  address: mailboxAddressSchema,
+  expectedOwnerId: userIdSchema.optional(),
+});
+
+const adminBatchMailboxRefsSchema = z.array(adminBatchMailboxRefSchema).min(1).max(MAX_ADMIN_MAILBOX_BATCH).superRefine(uniqueAddresses);
+
+/** 为指定用户批量认领：按该用户自己的认领规则逐个认领，响应同 POST /api/mailboxes/batch */
+export const adminBatchClaimRequestSchema = z.object({
+  userId: userIdSchema,
+  items: z.array(claimMailboxRequestSchema).min(1).max(MAX_ADMIN_MAILBOX_BATCH),
+});
+export type AdminBatchClaimRequest = z.infer<typeof adminBatchClaimRequestSchema>;
+
+/** 批量释放；deleteHistory=true 时同时永久删除这些地址的全部历史邮件 */
+export const adminBatchReleaseRequestSchema = z.object({
+  items: adminBatchMailboxRefsSchema,
+  deleteHistory: z.boolean().default(false),
+});
+export type AdminBatchReleaseRequest = z.infer<typeof adminBatchReleaseRequestSchema>;
+
+/** 批量过户给同一个用户；每项必须带 expectedOwnerId（同单个过户） */
+export const adminBatchTransferRequestSchema = z.object({
+  userId: userIdSchema,
+  items: z.array(adminBatchMailboxRefSchema.extend({ expectedOwnerId: userIdSchema }))
+    .min(1).max(MAX_ADMIN_MAILBOX_BATCH).superRefine(uniqueAddresses),
+});
+export type AdminBatchTransferRequest = z.infer<typeof adminBatchTransferRequestSchema>;
+
+/** 批量共享（追加，不移除已有成员）与批量取消共享：同一批用户作用于每个邮箱 */
+export const adminBatchShareRequestSchema = z.object({
+  userIds: z.array(userIdSchema).min(1).max(MAX_MAILBOX_GRANTEES),
+  items: adminBatchMailboxRefsSchema,
+});
+export type AdminBatchShareRequest = z.infer<typeof adminBatchShareRequestSchema>;
+
+/**
+ * 逐项结果。done 已执行；unchanged 已是目标状态（已归目标用户、成员都已在或都不在名单里）；
+ * failed 未执行，原因见 error（not_found 邮箱不存在、conflict 所有者与 expectedOwnerId 不符、其余同单个接口）。
+ */
+export interface AdminMailboxBatchItemResult {
+  address: string;
+  status: 'done' | 'unchanged' | 'failed';
+  mailboxId: number | null;
+  /** 处理前的所有者；邮箱不存在时为 null */
+  ownerId: number | null;
+  error: { code: ErrorCode; message: string } | null;
+  /** 释放：删除的历史邮件数（deleteHistory=false 时为 0） */
+  deletedMessages?: number;
+  /** 释放与过户：撤销的共享数；取消共享：移除的成员数 */
+  revokedShares?: number;
+  /** 共享：新增的成员数 */
+  addedShares?: number;
+}
+
+export interface AdminMailboxBatchResult {
+  /** 与请求 items 同序 */
+  results: AdminMailboxBatchItemResult[];
+  done: number;
+  unchanged: number;
+  failed: number;
 }

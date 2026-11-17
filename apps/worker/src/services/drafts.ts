@@ -38,12 +38,28 @@ import {
   consumeDraftAttachments, draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment, resolveDraftAttachments,
 } from './upload.js';
 import { fetchUrlAttachments, releaseUrlAttachments } from './url-attachment.js';
+import { emitSendResult } from './webhooks.js';
 
 type DraftRow = typeof drafts.$inferSelect;
+
+/**
+ * 能看到哪些草稿：始终限于 userId 的草稿；keyId 非空时（限定了范围的 API Key）只限这把 Key 自己创建的草稿，
+ * 不能借草稿读写范围外地址的内容。
+ */
+export interface DraftOwner {
+  userId: number;
+  keyId?: number | null;
+}
+
+function ownedBy(owner: DraftOwner) {
+  return and(eq(drafts.userId, owner.userId), owner.keyId ? eq(drafts.apiKeyId, owner.keyId) : undefined);
+}
 
 /** 操作草稿的调用方：网页会话或 API Key；草稿始终属于 userId */
 export interface DraftActor {
   userId: number;
+  /** 限定了范围的 API Key：只能操作它自己创建的草稿 */
+  restrictedKeyId: number | null;
   via: 'web' | 'api';
   /** API Key 调用时为 Key id */
   apiKeyId: number | null;
@@ -109,10 +125,10 @@ function toSummary(row: DraftRow, apiKeyName: string | null): DraftSummary {
 
 const keyName = sql<string | null>`(select ${apiKeys.name} from ${apiKeys} where ${apiKeys.id} = ${drafts.apiKeyId})`;
 
-export async function listDrafts(env: Env, userId: number, query: ListDraftsQuery): Promise<Page<DraftSummary>> {
+export async function listDrafts(env: Env, owner: DraftOwner, query: ListDraftsQuery): Promise<Page<DraftSummary>> {
   const cursorId = decodeCursor(query.cursor);
   const rows = await createDb(env).select({ draft: drafts, apiKeyName: keyName }).from(drafts)
-    .where(and(eq(drafts.userId, userId), query.status ? eq(drafts.status, query.status) : undefined,
+    .where(and(ownedBy(owner), query.status ? eq(drafts.status, query.status) : undefined,
       cursorId ? lt(drafts.id, cursorId) : undefined))
     .orderBy(desc(drafts.id)).limit(query.limit + 1).all();
   const hasMore = rows.length > query.limit;
@@ -124,19 +140,19 @@ export async function listDrafts(env: Env, userId: number, query: ListDraftsQuer
 }
 
 /** 草稿行与它引用的附件合成一次往返 */
-async function loadDraft(env: Env, userId: number, id: number) {
+async function loadDraft(env: Env, owner: DraftOwner, id: number) {
   const db = createDb(env);
   const [rows, files] = await db.batch([
-    db.select({ draft: drafts, apiKeyName: keyName }).from(drafts).where(and(eq(drafts.id, id), eq(drafts.userId, userId))),
-    db.select().from(draftAttachments).where(and(eq(draftAttachments.draftId, id), eq(draftAttachments.userId, userId))),
+    db.select({ draft: drafts, apiKeyName: keyName }).from(drafts).where(and(eq(drafts.id, id), ownedBy(owner))),
+    db.select().from(draftAttachments).where(and(eq(draftAttachments.draftId, id), eq(draftAttachments.userId, owner.userId))),
   ]);
   const row = rows[0];
   if (!row) throw notFound();
   return { row: row.draft, apiKeyName: row.apiKeyName, files };
 }
 
-export async function getDraft(env: Env, userId: number, id: number): Promise<Draft> {
-  const { row, apiKeyName, files } = await loadDraft(env, userId, id);
+export async function getDraft(env: Env, owner: DraftOwner, id: number): Promise<Draft> {
+  const { row, apiKeyName, files } = await loadDraft(env, owner, id);
   const body = await readMailBody(env, row);
   const byToken = new Map(files.map((file) => [file.token, file]));
   const attachments: DraftAttachment[] = row.content.attachmentTokens.flatMap((ref) => {
@@ -372,7 +388,7 @@ async function replayCreate(env: Env, userId: number, storedKey: string, request
   if (existing.requestHash !== requestHash) {
     throw new AppError('idempotency_mismatch', '相同 Idempotency-Key 不能用于不同的草稿内容，请使用新的 Key');
   }
-  return getDraft(env, userId, existing.id);
+  return getDraft(env, { userId }, existing.id);
 }
 
 export interface CreateDraftResult {
@@ -430,7 +446,7 @@ export async function createDraft(
   if (prepared.content.attachmentTokens.length) {
     await env.db.batch(attachmentRefStatements(env, actor.userId, id, prepared.content.attachmentTokens.map((ref) => ref.token)));
   }
-  return { draft: await getDraft(env, actor.userId, id), replayed: false };
+  return { draft: await getDraft(env, { userId: actor.userId }, id), replayed: false };
 }
 
 export async function updateDraft(
@@ -439,12 +455,13 @@ export async function updateDraft(
   id: number,
   input: DraftInput,
   request: DraftRequestEnv,
-  authorize?: (content: StoredDraftContent) => void,
+  authorize?: (content: StoredDraftContent) => void | Promise<void>,
 ): Promise<Draft> {
-  const { row } = await loadDraft(env, actor.userId, id);
+  const owner = { userId: actor.userId, keyId: actor.restrictedKeyId };
+  const { row } = await loadDraft(env, owner, id);
   if (input.expectedVersion !== undefined && input.expectedVersion !== row.version) throw stateConflict(row, conflictMessage(row, '修改'));
   if (!EDITABLE.includes(row.status)) throw stateConflict(row, conflictMessage(row, '修改'));
-  authorize?.(mergeContent(row.content, input));
+  await authorize?.(mergeContent(row.content, input));
   const sendAt = sendAtOf(input);
   const status: DraftStatus = sendAt ? 'scheduled' : sendAt === null ? 'draft' : row.status;
   // 只改部分字段又要保持（或进入）定时状态时，需要原正文一起做完整性校验
@@ -488,13 +505,14 @@ export async function updateDraft(
     ...(prepared.body ? bodyCleanupStatement(env, row.bodyR2Key) : []),
   ];
   if (followUps.length) await env.db.batch(followUps);
-  return getDraft(env, actor.userId, id);
+  return getDraft(env, owner, id);
 }
 
-export async function deleteDraft(env: Env, userId: number, id: number): Promise<void> {
+export async function deleteDraft(env: Env, owner: DraftOwner, id: number): Promise<void> {
   const db = createDb(env);
+  const userId = owner.userId;
   const row = await db.select({ status: drafts.status, version: drafts.version, bodyR2Key: drafts.bodyR2Key }).from(drafts)
-    .where(and(eq(drafts.id, id), eq(drafts.userId, userId))).get();
+    .where(and(eq(drafts.id, id), ownedBy(owner))).get();
   if (!row) throw notFound();
   if (row.status === 'sending') throw stateConflict(row, conflictMessage(row, '删除'));
   // 删除与释放附件、正文同一事务；附件只在草稿确实被删掉后才释放（并发进入 sending 时都不动）
@@ -601,6 +619,8 @@ async function performSend(
         await Promise.all([failIdempotentSend(env, idem.handle, error), releaseDeliveryLeases(env, leaseToken)]);
         throw error;
       }
+      // Webhook v2 的 mail.sent / mail.failed：与直接发信一样按发件行最终状态发
+      await emitSendResult(env, row.userId, summary.id, ctx);
       if (summary.status !== 'failed') {
         await consumeDraftAttachments(env, row.userId, req.attachmentTokens.map((ref) => ref.token))
           .catch((error) => console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', error));
@@ -632,11 +652,12 @@ export async function sendDraftNow(
   sender: Sender,
   id: number,
   origin: string,
-  authorize?: (content: StoredDraftContent) => void,
+  authorize?: (content: StoredDraftContent) => void | Promise<void>,
   expectedVersion?: number,
+  restrictedKeyId?: number | null,
 ): Promise<MessageSummary> {
   const db = createDb(env);
-  const row = await db.select().from(drafts).where(and(eq(drafts.id, id), eq(drafts.userId, sender.userId))).get();
+  const row = await db.select().from(drafts).where(and(eq(drafts.id, id), ownedBy({ userId: sender.userId, keyId: restrictedKeyId }))).get();
   if (!row) throw notFound();
   const settled = async (current: Pick<DraftRow, 'status' | 'version' | 'messageId'>): Promise<MessageSummary> => {
     if (current.status === 'sending') {
@@ -655,7 +676,7 @@ export async function sendDraftNow(
   if (expectedVersion !== undefined && expectedVersion !== row.version) {
     throw stateConflict(row, `草稿在你审阅之后被修改过（当前版本 ${row.version}），请重新审阅后再发送`);
   }
-  authorize?.(row.content);
+  await authorize?.(row.content);
   const claimed = await db.update(drafts).set({
     status: 'sending', attempt: sql`${drafts.attempt} + 1`, claimedAt: new Date(), version: sql`${drafts.version} + 1`, updatedAt: new Date(),
   }).where(and(eq(drafts.id, id), eq(drafts.version, row.version), eq(drafts.status, row.status))).returning().get();
@@ -670,10 +691,21 @@ export async function sendDraftNow(
 // ---------- 定时派发与恢复 ----------
 
 /** 到点复核：所有者仍启用、账户安全版本未变、安排它的 Key 仍有效；不满足时返回取消原因 */
+interface SchedulerKey {
+  status: string;
+  expiresAt: Date | null;
+  mailboxIds: number[];
+  domains: string[];
+}
+
+/** 发件地址对应的认领行（按 mailboxId 或地址查到的），用于复核限定了范围的 Key */
+type SenderBox = { id: number; domain: string } | undefined;
+
 function scheduleRevoked(
   row: DraftRow,
   owner: { status: string; authVersion: number } | undefined,
-  key: { status: string; expiresAt: Date | null } | undefined,
+  key: SchedulerKey | undefined,
+  sender: { box: SenderBox; domain: string | null },
   now: number,
 ): string | null {
   if (!owner || owner.status !== 'active') return '草稿所有者已被禁用，定时发送已取消';
@@ -682,6 +714,12 @@ function scheduleRevoked(
   }
   if (row.scheduledByKeyId !== null && (!key || key.status !== 'active' || (key.expiresAt && key.expiresAt.getTime() <= now))) {
     return '安排定时发送的 API Key 已失效，定时发送已取消，请确认后重新安排';
+  }
+  // Key 之后被收窄了范围：发件地址不在范围内就不发（与安排时的检查同一口径：域名在范围内或认领行在范围内）
+  if (key && (key.mailboxIds.length || key.domains.length)) {
+    const domain = sender.box?.domain ?? sender.domain;
+    const allowed = (domain !== null && key.domains.includes(domain)) || (sender.box !== undefined && key.mailboxIds.includes(sender.box.id));
+    if (!allowed) return '安排定时发送的 API Key 已不再覆盖这个发件地址，定时发送已取消，请确认后重新安排';
   }
   return null;
 }
@@ -740,22 +778,41 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
   if (!due.length) return report;
   const ownerIds = [...new Set(due.map((row) => row.userId))];
   const keyIds = [...new Set(due.flatMap((row) => (row.scheduledByKeyId !== null ? [row.scheduledByKeyId] : [])))];
-  const [owners, keys] = await env.db.batch<Record<string, unknown>>([
-    env.db.prepare(`SELECT id, role, status, auth_version FROM users WHERE id IN (${ownerIds.map(() => '?').join(', ')})`).bind(...ownerIds),
+  // 发件邮箱：限定范围的 Key 复核要用到认领行；草稿最多 DISPATCH_BATCH 封，绑定参数不会超
+  const boxIds = [...new Set(due.flatMap((row) => (row.content.from?.mailboxId ? [row.content.from.mailboxId] : [])))];
+  const addresses = [...new Set(due.flatMap((row) => (row.content.from?.localPart && row.content.from.domain
+    ? [`${row.content.from.localPart}@${row.content.from.domain}`] : [])))];
+  const list = (values: unknown[]) => values.map(() => '?').join(', ');
+  const [owners, keys, boxes] = await env.db.batch<Record<string, unknown>>([
+    env.db.prepare(`SELECT id, role, status, auth_version FROM users WHERE id IN (${list(ownerIds)})`).bind(...ownerIds),
     keyIds.length
-      ? env.db.prepare(`SELECT id, status, expires_at FROM api_keys WHERE id IN (${keyIds.map(() => '?').join(', ')})`).bind(...keyIds)
+      ? env.db.prepare(`SELECT id, status, expires_at, allowed_mailbox_ids, allowed_domains FROM api_keys WHERE id IN (${list(keyIds)})`).bind(...keyIds)
+      : env.db.prepare('SELECT NULL AS id WHERE 0'),
+    boxIds.length || addresses.length
+      ? env.db.prepare(`SELECT id, domain, address FROM mailboxes WHERE id IN (${list(boxIds) || 'NULL'}) OR address IN (${list(addresses) || 'NULL'})`)
+        .bind(...boxIds, ...addresses)
       : env.db.prepare('SELECT NULL AS id WHERE 0'),
   ]);
+  const boxById = new Map(boxes!.results.map((box) => [Number(box.id), { id: Number(box.id), domain: String(box.domain) }]));
+  const boxByAddress = new Map(boxes!.results.map((box) => [String(box.address), { id: Number(box.id), domain: String(box.domain) }]));
+  const senderOf = (row: DraftRow) => {
+    const from = row.content.from;
+    if (from?.mailboxId) return { box: boxById.get(from.mailboxId), domain: null };
+    if (from?.localPart && from.domain) return { box: boxByAddress.get(`${from.localPart}@${from.domain}`), domain: from.domain };
+    return { box: undefined, domain: null };
+  };
+  const json = (value: unknown) => { try { return JSON.parse(String(value ?? '[]')) as unknown[]; } catch { return []; } };
   const ownerById = new Map(owners!.results.map((owner) => [Number(owner.id), {
     role: owner.role as Role, status: String(owner.status), authVersion: Number(owner.auth_version),
   }]));
-  const keyById = new Map(keys!.results.map((key) => [Number(key.id), {
+  const keyById = new Map(keys!.results.map((key): [number, SchedulerKey] => [Number(key.id), {
     status: String(key.status), expiresAt: key.expires_at === null ? null : new Date(Number(key.expires_at)),
+    mailboxIds: json(key.allowed_mailbox_ids).map(Number), domains: json(key.allowed_domains).map(String),
   }]));
   await runPool(due, DISPATCH_CONCURRENCY, async (row) => {
     try {
       const owner = ownerById.get(row.userId);
-      const revoked = scheduleRevoked(row, owner, row.scheduledByKeyId !== null ? keyById.get(row.scheduledByKeyId) : undefined, now);
+      const revoked = scheduleRevoked(row, owner, row.scheduledByKeyId !== null ? keyById.get(row.scheduledByKeyId) : undefined, senderOf(row), now);
       if (revoked) {
         await settle(env, row, { status: 'failed', messageId: null, errorDetail: revoked });
         report.failed++;

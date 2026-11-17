@@ -1,4 +1,4 @@
-import { API_SCOPES, MAX_BATCH_SEND_ITEMS, type ApiScope, type BatchSendResult, type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
+import { MAX_BATCH_SEND_ITEMS, type ApiScope, type BatchSendResult, type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,6 +6,7 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
@@ -32,7 +33,7 @@ async function failure(response: Response, status: number) {
   return body.error;
 }
 
-async function account(name: string, scopes: ApiScope[] = [...API_SCOPES], quota = { dailyOutbound: 0, dailyRecipients: 0 }) {
+async function account(name: string, scopes: ApiScope[] = USER_SCOPES, quota = { dailyOutbound: 0, dailyRecipients: 0 }) {
   await updateSettings(env, {
     domains: { list: [{ domain: 'hpc.email', public: true, perUserLimit: 0 }] },
     code_extract: { enabled: false, aiEnabled: false },
@@ -40,11 +41,11 @@ async function account(name: string, scopes: ApiScope[] = [...API_SCOPES], quota
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username: name, role: 'user', passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username: name, role: 'user', passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   await db.insert(mailboxes).values({ address: `${name}@hpc.email`, domain: 'hpc.email', userId: user!.id });
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await call('/api/api-keys', post(jwt, { name: `${name}-key`, scopes, rateLimit: 600 })), 201);
+  const key = await data<CreatedApiKey>(await call('/api/api-keys', post(jwt, { name: `${name}-key`, scopes, rateLimit: 600, password: TEST_PASSWORD })), 201);
   return { id: user!.id, key: key.key, address: `${name}@hpc.email` };
 }
 
@@ -107,7 +108,7 @@ describe('POST /v1/messages/batch', () => {
   });
 
   it('配额逐项占用：超额的项是 429，前面的项照常发出', async () => {
-    const me = await account('batch-quota', [...API_SCOPES], { dailyOutbound: 2, dailyRecipients: 0 });
+    const me = await account('batch-quota', USER_SCOPES, { dailyOutbound: 2, dailyRecipients: 0 });
     const result = await data<BatchSendResult>(await call('/v1/messages/batch', post(me.key, { items: [
       item(me.address, 'batch-l@hpc.email'), item(me.address, 'batch-m@hpc.email'), item(me.address, 'batch-n@hpc.email'),
     ] })));
@@ -142,5 +143,23 @@ describe('POST /v1/messages/batch', () => {
       const row = await db.select({ recipients: messages.recipients }).from(messages).where(eq(messages.id, r.message!.id)).get();
       expect(row!.recipients.to).toEqual([targets[i]]);
     }
+  });
+});
+
+describe('批量发送与限定范围的 Key', () => {
+  it('范围外的发件地址只让该项 403，其余照发', async () => {
+    const me = await account('batch-narrow');
+    const [box] = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, me.address));
+    await db.insert(mailboxes).values({ address: 'batch-narrow-other@hpc.email', domain: 'hpc.email', userId: me.id });
+    const sid = await createSession(env, me.id);
+    const jwt = await signToken(env.jwt_secret, { sub: me.id, sid, epoch: 0, uepoch: 0 });
+    const narrow = await data<CreatedApiKey>(await call('/api/api-keys', post(jwt, {
+      name: 'narrow', scopes: USER_SCOPES, rateLimit: 600, password: TEST_PASSWORD, allowedMailboxIds: [box!.id],
+    })), 201);
+    const result = await data<BatchSendResult>(await call('/v1/messages/batch', post(narrow.key, { items: [
+      item('batch-narrow-other@hpc.email', 'bn1@hpc.email'), item(me.address, 'bn2@hpc.email'),
+    ] })));
+    expect(result.items.map((r) => [r.httpStatus, r.error?.code])).toEqual([[403, 'forbidden'], [201, undefined]]);
+    expect(result.items[0]!.error!.docs).toContain('#key-restricted');
   });
 });

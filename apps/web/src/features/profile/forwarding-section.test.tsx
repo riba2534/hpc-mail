@@ -2,7 +2,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { SessionUser, UserNotifyPrefs } from '@hpc-mail/shared';
+import type { NotifyPrefsView, SessionUser, UserNotifyPrefs } from '@hpc-mail/shared';
+import { ApiError } from '@/api/errors';
 import { CurrentUserContext } from '@/lib/use-session';
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -23,11 +24,12 @@ import { ForwardingSection } from './forwarding-section';
 
 const user: SessionUser = { id: 1, username: 'alice', role: 'user', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
 
-const prefs = (): UserNotifyPrefs => ({
+const prefs = (): NotifyPrefsView => ({
   feishu: { enabled: true, webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/old', secret: '', contentLevel: 'summary' },
   webhook: { enabled: false, url: '', secret: '' },
   forward: { enabled: false, addresses: [] },
   pushdeer: { enabled: false, endpoint: '', pushkey: '' },
+  forwardPending: [],
 });
 
 function renderSection() {
@@ -60,6 +62,28 @@ afterEach(() => {
 });
 
 describe('转发与通知', () => {
+  it('等待确认的转发目标留在列表里并标出；需要密码时弹窗，带上密码再保存一次', async () => {
+    const view: NotifyPrefsView = { ...prefs(), forward: { enabled: true, addresses: ['ok@example.net'] },
+      forwardPending: [{ address: 'wait@example.net', expiresAt: '2026-11-20T00:00:00.000Z' }] };
+    mocks.get.mockResolvedValue(view);
+    mocks.update
+      .mockRejectedValueOnce(new ApiError('该操作需要输入当前密码', { code: 'reauth_required', httpStatus: 403 }))
+      .mockImplementation(async (body: UserNotifyPrefs) => ({ ...body, forwardPending: view.forwardPending }));
+    const { client } = renderSection();
+    expect(await screen.findByRole('list', { name: '等待确认的转发目标' })).toHaveTextContent('wait@example.net');
+    const url = await screen.findByPlaceholderText(/open\.feishu\.cn/);
+    fireEvent.change(url, { target: { value: 'https://open.feishu.cn/open-apis/bot/v2/hook/new' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    fireEvent.change(await screen.findByLabelText('当前密码'), { target: { value: 'pw-123456' } });
+    fireEvent.click(screen.getByRole('button', { name: '确认并保存' }));
+    await waitFor(() => expect(mocks.update).toHaveBeenCalledTimes(2));
+    // 草稿里的转发目标包含已确认与等待确认的全部地址；第二次带上密码
+    expect(mocks.update.mock.calls[0]![0].forward.addresses).toEqual(['ok@example.net', 'wait@example.net']);
+    expect(mocks.update.mock.calls[0]![0]).not.toHaveProperty('password');
+    expect(mocks.update.mock.calls[1]![0].password).toBe('pw-123456');
+    client.clear();
+  });
+
   it('通道开关打开才展开配置项', async () => {
     mocks.get.mockResolvedValue(prefs());
     const { client } = renderSection();
@@ -77,7 +101,7 @@ describe('转发与通知', () => {
     mocks.get.mockResolvedValue(prefs());
     mocks.update.mockImplementation(async (body: UserNotifyPrefs) => {
       mocks.calls.push('save');
-      return body;
+      return { ...body, forwardPending: [] };
     });
     mocks.testFeishu.mockImplementation(async () => {
       mocks.calls.push('test');

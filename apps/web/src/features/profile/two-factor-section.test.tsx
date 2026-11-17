@@ -8,9 +8,10 @@ const mocks = vi.hoisted(() => ({
     secret: 'JBSWY3DPEHPK3PXP',
     otpauthUri: 'otpauth://totp/HPC%20Mail:alice?secret=JBSWY3DPEHPK3PXP&issuer=HPC%20Mail',
   })),
-  enable: vi.fn(async () => ({ recoveryCodes: ['aaaa-1111', 'bbbb-2222'] })),
+  enable: vi.fn(async () => ({ recoveryCodes: ['aaaa-1111', 'bbbb-2222'], token: 'rotated-token' })),
 }));
 vi.mock('@/api/resources', () => ({ authApi: { setup2fa: mocks.setup, enable2fa: mocks.enable, disable2fa: vi.fn() } }));
+import { getAuthToken, setAuthToken } from '@/lib/auth-token';
 import { recoveryCodesText, TwoFactorSection } from './two-factor-section';
 
 const user: SessionUser = { id: 1, username: 'alice', role: 'user', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
@@ -27,8 +28,15 @@ function renderSection() {
   return client;
 }
 
-async function enableToRecovery() {
+/** 点「启用两步验证」后先确认当前密码，再进入扫码 */
+async function startSetup() {
   fireEvent.click(screen.getByRole('button', { name: '启用两步验证' }));
+  fireEvent.change(await screen.findByLabelText('当前密码'), { target: { value: 'current-pass' } });
+  fireEvent.click(screen.getByRole('button', { name: '继续' }));
+}
+
+async function enableToRecovery() {
+  await startSetup();
   expect(await screen.findByRole('img', { name: '两步验证二维码' })).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('6 位验证码'), { target: { value: '123456' } });
   fireEvent.click(screen.getByRole('button', { name: '验证并启用' }));
@@ -38,9 +46,18 @@ async function enableToRecovery() {
 afterEach(() => vi.clearAllMocks());
 
 describe('两步验证', () => {
+  it('登记前要当前密码；启用成功后换上服务端返回的新会话令牌', async () => {
+    setAuthToken('old-token');
+    const client = renderSection();
+    await enableToRecovery();
+    expect(mocks.setup).toHaveBeenCalledWith('current-pass');
+    expect(getAuthToken()).toBe('rotated-token');
+    client.clear();
+  });
+
   it('启用时本地渲染二维码，并提供「复制密钥」「复制链接」两个按钮', async () => {
     const client = renderSection();
-    fireEvent.click(screen.getByRole('button', { name: '启用两步验证' }));
+    await startSetup();
     expect(await screen.findByRole('img', { name: '两步验证二维码' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '复制密钥' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '复制链接' })).toBeInTheDocument();
@@ -50,7 +67,7 @@ describe('两步验证', () => {
 
   it('验证码不足 6 位就地提示，不调用接口', async () => {
     const client = renderSection();
-    fireEvent.click(screen.getByRole('button', { name: '启用两步验证' }));
+    await startSetup();
     await screen.findByRole('img', { name: '两步验证二维码' });
     fireEvent.change(screen.getByLabelText('6 位验证码'), { target: { value: '12a3' } });
     expect(screen.getByLabelText('6 位验证码')).toHaveValue('123');

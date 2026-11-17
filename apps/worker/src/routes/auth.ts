@@ -4,6 +4,7 @@ import {
   enableTwoFactorRequestSchema,
   loginRequestSchema,
   registerRequestSchema,
+  setupTwoFactorRequestSchema,
   uploadAvatarRequestSchema,
   type SessionUser,
 } from '@hpc-mail/shared';
@@ -75,22 +76,22 @@ app.put('/password', requireAuth, async (c) => {
   return ok(c, result);
 });
 
-/** 两步验证：开始登记（返回密钥+otpauth URI） */
+/** 两步验证：开始登记（需当前密码；返回密钥+otpauth URI） */
 app.post('/2fa/setup', requireAuth, async (c) => {
-  return ok(c, await setupTwoFactor(c.env, c.get('user')!.id));
+  const req = await parseBody(c, setupTwoFactorRequestSchema);
+  return ok(c, await setupTwoFactor(c.env, c.get('user')!.id, req.password));
 });
 
-/** 两步验证：校验一次性码并启用（返回一次性恢复码） */
+/** 两步验证：校验一次性码并启用（返回一次性恢复码与替换当前会话的新令牌，其他会话失效） */
 app.post('/2fa/enable', requireAuth, async (c) => {
   const req = await parseBody(c, enableTwoFactorRequestSchema);
   return ok(c, await enableTwoFactor(c.env, c.get('user')!.id, req.code), 201);
 });
 
-/** 两步验证：关闭（需密码或有效 TOTP 码） */
+/** 两步验证：关闭（需当前密码；返回替换当前会话的新令牌，其他会话失效） */
 app.post('/2fa/disable', requireAuth, async (c) => {
   const req = await parseBody(c, disableTwoFactorRequestSchema);
-  await disableTwoFactor(c.env, c.get('user')!.id, req);
-  return ok(c, { success: true });
+  return ok(c, await disableTwoFactor(c.env, c.get('user')!.id, req.password));
 });
 
 app.post('/logout', requireAuth, async (c) => {

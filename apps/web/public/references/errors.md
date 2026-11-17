@@ -1,5 +1,12 @@
 # 错误码与改正方法
 
+## 目录
+
+- 发信与请求：[validation_failed](#validation_failed)、[header_not_allowed](#header_not_allowed)、[payload_too_large](#payload_too_large)、[idempotency_mismatch](#idempotency_mismatch)、[send_in_progress](#send_in_progress)、[source_unavailable](#source_unavailable)、[from_required](#from_required)、[delivery_failed](#delivery_failed)、[recipient_suppressed](#recipient_suppressed)、[rate_limited](#rate_limited)
+- 权限：[forbidden-scope](#forbidden-scope)、[forbidden-sender](#forbidden-sender)、[key-restricted](#key-restricted)、[reauth_required](#reauth_required)、[reauth_failed](#reauth_failed)
+- URL 附件与草稿：[attachment_url_forbidden](#attachment_url_forbidden)、[attachment_url_fetch_failed](#attachment_url_fetch_failed)、[draft_state_conflict](#draft_state_conflict)、[draft_limit_reached](#draft_limit_reached)
+- [其他错误码](#其他错误码)
+
 失败响应统一为 HTTP 4xx/5xx 加错误信封：
 
 ```json
@@ -49,7 +56,11 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 ## source_unavailable
 
-`replyToMessageId` 或 `forwardAttachmentsFrom` 引用的原邮件不存在、不可见，或附件已丢失（HTTP 404）。去掉这个字段后可以作为新邮件发送，丢失的附件需要重新附上。回复站外邮件不用 `replyToMessageId`，改在 `headers` 里写 `In-Reply-To`/`References`。
+`replyToMessageId` 或 `forwardAttachmentsFrom` 引用的原邮件、或回复/转发接口路径里的原邮件不存在、不可见，或附件已丢失（HTTP 404）。`details.source` 指明是哪一个：`reply` 是回复的原邮件（`replyToMessageId` 或回复接口路径里的 id），`forward` 是转发的原邮件或它的附件；`replyToMessageId` 与 `forwardAttachmentsFrom` 都带时只去掉对应的那个。去掉这个字段（或改用普通发送）后可以作为新邮件发送，丢失的附件需要重新附上。回复站外邮件不用 `replyToMessageId`，改在 `headers` 里写 `In-Reply-To`/`References`。
+
+## from_required
+
+回复或转发没给 `from`，而缺省的发件地址——原信的收件地址——不是你能用的发件身份（HTTP 400 `from_required`），典型情况是原信在别人共享给你的邮箱里。在请求的 `from` 写自己的地址（写法同普通发送），先调 `GET /v1/identities` 从 `canSend=true` 的项里选。显式给了 `from` 但无权使用时是 403 `forbidden`，见 [forbidden-sender](#forbidden-sender)。
 
 ## delivery_failed
 
@@ -65,6 +76,17 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 请求频率或每日外发配额超限（HTTP 429）。按 `X-RateLimit-Reset` 或错误信息稍后重试，设总期限，不要换 Key 绕过账户级限制；`GET /v1/me` 查看速率上限与今日外发用量（`outbound.resetsAt` 是配额重置时间）。
 
+## key-restricted
+
+这把 Key 限定了可用的邮箱或域名（HTTP 403 `forbidden`），请求涉及的地址、邮箱或域名不在范围内。`GET /v1/me` 的 `key.allowedMailboxIds`、`key.allowedDomains` 列出范围；只限定了邮箱的 Key 不能认领新地址。列表、等待、未读数等读取只返回范围内的邮件，不会报这个错。换用覆盖该地址的 Key，或请用户在网页「API Key」页面调整范围。
+
+## reauth_required
+
+网页会话（JWT）的敏感操作需要在请求体里带当前登录密码 `password`（HTTP 403）：创建 API Key、新增或启用邮箱转发目标、开启或关闭两步验证。向用户索取当前密码后带上重试；不要把密码写进日志或报告。
+
+## reauth_failed
+
+`password` 与当前登录密码不符（HTTP 403，网页会话不会因此失效）。同一账户 15 分钟内失败 5 次后返回 429 `rate_limited`，等窗口结束再试。
 ## attachment_url_forbidden
 
 URL 附件的地址不允许拉取（HTTP 400），没有发出，`details.url` 是被拒的地址（重定向时是跳转目标）。只接受公网可访问的 `https://` 地址，默认端口 443，地址里不能带账号密码；IP 字面量或域名解析结果落在内网、回环、链路本地（含云元数据 `169.254.169.254`）、CGNAT、组播、保留或文档网段时拒绝，`localhost`、`*.local`、`*.internal` 等内网主机名与本站自身的地址也拒绝。重定向的每一跳都按同样规则检查。内网或本站的文件先下载，再用 `POST /v1/uploads`（JWT 用 `POST /api/uploads`）上传后写进 `attachmentTokens`。详见[附件](attachments.md#url-附件)。

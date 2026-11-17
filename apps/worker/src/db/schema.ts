@@ -40,6 +40,8 @@ export const users = sqliteTable('users', {
   totpEnabledAt: integer('totp_enabled_at', { mode: 'timestamp_ms' }),
   /** 恢复码哈希列表（JSON，SHA-256）；每个用一次即移除 */
   totpRecoveryCodes: text('totp_recovery_codes', { mode: 'json' }).$type<string[]>(),
+  /** 最近一次成功使用的 TOTP 时间步（unix 秒 / 30）；同一步及更早的码不再接受（防重放） */
+  totpLastStep: integer('totp_last_step'),
   /** 个人转发与通知偏好（JSON）：飞书/通用 webhook/邮箱转发。null=未配置，走默认（管理员则继承旧全局） */
   notifyPrefs: text('notify_prefs', { mode: 'json' }).$type<UserNotifyPrefs>(),
   /** null=使用公共配置；专属配置只约束新增认领/过户，存量邮箱保持可用。 */
@@ -64,7 +66,12 @@ export const mailboxes = sqliteTable(
     displayName: text('display_name').notNull().default(''),
     createdAt: createdAtColumn(),
   },
-  (t) => [index('idx_mailboxes_user').on(t.userId), index('idx_mailboxes_domain').on(t.domain)],
+  (t) => [
+    index('idx_mailboxes_user').on(t.userId),
+    index('idx_mailboxes_domain').on(t.domain),
+    // domain 视图把 domain 下推到认领地址子查询（user_id = ? AND domain = ?），按用户取某个域的地址不必回表
+    index('idx_mailboxes_user_domain').on(t.userId, t.domain),
+  ],
 );
 
 export const messages = sqliteTable(
@@ -328,10 +335,31 @@ export const hostedDomains = sqliteTable(
     memberLimit: integer('member_limit').notNull().default(0),
     checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
     activatedAt: integer('activated_at', { mode: 'timestamp_ms' }),
+    /** 核对租约到期时间：定时巡检与「立即检测」领取后才核对，同一域名不会被并发核对；处理完清空 */
+    syncLeaseUntil: integer('sync_lease_until', { mode: 'timestamp_ms' }),
+    /** 首次确认 Cloudflare 中查不到该 zone 的时间：间隔复核仍查不到才判为已迁走，期间可照常收信 */
+    zoneMissingAt: integer('zone_missing_at', { mode: 'timestamp_ms' }),
     updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
     createdAt: createdAtColumn(),
   },
   (t) => [index('idx_hosted_domains_user').on(t.userId), index('idx_hosted_domains_status').on(t.status, t.checkedAt)],
+);
+
+/**
+ * 托管域名墓碑：删除或过期后保留前所有者与本站分配过的 NS。保留期内其他用户重新添加同名域名前
+ * 要核对公开委派，防止 NS 仍指向本账户时被他人接管来信；迁移 0024 按审计日志回填了此前删除的域名。
+ */
+export const hostedDomainTombstones = sqliteTable(
+  'hosted_domain_tombstones',
+  {
+    domain: text('domain').primaryKey(),
+    userId: integer('user_id').notNull(),
+    nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    /** expire / delete / backfill */
+    reason: text('reason').notNull().default(''),
+    deletedAt: integer('deleted_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  },
+  (t) => [index('idx_hosted_domain_tombstones_deleted').on(t.deletedAt)],
 );
 
 /** 托管域名成员：可在该域名下认领地址，不改变域名归属，也看不到他人地址的邮件 */
@@ -473,6 +501,10 @@ export const apiKeys = sqliteTable(
     userId: integer('user_id').notNull(),
     scopes: text('scopes', { mode: 'json' }).notNull().$type<string[]>(),
     allowedIps: text('allowed_ips', { mode: 'json' }).notNull().$type<string[]>(),
+    /** 限定的邮箱认领行 id（JSON 数组）；与 allowedDomains 都为空表示不限 */
+    allowedMailboxIds: text('allowed_mailbox_ids', { mode: 'json' }).notNull().$type<number[]>().default(sql`'[]'`),
+    /** 限定的域名（JSON 数组）；与 allowedMailboxIds 都为空表示不限 */
+    allowedDomains: text('allowed_domains', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
     rateLimit: integer('rate_limit').notNull().default(120),
     status: text('status', { enum: ['active', 'disabled', 'revoked'] })
       .notNull()
@@ -496,11 +528,16 @@ export const apiRequestLogs = sqliteTable(
     statusCode: integer('status_code').notNull(),
     ip: text('ip').notNull().default(''),
     durationMs: integer('duration_ms').notNull().default(0),
+    /** 本行代表的请求数：成功的 GET 按分钟聚合时累加，逐条记录的恒为 1 */
+    requestCount: integer('request_count').notNull().default(1),
+    /** 聚合行的分钟号（epoch 分钟）；逐条记录的为 NULL，不进聚合唯一索引 */
+    minute: integer('minute'),
     createdAt: createdAtColumn(),
   },
   (t) => [
     index('idx_api_logs_key').on(t.apiKeyId, t.id),
     index('idx_api_logs_created').on(t.createdAt),
+    uniqueIndex('idx_api_logs_minute').on(t.apiKeyId, t.minute, t.method, t.path, t.statusCode).where(sql`${t.minute} IS NOT NULL`),
   ],
 );
 
@@ -659,6 +696,71 @@ export const drafts = sqliteTable(
     uniqueIndex('idx_drafts_idempotency').on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
   ],
 );
+
+/**
+ * 新增的邮箱转发目标在确认前不生效：发确认链接到目标邮箱，确认后才写进 users.notify_prefs.forward.addresses。
+ * token 只存 SHA-256；同一用户同一地址只保留一行（重发会换 token）。
+ */
+export const forwardConfirmations = sqliteTable('forward_confirmations', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: integer('user_id').notNull(),
+  address: text('address').notNull(),
+  tokenHash: text('token_hash').notNull(),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('uq_forward_confirmations_token').on(t.tokenHash),
+  uniqueIndex('uq_forward_confirmations_user_address').on(t.userId, t.address),
+]);
+
+/** Webhook v2 端点：每个用户最多 MAX_WEBHOOK_ENDPOINTS_PER_USER 个 */
+export const webhookEndpoints = sqliteTable('webhook_endpoints', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: integer('user_id').notNull(),
+  url: text('url').notNull(),
+  description: text('description').notNull().default(''),
+  /** whsec_ 加 base64 的签名密钥（Svix 格式） */
+  secret: text('secret').notNull(),
+  /** 订阅的事件类型（JSON 数组） */
+  events: text('events', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  /** 地址与域名过滤（JSON 数组，「或」关系；都为空表示不过滤） */
+  addresses: text('addresses', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  domains: text('domains', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  includeBody: integer('include_body', { mode: 'boolean' }).notNull().default(false),
+  status: text('status', { enum: ['active', 'disabled'] }).notNull().default('active'),
+  disabledReason: text('disabled_reason').notNull().default(''),
+  consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+  lastSuccessAt: integer('last_success_at', { mode: 'timestamp_ms' }),
+  lastFailureAt: integer('last_failure_at', { mode: 'timestamp_ms' }),
+  createdAt: createdAtColumn(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+}, (t) => [index('idx_webhook_endpoints_user').on(t.userId, t.status)]);
+
+/** Webhook v2 投递：同一端点同一事件（event_key）只有一行，重试在同一行上累加 attempts */
+export const webhookDeliveries = sqliteTable('webhook_deliveries', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  endpointId: integer('endpoint_id').notNull(),
+  userId: integer('user_id').notNull(),
+  /** 请求头 webhook-id：同一事件的所有重试保持不变 */
+  eventId: text('event_id').notNull(),
+  eventType: text('event_type').notNull(),
+  /** 去重键，如 mail.received:123 */
+  eventKey: text('event_key').notNull(),
+  /** 首次投递前构造并保存的完整请求体（JSON 文本），重试原样发送；终态后可清空 */
+  payload: text('payload').notNull().default('{}'),
+  status: text('status', { enum: ['pending', 'processing', 'succeeded', 'failed'] }).notNull().default('pending'),
+  attempts: integer('attempts').notNull().default(0),
+  nextAttemptAt: integer('next_attempt_at', { mode: 'timestamp_ms' }).notNull(),
+  lastAttemptAt: integer('last_attempt_at', { mode: 'timestamp_ms' }),
+  lastError: text('last_error').notNull().default(''),
+  lastHttpStatus: integer('last_http_status'),
+  createdAt: createdAtColumn(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+}, (t) => [
+  uniqueIndex('uq_webhook_deliveries_event').on(t.endpointId, t.eventKey),
+  index('idx_webhook_deliveries_due').on(t.status, t.nextAttemptAt),
+  index('idx_webhook_deliveries_endpoint').on(t.endpointId, t.id),
+]);
 
 /**
  * 外发与 Cloudflare 投递事件的对应：每个外部收件人一次 send() 一行。事件到达时依次按 send() 返回的

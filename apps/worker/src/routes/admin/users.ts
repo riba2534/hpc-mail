@@ -10,7 +10,7 @@ const app = new Hono<AppContext>();
 app.use('*', requireAuth, requireAdmin);
 
 app.get('/', async (c) => ok(c, await listUsers(c.env)));
-app.get('/search', async (c) => ok(c, await searchUsers(c.env, parseQuery(c, searchUsersQuerySchema))));
+app.get('/search', async (c) => ok(c, await searchUsers(c.env, parseQuery(c, searchUsersQuerySchema), { includeRole: true })));
 
 app.post('/', async (c) => {
   const acting = c.get('user')!;

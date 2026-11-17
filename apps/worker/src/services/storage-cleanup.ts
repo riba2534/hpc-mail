@@ -1,6 +1,3 @@
-import { and, eq, lt } from 'drizzle-orm';
-import { createDb } from '../db/client.js';
-import { externalAttachmentLinks, storageCleanupJobs } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
 import type { Env, ExecCtx } from '../types.js';
 
@@ -90,16 +87,22 @@ export async function scheduleStorageCleanup(env: Env, ctx?: ExecCtx | null, lim
   ctx.waitUntil(next);
 }
 
+/**
+ * 过期的 90 天外链：对象 key 写进清理台账、删除外链行，两条语句同一个 batch（一次往返、同一事务），
+ * 按同一时间点与同一顺序各取最早的 1000 条，选中的是同一批行。原先逐行各一个 batch，最多 1000 次往返。
+ * 对象是否真删由 processStorageCleanup 按引用复核（邮件或附件行仍引用时保留）。
+ */
+export const EXPIRED_LINKS_SQL = `SELECT attachment_id FROM external_attachment_links WHERE expires_at < ?
+  ORDER BY expires_at, attachment_id LIMIT 1000`;
+
 export async function expireExternalAttachmentLinks(env: Env): Promise<number> {
-  const db = createDb(env);
-  const rows = await db.select().from(externalAttachmentLinks).where(lt(externalAttachmentLinks.expiresAt, new Date())).limit(1000).all();
-  for (const row of rows) {
-    await db.batch([
-      db.insert(storageCleanupJobs).values({ r2Key: row.r2Key }).onConflictDoNothing(),
-      db.delete(externalAttachmentLinks).where(and(eq(externalAttachmentLinks.attachmentId, row.attachmentId), lt(externalAttachmentLinks.expiresAt, new Date()))),
-    ]);
-  }
-  return rows.length;
+  const now = Date.now();
+  const [, deleted] = await env.db.batch([
+    env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key)
+      SELECT r2_key FROM external_attachment_links WHERE attachment_id IN (${EXPIRED_LINKS_SQL})`).bind(now),
+    env.db.prepare(`DELETE FROM external_attachment_links WHERE attachment_id IN (${EXPIRED_LINKS_SQL})`).bind(now),
+  ]);
+  return deleted?.meta.changes ?? 0;
 }
 
 /**

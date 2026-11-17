@@ -73,11 +73,15 @@ function useListPolling(client: QueryClient): boolean {
   return useSyncExternalStore(subscribe, () => pollersOf(client).count > 0, () => false);
 }
 
-/** 未读收件数（用户自己认领地址）。key 在 messages 前缀下，读/删/星标失效会连带刷新。 */
-export function useUnreadCount() {
+/**
+ * 未读收件数（用户自己认领地址）。key 在 messages 前缀下，读/删/星标失效会连带刷新。
+ * enabled=false 时不请求也不轮询（站点强制两步验证而账号未绑定时，接口只会返回 403）。
+ */
+export function useUnreadCount(enabled = true) {
   const client = useQueryClient();
   const listPolling = useListPolling(client);
   return useQuery({
+    enabled,
     queryKey: queryKeys.messages.unreadCount,
     queryFn: async () => {
       const result = await messageApi.unreadCount();

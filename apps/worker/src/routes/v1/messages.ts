@@ -16,11 +16,14 @@ import {
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
-import { messageViewer, mutationViewer } from '../../lib/message-viewer.js';
+import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer } from '../../lib/message-viewer.js';
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
+import { conditionalDetailResponse } from '../../lib/etag.js';
 import { execCtx, ok, parseBody, parseId, parseQuery, parseValue } from '../../lib/http.js';
-import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
+import {
+  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, assertKeyCanUseSender, keyRestriction, requireScope,
+} from '../../middleware/api-key-auth.js';
 import { errorObject } from '../../middleware/error.js';
 import {
   countUnread,
@@ -33,13 +36,14 @@ import {
   restoreMessages,
   purgeMessages,
   findNextMessage,
-  getMessageDetail,
+  getMessageDetailConditional,
   listMessages,
   loadAttachmentForViewer,
+  loadSourceMessage,
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import { assertSendBodySize, handleSend, sendEnvironment, sendOne } from '../send-handler.js';
+import { assertRequestSize, handleCompose, handleSend, sendEnvironment, sendOne } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -52,18 +56,27 @@ app.get('/', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const query = parseQuery(c, listMessagesQuerySchema);
-  return ok(c, await listMessages(c.env, viewerFromKey(key, query), query));
+  // 显式给出范围外的地址或域名直接 403，而不是静默返回空列表
+  if (query.address) await assertKeyCanUseAddress(c, query.address);
+  if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
+  return ok(c, await listMessages(c.env, viewerFromKey(key, query, c), query));
 });
 
 app.post('/', (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
-  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, (req) => authorizeSource(c, req));
+  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, (req) => authorizeSend(c, key, req));
 });
 
-/** 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send */
-function authorizeSource(c: Context<AppContext>, req: InternalSendMailRequest): void {
+/** 单发与批量的每一项共用：引用来源邮件另需 mail.read，限定范围的 Key 只能用范围内的发件地址与来源 */
+async function authorizeSend(
+  c: Context<AppContext>,
+  key: { userId: number; role: Viewer['role'] },
+  req: InternalSendMailRequest,
+): Promise<void> {
+  // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
   if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
+  await assertSendWithinRestriction(c, key, req);
 }
 
 /** 批量发送并发上限：项与项之间互不等待，又不至于同时持有太多附件或占满出站连接 */
@@ -76,7 +89,7 @@ const BATCH_SEND_CONCURRENCY = 4;
  */
 app.post('/batch', async (c) => {
   requireScope(c, 'mail.send');
-  assertSendBodySize(c);
+  assertRequestSize(c);
   const key = c.get('apiKey')!;
   const { items } = await parseBody(c, batchSendRequestSchema);
   const headerKey = c.req.header('Idempotency-Key')?.trim() || undefined;
@@ -108,7 +121,7 @@ app.post('/batch', async (c) => {
       const itemKey = 'itemKey' in item ? item.itemKey : undefined;
       try {
         if ('error' in item) throw item.error;
-        authorizeSource(c, item.req);
+        await authorizeSend(c, key, item.req);
         const message = await sendOne(se, { type: 'api_key', id: key.id }, sender, item.req, itemKey);
         results.push({ index: item.index, ok: true, httpStatus: 201, ...(itemKey ? { idempotencyKey: itemKey } : {}), message });
       } catch (error) {
@@ -123,6 +136,48 @@ app.post('/batch', async (c) => {
   const body: BatchSendResult = { items: results, succeeded, failed: results.length - succeeded };
   return ok(c, body);
 });
+
+/**
+ * 限定了范围的 Key 发信：发件地址与回复、转发引用的来源邮件都要在范围内。
+ * 发件邮箱或来源不存在、不可见时交给 sendMail 按原有口径报 404，这里只拦范围外的。
+ */
+async function assertSendWithinRestriction(
+  c: Context<AppContext>,
+  key: { userId: number; role: Viewer['role'] },
+  req: InternalSendMailRequest,
+): Promise<void> {
+  if (!keyRestriction(c)) return;
+  await assertKeyCanUseSender(c, req.from);
+  const sources = [['reply', req.replyToMessageId], ['forward', req.forwardAttachmentsFrom]] as const;
+  for (const [source, id] of sources) {
+    if (id === undefined) continue;
+    const row = await loadSourceMessage(c.env, key, id, '引用的原邮件不存在或不可见', source);
+    await assertKeyCanUseAddress(c, row.address);
+  }
+}
+
+/**
+ * 按域名收窄：域名在 allowedDomains 中，或只限定了邮箱时该域名下有允许的邮箱（列表照常只返回允许的邮箱），
+ * 否则 403。只限定邮箱的 Key 按域名筛自己邮箱的邮件是合理用法，不应一律拒绝。
+ */
+function assertKeyCanUseDomainOrMailboxes(c: Context<AppContext>, domain: string): void {
+  const restriction = keyRestriction(c);
+  if (!restriction || restriction.domains.includes(domain) || restriction.mailboxIds.length) return;
+  assertKeyCanUseDomain(c, domain);
+}
+
+/**
+ * 回复与转发：服务端按原信算收件人、主题、引用与线程头，from 缺省用原信的收件地址。
+ * 会读出原信内容，与 POST / 引用来源邮件一样同时需要 mail.send 与 mail.read。
+ */
+for (const op of ['reply', 'forward'] as const) {
+  app.post(`/:id/${op}`, (c) => {
+    requireScope(c, 'mail.send');
+    requireScope(c, 'mail.read');
+    const key = c.get('apiKey')!;
+    return handleCompose(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, op, parseId(c.req.param('id')));
+  });
+}
 
 /** 标记已读/未读——Agent 处理完邮件后维护状态用（需 mail.write） */
 app.post('/read', async (c) => {
@@ -168,7 +223,9 @@ app.post('/restore', async (c) => {
 app.post('/purge', async (c) => {
   requireScope(c, 'mail.write');
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewer(c, c.get('apiKey')!, req.scope), req.ids, execCtx(c));
+  const viewer = mutationViewer(c, c.get('apiKey')!, req.scope);
+  const purged = await purgeMessages(c.env, viewer, req.ids, execCtx(c));
+  await auditUnclaimedPurge(c, viewer, req.ids, purged);
   return ok(c, { purged, changed: purged });
 });
 
@@ -185,7 +242,7 @@ app.get('/unread-count', async (c) => {
   if (scope !== undefined && scope !== 'mine') {
     throw new AppError('validation_failed', '未读数只统计调用者认领的地址，scope 只能为 mine');
   }
-  return ok(c, { unread: await countUnread(c.env, key.userId, key.role) });
+  return ok(c, { unread: await countUnread(c.env, key.userId, key.role, undefined, keyRestriction(c) ?? undefined) });
 });
 
 /**
@@ -203,6 +260,8 @@ app.get('/wait', async (c) => {
   const query = parseQuery(c, {
     safeParse: (raw) => waitMessagesQuerySchema.safeParse({ ...(raw as Record<string, string>), address: addresses?.join(',') }),
   });
+  for (const address of query.address ?? []) await assertKeyCanUseAddress(c, address);
+  if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
   const signal = c.req.raw.signal;
@@ -257,8 +316,12 @@ function waitForPoll(signal: AbortSignal, milliseconds: number): Promise<void> {
 function viewerFromKey(
   key: { userId: number; role: Viewer['role'] },
   query: { scope?: Viewer['scope']; userId?: number },
+  c: Context<AppContext>,
 ): Viewer {
-  return { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId };
+  const restrict = keyRestriction(c) ?? undefined;
+  const viewer: Viewer = { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId, ...(restrict ? { restrict } : {}) };
+  auditUserScopeRead(c, viewer);
+  return viewer;
 }
 
 app.get('/:id/thread', async (c) => {
@@ -281,7 +344,10 @@ app.get('/:id', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
-  return ok(c, await getMessageDetail(c.env, messageViewer(c, key), id, V1_ATTACHMENT_TTL_SECONDS));
+  const ifNoneMatch = c.req.header('If-None-Match');
+  return conditionalDetailResponse(c, await getMessageDetailConditional(c.env, messageViewer(c, key), id, {
+    attachmentTtlSeconds: V1_ATTACHMENT_TTL_SECONDS, ifNoneMatch,
+  }));
 });
 
 app.get('/:id/attachments/:attId', async (c) => {

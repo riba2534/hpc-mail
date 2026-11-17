@@ -1,9 +1,10 @@
-import type {
-  AdminHostedDomainsQuery, HostedDomain, HostedDomainMember, HostedDomainRole, HostedDomainSteps, HostedDomainStepState,
-  HostedDomainTransferResult, HostedDomainsHealth, Page, Settings, TransferHostedDomainRequest,
+import {
+  HOSTED_DOMAIN_USABLE_STATUSES,
+  type AdminHostedDomainsQuery, type HostedDomain, type HostedDomainMember, type HostedDomainRole, type HostedDomainSteps,
+  type HostedDomainStepState, type HostedDomainTransferResult, type HostedDomainsHealth, type Page, type Settings, type TransferHostedDomainRequest,
 } from '@hpc-mail/shared';
 import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
-import { createDb } from '../db/client.js';
+import { createDb, type Db } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
 import { chunk, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
@@ -12,23 +13,30 @@ import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
 import { subscribeHostedDomainEvents } from './event-subscriptions.js';
 import {
-  CloudflareApiError, catchAllTargetsWorker, cloudflareCredentials, countZones, createSendingSubdomain, createZone, deleteSendingSubdomain,
+  assertZonesVisible, CloudflareApiError, catchAllTargetsWorker, cloudflareCredentials, countZones, createSendingSubdomain, createZone, deleteSendingSubdomain,
   deleteZone, enableRouting, findZone, getCatchAll, getRouting, getSendingDnsStatus, getZone, isCloudflareNotFound,
   isTransientCloudflareError, listSendingSubdomains, putCatchAll, repairSendingDns, requestActivationCheck, verifyToken,
-  type CloudflareCredentials,
+  type CfZone, type CloudflareCredentials, type ZoneDeleteGuard,
 } from './cloudflare.js';
 import { hasDnssec } from './domain-check.js';
+import { getSystemFromAddress } from './domain.js';
+import { delegationBlock, tombstoneStatement } from './hosted-tombstone.js';
 import { onboardingActiveSql, SYSTEM_PENDING_ZONES_SQL, systemDomainListedSql } from './domain-occupancy.js';
+import { sendFeishuNotification } from './feishu.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
+import { getUserNotifyPrefs } from './notify-prefs.js';
+import { sendPushDeerNotification } from './pushdeer.js';
 import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
+import { emitHostedDomainTransitions } from './webhooks.js';
 
 type HostedRow = typeof hostedDomains.$inferSelect;
 type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 type Access = HostedDomainRole | null;
 
 const MINUTE = 60_000;
-const DAY = 24 * 60 * MINUTE;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 /** NS 生效后这段时间内未全部就绪仍算 provisioning，之后转为 error 并降低重试频率 */
 const PROVISION_GRACE_MS = 30 * MINUTE;
 /** 「立即检测」的最短间隔，避免连点刷 Cloudflare API */
@@ -37,6 +45,13 @@ const CHECK_THROTTLE_MS = 15_000;
 const RESERVATION_STALE_MS = 10 * MINUTE;
 /** 删除时单次定时任务清理邮件的时长上限，剩余的下次继续 */
 const TEARDOWN_PURGE_MS = 8_000;
+/** 核对租约：覆盖单个域名最坏的核对时长（Cloudflare 单次 10 秒超时 × 串行调用数），超时未释放的可被重新领取 */
+const SYNC_LEASE_MS = 3 * MINUTE;
+/** 定时巡检单轮的时间预算与并发数；到期没处理的留给下一轮，按 checked_at 最旧优先 */
+const SYNC_BUDGET_MS = 20_000;
+const SYNC_CONCURRENCY = 4;
+/** 曾生效的域名首次查不到 zone 后，至少间隔这么久再次确认仍查不到，才判为已迁走 */
+const MISSING_CONFIRM_MS = 25 * MINUTE;
 
 const SYSTEM_ACTOR = { id: 0, username: 'system' };
 
@@ -54,12 +69,14 @@ export const MAX_HOSTED_CREATES_PER_MINUTE = 5;
 export const MAX_HOSTED_CHECKS_PER_MINUTE = 10;
 /**
  * 计入全站额度的 Cloudflare 调用数（按调用序列基准用例核实）：添加先按名称查 zone 再创建 2 次，建好后后台预配置
- * catch-all 与发信 5 次；删除撤发信接入、删 zone 2 次；检测在等待 NS 时 2 次，生效后补齐配置约 4 次。
+ * catch-all 与发信 5 次；删除撤发信接入、核对并删 zone 3 次；检测在等待 NS 时 2 次，生效后补齐配置约 4 次。
  */
 export const CREATE_CF_CALLS = 2;
 const PRECONFIGURE_CF_CALLS = 5;
-const TEARDOWN_CF_CALLS = 2;
+const TEARDOWN_CF_CALLS = 3;
 export const CHECK_CF_CALLS = 4;
+/** 重新接入：zone 仍在时读 zone、请求复查后再核对一次约 6 次；zone 已删除时确认失踪（含自检）、按名称查找并重建共 5 次 */
+export const RECONNECT_CF_CALLS = 6;
 const SITE_BUSY = '当前域名操作较多，请稍后再试';
 
 /** 功能可用：设置总开关打开且 Worker 配置了 Cloudflare 凭据 */
@@ -82,6 +99,12 @@ async function runDetached(ctx: ExecCtx | null | undefined, label: string, task:
   const guarded = task().catch((error) => console.error(`${label}失败:`, error));
   if (ctx) ctx.waitUntil(guarded);
   else await guarded;
+}
+
+/** 删除 zone 前核对身份：不能是系统域名，创建时间不早于本站记录 */
+async function zoneGuard(env: Env, row: HostedRow): Promise<ZoneDeleteGuard> {
+  const settings = await getSettings(env);
+  return { notBefore: row.createdAt, protectedNames: settings.domains.list.map((entry) => entry.domain) };
 }
 
 /** 用户操作触发的后台调用（预配置、删除）只计入全站额度，不因额度拒绝；计数失败不影响任务本身 */
@@ -132,8 +155,11 @@ function warningsOf(row: HostedRow): string[] {
   if (row.status === 'pending' && /cloudflare/i.test(row.originalRegistrar)) {
     warnings.push('该域名注册在 Cloudflare Registrar，它通常不允许改用其他账户的名称服务器，可能需要先把域名转出到其他注册商。');
   }
-  if (row.status === 'moved') {
-    warnings.push('域名的名称服务器已不再指向本站，收发已停止。如需继续使用，请把 NS 改回上面两条。');
+  if (row.status === 'moved' && row.zoneStatus === 'missing') {
+    warnings.push('Cloudflare 中该域名的 zone 已被删除，收发已停止。点「重新接入」会重新分配名称服务器，地址与历史邮件都保留。');
+  } else if (row.status === 'moved') {
+    warnings.push('域名的名称服务器已不再指向本站，收发已停止。如需继续使用，请把 NS 改回上面两条。'
+      + 'Cloudflare 通常在 7 天后删除已迁走的 zone；删除前改回即可恢复，删除后可点「重新接入」，地址与历史邮件都保留。');
   }
   return warnings;
 }
@@ -169,7 +195,8 @@ function toView(view: ViewRow, viewer: Viewer, pendingDays: number): HostedDomai
     createdAt: row.createdAt.toISOString(),
     activatedAt: iso(row.activatedAt),
     checkedAt: iso(row.checkedAt),
-    expiresAt: row.status === 'pending' ? new Date(row.createdAt.getTime() + pendingDays * DAY).toISOString() : null,
+    // 重新接入后的 pending 保留生效时间，不按等待期限删除
+    expiresAt: row.status === 'pending' && !row.activatedAt ? new Date(row.createdAt.getTime() + pendingDays * DAY).toISOString() : null,
   };
 }
 
@@ -330,12 +357,17 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
  * 从不接管账户里已有的同名 zone；建 zone 失败释放占位。能在 NS 生效前做的配置随后在后台尝试。
  */
 export async function createHostedDomain(env: Env, viewer: Viewer, domain: string, ctx?: ExecCtx | null, ip = ''): Promise<HostedDomain> {
+  // 公开委派预检与读取设置并行（查 RDAP/DoH，不走 Cloudflare API）；先处理下面的快速失败再看它的结论
+  const delegation = delegationBlock(env, viewer, domain);
+  delegation.catch(() => undefined);
   const settings = await getSettingsFresh(env);
   const creds = requireCredentials(env, settings);
   // 快速失败；与管理员同时把它加为系统域名的竞态由下面占位语句里的守卫兜住
   if (settings.domains.list.some((entry) => entry.domain === domain)) {
     throw new AppError('conflict', '该域名已是本站的系统域名');
   }
+  const blocked = await delegation;
+  if (blocked) throw blocked;
   const cfg = settings.hosted_domains;
   // 个人计数、占位与全站计数在同一个 batch：超过个人上限或全站额度不够的请求不占位、不占全站额度，
   // 也不会走到 Cloudflare。全站计数只认本次占到的那一行（created_at 写入本次请求的时间戳以区分已有占位）
@@ -400,7 +432,8 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
   }).where(and(eq(hostedDomains.id, id), sql`${hostedDomains.zoneId} IS NULL`)).returning({ id: hostedDomains.id });
   if (!filled.length) {
     // 建 zone 期间占位已被删除：不留下没有记录的 zone
-    await deleteZone(creds, zone.id, domain).catch((error) => console.error('回收孤儿 zone 失败:', error));
+    await deleteZone(creds, zone.id, domain, { notBefore: new Date(reservedAt), protectedNames: settings.domains.list.map((entry) => entry.domain) })
+      .catch((error) => console.error('回收孤儿 zone 失败:', error));
     throw new AppError('conflict', '该域名已被删除，请重新添加');
   }
   await logAdminAction(env, viewer, 'hosted_domain.create', domain, `zone ${zone.id}，NS ${(zone.name_servers ?? []).join(' / ')}`, ip);
@@ -487,10 +520,17 @@ async function ensureMailConfig(creds: CloudflareCredentials, row: HostedRow, zo
   return out;
 }
 
-/** 写回核对结果；暂停与删除中的域名不被并发的巡检改回 */
-async function saveChecked(env: Env, id: number, fields: Partial<typeof hostedDomains.$inferInsert>): Promise<void> {
-  await createDb(env).update(hostedDomains).set({ ...fields, updatedAt: new Date() })
-    .where(and(eq(hostedDomains.id, id), notInArray(hostedDomains.status, ['suspended', 'deleting'])));
+/**
+ * 写回核对结果；暂停与删除中的域名不被并发的巡检改回。带租约时只在仍持有该租约时写入（超时后被别人领走的不覆盖），
+ * 并在同一次写入里释放租约。返回是否写入
+ */
+async function saveChecked(env: Env, id: number, fields: Partial<typeof hostedDomains.$inferInsert>, lease?: Date): Promise<boolean> {
+  const saved = await createDb(env).update(hostedDomains)
+    .set({ ...fields, ...(lease ? { syncLeaseUntil: null } : {}), updatedAt: new Date() })
+    .where(and(eq(hostedDomains.id, id), notInArray(hostedDomains.status, ['suspended', 'deleting']),
+      lease ? eq(hostedDomains.syncLeaseUntil, lease) : undefined))
+    .returning({ id: hostedDomains.id });
+  return saved.length > 0;
 }
 
 async function preconfigure(env: Env, creds: CloudflareCredentials, id: number): Promise<void> {
@@ -504,26 +544,35 @@ async function preconfigure(env: Env, creds: CloudflareCredentials, id: number):
 
 /** 删除 zone 与记录（只用于从未生效的 pending 域名，没有地址和邮件） */
 async function dropPending(env: Env, creds: CloudflareCredentials, row: HostedRow, reason: string): Promise<void> {
-  if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain);
-  const [removed] = await env.db.batch([
-    env.db.prepare("DELETE FROM hosted_domains WHERE id = ? AND status = 'pending' AND activated_at IS NULL").bind(row.id),
+  if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain, await zoneGuard(env, row));
+  const guard = "id = ? AND status = 'pending' AND activated_at IS NULL";
+  const [, removed] = await env.db.batch([
+    tombstoneStatement(env, 'expire', guard, [row.id]),
+    env.db.prepare(`DELETE FROM hosted_domains WHERE ${guard}`).bind(row.id),
     env.db.prepare('DELETE FROM hosted_domain_members WHERE domain_id = ?1 AND NOT EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1)').bind(row.id),
   ]);
   if (removed?.meta.changes) await logAdminAction(env, SYSTEM_ACTOR, 'hosted_domain.expire', row.domain, reason);
 }
 
-/** 创建请求在 zone 建好前中断：找回本次创建的 zone，找不到则释放占位 */
-async function recoverReservation(env: Env, creds: CloudflareCredentials, row: HostedRow): Promise<void> {
-  if (Date.now() - row.createdAt.getTime() < RESERVATION_STALE_MS) return;
+/**
+ * 创建请求在 zone 建好前中断：找回本次创建的 zone，找不到则释放占位（先做可见性自检，Token 看不到账户时保留占位）。
+ * 返回租约是否已随写入释放或记录已删除
+ */
+async function recoverReservation(env: Env, creds: CloudflareCredentials, row: HostedRow, lease: Date): Promise<boolean> {
+  if (Date.now() - row.createdAt.getTime() < RESERVATION_STALE_MS) return false;
   const zone = await findZone(creds, row.domain);
   if (zone && zone.created_on && new Date(zone.created_on).getTime() >= row.createdAt.getTime() - MINUTE) {
-    await createDb(env).update(hostedDomains).set({
+    const filled = await createDb(env).update(hostedDomains).set({
       zoneId: zone.id, nameServers: zone.name_servers ?? [], originalNameServers: zone.original_name_servers ?? [],
       originalRegistrar: zone.original_registrar ?? '', zoneStatus: zone.status, checkedAt: new Date(), updatedAt: new Date(),
-    }).where(and(eq(hostedDomains.id, row.id), sql`${hostedDomains.zoneId} IS NULL`));
-    return;
+      syncLeaseUntil: null,
+    }).where(and(eq(hostedDomains.id, row.id), sql`${hostedDomains.zoneId} IS NULL`, eq(hostedDomains.syncLeaseUntil, lease)))
+      .returning({ id: hostedDomains.id });
+    return filled.length > 0;
   }
-  await env.db.prepare("DELETE FROM hosted_domains WHERE id = ? AND zone_id IS NULL AND status = 'pending'").bind(row.id).run();
+  if (!zone) await assertZonesVisible(creds, '');
+  const removed = await env.db.prepare("DELETE FROM hosted_domains WHERE id = ? AND zone_id IS NULL AND status = 'pending'").bind(row.id).run();
+  return removed.meta.changes > 0;
 }
 
 /**
@@ -552,7 +601,7 @@ async function teardown(env: Env, creds: CloudflareCredentials, row: HostedRow):
     if (zoneId) {
       // 发信接入随 zone 删除，单独删除失败不阻塞
       if (row.sendingTag) await deleteSendingSubdomain(creds, zoneId, row.sendingTag).catch(() => undefined);
-      await deleteZone(creds, zoneId, row.domain);
+      await deleteZone(creds, zoneId, row.domain, await zoneGuard(env, row));
     }
   } catch (error) {
     await createDb(env).update(hostedDomains).set({ lastError: `删除 Cloudflare 配置失败：${errorText(error)}`, checkedAt: new Date() })
@@ -560,61 +609,217 @@ async function teardown(env: Env, creds: CloudflareCredentials, row: HostedRow):
     return;
   }
   // 删除中的域名拒收、不可认领；进行中的收件仍可能晚到，留到该域没有邮件和地址时再删记录，下一轮继续清理
-  await env.db.prepare(`DELETE FROM hosted_domains WHERE id = ?1 AND status = 'deleting'
-    AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?2) AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?2)`)
-    .bind(row.id, row.domain).run();
+  // 墓碑与删除同一守卫、同一 batch：记录真正删掉时才留下前所有者与 NS
+  const guard = `id = ? AND status = 'deleting'
+    AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?) AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?)`;
+  await env.db.batch([
+    tombstoneStatement(env, 'delete', guard, [row.id, row.domain, row.domain]),
+    env.db.prepare(`DELETE FROM hosted_domains WHERE ${guard}`).bind(row.id, row.domain, row.domain),
+  ]);
+}
+
+interface SyncOptions {
+  /** 等待 NS 时请 Cloudflare 立即复查 */
+  activationCheck?: boolean;
+  /** 转入 moved 时的提醒放进 waitUntil；没有时（定时任务）同步等待 */
+  ctx?: ExecCtx | null;
+}
+
+/** 领到的核对：同一批共用一个租约值，写回与释放都以它为准 */
+interface SyncClaim {
+  row: HostedRow;
+  lease: Date;
+  /** 可见性自检的参照候选（zone_id） */
+  probes: string[];
+}
+
+/** 参照候选：最近核对为 active、没有失踪记录的 zone。取两个，保证总有一个不是被核对的域名自己 */
+function probeQuery(db: Db) {
+  return db.select({ zoneId: hostedDomains.zoneId }).from(hostedDomains)
+    .where(and(eq(hostedDomains.status, 'active'), sql`${hostedDomains.zoneMissingAt} IS NULL`, sql`${hostedDomains.zoneId} IS NOT NULL`))
+    .orderBy(desc(hostedDomains.checkedAt)).limit(2);
+}
+
+const probeIds = (rows: { zoneId: string | null }[]) => rows.flatMap((row) => (row.zoneId ? [row.zoneId] : []));
+
+function credsFor(base: CloudflareCredentials, claim: SyncClaim): CloudflareCredentials {
+  const probe = claim.probes.find((zoneId) => zoneId !== claim.row.zoneId);
+  return { ...base, probeZone: probe ? { id: probe } : null };
+}
+
+/** 领取单个域名的核对租约（暂停的不领），与参照候选同一个 batch；记录不存在或正被别人核对时返回 null */
+async function claimOne(env: Env, id: number): Promise<SyncClaim | null> {
+  const db = createDb(env);
+  const now = Date.now();
+  const lease = new Date(now + SYNC_LEASE_MS);
+  const [rows, probes] = await db.batch([
+    db.update(hostedDomains).set({ syncLeaseUntil: lease })
+      .where(and(eq(hostedDomains.id, id), sql`${hostedDomains.status} <> 'suspended'`,
+        sql`COALESCE(${hostedDomains.syncLeaseUntil}, 0) < ${now}`))
+      .returning(),
+    probeQuery(db),
+  ]);
+  return rows[0] ? { row: rows[0], lease, probes: probeIds(probes) } : null;
 }
 
 /**
- * 与 Cloudflare 核对一次并推进状态。zone 未激活：刷新 NS 与 DNSSEC，到期删除；
- * 已激活：补齐收发配置，全部就绪为 active，否则 provisioning（宽限期内）或 error。
+ * 到期条件：开通中与删除中每轮处理；等待 NS 按创建时长退避（1 小时内每 4 分钟、1 天内每 15 分钟、之后每小时，
+ * 只读 zone 状态）；异常与 zone 仍在的已迁走（用户可能改回 NS）每 30 分钟；已生效与 zone 已删除的已迁走每天一次。
+ * 每个分支都以 status 等值开头，走 idx_hosted_domains_status
  */
-export async function syncHostedDomain(env: Env, id: number, opts: { activationCheck?: boolean } = {}): Promise<void> {
-  const creds = cloudflareCredentials(env);
-  if (!creds) return;
+function dueCondition(now: number): SQL {
+  return sql`(status IN ('provisioning', 'deleting')
+    OR (status = 'pending' AND COALESCE(checked_at, 0) < CASE WHEN created_at > ${now - HOUR} THEN ${now - 4 * MINUTE}
+      WHEN created_at > ${now - DAY} THEN ${now - 15 * MINUTE} ELSE ${now - HOUR} END)
+    OR (status = 'error' AND COALESCE(checked_at, 0) < ${now - 30 * MINUTE})
+    OR (status = 'moved' AND zone_status = 'moved' AND COALESCE(checked_at, 0) < ${now - 30 * MINUTE})
+    OR (status IN ('active', 'moved') AND COALESCE(checked_at, 0) < ${now - DAY}))`;
+}
+
+/** 一条语句领取一批到期且未被租用的域名（checked_at 最旧优先），领取结果直接当行用；本轮已领过的不再领 */
+async function claimDue(env: Env, limit: number, seen: number[]): Promise<{ rows: HostedRow[]; lease: Date; probes: string[] }> {
   const db = createDb(env);
-  const row = await db.select().from(hostedDomains).where(eq(hostedDomains.id, id)).get();
-  if (!row || row.status === 'suspended') return;
-  if (row.status === 'deleting') return teardown(env, creds, row);
-  if (!row.zoneId) return recoverReservation(env, creds, row);
+  const now = Date.now();
+  const lease = new Date(now + SYNC_LEASE_MS);
+  const [rows, probes] = await db.batch([
+    db.update(hostedDomains).set({ syncLeaseUntil: lease })
+      .where(sql`${hostedDomains.id} IN (SELECT id FROM hosted_domains WHERE ${dueCondition(now)}
+        AND COALESCE(sync_lease_until, 0) < ${now} AND id NOT IN (SELECT value FROM json_each(${JSON.stringify(seen)}))
+        ORDER BY COALESCE(checked_at, 0) LIMIT ${limit})`)
+      .returning(),
+    probeQuery(db),
+  ]);
+  return { rows, lease, probes: probeIds(probes) };
+}
+
+async function releaseLeases(env: Env, ids: number[], lease: Date): Promise<void> {
+  await createDb(env).update(hostedDomains).set({ syncLeaseUntil: null })
+    .where(and(inArray(hostedDomains.id, ids), eq(hostedDomains.syncLeaseUntil, lease)))
+    .catch((error) => console.error('释放托管域名核对租约失败:', error));
+}
+
+/** 持有租约时核对一次；最后一次写入没有顺带释放租约的（提前返回、写入被守卫拦下、出错）在这里释放 */
+async function runClaim(env: Env, base: CloudflareCredentials, claim: SyncClaim, opts: SyncOptions = {}): Promise<void> {
+  let released = false;
+  try {
+    released = await syncClaimed(env, credsFor(base, claim), claim, opts);
+  } finally {
+    if (!released) await releaseLeases(env, [claim.row.id], claim.lease);
+  }
+}
+
+/**
+ * 托管域名转入 moved 时提醒所有者：按个人通知偏好发飞书与 PushDeer，失败只记日志。Cloudflare 通常 7 天后删除已迁走的 zone，
+ * 提醒要赶在这之前
+ */
+export async function notifyHostedDomainMoved(
+  env: Env, row: Pick<HostedRow, 'userId' | 'domain' | 'nameServers' | 'zoneStatus'>, ctx?: ExecCtx | null,
+): Promise<void> {
+  await runDetached(ctx, '托管域名迁走提醒', async () => {
+    const [prefs, fromAddress] = await Promise.all([getUserNotifyPrefs(env, row.userId), getSystemFromAddress(env)]);
+    const nameServers = row.nameServers.join('、');
+    const lines = row.zoneStatus === 'missing'
+      ? [`托管域名 ${row.domain} 在 Cloudflare 中的 zone 已被删除，收发已停止。`, `原分配的名称服务器：${nameServers}`]
+      : [`托管域名 ${row.domain} 的名称服务器已不再指向本站，收发已停止。`, `如需继续使用，请到注册商把名称服务器改回：${nameServers}`];
+    lines.push('Cloudflare 通常在 7 天后删除已迁走的 zone；删除前把 NS 改回即可恢复，删除后可在域名详情点「重新接入」，地址与历史邮件都保留。');
+    const info = {
+      subject: `托管域名 ${row.domain} 已停止收发`, fromAddress, fromName: 'HPC Mail', toAddress: row.domain, code: '', body: lines.join('\n'),
+    };
+    try {
+      await sendFeishuNotification(prefs.feishu, info);
+    } catch (error) {
+      console.error('托管域名迁走飞书提醒失败:', error);
+    }
+    try {
+      await sendPushDeerNotification(prefs.pushdeer, info);
+    } catch (error) {
+      console.error('托管域名迁走 PushDeer 提醒失败:', error);
+    }
+  });
+}
+
+/** 转为 moved：持有租约，领取时读到的就是旧状态，只有这次写入把其他状态改成 moved 时才提醒一次 */
+async function markMoved(
+  env: Env, { row, lease }: SyncClaim, fields: Partial<typeof hostedDomains.$inferInsert>, ctx?: ExecCtx | null,
+): Promise<boolean> {
+  const saved = await saveChecked(env, row.id, { ...fields, status: 'moved' }, lease);
+  if (saved && row.status !== 'moved') {
+    await emitHostedDomainTransitions(env, row, { status: 'moved', zoneStatus: fields.zoneStatus ?? row.zoneStatus });
+    await notifyHostedDomainMoved(env, { ...row, zoneStatus: fields.zoneStatus ?? row.zoneStatus }, ctx);
+  }
+  return saved;
+}
+
+/**
+ * zone 已确认不存在（含可见性自检）。从未生效的 pending 域名没有地址和邮件，直接清理；曾生效的先记首次时间，
+ * 可收信的转为 error 照常收信，间隔复核仍不存在才判为已迁走，避免一次误判就拒收
+ */
+async function zoneGone(env: Env, creds: CloudflareCredentials, claim: SyncClaim, now: Date, ctx?: ExecCtx | null): Promise<boolean> {
+  const { row, lease } = claim;
+  if (row.status === 'pending' && !row.activatedAt) {
+    await dropPending(env, creds, row, 'Cloudflare 已删除未激活的 zone');
+    return false;
+  }
+  if (!row.zoneMissingAt) {
+    const usable = (HOSTED_DOMAIN_USABLE_STATUSES as readonly string[]).includes(row.status);
+    return saveChecked(env, row.id, {
+      ...(usable ? { status: 'error' as const } : {}),
+      zoneMissingAt: now,
+      lastError: `首次发现 Cloudflare 中查不到该域名的 zone，约 30 分钟后复核${usable ? '，期间照常收信' : ''}`,
+      checkedAt: now,
+    }, lease);
+  }
+  if (now.getTime() - row.zoneMissingAt.getTime() < MISSING_CONFIRM_MS) return saveChecked(env, row.id, { checkedAt: now }, lease);
+  return markMoved(env, claim, { zoneStatus: 'missing', lastError: 'Cloudflare 中的 zone 已不存在', checkedAt: now }, ctx);
+}
+
+/**
+ * 持有租约时与 Cloudflare 核对一次并推进状态。zone 未激活：刷新 NS 与 DNSSEC，到期删除；
+ * 已激活：补齐收发配置，全部就绪为 active，否则 provisioning（宽限期内）或 error。读到 zone 就清掉失踪记录。
+ * 返回租约是否已随最后一次写入释放（或记录已删除）
+ */
+async function syncClaimed(env: Env, creds: CloudflareCredentials, claim: SyncClaim, opts: SyncOptions): Promise<boolean> {
+  const { row, lease } = claim;
+  if (row.status === 'deleting') {
+    await teardown(env, creds, row);
+    return false;
+  }
+  if (!row.zoneId) return recoverReservation(env, creds, row, lease);
 
   const now = new Date();
   let zone;
   try {
     zone = await getZone(creds, row.zoneId, row.domain);
   } catch (error) {
-    await saveChecked(env, id, { lastError: `查询 Cloudflare 失败：${errorText(error)}`, checkedAt: now });
-    return;
+    return saveChecked(env, row.id, { lastError: `查询 Cloudflare 失败：${errorText(error)}`, checkedAt: now }, lease);
   }
-  if (!zone) {
-    if (row.status === 'pending') return dropPending(env, creds, row, 'Cloudflare 已删除未激活的 zone');
-    await saveChecked(env, id, { status: 'moved', zoneStatus: 'missing', lastError: 'Cloudflare 中的 zone 已不存在', checkedAt: now });
-    return;
-  }
+  if (!zone) return zoneGone(env, creds, claim, now, opts.ctx);
   if (zone.status === 'pending' || zone.status === 'initializing') {
     const { hosted_domains: cfg } = await getSettings(env);
     if (row.status === 'pending' && !row.activatedAt && now.getTime() > row.createdAt.getTime() + cfg.pendingDays * DAY) {
-      return dropPending(env, creds, row, `${cfg.pendingDays} 天内未完成 NS 修改，已自动删除`);
+      await dropPending(env, creds, row, `${cfg.pendingDays} 天内未完成 NS 修改，已自动删除`);
+      return false;
     }
     if (opts.activationCheck) await requestActivationCheck(creds, zone.id);
     const dnssec = await hasDnssec(row.domain).catch(() => row.dnssec);
-    await saveChecked(env, id, {
+    return saveChecked(env, row.id, {
       status: 'pending', zoneStatus: zone.status, nameServers: zone.name_servers ?? row.nameServers,
-      dnssec, lastError: '', checkedAt: now,
-    });
-    return;
+      dnssec, zoneMissingAt: null, lastError: '', checkedAt: now,
+    }, lease);
   }
   if (zone.status === 'moved') {
-    await saveChecked(env, id, { status: 'moved', zoneStatus: 'moved', lastError: '域名的名称服务器已不再指向本站', checkedAt: now });
-    return;
+    return markMoved(env, claim, {
+      zoneStatus: 'moved', zoneMissingAt: null, lastError: '域名的名称服务器已不再指向本站', checkedAt: now,
+    }, opts.ctx);
   }
   const activatedAt = row.activatedAt ?? (zone.activated_on ? new Date(zone.activated_on) : now);
   const config = await ensureMailConfig(creds, row, true);
   // 发信就绪后订阅投递回执（失败只记录在订阅状态里，不影响开通）
   if (config.sendingStatus === 'ready') await subscribeHostedDomainEvents(env, creds, row.domain, zone.id);
   const ready = config.routingStatus === 'ready' && config.catchAllReady && config.sendingStatus === 'ready';
-  await saveChecked(env, id, {
-    status: ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning',
+  const status = ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning';
+  const saved = await saveChecked(env, row.id, {
+    status,
     zoneStatus: 'active',
     activatedAt,
     routingStatus: config.routingStatus,
@@ -622,45 +827,72 @@ export async function syncHostedDomain(env: Env, id: number, opts: { activationC
     sendingStatus: config.sendingStatus,
     sendingTag: config.sendingTag,
     dnssec: false,
+    zoneMissingAt: null,
     lastError: ready ? '' : config.error,
     checkedAt: now,
-  });
+  }, lease);
+  // Webhook v2：可以收信、发信就绪的状态变化（只在这次写入生效时）
+  if (saved) await emitHostedDomainTransitions(env, row, { status, zoneStatus: 'active', ...config });
+  return saved;
+}
+
+/** 核对单个域名：先领租约，正被其他请求或定时任务核对（或已暂停、不存在）时不调用 Cloudflare */
+export async function syncHostedDomain(env: Env, id: number, opts: SyncOptions = {}): Promise<void> {
+  const base = cloudflareCredentials(env);
+  if (!base) return;
+  const claim = await claimOne(env, id);
+  if (claim) await runClaim(env, base, claim, opts);
 }
 
 /**
- * 定时任务：开通中与删除中的每轮处理；等待 NS 每 4 分钟查一次（只读 zone 状态，不触发 activation_check）；
- * 异常每 30 分钟重试；已生效与已迁走每天巡检一次。
+ * 定时任务：按到期条件分批领取租约并发处理，在时间预算内循环领取下一批；到期没处理的释放租约留给下一轮。
+ * 返回处理的域名数
  */
 export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number> {
-  if (!cloudflareCredentials(env)) return 0;
-  const now = Date.now();
-  const due = await env.db.prepare(`SELECT id FROM hosted_domains WHERE status IN ('provisioning', 'deleting')
-      OR (status = 'pending' AND COALESCE(checked_at, 0) < ?1)
-      OR (status = 'error' AND COALESCE(checked_at, 0) < ?2)
-      OR (status IN ('active', 'moved') AND COALESCE(checked_at, 0) < ?3)
-    ORDER BY COALESCE(checked_at, 0) LIMIT ?4`)
-    .bind(now - 4 * MINUTE, now - 30 * MINUTE, now - DAY, limit).all<{ id: number }>();
-  for (const row of due.results) {
-    try {
-      await syncHostedDomain(env, Number(row.id));
-    } catch (error) {
-      console.error(`托管域名 #${row.id} 核对失败:`, error);
-    }
+  const base = cloudflareCredentials(env);
+  if (!base) return 0;
+  const deadline = Date.now() + SYNC_BUDGET_MS;
+  const seen: number[] = [];
+  let processed = 0;
+  while (Date.now() < deadline) {
+    const batch = await claimDue(env, limit, seen);
+    if (!batch.rows.length) break;
+    seen.push(...batch.rows.map((row) => row.id));
+    const queue = [...batch.rows];
+    const skipped: number[] = [];
+    const work = async () => {
+      for (let row = queue.shift(); row; row = queue.shift()) {
+        if (Date.now() >= deadline) {
+          skipped.push(row.id);
+          continue;
+        }
+        processed++;
+        try {
+          await runClaim(env, base, { row, lease: batch.lease, probes: batch.probes });
+        } catch (error) {
+          console.error(`托管域名 #${row.id} 核对失败:`, error);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(SYNC_CONCURRENCY, queue.length) }, work));
+    if (skipped.length) await releaseLeases(env, skipped, batch.lease);
+    if (batch.rows.length < limit) break;
   }
-  return due.results.length;
+  return processed;
 }
 
 /** 用户点「立即检测」：等待 NS 时请 Cloudflare 立即复查，再核对并推进开通 */
-export async function checkHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
-  // 全站计数的条件与下面实际触发核对的一致：功能开着且有凭据、所有者或管理员、未暂停或删除、过了节流间隔
+export async function checkHostedDomain(env: Env, viewer: Viewer, id: number, ctx?: ExecCtx | null): Promise<HostedDomain> {
+  // 全站计数的条件与下面实际触发核对的一致：功能开着且有凭据、所有者或管理员、未暂停或删除、过了节流间隔、没有正被核对
   const settings = await getSettings(env);
+  const now = Date.now();
   const { row, access } = await meterHostedCall(env, viewer, id, {
     scope: HOSTED_CHECK_RATE_SCOPE, limit: MAX_HOSTED_CHECKS_PER_MINUTE, calls: CHECK_CF_CALLS,
     eligible: {
       sql: `? = 1 AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
-        AND status NOT IN ('suspended', 'deleting') AND COALESCE(checked_at, 0) <= ?)`,
+        AND status NOT IN ('suspended', 'deleting') AND COALESCE(checked_at, 0) <= ? AND COALESCE(sync_lease_until, 0) < ?)`,
       params: [hostedDomainsAvailable(env, settings) ? 1 : 0, id, viewer.id, viewer.role === 'admin' ? 1 : 0,
-        Date.now() - CHECK_THROTTLE_MS],
+        now - CHECK_THROTTLE_MS, now],
     },
     userBusy: '检测过于频繁，请稍后再试',
     siteBusy: SITE_BUSY,
@@ -669,7 +901,125 @@ export async function checkHostedDomain(env: Env, viewer: Viewer, id: number): P
   requireCredentials(env, settings);
   const recent = row.checkedAt && Date.now() - row.checkedAt.getTime() < CHECK_THROTTLE_MS;
   if (!recent && row.status !== 'suspended' && row.status !== 'deleting') {
-    await syncHostedDomain(env, id, { activationCheck: row.status === 'pending' });
+    await syncHostedDomain(env, id, { activationCheck: row.status === 'pending', ctx });
+  }
+  return getHostedDomain(env, viewer, id);
+}
+
+/**
+ * zone 已被删除时重建：同名 zone 只采用上次中断的重新接入建出的（创建时间不早于首次失踪时间前 1 分钟），其他一律不接管；
+ * 找不到就新建。回填后回到 pending，保留生效时间、地址、邮件与成员。返回租约是否已随回填释放
+ */
+async function rebuildZone(
+  env: Env, creds: CloudflareCredentials, claim: SyncClaim, viewer: Viewer, protectedNames: string[], ctx?: ExecCtx | null, ip = '',
+): Promise<boolean> {
+  const { row, lease } = claim;
+  const db = createDb(env);
+  const now = new Date();
+  let missingSince = row.zoneMissingAt;
+  if (!missingSince) {
+    // 没有失踪记录（失踪复核上线前就已迁走的）：以本次确认为准并先记下，中断后再点能认出本次建的 zone
+    missingSince = now;
+    await db.update(hostedDomains).set({ zoneMissingAt: now })
+      .where(and(eq(hostedDomains.id, row.id), eq(hostedDomains.syncLeaseUntil, lease)));
+  }
+  let zone: CfZone | null;
+  let created = false;
+  try {
+    zone = await findZone(creds, row.domain);
+  } catch (error) {
+    throw new AppError('internal', `查询 Cloudflare 失败，请稍后重试：${errorText(error)}`);
+  }
+  if (zone && !(zone.created_on && new Date(zone.created_on).getTime() >= missingSince.getTime() - MINUTE)) {
+    throw new AppError('conflict', '站长账户中已有同名 zone，不能接管');
+  }
+  if (!zone) {
+    try {
+      zone = await createZone(creds, row.domain);
+      created = true;
+    } catch (error) {
+      // 结果不确定时 zone 可能已经建好：下次再点按创建时间采用
+      if (isTransientCloudflareError(error)) throw new AppError('internal', 'Cloudflare 暂时没有响应，请稍后再点「重新接入」');
+      throw createZoneError(error);
+    }
+  }
+  const filled = await db.update(hostedDomains).set({
+    zoneId: zone.id,
+    nameServers: zone.name_servers ?? [],
+    originalNameServers: zone.original_name_servers ?? [],
+    originalRegistrar: zone.original_registrar ?? '',
+    zoneStatus: zone.status,
+    status: 'pending',
+    routingStatus: '',
+    catchAllReady: false,
+    sendingStatus: '',
+    sendingTag: null,
+    zoneMissingAt: null,
+    lastError: '',
+    checkedAt: now,
+    syncLeaseUntil: null,
+    updatedAt: now,
+  }).where(and(eq(hostedDomains.id, row.id), eq(hostedDomains.status, 'moved'), eq(hostedDomains.syncLeaseUntil, lease)))
+    .returning({ id: hostedDomains.id });
+  if (!filled.length) {
+    // 期间被暂停、删除或租约超时被别人领走：不留下没有记录的 zone
+    if (created) {
+      await deleteZone(creds, zone.id, row.domain, { notBefore: now, protectedNames })
+        .catch((error) => console.error('回收孤儿 zone 失败:', error));
+    }
+    throw new AppError('conflict', '域名状态已改变，请刷新后重试');
+  }
+  await logAdminAction(env, viewer, 'hosted_domain.reconnect', row.domain,
+    `zone ${zone.id}${created ? '' : '（采用上次中断时建出的）'}，NS ${(zone.name_servers ?? []).join(' / ')}`, ip);
+  await runDetached(ctx, '托管域名预配置', async () => {
+    await recordSiteCalls(env, PRECONFIGURE_CF_CALLS);
+    await preconfigure(env, creds, row.id);
+  });
+  return true;
+}
+
+/**
+ * 重新接入已迁走的域名（所有者或管理员）：zone 仍在时请 Cloudflare 复查 NS 并核对一次，返回最新状态；
+ * zone 已被删除（经可见性自检确认）时重建 zone 并回到 pending，用户需要把 NS 改成新分配的两条。
+ * 正被其他请求或定时任务核对时不调用 Cloudflare，直接返回当前状态
+ */
+export async function reconnectHostedDomain(env: Env, viewer: Viewer, id: number, ctx?: ExecCtx | null, ip = ''): Promise<HostedDomain> {
+  // 全站计数的条件与实际会调用 Cloudflare 的条件一致：功能开着且有凭据、所有者或管理员、已迁走、没有正被核对
+  const settings = await getSettings(env);
+  const { row, access } = await meterHostedCall(env, viewer, id, {
+    scope: HOSTED_CREATE_RATE_SCOPE, limit: MAX_HOSTED_CREATES_PER_MINUTE, calls: RECONNECT_CF_CALLS,
+    eligible: {
+      sql: `? = 1 AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
+        AND status = 'moved' AND COALESCE(sync_lease_until, 0) < ?)`,
+      params: [hostedDomainsAvailable(env, settings) ? 1 : 0, id, viewer.id, viewer.role === 'admin' ? 1 : 0, Date.now()],
+    },
+    userBusy: '重新接入过于频繁，请稍后再试',
+    siteBusy: SITE_BUSY,
+  });
+  requireManage(access);
+  const base = requireCredentials(env, settings);
+  if (row.status !== 'moved') throw new AppError('conflict', '只有名称服务器已改走的域名可以重新接入');
+  const claim = await claimOne(env, id);
+  if (!claim) return getHostedDomain(env, viewer, id);
+  let released = false;
+  try {
+    if (claim.row.status !== 'moved') throw new AppError('conflict', '域名状态已改变，请刷新后重试');
+    const creds = credsFor(base, claim);
+    let zone: CfZone | null;
+    try {
+      zone = claim.row.zoneId ? await getZone(creds, claim.row.zoneId, claim.row.domain) : null;
+    } catch (error) {
+      throw new AppError('internal', `查询 Cloudflare 失败，请稍后重试：${errorText(error)}`);
+    }
+    if (zone) {
+      // NS 可能已改回：请 Cloudflare 立即复查，再按正常流程核对一次
+      await requestActivationCheck(creds, zone.id);
+      released = await syncClaimed(env, creds, claim, { ctx });
+    } else {
+      released = await rebuildZone(env, creds, claim, viewer, settings.domains.list.map((entry) => entry.domain), ctx, ip);
+    }
+  } finally {
+    if (!released) await releaseLeases(env, [id], claim.lease);
   }
   return getHostedDomain(env, viewer, id);
 }

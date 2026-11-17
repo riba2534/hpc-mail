@@ -1,6 +1,6 @@
 ---
 name: hpc-mail
-description: 通过 HTTP API 操作 HPC Mail 多域名邮箱（默认 https://hpc.email，也适用于自部署实例）：查收和搜索邮件，等待并读取验证码与验证链接，按 afterId 增量同步新邮件；从自己有发信权限的地址发信、回复（含站外邮件）和转发，支持显示名、抄送密送、Reply-To、自定义邮件头、HTML、附件与内联图片；认领、批量认领和释放邮箱地址；接入自有域名（托管域名与 DNS 解析）。用户提供了 hpcm_ 开头的 API Key，要求用 HPC Mail 收发邮件、管理其中的邮箱地址或接入自己的域名，或目标邮箱已确认属于该实例时使用；普通邮箱请求不能据此推断属于 HPC Mail。登录、通知等会话功能见 references。
+description: 通过 HTTP API 操作 HPC Mail 多域名邮箱（默认 https://hpc.email，也适用于自部署实例）：查收和搜索邮件，等待并读取验证码与验证链接，按 afterId 增量同步新邮件；从自己有发信权限的地址发信、回复（含站外邮件）和转发，支持显示名、抄送密送、Reply-To、自定义邮件头、HTML、附件与内联图片；认领、批量认领和释放邮箱地址；接入自有域名（托管域名与 DNS 解析）；订阅 Webhook 接收新邮件、发信结果与域名状态推送，管理通知通道与邮箱共享。用户提供了 hpcm_ 开头的 API Key，要求用 HPC Mail 收发邮件、管理其中的邮箱地址或接入自己的域名，或目标邮箱已确认属于该实例时使用；普通邮箱请求不能据此推断属于 HPC Mail。登录、通知等会话功能见 references。
 ---
 
 # HPC Mail
@@ -69,18 +69,16 @@ hpc '/messages' -X POST -H 'Content-Type: application/json' -H "Idempotency-Key:
 
 ### ③ 回复与转发
 ```bash
-# 没有单独的回复端点（POST /messages/:id 是 404）：读原信，自己填收件人和主题，再按配方②换新 Key 发送
-hpc "/messages/$MSG_ID" > "$WORK/orig.json"
-jq --arg from "$FROM" --arg text '回复正文' '.data as $m | {from:$from,
-  to:(if ($m.replyTo | length) > 0 then $m.replyTo else [$m.fromAddress] end),
-  subject:(if ($m.subject | test("^re:"; "i")) then $m.subject else "Re: " + $m.subject end),
-  text:$text, replyToMessageId:$m.id}' "$WORK/orig.json" > "$WORK/send.json"
+# 服务器按原信填收件人、Re:/Fwd: 主题、线程头与原文引用；需要 mail.send 与 mail.read，Idempotency-Key 同配方②
+hpc "/messages/$MSG_ID/reply" -X POST -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY" \
+  --data "$(jq -n --arg text '回复正文' '{text:$text, replyAll:false}')" | jq '.data | {id,status,recipientOutcomes}'
+hpc "/messages/$MSG_ID/forward" -X POST -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY2" \
+  --data "$(jq -n '{to:["bob@example.net"], note:"请看下面这封"}')" | jq '.data | {id,status,recipientOutcomes}'
 ```
 
-- `replyToMessageId` 只写入线程头。回复全部时从原信 `recipients.to/cc` 重新计算收件人，去掉自己的地址，不要带上原 Bcc。
-- 回复外部邮件（原信不在本站，只知道对方的 Message-ID）：不写 `replyToMessageId`，改写 `headers:{"In-Reply-To":"<id@example.net>","References":"<root@example.net> <id@example.net>"}`。两者同时给返回 400。
-- 转发：自己写新的 `to`、`Fwd: ` 主题和正文（需要原文就自己引用 `bodyText/bodyHtml`），加 `forwardAttachmentsFrom: <原邮件 id>` 复制原附件和内嵌图。
-- 带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时 Key 还需要 `mail.read`。来源可以是自己地址的邮件或共享给你的未删除来信；不存在、看不到或原附件已丢失返回 404 `source_unavailable`，去掉该字段即可作为新邮件发送。发件人仍须是自己的地址。
+- 回复默认回给原信 `replyTo`（没有时回发件人）；`replyAll:true` 另抄送原 To/Cc 里的其他人，去掉你自己，从不带原 Bcc；`quote` 默认附原文引用，`text`/`html` 至少一个。转发时 `note` 在前，`includeOriginal` 默认附原文，原附件总会带上。
+- `from` 缺省用原信的收件地址；原信在共享给你的邮箱里时返回 400 `from_required`，在 `from` 写自己的地址即可。来源看不到或原附件已丢失返回 404 `source_unavailable`。
+- 要自己定收件人、主题或正文时用配方②，带 `replyToMessageId`（只写线程头）或 `forwardAttachmentsFrom`（复制原附件和内嵌图），同样需要 `mail.read`。回复站外邮件（只知道对方 Message-ID）：不写 `replyToMessageId`，改写 `headers:{"In-Reply-To":"<id@example.net>","References":"<root@example.net> <id@example.net>"}`，两者同时给返回 400。
 
 ### ④ 附件与内联图片
 ```bash
@@ -124,6 +122,7 @@ SINCE=$MAX   # 所有页处理完才推进基线
 
 - 摘要已含 `preview`、`verificationCode`、`verificationLink`。只有需要正文或附件时才读详情，每封读一次并按 id 缓存，不要定时重拉同一封详情。处理完可用 `POST /messages/read` 标记已读（需要 `mail.write`）。
 - 持续监听用不带过滤的 `wait` 循环：每次返回最早一封新来信，以 `scannedThroughId` 作为下一轮的 `afterId`，不要高频轮询列表。`cursor` 只用服务器返回的值，伪造或截断的返回 400。
+- 有可公网访问的 HTTPS 接收端时改用 [Webhook v2](references/webhooks.md)（`POST /webhooks`，需要 `webhook.write`）：收信、发信结果与托管域名状态主动推送，Svix 兼容签名，失败自动重试，按 `webhook-id` 去重。
 
 ### ⑦ 接入自有域名
 ```bash
@@ -139,12 +138,13 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 ## 身份与权限模型
 
 1. 登录用户名不是邮箱地址。一个账户可以认领多个 `localPart@domain`，邮件按完整地址归属；认领即可看到该地址的全部历史，包括认领之前收到的。
-2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
+2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。自己拥有的托管域名发信就绪后可用任意前缀（`/identities` 的 `domains` 里 `kind:"hosted"`），发出时自动认领。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
 3. 共享给你的地址（`kind=shared`，`reason=shared_readonly`）对普通用户只读：可读来信、设个人星标、作为回复或转发的来源；不能发信、删除、标记已读或释放。已读状态属于所有者，未读数与 `unread=1` 只统计自己认领的地址。
-4. 管理员可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 列出可用任意前缀发信的系统域名；不能推断任意外部域名可用。
-5. scope：`mail.read` 读邮件、等待、下载附件；`mail.write` 标记已读、星标、删除与恢复；`mail.send` 发信与上传附件；`mailbox.read` 查看邮箱、可用性与随机后缀；`mailbox.write` 认领（含批量）、改显示名、释放；`domain.read` 查看自己的托管域名、接入进度与 DNS 记录；`domain.write` 添加托管域名、立即检测、增改删 DNS 记录，能改该用户托管域名的解析，按需授予。`/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
+4. 管理员（用 Key 时需带 `admin` scope）可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 列出管理员可用任意前缀发信的域名（`kind` 为 `system`/`hosted`/`legacy`）；不能推断任意外部域名可用。
+5. scope：`mail.read` 读邮件、等待、下载附件；`mail.write` 标记已读、星标、删除与恢复；`mail.send` 发信与上传附件；`mailbox.read` 查看邮箱、可用性与随机后缀；`mailbox.write` 认领（含批量）、改显示名、释放；`domain.read` 查看自己的托管域名、接入进度与 DNS 记录；`domain.write` 添加托管域名、立即检测、增改删 DNS 记录，能改该用户托管域名的解析，按需授予；`mailbox.share` 管理自己邮箱的共享（按 userId）；`webhook.write` 管理 Webhook 端点；`notify.read`/`notify.write` 读写飞书、PushDeer、通用 Webhook 通知；`admin` 是管理员能力开关。`/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
 6. 管理员的列表默认也只看自己的邮箱：未认领地址用 `scope=unclaimed`，只读审阅某个用户用 `scope=user&userId=`。
-7. Key 不能用于 `/api`，也不能管理 Key、改密码、配置通知，不能删除托管域名、改成员上限、管理成员或过户。用户改密码时默认吊销本人全部 Key，管理员重置密码时一律吊销；之后这些 Key 返回 401。
+7. Key 不能用于 `/api`，也不能管理 Key、改密码、开关两步验证、修改邮箱转发目标，不能删除托管域名、改成员上限、管理成员或过户。用户改密码时默认吊销本人全部 Key，管理员重置密码时一律吊销；之后这些 Key 返回 401。
+8. Key 可以限定到指定邮箱或域名（`GET /me` 的 `key.allowedMailboxIds`、`key.allowedDomains`）：范围外的邮件不出现在列表与等待里，按 id 读是 404，显式给出范围外的地址、域名或发件地址是 403，见[限定范围](references/auth-and-http.md#key-only-与长期自动化)。管理员的 Key 只有带 `admin` scope 才按管理员执行（`key.effectiveRole`）。
 
 ## 能力地图（路径相对 `/v1`）
 
@@ -156,7 +156,8 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 | 等新邮件、验证码、验证链接 | `GET /messages/wait` | `mail.read` | [mail](references/mail.md#等待本次验证码) |
 | 详情、线程、原始 .eml、未读数、联系人 | `GET /messages/:id`、`GET /messages/:id/thread`、`GET /messages/:id/raw`、`GET /messages/unread-count`、`GET /messages/contacts` | `mail.read` | [mail](references/mail.md) |
 | 已读、全部已读、星标、删除、恢复、永久删除 | `POST /messages/read\|read-all\|star\|delete\|restore\|purge` | `mail.write` | [mail](references/mail.md#维护状态与回收站) |
-| 发信、回复、转发、补发（附件可写 `{url}` 由服务端拉取） | `POST /messages` | `mail.send`（回复、转发另需 `mail.read`） | [mail](references/mail.md#发送)、[URL 附件](references/attachments.md#url-附件) |
+| 发信、补发（可带回复/转发字段；附件可写 `{url}` 由服务端拉取） | `POST /messages` | `mail.send`（带回复、转发字段另需 `mail.read`） | [mail](references/mail.md#发送)、[URL 附件](references/attachments.md#url-附件) |
+| 回复、转发（服务器填收件人、主题与引用） | `POST /messages/:id/reply`、`POST /messages/:id/forward` | `mail.send` + `mail.read` | [mail](references/mail.md#回复和转发) |
 | 一次发最多 20 封独立的信 | `POST /messages/batch` | `mail.send` | [mail](references/mail.md#批量发送) |
 | 草稿（等用户在网页确认后再发）、定时发送、取消定时 | `GET\|POST /drafts`、`GET\|PATCH\|DELETE /drafts/:id`、`POST /drafts/:id/send` | 读 `mail.read` 或 `mail.send`；写与发送 `mail.send` | [drafts](references/drafts.md) |
 | 下载附件 | `GET /messages/:id/attachments/:attId` | `mail.read` | [attachments](references/attachments.md) |
@@ -164,9 +165,12 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 | 我的邮箱、共享给我的、可用性、随机后缀 | `GET /mailboxes`、`GET /mailboxes/shared`、`GET /mailboxes/availability`、`POST /mailboxes/availability/batch`、`GET /mailboxes/random-plan` | `mailbox.read` | [mailboxes](references/mailboxes-and-domains.md) |
 | 认领、批量认领、改显示名、释放 | `POST /mailboxes`、`POST /mailboxes/batch`、`PUT /mailboxes/:id`、`DELETE /mailboxes/:id` | `mailbox.write` | [mailboxes](references/mailboxes-and-domains.md) |
 | 托管域名列表与接入进度、DNS 记录 | `GET /hosted-domains`、`GET /hosted-domains/:id`、`GET /hosted-domains/:id/dns-records` | `domain.read` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
-| 接入自有域名、立即检测、增改删 DNS 记录 | `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
+| 接入自有域名、立即检测、重新接入、增改删 DNS 记录 | `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/reconnect`、`POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
+| 共享自己的邮箱（按 userId） | `GET /mailboxes/shares`、`PUT /mailboxes/shares`、`POST /mailboxes/shares/batch`、`DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | `mailbox.share` | [mailboxes](references/mailboxes-and-domains.md#释放历史与共享边界) |
+| Webhook 端点、测试、投递记录与重试 | `GET /webhooks`、`POST /webhooks`、`PUT /webhooks/:id`、`POST /webhooks/:id/test`、`GET /webhooks/:id/deliveries` | `webhook.write` | [webhooks](references/webhooks.md) |
+| 通知通道（飞书、PushDeer、通用 Webhook）与投递健康 | `GET /notify-prefs`、`PUT /notify-prefs`、`GET /notify-prefs/health` | `notify.read` / `notify.write` | [notifications](references/notifications.md) |
 
-只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；共享管理以及托管域名的删除、成员与过户见 [mailboxes](references/mailboxes-and-domains.md)；个人通知与转发见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
+只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；托管域名的删除、成员与过户、共享候选用户搜索见 [mailboxes](references/mailboxes-and-domains.md)；邮箱转发目标（新目标要邮件确认）见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
 
 ## 完成标准与安全
 

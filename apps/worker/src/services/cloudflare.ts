@@ -9,6 +9,11 @@ export interface CloudflareCredentials {
   accountId: string;
   /** catch-all 投递目标：本 Worker 的脚本名 */
   workerName: string;
+  /**
+   * 判定 zone 不存在前的可见性参照：另一个最近核对为 active 的托管 zone。Token 可见范围变窄时它也会读不到，
+   * 据此避免把全部托管域名一起误判为失踪；没有参照时改为确认账户里仍能列出 zone。
+   */
+  probeZone?: { id: string } | null;
 }
 
 export function cloudflareCredentials(env: Env): CloudflareCredentials | null {
@@ -132,15 +137,42 @@ export interface CfSendingDnsStatus {
 }
 
 /**
- * 「可能不存在」：不存在的 zone 返回 403/9109（与无权限难以区分）或 404/7003，
- * 所以对 zone 的结论一律再按名称列一次账户里的 zone 确认，不凭单次报错做破坏性判断。
+ * 「可能不存在」：不存在的 zone 返回 403/9109（与无权限难以区分）或 404/7003。只认这几种，其他 403（Token 无权限等）
+ * 一律当作失败；即便如此也要再按名称列一次账户里的 zone 并做可见性自检，不凭单次报错做破坏性判断。
  */
 const maybeMissing = (error: unknown) => error instanceof CloudflareApiError
-  && (error.status === 403 || error.status === 404 || error.has(1001, 7003, 9109));
+  && (error.status === 404 || error.has(7003, 9109));
 
-/** 超时、网络错误、5xx 与限流：结果不确定，调用方应保留原状态稍后重试 */
+/**
+ * 超时、网络错误、5xx、限流，以及 2xx/3xx 但响应体解析失败或 success:false：结果不确定（请求可能已生效），
+ * 调用方应保留原状态稍后重试
+ */
 export function isTransientCloudflareError(error: unknown): boolean {
-  return !(error instanceof CloudflareApiError) || error.status === 0 || error.status === 429 || error.status >= 500;
+  return !(error instanceof CloudflareApiError) || error.status < 400 || error.status === 429 || error.status >= 500;
+}
+
+/** 自检没通过时抛出：status 0 让调用方按结果不确定处理（保留原状态、只记 lastError） */
+const unconfirmed = (detail: string) => new CloudflareApiError(0, [], `无法确认 zone 已不存在：${detail}`);
+
+/**
+ * 按名称列不到之后、下「zone 不存在」结论之前，确认 Token 仍看得到账户里的 zone：优先读参照 zone（不能是被判定的这个），
+ * 没有参照时要求账户 zone 总数至少为 1。可见范围变窄时两者都会失败，避免把全部托管域名判为失踪或把删除当作成功。
+ */
+export async function assertZonesVisible(creds: CloudflareCredentials, zoneId: string): Promise<void> {
+  const probe = creds.probeZone && creds.probeZone.id !== zoneId ? creds.probeZone : null;
+  let visible: boolean;
+  try {
+    if (probe) {
+      visible = (await cf<CfZone>(creds, 'GET', `/zones/${probe.id}`)).id === probe.id;
+    } else {
+      // Cloudflare 的 per_page 最小为 5
+      const query = new URLSearchParams({ 'account.id': creds.accountId, per_page: '5' });
+      visible = ((await cfFetch<unknown[]>(creds, 'GET', `/zones?${query}`)).result_info?.total_count ?? 0) >= 1;
+    }
+  } catch (error) {
+    throw unconfirmed(`可见性自检失败（${error instanceof Error ? error.message : String(error)}）`);
+  }
+  if (!visible) throw unconfirmed(probe ? '可见性自检读到的参照 zone 不符' : '可见性自检列不到账户里的任何 zone');
 }
 
 /**
@@ -154,6 +186,7 @@ export function isOutcomeUnknown(error: unknown): boolean {
 async function confirmMissing(creds: CloudflareCredentials, zoneId: string, name: string, error: unknown): Promise<void> {
   if (!maybeMissing(error)) throw error;
   if ((await findZone(creds, name))?.id === zoneId) throw error;
+  await assertZonesVisible(creds, zoneId);
 }
 
 /** 账户内同名 zone（含 pending）；不存在返回 null */
@@ -167,7 +200,7 @@ export function createZone(creds: CloudflareCredentials, name: string): Promise<
   return cf<CfZone>(creds, 'POST', '/zones', { name, account: { id: creds.accountId }, type: 'full' });
 }
 
-/** zone 已被删除（账户里按名称也找不到该 id）时返回 null */
+/** zone 已被删除（账户里按名称也找不到该 id，且通过可见性自检）时返回 null */
 export async function getZone(creds: CloudflareCredentials, zoneId: string, name: string): Promise<CfZone | null> {
   try {
     return await cf<CfZone>(creds, 'GET', `/zones/${zoneId}`);
@@ -177,8 +210,24 @@ export async function getZone(creds: CloudflareCredentials, zoneId: string, name
   }
 }
 
-/** 已不存在视为成功 */
-export async function deleteZone(creds: CloudflareCredentials, zoneId: string, name: string): Promise<void> {
+/** 删除前核对的 zone 身份：不能是系统域名；创建时间不早于本站记录（留 1 分钟时钟误差） */
+export interface ZoneDeleteGuard {
+  notBefore?: Date | null;
+  protectedNames?: readonly string[];
+}
+
+/**
+ * 先读出 zone 核对身份再删除：名称须与记录一致，身份不符时抛错且不删除（D1 里的 zone_id 被人工改错时
+ * 不会删到别的 zone）。已不存在视为成功。
+ */
+export async function deleteZone(creds: CloudflareCredentials, zoneId: string, name: string, guard: ZoneDeleteGuard = {}): Promise<void> {
+  if (guard.protectedNames?.includes(name)) throw new Error(`拒绝删除：${name} 是本站的系统域名`);
+  const zone = await getZone(creds, zoneId, name);
+  if (!zone) return;
+  if (zone.name !== name) throw new Error(`拒绝删除：zone ${zoneId} 的名称为 ${zone.name}，与记录的 ${name} 不符`);
+  if (guard.notBefore && zone.created_on && new Date(zone.created_on).getTime() < guard.notBefore.getTime() - 60_000) {
+    throw new Error(`拒绝删除：zone ${zoneId} 创建于 ${zone.created_on}，早于本站记录`);
+  }
   try {
     await cf(creds, 'DELETE', `/zones/${zoneId}`);
   } catch (error) {

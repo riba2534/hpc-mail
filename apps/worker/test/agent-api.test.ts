@@ -11,6 +11,7 @@ import { handleInbound } from '../src/services/inbound.js';
 import { minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 
@@ -39,11 +40,14 @@ async function actor(username: string, role: 'admin' | 'user' = 'user', scopes: 
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await createDb(env).insert(users).values({ username, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await createDb(env).insert(users).values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-agent`, scopes, rateLimit: 120 })), 201);
-  expect(key.scopes).toEqual(scopes);
+  // admin scope 按存量管理员 Key 的形态补上（新建要求 IP 白名单，测试请求不带来源 IP）
+  const granted = scopes.filter((scope) => scope !== 'admin');
+  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-agent`, scopes: granted, rateLimit: 120, password: TEST_PASSWORD })), 201);
+  expect(key.scopes).toEqual(granted);
+  if (role === 'admin' && scopes.includes('admin')) await grantLegacyAdminScope(env, key.id);
   return { id: user!.id, jwt, key: key.key };
 }
 
@@ -185,7 +189,7 @@ describe('外部 Agent API 真实 HTTP 工作流', () => {
     expect((await request('/v1/mailboxes?all=anything', { headers: auth(writer.key) })).status).toBe(400);
     expect((await data<{ available: boolean }>(await request('/v1/mailboxes/availability?localPart=private-user&domain=private.test', { headers: auth(writer.key) }))).available).toBe(false);
     expect((await request('/v1/mailboxes/availability?localPart=bad%40prefix&domain=hpc.email', { headers: auth(writer.key) })).status).toBe(400);
-    const admin = await actor('agent-admin-permissions', 'admin', ['mailbox.read']);
+    const admin = await actor('agent-admin-permissions', 'admin', ['mailbox.read', 'admin']);
     expect(await data(await request('/v1/mailboxes', { headers: auth(admin.key) }))).toEqual([]);
     expect((await data<{ id: number }[]>(await request('/v1/mailboxes?all=1', { headers: auth(admin.key) }))).map(item => item.id)).toContain(box.id);
     expect((await data<{ available: boolean }>(await request('/v1/mailboxes/availability?localPart=private-admin&domain=private.test', { headers: auth(admin.key) }))).available).toBe(true);

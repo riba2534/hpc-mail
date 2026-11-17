@@ -30,7 +30,12 @@ export function setAuthToken(token: string): void {
     clearAuthToken();
     return;
   }
-  storage()?.setItem(TOKEN_STORAGE_KEY, normalized);
+  try {
+    storage()?.setItem(TOKEN_STORAGE_KEY, normalized);
+  } catch {
+    // 存储写满或被禁用：保持原状，不让登录、改密的回调抛错中断
+    return;
+  }
   globalThis.dispatchEvent?.(new CustomEvent(TOKEN_EVENT, { detail: normalized }));
 }
 

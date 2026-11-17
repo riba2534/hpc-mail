@@ -1,4 +1,4 @@
-import { API_SCOPES, OUTBOUND_PENDING_STALE_MS, type CreatedApiKey, type MessageSummary, type SingleUploadResult } from '@hpc-mail/shared';
+import { OUTBOUND_PENDING_STALE_MS, type CreatedApiKey, type MessageSummary, type SingleUploadResult } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import PostalMime from 'postal-mime';
@@ -15,6 +15,7 @@ import { finalWriteRetry, isDefiniteSendRejection, sendMail } from '../src/servi
 import { runDraftAttachmentCleanup } from '../src/services/scheduled.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
 import { draftKey, resolveDraftAttachments } from '../src/services/upload.js';
 import type { Env } from '../src/types.js';
@@ -68,11 +69,13 @@ async function account(name: string, role: 'admin' | 'user' = 'user', quota = { 
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username: name, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username: name, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const [box] = await db.insert(mailboxes).values({ address: `${name}@hpc.email`, domain: 'hpc.email', userId: user!.id }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const created = await body(await call(env, '/api/api-keys', json(jwt, { name: `${name}-key`, scopes: [...API_SCOPES], rateLimit: 600 })), 201);
+  const created = await body(await call(env, '/api/api-keys', json(jwt, { name: `${name}-key`, scopes: USER_SCOPES, rateLimit: 600, password: TEST_PASSWORD })), 201);
+  // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope）
+  if (role === 'admin') await grantLegacyAdminScope(env, (created.data as unknown as CreatedApiKey).id);
   return { id: user!.id, key: (created.data as unknown as CreatedApiKey).key, address: `${name}@hpc.email`, boxId: box!.id,
     sender: { userId: user!.id, role } };
 }

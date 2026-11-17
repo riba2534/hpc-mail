@@ -130,8 +130,9 @@ describe('R03 /v1 审计写入受控', () => {
       expect(id).not.toBe(bad);
       expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     }
+    // 成功的 GET 按分钟聚合成一行（跨分钟边界时两行），requestId 取该分钟第一次请求
     const logs = await logsOf(key.id);
-    expect(logs).toHaveLength(5);
+    expect(logs.reduce((sum, log) => sum + log.requestCount, 0)).toBe(5);
     expect(logs.every((log) => /^[A-Za-z0-9._:-]{1,64}$/.test(log.requestId))).toBe(true);
     expect(logs.map((log) => log.requestId)).toContain('trace-1:Ab.9_x');
   });
@@ -187,7 +188,7 @@ describe('R03 /v1 审计写入受控', () => {
     expect(await logsOf(stoppedKey.id)).toHaveLength(1);
   });
 
-  it('Key 超限后 429 只写 1 行明细、不写 api_rate_limits；正常请求逐条记录', async () => {
+  it('Key 超限后 429 只写 1 行明细、不写 api_rate_limits；成功请求按分钟聚合', async () => {
     await enableApi();
     await awayFromMinuteBoundary();
     const user = await seedUser('p0-429');
@@ -197,7 +198,7 @@ describe('R03 /v1 审计写入受控', () => {
     expect(statuses).toEqual([200, 200, 429, 429, 429, 429]);
     expect(await createDb(env).select().from(apiRateLimits).where(eq(apiRateLimits.apiKeyId, key.id)).all()).toEqual([]);
     const logs = await logsOf(key.id);
-    expect(logs.map((log) => log.statusCode).sort()).toEqual([200, 200, 429]);
+    expect(logs.map((log) => [log.statusCode, log.requestCount]).sort()).toEqual([[200, 2], [429, 1]]);
   });
 });
 
@@ -281,9 +282,9 @@ describe('API Key 管理的并发守卫', () => {
   });
 
   it('网页创建 Key 带令牌鉴权版本，正常会话照常创建', async () => {
-    const user = await seedUser('p0-create-http');
+    const user = await seedUser('p0-create-http', { password: 'p0-create-http-pass' });
     const response = await call('/api/api-keys', await jwtFor(user.id),
-      jsonInit('POST', { name: 'web', scopes: ['mail.read'], rateLimit: 60 }));
+      jsonInit('POST', { name: 'web', scopes: ['mail.read'], rateLimit: 60, password: 'p0-create-http-pass' }));
     expect(response.status).toBe(201);
   });
 });

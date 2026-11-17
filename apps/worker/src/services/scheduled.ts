@@ -13,12 +13,15 @@ import { chunk } from '../lib/d1.js';
 import type { Env, ExecCtx } from '../types.js';
 import { API_REJECT_SCOPE, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
+import { REAUTH_FAIL_SCOPE } from './reauth.js';
+import { cleanupWebhookDeliveries, processWebhookDeliveries } from './webhooks.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
 import {
   HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
 } from './hosted-domain.js';
 import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
+import { purgeHostedTombstones } from './hosted-tombstone.js';
 import { CANARY_RATE_SCOPE, writeCronHeartbeat } from './ops-probe.js';
 import {
   processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases, purgeOrphanAttachments,
@@ -226,6 +229,8 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
   // 投递回执订阅：只为新域名或失败超过 6 小时的域名调用 Cloudflare，其余时候只读本地记录
   await step(report, 'delivery_events.subscriptions', () => syncDeliveryEventSubscriptions(env));
+  // 排在托管域名核对之后：本轮产生的域名事件同轮投递
+  await step(report, 'webhooks.process', async () => (await processWebhookDeliveries(env, { limit: 50 })).processed);
 }
 
 async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
@@ -234,6 +239,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   // 每日核对 Cloudflare 上的投递回执订阅（被删除的重建），并清理过期的回执对应关系与抑制条目
   await step(report, 'delivery_events.verify', () => syncDeliveryEventSubscriptions(env, { verify: true }));
   await step(report, 'delivery_events.cleanup', async () => await cleanupDeliveryRefs(env) + await cleanupExpiredSuppressions(env));
+  await step(report, 'webhooks.cleanup', () => cleanupWebhookDeliveries(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
   const staleWindow = Math.floor(Date.now() / 60000) - 120;
@@ -285,11 +291,14 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'drafts.sent', () => purgeSentDrafts(env));
   // 附件行指向已不存在的邮件（附件写入前邮件被永久删除等）：登记对象清理并删行
   await step(report, 'attachments.orphans', () => purgeOrphanAttachments(env));
+  // 托管域名墓碑过了保留期：前所有者的优先权到期，NS 委派预检只看仍在的托管记录与墓碑
+  await step(report, 'hosted_domains.tombstones', () => purgeHostedTombstones(env));
   // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组。
   // auth-user/auth-global/api-user/api-global 已由 Rate Limiting binding 计数，只剩升级前写入的旧行待回收
   await step(report, 'counters', async () => {
     await purgeCounters(env, [
       OUTBOUND_QUOTA_SCOPE, 'fwd-domain', 'fwd-target', FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, 'ai-extract', TRANSLATE_CHARS_SCOPE,
+      'fwd-confirm',
     ], dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
@@ -297,7 +306,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
       CANARY_RATE_SCOPE,
     ], minuteWindow(1) - 120);
     await purgeCounters(env, SYSTEM_DOMAIN_CF_SCOPE, minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES) - 24);
-    await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
+    await purgeCounters(env, ['login-fail', REAUTH_FAIL_SCOPE], minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });
 }
