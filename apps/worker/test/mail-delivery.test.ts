@@ -1,6 +1,6 @@
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
-import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import PostalMime from 'postal-mime';
 import { createDb } from '../src/db/client.js';
 import { attachments, deliveryObjectLeases, idempotencyRecords, mailboxes, messages, users } from '../src/db/schema.js';
@@ -14,6 +14,7 @@ import { processStorageCleanup } from '../src/services/storage-cleanup.js';
 import { BODY_PREVIEW_BYTES } from '../src/services/mail-body.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { createApp } from '../src/app.js';
+import { collectBackground } from './support/background.js';
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -45,22 +46,7 @@ function captureEnv() {
   return { customEnv: { ...env, email: { send } } as any, send, captured };
 }
 
-/**
- * sendMail 登记的后台任务（结果回填重试、通知、转发等）收集起来，每个用例结束前全部等完。
- * 用例结束后仍在跑的任务会在拆测试环境时写日志，vitest 记为 Unhandled Rejection
- * （EnvironmentTeardownError: Closing rpc while "onUserConsoleLog" was pending），进程退出 1。
- */
-const background = (() => {
-  const tasks: Promise<unknown>[] = [];
-  return {
-    ctx: { waitUntil: (promise: Promise<unknown>) => { tasks.push(promise); } },
-    /** 等完已登记的任务（含等待期间新登记的） */
-    async settle() {
-      while (tasks.length) await Promise.allSettled(tasks.splice(0));
-    },
-  };
-})();
-afterEach(() => background.settle());
+const background = collectBackground();
 
 const cidMime = (to: string, subject: string) => [
   'From: Sender <sender@example.net>', `To: ${to}`, `Subject: ${subject}`, 'MIME-Version: 1.0',

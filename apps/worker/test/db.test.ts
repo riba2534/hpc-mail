@@ -25,6 +25,10 @@ import {
 import { sendMail } from '../src/services/outbound.js';
 import { updateSettings } from '../src/services/setting.js';
 import { deleteUser, updateUser } from '../src/services/user.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 async function seedUser(username: string, role: 'admin' | 'user'): Promise<number> {
   const db = createDb(env);
@@ -469,7 +473,7 @@ describe('域名可见性与按域名认领上限', () => {
     expect(await getDomains(env)).toEqual([]);
     expect(await getRoutableDomains(env)).toContain('kept.example');
 
-    const ctx = { waitUntil: () => {} };
+    const ctx = background.ctx;
     await sendMail(
       env,
       ctx,
@@ -588,7 +592,7 @@ describe('回复头 replyToMessageId', () => {
       })
       .returning({ id: messages.id });
 
-    const ctx = { waitUntil: () => {} };
+    const ctx = background.ctx;
     await sendMail(
       env,
       ctx,
@@ -743,7 +747,7 @@ describe('共享邮箱', () => {
     await expect(
       sendMail(
         env,
-        { waitUntil: () => {} },
+        background.ctx,
         sharee,
         {
           from: { localPart, domain: 'inbox.test' },

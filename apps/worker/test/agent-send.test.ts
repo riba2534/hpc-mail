@@ -19,6 +19,10 @@ import { processStorageCleanup } from '../src/services/storage-cleanup.js';
 import { consumeDraftAttachments, draftKey } from '../src/services/upload.js';
 import type { Env } from '../src/types.js';
 import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -346,7 +350,7 @@ describe('R23/R36 外发可靠性', () => {
       } finally { inflight--; }
     });
     const targets = Array.from({ length: 6 }, (_, i) => `pool-${i}@example.net`);
-    const pending = sendMail({ ...env, email: { send } } as unknown as Env, { waitUntil: () => {} }, owner.sender, {
+    const pending = sendMail({ ...env, email: { send } } as unknown as Env, background.ctx, owner.sender, {
       from: { localPart: 'pool-owner', domain: 'hpc.email' }, to: [], cc: [], bcc: targets, subject: 'bounded pool', text: 'body',
     }, [], 'https://hpc.email');
     await vi.waitFor(() => expect(gates.size).toBe(OUTBOUND_DELIVERY_CONCURRENCY));

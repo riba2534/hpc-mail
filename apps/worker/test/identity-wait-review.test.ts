@@ -10,6 +10,10 @@ import { findNextMessage, type Viewer } from '../src/services/message.js';
 import { sendMail } from '../src/services/outbound.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 const db = createDb(env);
 
@@ -84,7 +88,7 @@ describe('N9 发件身份按管理员实际放行规则计算', () => {
     });
 
     // 与实际发信逐项对照：列出可发的都能发，不能发的（含未列出的域名）都被拒
-    const send = (from: { mailboxId: number } | { localPart: string; domain: string }) => sendMail(env as Env, { waitUntil: () => {} },
+    const send = (from: { mailboxId: number } | { localPart: string; domain: string }) => sendMail(env as Env, background.ctx,
       { userId: admin, role: 'admin' }, { from, to: ['sink@x3-sys.example'], cc: [], bcc: [], subject: 'x3 identity probe', text: 't' } as never,
       [], 'https://hpc.email');
     for (const item of listed.identities) {

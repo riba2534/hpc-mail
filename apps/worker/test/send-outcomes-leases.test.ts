@@ -19,6 +19,10 @@ import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash, USER_SCOPES } f
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
 import { draftKey, resolveDraftAttachments } from '../src/services/upload.js';
 import type { Env } from '../src/types.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -346,7 +350,7 @@ describe('N15 引用对象先登记租约再校验', () => {
     expect(await runDraftAttachmentCleanup(env)).toBeGreaterThanOrEqual(1);
     await processStorageCleanup(env, 1000);
     expect(await env.r2.head(draftKey(owner.id, kept.token))).not.toBeNull();
-    const summary = await sendMail(runtime, { waitUntil: () => {} }, owner.sender, {
+    const summary = await sendMail(runtime, background.ctx, owner.sender, {
       from: { localPart: 'x2-draft-expiry', domain: 'hpc.email' }, to: ['far@example.net'], cc: [], bcc: [], subject: 'x2 expired draft', text: 'x',
     }, resolved, 'https://hpc.email', null, leaseToken);
     expect(summary.status).toBe('sent');
