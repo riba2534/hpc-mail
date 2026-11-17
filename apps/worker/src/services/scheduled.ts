@@ -28,6 +28,7 @@ import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotific
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 import { releaseDraftStatements } from './upload.js';
 import { markStaleOutbound } from './outbound-recovery.js';
+import { offloadMailBodies } from './body-offload.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -191,6 +192,8 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'claude_facts.harvest', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_WINDOW_MS));
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
+  // 历史正文分批搬到 R2（放在清理之前：本轮没被引用的对象登记后同一轮就能回收）
+  await step(report, 'bodies.offload', () => offloadMailBodies(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
 }
