@@ -34,20 +34,29 @@ const POST_PROCESS_WAIT_MS = 20_000;
 /**
  * 候选行：只扫 idx_messages_inbound_pending 部分索引（正常时 0 行）。带 deleted_at 条件时规划器会改走
  * idx_messages_live 扫全站，所以用 INDEXED BY 固定；方向与状态写成字面量才满足部分索引的条件。
- * 失败或被中断过的排在后面，不挡住新出现的 pending；回收站里的不修。导出供 EXPLAIN 回归。
+ * 失败或被中断过的排在后面，不挡住新出现的 pending；回收站里的不修；本轮已领取过的（?3，JSON 数组）不再领取，
+ * 每行一轮最多试一次，重试间隔至少一个 cron 周期。导出供 EXPLAIN 回归。
  */
 export const STALE_INBOUND_SQL = `SELECT id FROM messages INDEXED BY idx_messages_inbound_pending
   WHERE direction = 'inbound' AND status = 'pending' AND created_at < ?1 AND deleted_at IS NULL
-    AND inbound_repair_attempts < ?2
+    AND inbound_repair_attempts < ?2 AND id NOT IN (SELECT value FROM json_each(?3))
   ORDER BY inbound_repair_attempts, created_at LIMIT 1`;
 
-/** 领取一行：同一条语句里先把尝试次数加一（先占位再处理），isolate 中途被终止也已记过这一次 */
-const CLAIM_SQL = `UPDATE messages SET inbound_repair_attempts = inbound_repair_attempts + 1
+/**
+ * 领取一行：同一条语句里先把尝试次数加一（先占位再处理），并写下「第 N 次在处理途中被中断」。
+ * isolate 中途被终止时这次尝试已计数、说明也留在行上；正常结束时收件链路或失败记录会覆盖这条说明。
+ */
+const CLAIM_SQL = `UPDATE messages SET inbound_repair_attempts = inbound_repair_attempts + 1,
+    error_detail = '自动修复第 ' || (inbound_repair_attempts + 1) || ' 次在处理途中被中断（可能超出运行内存或 CPU 上限），稍后重试'
   WHERE id = (${STALE_INBOUND_SQL}) AND status = 'pending'
   RETURNING id, address, ingest_key, raw_r2_key, inbound_repair_attempts AS attempts`;
 
-/** 尝试次数已满仍是 pending：只可能是每次都在处理途中被终止（可捕获的失败在满额那次就转 degraded 了） */
-const GIVE_UP_SQL = `UPDATE messages SET status = 'degraded', error_detail = ?3
+/**
+ * 尝试次数已满仍是 pending（最后一次在处理途中被终止，或放弃后发件方重投又失败把它写回 pending）：
+ * 转 degraded，说明里带上最后一次的原因（去掉重复的「附件保存失败，」前缀与「稍后重试」），保留「保存失败」供原样重投修复
+ */
+const GIVE_UP_SQL = `UPDATE messages SET status = 'degraded',
+    error_detail = '附件保存失败，自动修复已达 ' || CAST(?2 AS INTEGER) || ' 次上限（最后一次：' || replace(replace(error_detail, '附件保存失败，', ''), '，稍后重试', '') || '），请下载原始邮件查看'
   WHERE direction = 'inbound' AND status = 'pending' AND created_at < ?1 AND inbound_repair_attempts >= ?2`;
 
 interface PendingRow {
@@ -198,10 +207,10 @@ export async function repairPendingInbound(env: Env, now = Date.now(), opts: Rep
   const { limit = REPAIR_BATCH, budgetMs = REPAIR_BUDGET_MS, clock = Date.now } = opts;
   const deadline = clock() + budgetMs;
   const cutoff = now - INBOUND_PENDING_STALE_MS;
-  const claim = () => env.db.prepare(CLAIM_SQL).bind(cutoff, MAX_INBOUND_REPAIR_ATTEMPTS);
+  const tried: number[] = [];
+  const claim = () => env.db.prepare(CLAIM_SQL).bind(cutoff, MAX_INBOUND_REPAIR_ATTEMPTS, JSON.stringify(tried));
   const [abandoned, first] = await env.db.batch<PendingRow>([
-    env.db.prepare(GIVE_UP_SQL).bind(cutoff, MAX_INBOUND_REPAIR_ATTEMPTS,
-      `附件保存失败，自动修复 ${MAX_INBOUND_REPAIR_ATTEMPTS} 次均在处理途中被中断（可能超出运行内存或 CPU 上限），请下载原始邮件查看`),
+    env.db.prepare(GIVE_UP_SQL).bind(cutoff, MAX_INBOUND_REPAIR_ATTEMPTS),
     claim(),
   ]);
   const outcomes: Record<RepairOutcome | 'abandoned', number> = {
@@ -211,6 +220,7 @@ export async function repairPendingInbound(env: Env, now = Date.now(), opts: Rep
   let claimed = 0;
   while (row) {
     claimed++;
+    tried.push(Number(row.id));
     const current = { ...row, attempts: Number(row.attempts) };
     let outcome: RepairOutcome;
     try {

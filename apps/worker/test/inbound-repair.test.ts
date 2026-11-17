@@ -162,6 +162,37 @@ describe('入站 pending 自愈', () => {
     expect(await rowsWithSubject('repair-mismatch-subject')).toHaveLength(1);
   });
 
+  it('同一轮里每行最多尝试一次：可捕获的失败不会在本轮被立即重新领取', async () => {
+    await clearPending();
+    const owner = await seedOwner('repair-once');
+    const rows = [await pendingDelivery(owner.address, 'repair-once-1'), await pendingDelivery(owner.address, 'repair-once-2')];
+    const broken = failingAttachments();
+    // 默认每轮 5 行：只有 2 行候选时本轮领取 2 次，各计一次
+    expect(await repairPendingInbound(broken)).toBe(2);
+    for (const row of rows) expect(await rowOf(row.id)).toMatchObject({ status: 'pending', inboundRepairAttempts: 1 });
+    // 下一轮再各试一次
+    expect(await repairPendingInbound(broken)).toBe(2);
+    for (const row of rows) expect((await rowOf(row.id))?.inboundRepairAttempts).toBe(2);
+    await clearPending();
+  });
+
+  it('放弃时的说明按最后一次的原因写，不把重投失败等情况一律说成中断', async () => {
+    await clearPending();
+    const owner = await seedOwner('repair-reason');
+    const pending = await pendingDelivery(owner.address, 'repair-reason-subject');
+    // 6 次可捕获失败转 degraded 后，发件方原样重投时附件仍写入失败：收件链路把它写回 pending，次数仍是 6
+    await createDb(env).update(messages).set({
+      inboundRepairAttempts: MAX_INBOUND_REPAIR_ATTEMPTS, status: 'pending', errorDetail: '附件保存失败，等待投递重试恢复',
+    }).where(eq(messages.id, pending.id));
+    expect(await repairPendingInbound(env)).toBe(0);
+    const gaveUp = await rowOf(pending.id);
+    expect(gaveUp?.status).toBe('degraded');
+    expect(gaveUp?.errorDetail).toContain(`${MAX_INBOUND_REPAIR_ATTEMPTS} 次`);
+    expect(gaveUp?.errorDetail).toContain('等待投递重试恢复');
+    expect(gaveUp?.errorDetail).not.toContain('中断');
+    expect(gaveUp?.errorDetail).toContain('保存失败');
+  });
+
   it('持续失败逐次累计，失败过的排在新行之后，第 6 次标 degraded', async () => {
     await clearPending();
     const owner = await seedOwner('repair-poison');
@@ -232,7 +263,7 @@ describe('入站 pending 自愈', () => {
   });
 
   it('候选查询命中 idx_messages_inbound_pending 部分索引', async () => {
-    const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${STALE_INBOUND_SQL}`).bind(Date.now(), 5).all<{ detail: string }>();
+    const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${STALE_INBOUND_SQL}`).bind(Date.now(), 5, '[1,2]').all<{ detail: string }>();
     const details = plan.results.map((row) => row.detail).join('\n');
     expect(details).toContain('idx_messages_inbound_pending');
   });
@@ -245,6 +276,8 @@ describe('入站 pending 自愈', () => {
 
     void repairPendingInbound(killed, Date.now(), { limit: 1 });
     await until(async () => (await rowOf(poison.id))?.inboundRepairAttempts === 1, '领取时先计一次');
+    // 处理途中被终止：领取时写下的说明留在行上，排查时能看出是第几次在处理中断
+    expect((await rowOf(poison.id))?.errorDetail).toContain('第 1 次在处理途中被中断');
 
     // 新出现的 pending 行排在被中断过的行之前
     const fresh = await pendingDelivery(owner.address, 'repair-killed-fresh');
