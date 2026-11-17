@@ -65,7 +65,7 @@ app.put('/password', requireAuth, async (c) => {
   const req = await parseBody(c, changePasswordRequestSchema);
   const result = await changePassword(c.env, user, req, execCtx(c));
   if (result.revokedApiKeys) {
-    await logAdminAction(c.env, user, 'api_key.revoke_all', user.username, `修改密码时吊销 ${result.revokedApiKeys} 个 API Key`, clientIp(c));
+    await logAdminAction(c.env, user, 'apikey.revoke_all', user.username, `修改密码时吊销 ${result.revokedApiKeys} 个 API Key`, clientIp(c));
   }
   return ok(c, result);
 });

@@ -11,6 +11,7 @@ import {
   transferHostedDomainRequestSchema, HOSTED_DNS_CAA_TAGS, HOSTED_DNS_TTL_AUTO, hostedDnsRecordInputSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
 } from '@hpc-mail/shared';
+import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 
 export type Schema = Record<string, unknown>;
 export type Operation = Record<string, unknown>;
@@ -35,7 +36,8 @@ export function fromZod(schema: { toJSONSchema(params: { io: 'input' | 'output';
   const { $schema: _dialect, ...result } = schema.toJSONSchema({ io, unrepresentable: 'any' }) as Schema;
   return result;
 }
-const REQUEST_ID_DESCRIPTION = 'Same value as the X-Request-ID response header, which every response carries. Clients may send X-Request-ID to correlate logs; only values matching ^[A-Za-z0-9._:-]{1,64}$ are used, anything else is replaced by a server-generated UUID.';
+/** 客户端 X-Request-ID 的取用规则，与 requestId 中间件同一正则 */
+export const clientRequestIdRule = `a client-supplied X-Request-ID is used only when it matches ${REQUEST_ID_PATTERN.source}`;
 export const claimStrategy: Schema = { type: 'string', enum: ['uniform', 'claude'],
   description: 'Optional. Omitted or uniform uses ordinary claim rules. claude rejects any domain with a historical Claude suspension, including for administrators and hosted domains; writes recheck atomically and return 403 forbidden: 该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领. Historical observations do not guarantee future safety.' };
 const claimRequest = fromZod(claimMailboxRequestSchema);
@@ -105,7 +107,7 @@ const delivery = object({ id: positiveId, messageId: nullable(positiveId), targe
 export const schemas: Record<string, Schema> = {
   Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
     description: 'Stable machine-readable code. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one.' }, message: str }),
-    requestId: { ...str, description: REQUEST_ID_DESCRIPTION } }),
+    requestId: { ...str, description: `Same value as the X-Request-ID response header, which every response carries; ${clientRequestIdRule}, anything else is replaced by a server-generated UUID.` } }),
   MessageSummary: messageSummary,
   MessageDetail: object({ ...summaryProperties, replyTo: array(str), recipients: object({ to: array(str), cc: array(str), bcc: array(str) }),
     bodyText: str, bodyHtml: str, attachments: array(ref('Attachment')), hasRaw: bool }, ['recipientOutcomes', 'recipientsTo', 'replyTo', 'verificationLink']),

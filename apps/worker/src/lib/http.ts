@@ -32,6 +32,11 @@ export function clientIp(c: Context<AppContext>): string {
   return (value.split(',')[0] ?? '').trim() || 'unknown';
 }
 
+/** 路由标签：数字 id 段归一为 :id，日志与审计里的路径不随 id 变成高基数 */
+export function routeLabel(pathname: string): string {
+  return pathname.replace(/\/\d+(?=\/|$)/g, '/:id');
+}
+
 /** 解析路径参数中的正整数 id，非法抛 not_found */
 export function parseId(value: string | undefined): number {
   const id = Number(value);

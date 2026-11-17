@@ -37,7 +37,7 @@ app.put('/:id', async (c) => {
   }
   await logAdminAction(c.env, acting, 'user.update', updated.username, changes.join('、'), clientIp(c));
   if (revokedApiKeys) {
-    await logAdminAction(c.env, acting, 'api_key.revoke_all', updated.username, `重置密码时吊销 ${revokedApiKeys} 个 API Key`, clientIp(c));
+    await logAdminAction(c.env, acting, 'apikey.revoke_all', updated.username, `重置密码时吊销 ${revokedApiKeys} 个 API Key`, clientIp(c));
   }
   return ok(c, updated);
 });

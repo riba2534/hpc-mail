@@ -1,4 +1,4 @@
-import { and, eq, lt } from 'drizzle-orm';
+import { and, eq, inArray, lt } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { rateCounters } from '../db/schema.js';
 import type { Env } from '../types.js';
@@ -113,10 +113,10 @@ export async function readCounter(
   return { count: row?.count ?? 0, units: row?.units ?? 0 };
 }
 
-/** 清理过期窗口行（由 scheduled 调用），按 scope 各自的窗口单位传 cutoff */
-export async function purgeCounters(env: Env, scope: string, beforeWindow: number): Promise<void> {
+/** 清理过期窗口行（由 scheduled 调用）；窗口单位相同的 scope 一起传，cutoff 按该单位计 */
+export async function purgeCounters(env: Env, scopes: string | string[], beforeWindow: number): Promise<void> {
   const db = createDb(env);
   await db
     .delete(rateCounters)
-    .where(and(eq(rateCounters.scope, scope), lt(rateCounters.window, beforeWindow)));
+    .where(and(inArray(rateCounters.scope, ([] as string[]).concat(scopes)), lt(rateCounters.window, beforeWindow)));
 }

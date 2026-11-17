@@ -1,5 +1,5 @@
 import {
-  array, bool, changed, claimStrategy, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, operation,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, operation,
   positiveId, query, ref, scopeQuery, specInfo, specificationOperation, str, uploadPaths, usedSchemas, type Paths,
 } from '../openapi-common.js';
 
@@ -68,7 +68,7 @@ export function buildOpenApiSpec(origin: string) {
     ...uploadPaths('mail.send'),
   };
   return {
-    openapi: '3.1.0', info: specInfo('HPC Mail Open API', 'API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; requests already over a key or user limit do not count toward the instance limit. Users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API. Every response carries X-Request-ID; a client-supplied X-Request-ID is used only when it matches ^[A-Za-z0-9._:-]{1,64}$.'),
+    openapi: '3.1.0', info: specInfo('HPC Mail Open API', `API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; requests already over a key or user limit do not count toward the instance limit. Users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API. Every response carries X-Request-ID; ${clientRequestIdRule}.`),
     servers: [{ url: `${origin}/v1` }], security: [{ apiKey: [] }],
     externalDocs: { description: 'Agent usage guide and authentication workflows', url: `${origin}/skill.md` },
     'x-relatedApis': [{ url: `${origin}/api/openapi.json`, description: 'JWT session and administration API' }],

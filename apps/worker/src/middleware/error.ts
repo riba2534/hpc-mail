@@ -5,7 +5,7 @@ import { AppError } from '../lib/errors.js';
 import type { AppContext } from '../types.js';
 
 /** 客户端传入的 X-Request-ID 只接受短的安全字符，否则改用服务端生成的 UUID（会写进审计日志） */
-const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
+export const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
 
 /** 每请求分配 requestId 并回显 X-Request-ID */
 export const requestId: MiddlewareHandler<AppContext> = async (c, next) => {

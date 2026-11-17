@@ -10,6 +10,7 @@ import {
   sessions,
 } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
+import { API_REJECT_SCOPE } from '../middleware/api-key-auth.js';
 import type { Env } from '../types.js';
 import { dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
@@ -234,24 +235,14 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   });
   // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ 回收 R2 + 删行
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
-  // 计数器：外发/转发/翻译配额按天、登录失败与注册限流按分钟窗口，各自回收过期行
+  // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组
   await step(report, 'counters', async () => {
-    await purgeCounters(env, 'out', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
-    await purgeCounters(env, 'fwd-domain', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
-    await purgeCounters(env, 'fwd-target', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
-    await purgeCounters(env, 'api-user', minuteWindow(1) - 120);
-    await purgeCounters(env, 'api-global', minuteWindow(1) - 120);
-    await purgeCounters(env, 'api-wait', minuteWindow(1) - 120);
-    await purgeCounters(env, 'api-reject', minuteWindow(1) - 120);
-    await purgeCounters(env, 'auth-user', minuteWindow(1) - 120);
-    await purgeCounters(env, 'auth-global', minuteWindow(1) - 120);
-    await purgeCounters(env, HOSTED_DNS_RATE_SCOPE, minuteWindow(1) - 120);
-    await purgeCounters(env, HOSTED_DNS_SITE_RATE_SCOPE, minuteWindow(1) - 120);
-    await purgeCounters(env, HOSTED_CREATE_RATE_SCOPE, minuteWindow(1) - 120);
-    await purgeCounters(env, HOSTED_CHECK_RATE_SCOPE, minuteWindow(1) - 120);
-    await purgeCounters(env, 'ai-extract', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
-    await purgeCounters(env, TRANSLATE_CHARS_SCOPE, dayWindow(new Date(Date.now() - 3 * DAY_MS)));
-    await purgeCounters(env, TRANSLATE_REQUESTS_SCOPE, minuteWindow(1) - 120);
+    await purgeCounters(env, ['out', 'fwd-domain', 'fwd-target', 'ai-extract', TRANSLATE_CHARS_SCOPE],
+      dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, [
+      'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
+      HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
+    ], minuteWindow(1) - 120);
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });

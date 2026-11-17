@@ -28,13 +28,12 @@ function normalizeKey(value: string | undefined): string | null {
   return key;
 }
 
+function keyOf(actor: IdempotencyActor, key: string) {
+  return and(eq(idempotencyRecords.actorType, actor.type), eq(idempotencyRecords.actorId, actor.id), eq(idempotencyRecords.key, key));
+}
+
 function recordOf(handle: IdempotencyHandle) {
-  return and(
-    eq(idempotencyRecords.actorType, handle.actor.type),
-    eq(idempotencyRecords.actorId, handle.actor.id),
-    eq(idempotencyRecords.key, handle.key),
-    eq(idempotencyRecords.requestHash, handle.requestHash),
-  );
+  return and(keyOf(handle.actor, handle.key), eq(idempotencyRecords.requestHash, handle.requestHash));
 }
 
 /**
@@ -69,17 +68,7 @@ export async function beginIdempotentSend(
       .get();
     if (inserted) return { kind: 'owner', handle };
 
-    const existing = await db
-      .select()
-      .from(idempotencyRecords)
-      .where(
-        and(
-          eq(idempotencyRecords.actorType, actor.type),
-          eq(idempotencyRecords.actorId, actor.id),
-          eq(idempotencyRecords.key, key),
-        ),
-      )
-      .get();
+    const existing = await db.select().from(idempotencyRecords).where(keyOf(actor, key)).get();
     if (!existing) continue;
     if (existing.requestHash !== requestHash) {
       throw new AppError('idempotency_mismatch', '相同 Idempotency-Key 不能用于不同的发信内容，请使用新的 Key');

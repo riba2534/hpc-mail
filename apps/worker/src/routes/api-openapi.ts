@@ -1,6 +1,6 @@
 import { HOSTED_DOMAIN_STATUSES, MAX_BATCH_CLAIM, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, okResult, operation,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, idempotencyHeader, int, listQuery, mutationQuery, object, okResult, operation,
   page, pageQuery, query, ref, scopeQuery, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
@@ -216,7 +216,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/admin/audit-logs': { get: operation('Read administrator audit logs', page(ref('AdminAuditLog')), { ...admin, parameters: pageQuery }) },
   };
   return { openapi: '3.1.0', info: specInfo('HPC Mail Session and Administration API',
-    'JWT session API for all web-client functions. Authorization: Bearer <JWT> from login/register. hpcm_ API keys cannot authenticate these routes; see the related /v1 specification. Administrator endpoints require an active admin role. If site policy requires 2FA, un-enrolled sessions receive 403 totp_setup_required; /auth/me, logout and /auth/2fa routes remain available to complete setup. Requests already over the per-user limit do not count toward the instance limit. Every response carries X-Request-ID; a client-supplied X-Request-ID is used only when it matches ^[A-Za-z0-9._:-]{1,64}$.'),
+    `JWT session API for all web-client functions. Authorization: Bearer <JWT> from login/register. hpcm_ API keys cannot authenticate these routes; see the related /v1 specification. Administrator endpoints require an active admin role. If site policy requires 2FA, un-enrolled sessions receive 403 totp_setup_required; /auth/me, logout and /auth/2fa routes remain available to complete setup. Requests already over the per-user limit do not count toward the instance limit. Every response carries X-Request-ID; ${clientRequestIdRule}.`),
     servers: [{ url: `${origin}/api` }], security: [{ sessionToken: [] }],
     externalDocs: { description: 'Agent usage guide and workflows', url: `${origin}/skill.md` },
     'x-relatedApis': [{ url: `${origin}/v1/openapi.json`, description: 'Scoped API-key mail/mailbox automation' }],

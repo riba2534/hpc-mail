@@ -1,4 +1,5 @@
 import { createApp, isApiPath } from './app.js';
+import { routeLabel } from './lib/http.js';
 import { handleInbound } from './services/inbound.js';
 import { runScheduled } from './services/scheduled.js';
 import type { Env } from './types.js';
@@ -56,11 +57,6 @@ function countingDb(db: D1Database, stats: { d1: number }): D1Database {
     dump: () => db.dump(),
     withSession: (constraint?: Parameters<D1Database['withSession']>[0]) => db.withSession(constraint),
   } as unknown as D1Database;
-}
-
-/** 日志里的路由：去掉查询串，数字 id 归一为 :id，避免高基数 */
-function routeLabel(pathname: string): string {
-  return pathname.replace(/\/\d+(?=\/|$)/g, '/:id');
 }
 
 async function handleApi(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {

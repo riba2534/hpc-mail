@@ -10,7 +10,7 @@ import {
 import type { Context, MiddlewareHandler } from 'hono';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { execCtx } from '../lib/http.js';
+import { execCtx, routeLabel } from '../lib/http.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { getSettings, settingsQuery } from '../services/setting.js';
 import {
@@ -19,7 +19,6 @@ import {
   counterStatement,
   counterWithinGuard,
   minuteWindow,
-  type CounterGuard,
 } from '../services/rate-counter.js';
 import type { AppContext, Env } from '../types.js';
 
@@ -27,12 +26,7 @@ const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
 const LAST_USED_THROTTLE_MS = 60_000;
 const AUDIT_PATH_MAX = 256;
 /** 被拒请求的明细节流计数（每 Key 每分钟一格） */
-const REJECT_SCOPE = 'api-reject';
-
-/** 审计里的路径：数字 id 段归一为 :id 并截断，任意长的 URL 不会原样落库 */
-function auditPath(pathname: string): string {
-  return pathname.replace(/\/\d+(?=\/|$)/g, '/:id').slice(0, AUDIT_PATH_MAX);
-}
+export const API_REJECT_SCOPE = 'api-reject';
 
 function clientIp(c: Context<AppContext>): string {
   const value = c.req.header('CF-Connecting-IP') || '';
@@ -156,11 +150,9 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     if (requestCount > row.rateLimit) throw new AppError('rate_limited', 'API 调用频率超限');
 
     // Key 级限制之外再加用户级与实例级总桶，避免创建多个 Key 横向放大额度。
-    // 守卫与 Key 级计数同一事务：Key 未超限时用户桶必有返回；实例桶无返回即用户桶已超限、未计入。
-    const userRate = counterResult(results[1]);
+    // 实例桶的守卫包含 Key 级与用户级未超限：无返回即用户桶已超限、未计入，有返回则只需再看实例桶本身。
     const globalRate = counterResult(results[2]);
-    if (!userRate || !globalRate || userRate.count > MAX_API_USER_REQUESTS_PER_MINUTE
-      || globalRate.count > MAX_API_GLOBAL_REQUESTS_PER_MINUTE) {
+    if (!globalRate || globalRate.count > MAX_API_GLOBAL_REQUESTS_PER_MINUTE) {
       throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
     }
 
@@ -176,7 +168,8 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
       apiKeyId: row.id,
       requestId: c.get('requestId') ?? '',
       method: c.req.method,
-      path: auditPath(c.req.path),
+      // 数字 id 段归一并截断，任意长的 URL 不会原样落库
+      path: routeLabel(c.req.path).slice(0, AUDIT_PATH_MAX),
       statusCode,
       ip,
       durationMs: Math.max(0, Date.now() - startedAt),
@@ -202,23 +195,18 @@ interface AuditEntry {
  * 第一次拒绝写明细。
  */
 async function writeAudit(env: Env, admitted: boolean, entry: AuditEntry): Promise<void> {
-  const insert = (guard?: CounterGuard) => env.db.prepare(`INSERT INTO api_request_logs
-      (api_key_id, request_id, method, path, status_code, ip, duration_ms)
-    SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${guard?.sql ?? '1'}`)
-    .bind(entry.apiKeyId, entry.requestId, entry.method, entry.path, entry.statusCode, entry.ip, entry.durationMs,
-      ...(guard?.params ?? []));
+  const values = [entry.apiKeyId, entry.requestId, entry.method, entry.path, entry.statusCode, entry.ip, entry.durationMs];
+  const columns = 'INSERT INTO api_request_logs (api_key_id, request_id, method, path, status_code, ip, duration_ms)';
   if (admitted) {
-    await insert().run();
+    await env.db.prepare(`${columns} VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(...values).run();
     return;
   }
   const subject = String(entry.apiKeyId);
   const minute = minuteWindow(1);
+  const firstReject = counterWithinGuard(API_REJECT_SCOPE, subject, minute, 1);
   await env.db.batch([
-    counterStatement(env, REJECT_SCOPE, subject, minute),
-    insert({
-      sql: '(SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?) = 1',
-      params: [REJECT_SCOPE, subject, minute],
-    }),
+    counterStatement(env, API_REJECT_SCOPE, subject, minute),
+    env.db.prepare(`${columns} SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${firstReject.sql}`).bind(...values, ...firstReject.params),
   ]);
 }
 

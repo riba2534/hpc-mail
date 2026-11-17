@@ -230,7 +230,7 @@ describe('R04 全站限流桶不被单个用户打满', () => {
 
 describe('R10 改密与重置密码吊销 API Key', () => {
   const auditsFor = (target: string) => createDb(env).select().from(adminAuditLogs)
-    .where(and(eq(adminAuditLogs.action, 'api_key.revoke_all'), eq(adminAuditLogs.target, target))).all();
+    .where(and(eq(adminAuditLogs.action, 'apikey.revoke_all'), eq(adminAuditLogs.target, target))).all();
 
   it('改密默认吊销本人全部 Key：旧 Key 401，响应带 revokedApiKeys，写审计', async () => {
     await enableApi();
