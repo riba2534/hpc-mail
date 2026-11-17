@@ -12,6 +12,7 @@ import {
   claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
   type ClaimSettings, type MailboxPolicyUser,
 } from './mailbox-policy.js';
+import { hostedSendBlock } from './domain.js';
 import { getSettingsFresh, mergeSettingRows } from './setting.js';
 import { PURGE_MESSAGES_INDEX, purgeStatements } from './message-lifecycle.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
@@ -33,6 +34,9 @@ function serialize(row: MailboxRow, messageCount: number, ownerUsername?: string
   };
 }
 
+/** 列表项的发信判定所需列：托管域名 LEFT JOIN 进同一条查询，不多一次往返 */
+const sendableColumns = { status: hostedDomains.status, sendingStatus: hostedDomains.sendingStatus };
+
 export async function listMailboxes(
   env: Env,
   opts: { userId?: number; all?: boolean },
@@ -40,32 +44,35 @@ export async function listMailboxes(
   const db = createDb(env);
   if (opts.all) {
     const rows = await db
-      .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql })
+      .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql, ...sendableColumns })
       .from(mailboxes)
       .leftJoin(users, eq(users.id, mailboxes.userId))
+      .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
       .orderBy(desc(mailboxes.id))
       .all();
-    return rows.map((r) => serialize(r.mailbox, Number(r.messageCount), r.username ?? ''));
+    return rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount), r.username ?? ''), canSend: hostedSendBlock(r) === null }));
   }
   const rows = await db
-    .select({ mailbox: mailboxes, messageCount: messageCountSql })
+    .select({ mailbox: mailboxes, messageCount: messageCountSql, ...sendableColumns })
     .from(mailboxes)
+    .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
     .where(eq(mailboxes.userId, opts.userId!))
     .orderBy(desc(mailboxes.id))
     .all();
-  return rows.map((r) => serialize(r.mailbox, Number(r.messageCount)));
+  return rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount)), canSend: hostedSendBlock(r) === null }));
 }
 
-/** 管理员按 id 读任意邮箱：与 ?all=1 列表同形（含所有者用户名与邮件数），一次查询 */
+/** 管理员按 id 读任意邮箱：与 ?all=1 列表同形（含所有者用户名、邮件数与 canSend），一次查询 */
 export async function getMailbox(env: Env, id: number): Promise<Mailbox> {
   const row = await createDb(env)
-    .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql })
+    .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql, ...sendableColumns })
     .from(mailboxes)
     .leftJoin(users, eq(users.id, mailboxes.userId))
+    .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
     .where(eq(mailboxes.id, id))
     .get();
   if (!row) throw new AppError('not_found', '邮箱不存在');
-  return serialize(row.mailbox, Number(row.messageCount), row.username ?? '');
+  return { ...serialize(row.mailbox, Number(row.messageCount), row.username ?? ''), canSend: hostedSendBlock(row) === null };
 }
 
 interface ClaimPolicy {
