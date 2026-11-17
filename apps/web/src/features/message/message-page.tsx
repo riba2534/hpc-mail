@@ -95,12 +95,11 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
   const link = inspectVerificationLink(message.verificationLink);
   if (!link) return null;
   const unverifiedSender = senderAuthFailed(message.auth);
-  const caution = unverifiedSender;
   return (
     <div
       className={cn(
         'flex flex-col gap-2 rounded-lg border px-4 py-3',
-        caution ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
+        unverifiedSender ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
       )}
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -108,7 +107,7 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
           <p className="text-xs font-medium text-ink-secondary">验证链接</p>
           <p className="truncate text-sm text-ink" title={link.href}>{link.hostname}</p>
         </div>
-        <Button asChild size="sm" variant={caution ? 'secondary' : 'primary'}>
+        <Button asChild size="sm" variant={unverifiedSender ? 'secondary' : 'primary'}>
           <a href={link.href} target="_blank" rel="noopener noreferrer">
             <ExternalLink className="size-4" />
             打开验证链接

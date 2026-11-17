@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom';
 import type { MessageSummary, OutboundStatus } from '@hpc-mail/shared';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
 import { useCopy } from '@/components/ui/copy-button';
+import { senderAuthFailed } from '@/features/message/sender-auth';
 import { inspectVerificationLink } from '@/features/message/verification-link';
 import { cn } from '@/lib/cn';
 import { formatRelativeTime } from '@/lib/format';
@@ -106,8 +107,8 @@ export const MessageRow = memo(function MessageRow({
   const unconfirmed = outbound && (message.status === 'unknown' || partlyUnconfirmed);
   const failed = outbound && !unconfirmed && message.status !== 'pending'
     && Boolean(message.errorDetail || message.status === 'failed' || message.status === 'bounced');
-  // 验证链接：与发件域一致才允许在列表里直接打开；不一致只做警示，点击进入详情页核对
-  const verification = outbound ? null : inspectVerificationLink(message.verificationLink);
+  // 验证链接：发件人未通过认证（SPF/DKIM/DMARC 失败）时不在列表里一键打开，点进详情页看到警示后再决定
+  const verification = outbound || senderAuthFailed(message.auth) ? null : inspectVerificationLink(message.verificationLink);
   const daysLeft = trash ? trashDaysLeft(message.deletedAt, now) : null;
   const showCheckbox = Boolean(onToggleSelect) && checkbox !== 'hidden';
 
