@@ -26,6 +26,7 @@ import { bodyBytes, D1_BODY_LIMIT, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
 import { HOSTED_AUTO_CLAIM_SQL, HOSTED_STATUS_SQL, NOTIFY_OWNER_IDS_SQL, hostedRejectReason } from './mailbox.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
+import { consumeCanaryMail } from './ops-probe.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
 import { DEFAULT_USER_NOTIFY_PREFS } from '@hpc-mail/shared';
 
@@ -131,6 +132,8 @@ export async function handleInbound(
   env: Env,
   ctx: ExecCtx,
 ): Promise<void> {
+  // 部署金丝雀只看 Cloudflare 已解析的信头：签名有效记 KV 后结束，普通来信不多任何 D1 往返
+  if (await consumeCanaryMail(message, env)) return;
   // 设置读取（isolate 内存缓存未命中时直读 D1）与原文缓冲、解析重叠，提码前才等待
   const settingsReady = getSettings(env, ctx);
 
