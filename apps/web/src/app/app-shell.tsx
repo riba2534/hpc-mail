@@ -36,9 +36,11 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Avatar } from '@/components/ui/avatar';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { GithubIconLink } from '@/components/ui/github-link';
 import { IconButton } from '@/components/ui/icon-button';
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
+import { purgeExpiredDrafts, userDraftKeys } from '@/features/compose/draft-retention';
 import { useUnreadCount } from '@/features/inbox/use-unread-count';
 import { cn } from '@/lib/cn';
 import { usePublicConfig } from '@/lib/use-config';
@@ -51,6 +53,7 @@ import { PageLoader } from './page-loader';
 import { preloadable } from './route-modules';
 import type { RouteHandle } from './router';
 import { ShortcutsHelpDialog } from './shortcuts-help-dialog';
+import { clearUserLocalData } from './user-local-data';
 
 // 只在外壳主内容区渲染的路由组件随外壳 chunk 下发（router 经 loadAppShell 取用）
 export { AdminGuard } from './admin-guard';
@@ -256,16 +259,28 @@ function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
   const [passwordOpen, setPasswordOpen] = useState(false);
   // 首次打开才加载对话框 chunk；之后保持挂载，关闭动画与原先一致
   const [passwordMounted, setPasswordMounted] = useState(false);
+  // 本机还有未发送草稿时先确认：退出会一并删除它们
+  const [unsentDrafts, setUnsentDrafts] = useState(0);
+  const [loggingOut, setLoggingOut] = useState(false);
 
-  const handleLogout = async () => {
+  const logout = async () => {
+    setLoggingOut(true);
     try {
       await authApi.logout();
     } catch {
       // 忽略：本地清理照常进行
     }
+    // 主动退出：清掉本机为该账户保存的草稿、发送凭据、信任的发件人等（会话过期不清，草稿留到重新登录）
+    clearUserLocalData(user.id);
     clearAuthToken();
     queryClient.clear();
     navigate('/login', { replace: true });
+  };
+
+  const handleLogout = () => {
+    const drafts = userDraftKeys(user.id).length;
+    if (drafts > 0) setUnsentDrafts(drafts);
+    else void logout();
   };
 
   return (
@@ -315,6 +330,18 @@ function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
         </DropdownMenuContent>
       </DropdownMenu>
       {passwordMounted && <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />}
+      <ConfirmDialog
+        open={unsentDrafts > 0}
+        onOpenChange={(open) => {
+          if (!open && !loggingOut) setUnsentDrafts(0);
+        }}
+        title="退出并删除本机草稿？"
+        description={`本机还保存着 ${unsentDrafts} 封未发送的草稿。退出登录会一并删除它们，以及本机为该账户保存的其他数据。`}
+        confirmLabel="退出登录"
+        tone="danger"
+        loading={loggingOut}
+        onConfirm={() => void logout()}
+      />
     </>
   );
 }
@@ -334,6 +361,8 @@ export function AppShell() {
   useKeyboardShortcuts({ onHelp: () => setShortcutsOpen(true) });
   useShellDocumentTitle(siteTitle, unreadCount);
   useBuildVersionCheck();
+  // 回收本机遗弃的写信草稿（最后保存超过 30 天）
+  useEffect(() => void purgeExpiredDrafts(), []);
 
   return (
     <div className="flex min-h-dvh flex-col bg-canvas md:flex-row">
