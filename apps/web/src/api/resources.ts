@@ -10,6 +10,7 @@ import type {
   ApiKeySummary,
   ApiRequestLogEntry,
   ChangePasswordRequest,
+  ChangePasswordResponse,
   ClaimMailboxRequest,
   ClaimPlan,
   ClaimPlanStrategy,
@@ -69,7 +70,7 @@ export const authApi = {
   logout: () => api.post<void>('/auth/logout'),
   me: () => api.get<SessionUser>('/auth/me'),
   changePassword: (body: ChangePasswordRequest) =>
-    api.put<LoginResponse, ChangePasswordRequest>('/auth/password', body),
+    api.put<ChangePasswordResponse, ChangePasswordRequest>('/auth/password', body),
   uploadAvatar: (body: UploadAvatarRequest) =>
     api.post<SessionUser, UploadAvatarRequest>('/auth/avatar', body),
   deleteAvatar: () => api.delete<SessionUser>('/auth/avatar'),
