@@ -400,6 +400,9 @@ async function loadForwardedAttachments(
   }));
 }
 
+/** 请求自带字节的附件同时上传几个（字节已在内存里，并发不增加占用） */
+const ATTACHMENT_UPLOAD_CONCURRENCY = 4;
+
 async function persistAttachments(
   env: Env,
   db: Db,
@@ -436,12 +439,19 @@ async function persistAttachments(
         r2Key, token: leaseToken, expiresAt: new Date(Date.now() + DELIVERY_LEASE_MS),
       }))).onConflictDoNothing();
     }
-    for (let index = 0; index < rows.length; index++) {
+    // 有界并发上传；任一失败后不再开始新的，等进行中的结束再抛错，清理登记才覆盖全部写过的对象
+    const uploads = rows.flatMap((row, index) => {
       const att = atts[index]!;
-      if (!('bytes' in att)) continue;
-      await env.r2.put(rows[index]!.r2Key, att.bytes, { httpMetadata: { contentType: att.mimeType } });
-      uploadedKeys.push(rows[index]!.r2Key);
-    }
+      return 'bytes' in att ? [{ r2Key: row.r2Key, att }] : [];
+    });
+    let failed: { error: unknown } | undefined;
+    await runLimited(uploads, ATTACHMENT_UPLOAD_CONCURRENCY, async ({ r2Key, att }) => {
+      if (failed) return;
+      uploadedKeys.push(r2Key);
+      try { await env.r2.put(r2Key, att.bytes, { httpMetadata: { contentType: att.mimeType } }); }
+      catch (error) { failed ??= { error }; }
+    });
+    if (failed) throw failed.error;
     return await db
       .insert(attachmentsTable)
       .values(rows)
