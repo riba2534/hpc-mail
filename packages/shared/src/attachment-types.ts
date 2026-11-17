@@ -11,9 +11,17 @@ export const SAFE_INLINE_IMAGE_TYPES: readonly string[] = [
   'image/avif',
 ];
 
-/** 取分号前的主类型，去空白、转小写；不做其他纠正，拼接值保持原样以便白名单拒绝 */
+/** 常见的非标准光栅图片写法，映射到标准类型（只映射到白名单内的光栅类型） */
+const MIME_ALIASES: Readonly<Record<string, string>> = {
+  'image/jpg': 'image/jpeg',
+  'image/pjpeg': 'image/jpeg',
+  'image/x-png': 'image/png',
+};
+
+/** 取分号前的主类型，去空白、转小写，映射常见别名；拼接值保持原样以便白名单拒绝 */
 export function normalizeMimeType(value: string | undefined | null): string {
-  return String(value || '').split(';')[0]?.trim().toLowerCase() ?? '';
+  const type = String(value || '').split(';')[0]?.trim().toLowerCase() ?? '';
+  return MIME_ALIASES[type] ?? type;
 }
 
 /** 规范化后精确命中白名单才算可内联的图片 */

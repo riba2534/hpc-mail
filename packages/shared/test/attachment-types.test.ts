@@ -7,6 +7,14 @@ describe('attachment-types', () => {
     expect(normalizeMimeType(undefined)).toBe('');
   });
 
+  it('常见的非标准光栅图片写法映射到标准类型并可内联', () => {
+    expect(normalizeMimeType('image/JPG')).toBe('image/jpeg');
+    expect(normalizeMimeType('image/pjpeg; name=a.jpg')).toBe('image/jpeg');
+    expect(normalizeMimeType('image/x-png')).toBe('image/png');
+    expect(isSafeInlineImageType('image/jpg')).toBe(true);
+    expect(isSafeInlineImageType('image/jpg,text/html')).toBe(false);
+  });
+
   it('只有精确命中白名单的光栅图片可内联', () => {
     expect(isSafeInlineImageType('image/png')).toBe(true);
     expect(isSafeInlineImageType('Image/JPEG; charset=binary')).toBe(true);
