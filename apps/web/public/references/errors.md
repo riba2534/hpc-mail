@@ -86,7 +86,7 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 ## reauth_failed
 
-`password` 与当前登录密码不符（HTTP 403，网页会话不会因此失效）。同一账户 15 分钟内失败 5 次后返回 429 `rate_limited`，等窗口结束再试。
+`password` 与当前登录密码不符（HTTP 403，网页会话不会因此失效）；改密接口 `PUT /api/auth/password` 的 `oldPassword` 错误同样返回它。同一账户 15 分钟内失败 5 次后（改密与其他重新验证合计）返回 429 `rate_limited`，等窗口结束再试。
 
 ## attachment_url_forbidden
 

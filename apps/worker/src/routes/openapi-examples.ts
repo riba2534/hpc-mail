@@ -204,7 +204,6 @@ export const ERROR_EXAMPLES = {
   NoRawArchive: { code: 'not_found', message: '该邮件无原始存档' },
   SignatureInvalid: { code: 'unauthorized', message: '签名无效或已过期' },
   BadCredentials: { code: 'bad_credentials', message: '用户名或密码错误' },
-  WrongPassword: { code: 'bad_credentials', message: '原密码错误' },
   WrongTotp: { code: 'bad_credentials', message: '两步验证码错误' },
   TotpRequired: { code: 'totp_required', message: '需要两步验证码' },
   UserDisabled: { code: 'user_disabled', message: '账号已被禁用' },

@@ -318,8 +318,9 @@ describe('R10 改密与重置密码吊销 API Key', () => {
     const user = await seedUser('p0-chpw-keep', { password: 'old-password-123' });
     const key = await keyFor(user.id);
     const jwt = await jwtFor(user.id);
+    // 原密码错误与重新验证同一口径：403 reauth_failed（不是 401，网页端不会因此清掉会话）
     expect((await call('/api/auth/password', jwt,
-      jsonInit('PUT', { oldPassword: 'wrong-password-000', newPassword: 'new-password-456' }))).status).toBe(401);
+      jsonInit('PUT', { oldPassword: 'wrong-password-000', newPassword: 'new-password-456' }))).status).toBe(403);
     expect((await call('/v1/status', key.key)).status).toBe(200);
     const response = await call('/api/auth/password', jwt,
       jsonInit('PUT', { oldPassword: 'old-password-123', newPassword: 'new-password-456', revokeApiKeys: false }));

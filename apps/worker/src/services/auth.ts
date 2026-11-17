@@ -25,6 +25,7 @@ import { getSystemFromAddress } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { sendPushDeerNotification } from './pushdeer.js';
+import { verifyOldPassword } from './reauth.js';
 import { createSession, destroySession } from './session.js';
 import { getSettings } from './setting.js';
 
@@ -378,18 +379,17 @@ export async function changePassword(
   req: ChangePasswordRequest,
 ): Promise<ChangePasswordResponse> {
   const db = createDb(env);
-  const row = await db.select().from(users).where(eq(users.id, user.id)).get();
-  if (!row) throw new AppError('not_found', '用户不存在');
-  if (!(await verifyPassword(req.oldPassword, row.passwordHash))) {
-    throw new AppError('bad_credentials', '原密码错误');
-  }
+  // 原密码错误与重新验证同一节流（每用户 15 分钟 5 次，403 reauth_failed / 429）：拿到会话的人不能借改密爆破原密码
+  const old = await verifyOldPassword(env, user.id, req.oldPassword);
   const passwordHash = await hashPassword(req.newPassword);
   const update = db.update(users).set({ passwordHash,
     authVersion: sql`${users.authVersion} + 1` })
-    .where(and(eq(users.id, user.id), eq(users.passwordHash, row.passwordHash), eq(users.authVersion, row.authVersion)))
+    .where(and(eq(users.id, user.id), eq(users.passwordHash, old.passwordHash), eq(users.authVersion, old.authVersion)))
     .returning();
   let updated: typeof users.$inferSelect | undefined;
   let revokedApiKeys = 0;
+  // 退回占位与改密写入并行（退回失败只多计一次失败，不影响改密）
+  const released = old.release().catch((error) => console.error('重新验证占位退回失败:', error instanceof Error ? error.message : error));
   if (req.revokeApiKeys !== false) {
     const [rows, revoked] = await db.batch([update, revokeAllApiKeysQuery(db, user.id, passwordHash)]);
     updated = rows[0];
@@ -397,6 +397,7 @@ export async function changePassword(
   } else {
     updated = await update.get();
   }
+  await released;
   if (!updated) throw new AppError('conflict', '密码已在另一请求中修改，请重新登录');
   const token = await issueToken(env, updated);
   return { token, user: toSessionUser(updated), revokedApiKeys };
