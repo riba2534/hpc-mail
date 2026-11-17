@@ -321,8 +321,11 @@ export function inlineAttachmentBytes(attachments: { content: string }[]): numbe
     - (a.content.endsWith('==') ? 2 : a.content.endsWith('=') ? 1 : 0), 0);
 }
 
-/** 收件人上限、正文非空、内联附件、头部与回复参数的组合约束（base64 与 token 两种发送共用） */
-function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
+/** 内联附件标记与 base64 体积（发信、回复共用） */
+function validateAttachmentRefs(
+  v: Pick<SendCommonShape, 'attachments' | 'attachmentTokens'>,
+  ctx: z.RefinementCtx,
+): void {
   const refs = [
     ...v.attachments.map((a, index) => ({ ...a, path: ['attachments', index] as (string | number)[] })),
     ...(v.attachmentTokens ?? []).map((a, index) => ({ ...a, path: ['attachmentTokens', index] as (string | number)[] })),
@@ -344,14 +347,6 @@ function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
       contentIds.add(key);
     }
   }
-  if (v.replyToMessageId !== undefined && v.headers &&
-    Object.keys(v.headers).some((name) => name === 'In-Reply-To' || name === 'References')) {
-    ctx.addIssue({
-      code: 'custom',
-      message: 'replyToMessageId 与 headers 里的 In-Reply-To/References 不能同时提供：回复站内邮件只用 replyToMessageId',
-      path: ['headers'],
-    });
-  }
   if (inlineAttachmentBytes(v.attachments) > MAX_INLINE_ATTACHMENT_TOTAL_BYTES) {
     const params: IssueErrorParams = {
       errorCode: 'payload_too_large',
@@ -365,6 +360,40 @@ function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
       params,
     });
   }
+  // 两路附件合并计数：各自 .max(MAX_ATTACHMENTS) 只管自己，混用会放行到 2 倍
+  if (v.attachments.length + (v.attachmentTokens?.length ?? 0) > MAX_ATTACHMENTS) {
+    ctx.addIssue({ code: 'custom', message: `附件最多 ${MAX_ATTACHMENTS} 个`, path: ['attachments'] });
+  }
+}
+
+/** 正文 UTF-8 字节数 */
+function utf8Length(value: string): number {
+  let bytes = 0;
+  for (const char of value) { const cp = char.codePointAt(0)!; bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4; }
+  return bytes;
+}
+
+/** 正文非空且合计不超上限 */
+function validateBody(v: { text?: string; html?: string }, ctx: z.RefinementCtx): void {
+  if (utf8Length(v.text ?? '') + utf8Length(v.html ?? '') > MAX_BODY_BYTES) {
+    ctx.addIssue({ code: 'custom', message: '正文 UTF-8 字节合计超过上限', path: ['body'] });
+  }
+  if ((v.text ?? '').length === 0 && (v.html ?? '').length === 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: '正文不能为空', path: ['body'] });
+  }
+}
+
+/** 收件人上限、正文非空、内联附件、头部与回复参数的组合约束（base64 与 token 两种发送共用） */
+function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
+  validateAttachmentRefs(v, ctx);
+  if (v.replyToMessageId !== undefined && v.headers &&
+    Object.keys(v.headers).some((name) => name === 'In-Reply-To' || name === 'References')) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'replyToMessageId 与 headers 里的 In-Reply-To/References 不能同时提供：回复站内邮件只用 replyToMessageId',
+      path: ['headers'],
+    });
+  }
   if (v.to.length + v.cc.length + v.bcc.length === 0) ctx.addIssue({ code: 'custom', message: '至少需要一个收件人', path: ['to'] });
   if (v.to.length + v.cc.length + v.bcc.length > MAX_RECIPIENTS) {
     ctx.addIssue({
@@ -373,12 +402,7 @@ function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
       path: ['to'],
     });
   }
-  const utf8Length = (value: string) => { let bytes = 0; for (const char of value) { const cp = char.codePointAt(0)!; bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4; } return bytes; };
-  const bytes = utf8Length(v.text ?? '') + utf8Length(v.html ?? '');
-  if (bytes > MAX_BODY_BYTES) ctx.addIssue({ code: 'custom', message: '正文 UTF-8 字节合计超过上限', path: ['body'] });
-  if ((v.text ?? '').length === 0 && (v.html ?? '').length === 0) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: '正文不能为空', path: ['body'] });
-  }
+  validateBody(v, ctx);
 }
 
 /**
@@ -408,18 +432,73 @@ export const internalSendMailSchema = z
   .superRefine((v, ctx) => {
     // 这里只能校验 base64 那路的体积；token 那路的真实大小要查库，由 sendMail 统一兜底
     validateSendCommon(v, ctx);
-    // 两路附件合并计数：各自 .max(MAX_ATTACHMENTS) 只管自己，混用会放行到 2 倍
-    if (v.attachments.length + v.attachmentTokens.length > MAX_ATTACHMENTS) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: `附件最多 ${MAX_ATTACHMENTS} 个`,
-        path: ['attachments'],
-      });
-    }
   });
 export type InternalSendMailRequest = z.infer<typeof internalSendMailSchema>;
 /** 请求体的输入形状（地址可写字符串或对象、token 可写字符串）；构造请求时用它，服务端拿到的是 InternalSendMailRequest */
 export type InternalSendMailInput = z.input<typeof internalSendMailSchema>;
+
+const strictFields = (endpoint: string, hint: string) => ({
+  error: (issue: { code: string; keys?: string[] }) => issue.code === 'unrecognized_keys'
+    ? `${endpoint} 不接受字段：${issue.keys?.join(', ')}。${hint}` : undefined,
+});
+
+/**
+ * POST /v1/messages/:id/reply：收件人、主题与线程头（In-Reply-To/References）由服务端按原信计算。
+ * from 缺省用原信的收件地址；quote 默认在正文后附原文引用。要自定义收件人或主题用 POST /v1/messages 带 replyToMessageId。
+ */
+export const replyMessageRequestSchema = z
+  .strictObject({
+    replyAll: z.boolean().default(false),
+    text: z.string().max(MAX_BODY_BYTES).optional(),
+    html: z.string().max(MAX_BODY_BYTES).optional(),
+    quote: z.boolean().default(true),
+    from: fromSchema.optional(),
+    attachments: z.array(sendAttachmentSchema).max(MAX_ATTACHMENTS).default([]),
+    attachmentTokens: z.array(attachmentTokenRefSchema).max(MAX_ATTACHMENTS).default([]),
+    headers: customHeadersSchema.optional(),
+  }, strictFields('回复', '收件人与主题由服务端按原信计算；要自定义请用 POST /v1/messages 并带 replyToMessageId'))
+  .superRefine((v, ctx) => {
+    validateAttachmentRefs(v, ctx);
+    validateBody(v, ctx);
+    if (v.headers && Object.keys(v.headers).some((name) => name === 'In-Reply-To' || name === 'References')) {
+      ctx.addIssue({ code: 'custom', message: '回复的 In-Reply-To/References 由服务端按原信生成，headers 里不能再给', path: ['headers'] });
+    }
+  });
+export type ReplyMessageRequest = z.infer<typeof replyMessageRequestSchema>;
+export type ReplyMessageInput = z.input<typeof replyMessageRequestSchema>;
+
+/**
+ * POST /v1/messages/:id/forward：主题加 Fwd:，note 在前，includeOriginal 默认附上原文；原邮件附件始终带上。
+ * from 缺省用原信的收件地址。
+ */
+export const forwardMessageRequestSchema = z
+  .strictObject({
+    to: z.array(mailAddressSchema('收件人')).default([]),
+    cc: z.array(mailAddressSchema('抄送')).default([]),
+    bcc: z.array(mailAddressSchema('密送')).default([]),
+    note: z.string().max(MAX_BODY_BYTES).optional(),
+    includeOriginal: z.boolean().default(true),
+    from: fromSchema.optional(),
+  }, strictFields('转发', '主题与正文由服务端按原信生成，自己的话写在 note；要完全自定义请用 POST /v1/messages 并带 forwardAttachmentsFrom'))
+  .superRefine((v, ctx) => {
+    const total = v.to.length + v.cc.length + v.bcc.length;
+    if (total === 0) ctx.addIssue({ code: 'custom', message: '至少需要一个收件人', path: ['to'] });
+    if (total > MAX_RECIPIENTS) ctx.addIssue({ code: 'custom', message: `收件人合计不能超过 ${MAX_RECIPIENTS} 个`, path: ['to'] });
+    if (!v.includeOriginal && !(v.note ?? '').trim()) {
+      ctx.addIssue({ code: 'custom', message: 'includeOriginal 为 false 时 note 不能为空', path: ['note'] });
+    }
+  });
+export type ForwardMessageRequest = z.infer<typeof forwardMessageRequestSchema>;
+export type ForwardMessageInput = z.input<typeof forwardMessageRequestSchema>;
+
+/** 回复/转发的幂等指纹：操作、来源邮件与解析后的请求（与 POST /v1/messages 的指纹天然不同，同 Key 混用即 mismatch） */
+export function composeRequestFingerprint(
+  op: 'reply' | 'forward',
+  sourceId: number,
+  req: ReplyMessageRequest | ForwardMessageRequest,
+): Record<string, unknown> {
+  return { op, sourceId, request: req };
+}
 
 /**
  * 幂等指纹的规范形：只用旧字段（无显示名的收件人、纯 token、没有 replyTo/headers）的请求，与新字段上线前

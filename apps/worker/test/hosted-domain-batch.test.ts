@@ -36,6 +36,8 @@ function fakeCloudflare() {
     original_registrar: 'Example Registrar, Inc.', activated_on: null, created_on: new Date().toISOString() });
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    // 他人添加前的公开委派预检：RDAP 查不到、DoH 的 NS 为空，按「委派已知且不指向本站」放行
+    if (url.hostname === 'rdap.org') return json({ errorCode: 404 }, 404);
     if (url.hostname === 'cloudflare-dns.com') return json({ Status: 0, Answer: [] });
     const method = (init?.method ?? 'GET').toUpperCase();
     const path = url.pathname.replace('/client/v4', '');

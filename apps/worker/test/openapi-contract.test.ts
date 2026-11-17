@@ -1,4 +1,6 @@
 import {
+  SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_SEVERITIES, SYSTEM_DOMAIN_VERDICTS, SYSTEM_DOMAIN_WRITE_STEPS,
+  SYSTEM_DOMAIN_ZONE_CATEGORIES,
   ALLOWED_CUSTOM_HEADERS, API_SCOPES, DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, ERROR_STATUS, MAIL_AUTH_RESULTS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES,
   PROMPT_INJECTION_REASONS, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
   MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, SUPPRESSION_REASONS, internalSendMailSchema,
@@ -96,6 +98,36 @@ describe('OpenAPI routes and public contracts', () => {
     const path = '/hosted-domains/{id}/dns-records/{recordId}';
     expect(specs.v1.paths[path]!.parameters).toEqual(specs.api.paths[path]!.parameters);
     expect(specs.v1.components.schemas.HostedDnsRecordInput).toEqual(input);
+  });
+
+  it('系统域名一键接入：9 个管理员接口只在 /api，枚举与 shared 一致，409 带 details.precheck', () => {
+    const ops = operations('api').filter((op) => op.includes('/admin/system-domains'));
+    expect(ops.sort()).toEqual([
+      'GET /api/admin/system-domains/onboardings', 'GET /api/admin/system-domains/onboardings/{id}', 'GET /api/admin/system-domains/precheck',
+      'GET /api/admin/system-domains/zones', 'POST /api/admin/system-domains/onboardings', 'POST /api/admin/system-domains/onboardings/{id}/cancel',
+      'POST /api/admin/system-domains/onboardings/{id}/check', 'POST /api/admin/system-domains/onboardings/{id}/confirm',
+      'PUT /api/admin/system-domains/hidden-zones',
+    ]);
+    expect(operations('v1').some((op) => op.includes('system-domains'))).toBe(false);
+    for (const [path, item] of Object.entries(specs.api.paths).filter(([path]) => path.startsWith('/admin/system-domains'))) {
+      for (const [method, op] of Object.entries(item)) if (methods.has(method)) expect((op as Schema)['x-required-role'], path).toBe('admin');
+    }
+    const schema = (name: string) => specs.api.components.schemas[name]!.properties as Record<string, Schema>;
+    expect(schema('SystemDomainOnboarding').state!.enum).toEqual([...SYSTEM_DOMAIN_ONBOARDING_STATES]);
+    expect(schema('SystemDomainCheck').severity!.enum).toEqual([...SYSTEM_DOMAIN_SEVERITIES]);
+    expect((schema('SystemDomainCheck').ack!.anyOf as Schema[])[0]!.enum).toEqual([...SYSTEM_DOMAIN_ACKS]);
+    expect(schema('SystemDomainPrecheck').verdict!.enum).toEqual([...SYSTEM_DOMAIN_VERDICTS]);
+    expect(((schema('SystemDomainPrecheck').steps!.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual([...SYSTEM_DOMAIN_WRITE_STEPS]);
+    expect(schema('SystemDomainZone').category!.enum).toEqual([...SYSTEM_DOMAIN_ZONE_CATEGORIES]);
+    const post = specs.api.paths['/admin/system-domains/onboardings']!.post as Schema;
+    expect(Object.keys(post.responses as Schema)).toContain('201');
+    expect(String(post.description)).toContain('error.details.precheck');
+    const details = ((specs.api.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).details!;
+    expect(details.properties as Record<string, Schema>).toHaveProperty('precheck');
+    // /v1 的错误信封不引入管理员 schema
+    expect(specs.v1.components.schemas).not.toHaveProperty('SystemDomainPrecheck');
+    expect(administrationDoc).toContain('## 系统域名一键接入');
+    for (const ack of SYSTEM_DOMAIN_ACKS) expect(administrationDoc).toContain(`\`${ack}\``);
   });
 
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
@@ -424,7 +456,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
       for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
       expect(envelope.required).toEqual(['code', 'message']);
-      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'source', 'suppressed']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'source', 'suppressed', 'precheck']);
       expect(props(error.details!).source).toMatchObject({ enum: ['reply', 'forward'] });
       expect(props(error.details!).suppressed).toMatchObject({ type: 'array', items: { $ref: '#/components/schemas/SuppressedRecipient' } });
       expect(error.docs).toMatchObject({ format: 'uri' });
@@ -740,17 +772,59 @@ describe('Agent docs reference only real endpoints and anchors', () => {
   });
 });
 
+describe('PR4b：回复/转发接口与托管域名任意前缀在 OpenAPI 与文档中一致', () => {
+  it('/v1 有 reply/forward，需要 mail.send+mail.read，请求体严格、错误含 from_required；/api 没有', () => {
+    for (const op of ['reply', 'forward'] as const) {
+      const operation = specs.v1.paths[`/messages/{id}/${op}`]!.post!;
+      expect(operation['x-required-scopes']).toEqual(['mail.send', 'mail.read']);
+      const request = (operation.requestBody as { content: Record<string, { schema: Schema }> }).content['application/json']!.schema;
+      const schema = specs.v1.components.schemas[(request.$ref as string).split('/').pop()!]!;
+      expect(schema.additionalProperties).toBe(false);
+      expect(Object.keys(schema.properties as object)).toEqual(op === 'reply'
+        ? ['replyAll', 'text', 'html', 'quote', 'from', 'attachments', 'attachmentTokens', 'headers']
+        : ['to', 'cc', 'bcc', 'note', 'includeOriginal', 'from']);
+      const responses = operation.responses as Record<string, { description: string }>;
+      expect(responses['400']!.description).toContain('from_required');
+      expect(responses['404']!.description).toContain('source_unavailable');
+      expect(responses).toHaveProperty('201');
+      expect(responses).toHaveProperty('422');
+      expect(specs.api.paths).not.toHaveProperty(`/messages/{id}/${op}`);
+    }
+    const reply = specs.v1.components.schemas.ReplyMessageRequest!.properties as Record<string, Schema>;
+    expect(reply.quote!.default).toBe(true);
+    expect(reply.replyAll!.default).toBe(false);
+    expect((specs.v1.components.schemas.ForwardMessageRequest!.properties as Record<string, Schema>).includeOriginal!.default).toBe(true);
+    const errorCode = ((specs.v1.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).code!;
+    expect(errorCode.enum).toContain('from_required');
+  });
+
+  it('identities 的 domains 有 kind=hosted，发信说明写明托管所有者任意前缀；文档同步', () => {
+    for (const spec of Object.values(specs)) {
+      const domains = (spec.components.schemas.SendIdentities!.properties as Record<string, Schema>).domains!;
+      expect(((domains.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual(['system', 'hosted', 'legacy']);
+      expect(spec.components.schemas.SendMailRequest!.description).toContain('owner of a hosted domain');
+    }
+    expect(mailDoc).toContain('POST /v1/messages/:id/reply');
+    expect(mailDoc).toContain('POST /v1/messages/:id/forward');
+    expect(mailDoc).toContain('kind:"hosted"');
+    expect(errorsDoc).toMatch(/^## from_required$/m);
+    expect(skillDoc).toContain('/reply');
+    expect(mailboxesDoc).toContain('kind:"hosted"');
+  });
+});
+
 describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文档', () => {
-  /** /v1 只开放这八个托管域名操作，读写分别要求 domain.read / domain.write */
+  /** /v1 只开放这九个托管域名操作，读写分别要求 domain.read / domain.write */
   const keyOperations: Record<string, Record<string, string>> = {
     '/hosted-domains': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}': { get: 'domain.read' },
     '/hosted-domains/{id}/check': { post: 'domain.write' },
+    '/hosted-domains/{id}/reconnect': { post: 'domain.write' },
     '/hosted-domains/{id}/dns-records': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}/dns-records/{recordId}': { put: 'domain.write', delete: 'domain.write' },
   };
 
-  it('八个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
+  it('九个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
     let checked = 0;
     for (const [path, scopes] of Object.entries(keyOperations)) {
       expect(specs.v1.paths[path]!.parameters, path).toEqual(specs.api.paths[path]!.parameters);
@@ -768,7 +842,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
         checked++;
       }
     }
-    expect(checked).toBe(8);
+    expect(checked).toBe(9);
   });
 
   it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
@@ -785,7 +859,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     // 两份规格只在认证相关措辞上不同：/v1 写明管理员 Key 的范围与审计记法，/api 保持原说明
     expect(specs.v1.paths['/hosted-domains']!.get!.description).toContain('/api/admin/hosted-domains');
     expect(specs.v1.paths['/hosted-domains/{id}']!.get!.description).toContain('JWT-only');
-    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
+    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/reconnect', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
       ['/hosted-domains/{id}/dns-records/{recordId}', 'put'], ['/hosted-domains/{id}/dns-records/{recordId}', 'delete']] as const) {
       expect(specs.v1.paths[path]![method]!.description, `${method} ${path}`).toContain('API Key #id');
       expect(specs.api.paths[path]![method]!.description, `${method} ${path}`).not.toContain('API Key');

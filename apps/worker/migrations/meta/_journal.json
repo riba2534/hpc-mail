@@ -157,6 +157,13 @@
       "breakpoints": true
     },
     {
+      "idx": 24,
+      "version": "6",
+      "when": 1795400000000,
+      "tag": "0024_hosted_domain_hardening",
+      "breakpoints": true
+    },
+    {
       "idx": 25,
       "version": "6",
       "when": 1795391000000,
@@ -175,13 +182,20 @@
       "version": "6",
       "when": 1795420800000,
       "tag": "0029_delivery_events",
-        "breakpoints": true
-      },
-      {
+      "breakpoints": true
+    },
+    {
       "idx": 30,
       "version": "6",
       "when": 1795420800001,
       "tag": "0030_maintenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1795420800002,
+      "tag": "0031_system_domain_onboarding",
       "breakpoints": true
     }
   ]

@@ -9,6 +9,7 @@
 - [邀请码](#邀请码)
 - [系统设置与域名](#系统设置与域名)：设置项、外发与中转配额、系统域名
 - [投递回执与抑制名单](#投递回执与抑制名单)：回执订阅状态、抑制名单的查看与解除
+- [系统域名一键接入](#系统域名一键接入)：把站长 Cloudflare 账户里的域名一键配好收发并加入系统域名
 - [Key 与管理审计](#key-与管理审计)
 
 所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
@@ -159,6 +160,48 @@ AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Wo
 抑制条目为 `{id,address,reason,sendingDomain,since,expiresAt,detail,updatedAt}`：`reason` 为 `hard_bounce`（永久退信）、`soft_bounce`（临时失败且重试耗尽）或 `complaint`（被标为垃圾邮件）；`expiresAt` 为 null 表示长期有效，只能由管理员解除；`detail` 是收件服务器的退信说明或投诉类型。条目只拦从 `sendingDomain` 发给该地址的信。解除前先确认对方地址已恢复（例如用户确认邮箱可用），解除后下一次发信才会重新尝试；投诉条目按用户授权处理，不要为了让发信通过而批量解除。解除只删本站条目，Cloudflare 侧的抑制需要在 Cloudflare 控制台另行解除，否则发送仍会被它拒绝。
 
 `credentials:false` 时不会自动建立订阅；没有订阅的域名收不到回执，结果停在 `sent`。建立订阅需要 Worker 的 Cloudflare Token（部署时的 `CF_HOSTED_DOMAINS_TOKEN`）具有 Account → Queues:Edit 权限，系统域名还要求它能读取域名所在的 zone，缺权限时 `lastError` 会给出提示。Token 读不到的系统域名可由站长在 Cloudflare 侧为该域名手动建立同一 Queue 的 email.sending 订阅，下一次重试或每日核对会识别并标为 `active`。
+
+## 系统域名一键接入
+
+只用管理员 JWT（`/api`），API Key 与 `/v1` 都没有这些接口。Worker 配有 Cloudflare 凭据即可用，不受 `hosted_domains.enabled` 开关控制。它替管理员在站长 Cloudflare 账户里开启 Email Routing、把 catch-all 指向本站 Worker、接入 Email Sending，收发都就绪后把域名追加到 `settings.domains.list`（`{public:false,perUserLimit:0,random:true}`，之后照常用 `PUT /admin/settings` 调整）。
+
+| 方法与 `/api` 路径 | 契约 |
+|---|---|
+| `GET /admin/system-domains/zones?hidden=0\|1&refresh=0\|1` | 账户 zone 分类：`zones` 是可接入（available）与接入中（onboarding，行上带任务摘要），`others` 是已是系统域名、用户托管（管理员名下的会标出）与记录不一致；每次最多预检 10 个可接入 zone 给出 `readiness.verdict`（ready/confirm/blocked/pending），其余 `unchecked`；无凭据时 `configured:false` |
+| `GET /admin/system-domains/precheck?mode=existing_zone&zoneId=…` 或 `?mode=new_zone&domain=…` | 只读预检：`checks`（severity none/info/confirm/blocker）、计划 `steps`、`requiredAcks`、`fingerprint`、RDAP 注册商；业务冲突不报错 |
+| `POST /admin/system-domains/onboardings` | 一键接入，体 `{mode,zoneId\|domain,fingerprint?,accept?}`；201 新建，同域名同方式进行中任务重放 200；需确认或有阻断时 409，`error.details.precheck` 带最新预检 |
+| `GET /admin/system-domains/onboardings?active=0\|1` | 任务列表（倒序） |
+| `GET /admin/system-domains/onboardings/:id` | 任务详情：分项 `steps`、最近预检、已确认项、变更台账 `changes`（含原值） |
+| `POST /admin/system-domains/onboardings/:id/check` | 立即检测或重试；15 秒内重复或正在处理时直接返回当前状态 |
+| `POST /admin/system-domains/onboardings/:id/confirm` | 只用于 `needs_confirmation`（远端在确认后又变了）：带 `fingerprint` 与 `accept`；指纹过期 409 并附新预检 |
+| `POST /admin/system-domains/onboardings/:id/cancel` | 取消，体 `{deleteCreatedZone?}`；只有本任务创建且从未激活的 zone 才能删（`canDeleteZone`），否则 400 |
+| `PUT /admin/system-domains/hidden-zones` | `{domain,hidden,expectedRevision}` 隐藏或恢复可接入列表中的 zone，revision 过期 409 |
+
+流程：读 zones → 选一个 available zone → `verdict=ready` 直接 POST；`confirm` 先 GET precheck，把要确认的变更逐条告诉用户、取得授权后带 `fingerprint` 与 `accept`（即 `requiredAcks`）POST；`blocked` 按 `checks` 里的说明处理后再检测。任务状态 `creating_zone → awaiting_ns → configuring → finalizing → completed`，`needs_confirmation`、`blocked` 等人处理（blocked 每 30 分钟自动复检），每 5 分钟由定时任务推进；轮询详情即可。
+
+```bash
+# API="$BASE/api"，AUTH 为管理员 JWT；HPC_ZONE_ID 来自 zones，用户已确认 requiredAcks 中的每一项
+PRECHECK=$(hpc "/admin/system-domains/precheck?mode=existing_zone&zoneId=$HPC_ZONE_ID")
+jq --arg zone "$HPC_ZONE_ID" '{mode:"existing_zone",zoneId:$zone,fingerprint:.data.fingerprint,accept:.data.requiredAcks}' <<< "$PRECHECK" |
+  hpc '/admin/system-domains/onboardings' -X POST -H 'Content-Type: application/json' --data-binary @-
+```
+
+需确认项（`ack`）的含义，每一项都要先征得用户同意：
+
+- `mx.delete`（危险）：根域有第三方 MX 或 null MX。确认后系统删除这些记录并紧接着开启 Email Routing，该域名**不再经原服务商收信**；原记录写进台账，可手动恢复。删除后 Routing 没开起来时任务 `blocked`、`errorCode=mx_removed_routing_pending`，按最短间隔重试。
+- `catchAll.replace`：catch-all 正指向其他 Worker、转发或丢弃，替换后原目标收不到这个域名的信。由其他 Worker 的 wrangler `addresses` 管理的 catch-all 是阻断项，不能替换。
+- `spf.merge`：把 `include:_spf.mx.cloudflare.net` 合并进唯一的一条 SPF；多条 SPF、含宏、超过 10 次查询为阻断项。
+- `rules.bypass`：启用中的专用地址规则优先于 catch-all，这些地址的来信不进本站（不修改规则）。
+- `dmarc.create`：没有 `_dmarc` 且域名另有邮件服务，接入发信时 Cloudflare 会写入 `p=reject`。
+- `ns.change`：`new_zone` 要把 NS 改到 Cloudflare，影响整个域名的 DNS；原记录不会自动迁移。
+
+规则与边界：
+
+- 任意读取失败都是阻断项，不会当作「不存在」去写入；不自动回滚，不关闭 Routing、不删除发信子域，只有取消时可删除本任务新建且从未激活的 zone。
+- 系统域名、用户托管域名与进行中的接入任务三方同名互斥；`new_zone` 新建的待激活 zone 与托管域名一起计入 `hosted_domains.maxPendingTotal`。
+- 接入完成前到达的来信按「未认领」收下。之后从系统域名列表移除不会停止 Cloudflare 的收件路由。
+- Cloudflare 调用另有额度：每 5 分钟 120 次；超出或 Cloudflare 返回 429 后的退避期内，这些接口返回 429 `rate_limited`。
+- 审计 action：`system_domain.create`、`.confirm`、`.cancel`、`.complete`、`.zone_delete`、`.fail`、`.hide`、`.unhide`。
 
 ## Key 与管理审计
 

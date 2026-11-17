@@ -45,7 +45,7 @@ import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
 import { assertHostedSendable, getRoutableDomains } from './domain.js';
-import { resolveDeliveryOwners } from './mailbox.js';
+import { HOSTED_SEND_CLAIM_SQL, resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { bumpCounter, dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
@@ -187,7 +187,11 @@ export interface SendMailInput {
   html?: string;
   replyToMessageId?: number;
   forwardAttachmentsFrom?: number;
+  /** 回复/转发接口已按同一可见口径读过的来源邮件：上面两个 id 指向它时不再重复读取 */
+  verifiedSource?: VerifiedSource;
 }
+
+type VerifiedSource = Pick<typeof messages.$inferSelect, 'id' | 'messageId' | 'inReplyTo' | 'references'>;
 
 interface ResolvedFrom {
   address: string;
@@ -299,8 +303,21 @@ const FORBIDDEN_SENDER: AppErrorHints = {
 
 type FromMailbox = Pick<typeof mailboxes.$inferSelect, 'address' | 'domain' | 'userId' | 'displayName'>;
 
-/** 发件邮箱行：mailboxId 写法按 id，地址写法按地址。与可路由域名查询并行发出，不多一次串行往返 */
-function lookupFromMailbox(db: Db, from: SendFrom): Promise<FromMailbox | undefined> {
+/**
+ * 发件邮箱行：mailboxId 写法按 id，地址写法按地址。与可路由域名查询并行发出，不多一次串行往返。
+ * 普通用户用地址写法时先在同一个 batch 里尝试认领：托管域名所有者可用本域任意前缀，未认领的地址发出前
+ * 认领给他（HOSTED_SEND_CLAIM_SQL 只对所有者、可用且发信就绪的域名生效，成员与共享不适用）。
+ */
+async function lookupFromMailbox(env: Env, db: Db, sender: Sender, from: SendFrom): Promise<FromMailbox | undefined> {
+  if (from.mailboxId === undefined && sender.role !== 'admin') {
+    const address = `${from.localPart}@${from.domain}`;
+    const [, found] = await env.db.batch([
+      env.db.prepare(HOSTED_SEND_CLAIM_SQL).bind(address, from.domain, sender.userId),
+      env.db.prepare('SELECT address, domain, user_id AS userId, display_name AS displayName FROM mailboxes WHERE address = ?').bind(address),
+    ]);
+    const row = found?.results?.[0] as FromMailbox | undefined;
+    return row && { ...row, userId: Number(row.userId) };
+  }
   return db
     .select({ address: mailboxes.address, domain: mailboxes.domain, userId: mailboxes.userId, displayName: mailboxes.displayName })
     .from(mailboxes)
@@ -346,9 +363,10 @@ async function loadForwardedAttachments(
   alreadyCount: number,
   alreadyBytes: number,
   leaseToken: string,
+  verified?: VerifiedSource,
 ): Promise<StoredAttachment[]> {
   const unavailable = '转发的原邮件不存在或不可见';
-  await loadSourceMessage(env, sender, sourceMessageId, unavailable, 'forward');
+  if (verified?.id !== sourceMessageId) await loadSourceMessage(env, sender, sourceMessageId, unavailable, 'forward');
   const ofSource = eq(attachmentsTable.messageId, sourceMessageId);
   const [, rows, source] = await db.batch([
     db.insert(deliveryObjectLeases)
@@ -558,9 +576,11 @@ async function resolveReply(
   env: Env,
   sender: Sender,
   replyToMessageId: number | undefined,
+  verified?: VerifiedSource,
 ): Promise<{ reply: ReplyContext | null; inReplyTo: string | null; references: string }> {
   if (!replyToMessageId) return { reply: null, inReplyTo: null, references: '' };
-  const orig = await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见', 'reply');
+  const orig = verified?.id === replyToMessageId
+    ? verified : await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见', 'reply');
   if (!orig.messageId) return { reply: null, inReplyTo: null, references: '' };
   const references = [...new Set([orig.references, orig.inReplyTo, orig.messageId]
     .filter(Boolean).flatMap(value => value!.match(/<[^<>\s]+>/g) ?? []))].join(' ');
@@ -698,14 +718,14 @@ export async function sendMail(
   // 投递回执启用时，抑制名单与域名、发件邮箱并行查询（查询失败按未抑制处理）；未启用时不查
   const [domains, fromBox, suppressionRows] = await Promise.all([
     getRoutableDomains(env, settings, candidateDomains),
-    lookupFromMailbox(db, req.from),
+    lookupFromMailbox(env, db, sender, req.from),
     deliveryEventsQueue(env) ? lookupSuppressions(env, [...to, ...cc, ...bcc].map(item => item.address)) : [],
   ]);
   const from = resolveFrom(sender, req, domains, fromBox);
   await assertHostedSendable(env, settings, from.domain);
   if (req.forwardAttachmentsFrom) {
     const forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
-      attachments.length, attachments.reduce((sum, att) => sum + attachmentSize(att), 0), leaseToken);
+      attachments.length, attachments.reduce((sum, att) => sum + attachmentSize(att), 0), leaseToken, req.verifiedSource);
     attachments = [...attachments, ...forwarded];
     const siteOrigin = env.site_origin ?? origin;
     // 补发/重发沿用的正文里有上次注入的下载区块：这些附件会重新带上，先去掉旧区块再判断是否重新注入，
@@ -737,7 +757,7 @@ export async function sendMail(
   const uniqueTargets = [...new Set([...recipients.to, ...recipients.cc, ...recipients.bcc])];
   const externalTargets = uniqueTargets.filter(address => !domains.includes(getEmailDomain(address)));
   const internalTargets = uniqueTargets.filter(address => domains.includes(getEmailDomain(address)));
-  const resolved = await resolveReply(env, sender, req.replyToMessageId);
+  const resolved = await resolveReply(env, sender, req.replyToMessageId, req.verifiedSource);
   // 回复站内邮件由 replyToMessageId 生成线程头；只知道站外 Message-ID 时由 headers 自带（两者互斥由 schema 保证），
   // 同样写进发件行与站内副本，线程才能连上
   const thread = resolved.reply

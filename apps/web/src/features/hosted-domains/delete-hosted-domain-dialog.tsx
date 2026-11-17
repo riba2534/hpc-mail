@@ -56,7 +56,9 @@ export function DeleteHostedDomainDialog({
               <AlertTriangle aria-hidden className="size-4 shrink-0" />
               先到注册商把名称服务器改回原值
             </p>
-            <p className="mt-1 text-ink-secondary">否则删除后该域名无法解析，网站、邮件等都将不可用。</p>
+            <p className="mt-1 text-ink-secondary">
+              否则删除后该域名无法解析，网站、邮件等都将不可用；在改回之前，其他用户也无法在本站添加这个域名。
+            </p>
             {domain.originalNameServers.length > 0 ? (
               <ul aria-label="原名称服务器" className="mt-2 flex flex-col gap-1.5">
                 {domain.originalNameServers.map((ns) => (
