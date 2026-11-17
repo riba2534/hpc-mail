@@ -4,7 +4,8 @@ import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { inboxListQuery, parseInboxFilters } from '@/features/inbox/inbox-query';
 import type { MessageListData } from '@/features/inbox/message-cache';
-import { getAuthRevision, getAuthToken, readTokenClaims, subscribeAuthToken } from '@/lib/auth-token';
+import { getAuthRevision, getAuthToken, subscribeAuthToken } from '@/lib/auth-token';
+import { isObject, readTokenClaims } from '@/lib/token-claims';
 
 export { readTokenClaims };
 
@@ -33,7 +34,6 @@ interface PersistedQuery {
   valid?: (data: unknown, userId: number) => boolean;
 }
 
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 /** 缓存里的会话用户必须就是 token 所属账户 */
 const isSessionOf = (data: unknown, userId: number) => isObject(data) && data.id === userId;
 

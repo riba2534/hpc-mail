@@ -5,7 +5,7 @@ vi.mock('@/api/resources', () => ({
   authApi: { me: vi.fn(async () => ({ id: localStorage.getItem('token') === 'A' ? 1 : 2, username: localStorage.getItem('token') })) },
   mailboxApi: { list: vi.fn(async () => [{ address: `${localStorage.getItem('token')}@example.com` }]) },
 }));
-import { getAuthRevision, setAuthToken, tokenIdentity } from './auth-token';
+import { getAuthRevision, setAuthToken } from './auth-token';
 import { subscribeAuthCache } from './auth-cache';
 import { useSessionQuery } from './use-session';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
@@ -52,13 +52,5 @@ describe('account cache isolation', () => {
     act(() => { localStorage.clear(); window.dispatchEvent(new StorageEvent('storage', { key: null })); });
     expect(client.getQueryData(['messages', 'detail', 1])).toBeUndefined();
     unsubscribe();
-  });
-
-  it('tokenIdentity 按 JWT sub 识别账户，读不出 sub 时就是 token 本身', () => {
-    const b64url = (value: unknown) => btoa(JSON.stringify(value)).replace(/=+$/, '');
-    expect(tokenIdentity(`h.${b64url({ sub: 7, sid: 'a' })}.s`)).toBe(tokenIdentity(`h.${b64url({ sub: 7, sid: 'b' })}.t`));
-    expect(tokenIdentity(`h.${b64url({ sub: 7 })}.s`)).not.toBe(tokenIdentity(`h.${b64url({ sub: 8 })}.s`));
-    expect(tokenIdentity('opaque')).toBe('opaque');
-    expect(tokenIdentity(null)).toBeNull();
   });
 });

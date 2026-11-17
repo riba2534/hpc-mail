@@ -32,7 +32,7 @@ function technicalDetail(error: unknown): string {
 
 /**
  * 路由错误的说明区（图标、标题、说明与技术细节）。根错误页整屏显示并提供刷新；
- * 外壳内的页面错误只替换主内容区，操作按钮由调用方给出。
+ * 外壳内的页面错误只替换主内容区。容器样式与操作按钮由调用方给出。
  */
 export function RouteErrorView({ className, actions }: { className: string; actions: ReactNode }) {
   const error = useRouteError();
@@ -61,7 +61,7 @@ export function RouteErrorView({ className, actions }: { className: string; acti
   const Icon = kind === 'network' || offline ? WifiOff : friendly ? RefreshCw : AlertTriangle;
 
   return (
-    <div className={`grid place-items-center px-6 ${className}`}>
+    <div className={className}>
       <div className="flex w-full max-w-sm flex-col items-center gap-4 text-center">
         <div
           className={
@@ -94,7 +94,7 @@ export function RouteErrorView({ className, actions }: { className: string; acti
 export function RouteErrorPage() {
   return (
     <RouteErrorView
-      className="min-h-dvh bg-canvas"
+      className="grid min-h-dvh place-items-center bg-canvas px-6"
       actions={<Button onClick={() => globalThis.location.reload()}>刷新页面</Button>}
     />
   );

@@ -12,7 +12,7 @@ export function PageError() {
   const { pathname, search, hash, state } = useLocation();
   return (
     <RouteErrorView
-      className="min-h-96 py-10"
+      className="grid min-h-96 place-items-center px-6 py-10"
       actions={
         <div className="flex flex-wrap justify-center gap-2">
           <Button onClick={() => navigate({ pathname, search, hash }, { replace: true, state })}>

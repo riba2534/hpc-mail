@@ -4,7 +4,8 @@ import { useEffect } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryKeys } from '@/api/query-keys';
-import { getAuthRevision, readTokenClaims, setAuthToken } from '@/lib/auth-token';
+import { getAuthRevision, setAuthToken } from '@/lib/auth-token';
+import { readTokenClaims } from '@/lib/token-claims';
 import { useCurrentUser } from '@/lib/use-session';
 
 const shellMounts = vi.hoisted(() => ({ count: 0 }));

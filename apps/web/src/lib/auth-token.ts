@@ -24,32 +24,6 @@ export function getAuthToken(): string | null {
 /** A local generation number keeps bearer tokens out of query keys and separates missed storage events. */
 export function getAuthRevision(): number { getAuthToken(); return tokenRevision; }
 
-/**
- * 读 JWT payload 的 sub/exp。只用来区分账户、挑选缓存 key（以及跳过明显已过期 token 的恢复），
- * 不验签、不做鉴权判断：会话是否有效始终以 /auth/me 为准。
- */
-export function readTokenClaims(token: string | null): { sub: number; exp?: number } | null {
-  const payload = token?.split('.')[1];
-  if (!payload) return null;
-  try {
-    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-    const claims: unknown = JSON.parse(atob(base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=')));
-    if (typeof claims !== 'object' || claims === null) return null;
-    const { sub, exp } = claims as Record<string, unknown>;
-    if (typeof sub !== 'number' || !Number.isSafeInteger(sub)) return null;
-    return { sub, exp: typeof exp === 'number' ? exp : undefined };
-  } catch {
-    return null;
-  }
-}
-
-/** token 所属的账户：同一账户换发的 token（如改密）视为同一身份；读不出 sub 时就是 token 本身 */
-export function tokenIdentity(token: string | null): string | null {
-  if (!token) return null;
-  const claims = readTokenClaims(token);
-  return claims ? `uid:${claims.sub}` : token;
-}
-
 export function setAuthToken(token: string): void {
   const normalized = token.trim();
   if (!normalized) {

@@ -3,7 +3,8 @@ import { createContext, useCallback, useContext, useSyncExternalStore } from 're
 import type { SessionUser } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { authApi } from '@/api/resources';
-import { getAuthRevision, getAuthToken, readTokenClaims } from './auth-token';
+import { getAuthRevision, getAuthToken } from './auth-token';
+import { readTokenClaims } from './token-claims';
 import { subscribeAuthCache } from './auth-cache';
 
 /** 订阅 localStorage token 变化（登录/登出/跨标签页同步） */

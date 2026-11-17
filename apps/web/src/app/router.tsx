@@ -31,10 +31,10 @@ const title = (value: string): RouteHandle => ({ title: value });
 const page = <M,>(load: ModuleLoader<M>, pick: (module: M) => ComponentType) =>
   lazyWithReload(load, pick, <PageLoader />);
 
-// 只在外壳的主内容区渲染，此时外壳 chunk 必已加载：随外壳 chunk 下发，不进登录页入口
-const PageError = lazyWithReload(loadAppShell, (m) => m.PageError);
-const AdminGuard = lazyWithReload(loadAppShell, (m) => m.AdminGuard);
-const NotFoundPage = lazyWithReload(loadAppShell, (m) => m.NotFoundPage);
+// 只在外壳的主内容区渲染，此时外壳 chunk 必已加载（同步取到，不会显示加载占位）：随外壳 chunk 下发，不进登录页入口
+const PageError = page(loadAppShell, (m) => m.PageError);
+const AdminGuard = page(loadAppShell, (m) => m.AdminGuard);
+const NotFoundPage = page(loadAppShell, (m) => m.NotFoundPage);
 
 const InboxPage = page(loadInboxPage, (m) => m.InboxPage);
 const MessagePage = page(loadMessagePage, (m) => m.MessagePage);
