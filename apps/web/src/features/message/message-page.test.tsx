@@ -85,6 +85,20 @@ describe('MessagePage navigation', () => {
     client.clear();
   });
 
+  it('tells the user when marking the opened mail read fails, keeping the server reason and request id', async () => {
+    const { ApiError } = await import('@/api/errors');
+    // 失败提示来自应用的全局 mutationCache
+    const { queryClient } = await import('@/lib/query-client');
+    mocks.markRead.mockRejectedValueOnce(new ApiError('操作过于频繁', { code: 'rate_limited', httpStatus: 429, requestId: 'req-9' }));
+    const client = show('/mail/1', queryClient);
+    await screen.findByText('mail-1');
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({
+      title: '已读状态更新失败', description: '操作过于频繁', requestId: 'req-9', variant: 'error',
+    }));
+    expect(mocks.toast).toHaveBeenCalledOnce();
+    client.clear();
+  });
+
   it('steps through the originating list with j/k and the arrow buttons', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
     const list = { direction: 'inbound' as const, scope: 'mine' as const, unread: true };

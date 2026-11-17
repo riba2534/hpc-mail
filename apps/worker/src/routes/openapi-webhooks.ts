@@ -42,27 +42,32 @@ const contract = `Events are POSTed as JSON {id,type,timestamp,data} with Svix-c
  */
 export function webhookPaths(kind: 'api' | 'v1'): Paths {
   const scope = kind === 'v1' ? 'webhook.write' : undefined;
+  const keyErrors = kind === 'v1' ? ['KeyRestricted' as const] : [];
   const restricted = kind === 'v1'
     ? ' A key restricted to mailboxes or domains only sees and manages endpoints whose filters are non-empty and inside its range (others are 404; creating or updating outside it is 403).' : '';
   return {
     '/webhooks': {
-      get: operation('List Webhook v2 endpoints', array(ref('WebhookEndpoint')), { scope, description: `Endpoints of the caller, without secrets.${restricted}` }),
-      post: operation('Create a Webhook v2 endpoint', ref('CreatedWebhookEndpoint'), { scope, request: 'CreateWebhookEndpointRequest', status: 201,
+      get: operation('listWebhookEndpoints', 'List Webhook v2 endpoints', array(ref('WebhookEndpoint')), { scope, description: `Endpoints of the caller, without secrets.${restricted}` }),
+      post: operation('createWebhookEndpoint', 'Create a Webhook v2 endpoint', ref('CreatedWebhookEndpoint'), { scope, request: 'CreateWebhookEndpointRequest', status: 201,
+        errors: ['WebhookEndpointLimit', 'WebhookUrlInvalid', ...keyErrors],
         description: `At most ${MAX_WEBHOOK_ENDPOINTS_PER_USER} endpoints per user (403 beyond). url must be https on a public host: private, reserved, link-local and metadata addresses, URL credentials and this site's own hosts and system domains are rejected with 400. ${contract}${restricted}` }),
     },
     '/webhooks/{id}': {
-      get: operation('Read a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope }),
-      put: operation('Update a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope, request: 'UpdateWebhookEndpointRequest',
+      get: operation('getWebhookEndpoint', 'Read a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope }),
+      put: operation('updateWebhookEndpoint', 'Update a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope, request: 'UpdateWebhookEndpointRequest',
+        errors: ['WebhookUrlInvalid', ...keyErrors],
         description: `Only supplied fields change; lists replace the whole list. enabled:true re-enables an endpoint (clearing disabledReason and the failure count); failed deliveries are not resent automatically, retry them explicitly.${restricted}` }),
-      delete: operation('Delete a Webhook v2 endpoint and its delivery records', success, { scope }),
+      delete: operation('deleteWebhookEndpoint', 'Delete a Webhook v2 endpoint and its delivery records', success, { scope }),
     },
-    '/webhooks/{id}/rotate-secret': { post: operation('Rotate the signing secret', ref('CreatedWebhookEndpoint'), { scope,
+    '/webhooks/{id}/rotate-secret': { post: operation('changeWebhookSecret', 'Rotate the signing secret', ref('CreatedWebhookEndpoint'), { scope,
       description: 'The new secret takes effect immediately for every following attempt and is returned only here.' }) },
-    '/webhooks/{id}/test': { post: operation('Send a webhook.test event now', ref('WebhookTestResult'), { scope,
+    '/webhooks/{id}/test': { post: operation('testWebhookEndpoint', 'Send a webhook.test event now', ref('WebhookTestResult'), { scope,
+      example: { ok: false, httpStatus: 503, error: 'Webhook HTTP 503', durationMs: 412 },
       description: 'Synchronously sends {type:"webhook.test"} signed like real events and reports the receiver response; a failing receiver is still HTTP 200 with ok=false. Works on disabled endpoints; not recorded as a delivery.' }) },
-    '/webhooks/{id}/deliveries': { get: operation('List recent deliveries of an endpoint', page(ref('WebhookDelivery')), { scope, parameters: pageQuery,
+    '/webhooks/{id}/deliveries': { get: operation('listWebhookDeliveries', 'List recent deliveries of an endpoint', page(ref('WebhookDelivery')), { scope, parameters: pageQuery,
       description: 'Newest first; terminal records are kept about 30 days. Payloads are not returned.' }) },
-    '/webhooks/{id}/deliveries/{deliveryId}/retry': { post: operation('Retry a failed delivery once', ref('WebhookDelivery'), { scope,
+    '/webhooks/{id}/deliveries/{deliveryId}/retry': { post: operation('retryWebhookDelivery', 'Retry a failed delivery once', ref('WebhookDelivery'), { scope,
+      errors: ['WebhookNotRetryable'],
       description: 'Only failed deliveries of an active endpoint (409 otherwise); sends one more attempt with the same webhook-id. Deliveries whose source message was purged cannot be retried.' }) },
   };
 }

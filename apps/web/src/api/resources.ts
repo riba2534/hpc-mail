@@ -70,7 +70,10 @@ import type {
   TwoFactorSetup,
 } from '@hpc-mail/shared';
 import { api, type QueryParams } from './client';
-import { xhrSend, type UploadProgress } from './upload-client';
+import type { UploadProgress, XhrSendOptions } from './upload-client';
+
+/** 带进度的 XHR 上传通道只有写信附件用到：按需加载，不随入口下载 */
+const xhrSend = async <T>(options: XhrSendOptions) => (await import('./upload-client')).xhrSend<T>(options);
 
 // ---- auth ----
 export const authApi = {

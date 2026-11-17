@@ -22,28 +22,36 @@ const restricted = 'Keys restricted to mailboxes or domains get 403 forbidden (k
 export function accountKeyPaths(): Paths {
   return {
     '/notify-prefs': {
-      get: operation('Read masked notification preferences', ref('NotifyPrefs'), { scope: 'notify.read',
+      get: operation('getNotifyPrefs', 'Read masked notification preferences', ref('NotifyPrefs'), { scope: 'notify.read',
         description: 'Same masked structure as the session API GET /me/notify-prefs, including forward (read-only for keys) and forwardPending. Secrets are returned as ******.' }),
-      put: operation('Update Feishu, PushDeer or generic webhook notification settings', ref('NotifyPrefs'), { scope: 'notify.write', request: 'UpdateKeyNotifyPrefsRequest',
+      put: operation('updateNotifyPrefs', 'Update Feishu, PushDeer or generic webhook notification settings', ref('NotifyPrefs'), { scope: 'notify.write', request: 'UpdateKeyNotifyPrefsRequest',
+        errors: ['ForwardSessionOnly', 'KeyRestricted', 'PushKeyReentryRequired'],
         description: `Replaces only the supplied channels; ****** keeps a stored secret, an empty string clears it. Enabled channels need a complete valid configuration (https public endpoints). forward cannot be changed with an API key: a request containing forward returns 403 forbidden, because forwarding sends every incoming mail elsewhere; ask the user to change it in the web session. ${restricted}` }),
     },
-    '/notify-prefs/health': { get: operation('Read recent notification delivery health and forwarding quotas', ref('NotificationHealth'), { scope: 'notify.read',
+    '/notify-prefs/health': { get: operation('getNotifyHealth', 'Read recent notification delivery health and forwarding quotas', ref('NotificationHealth'), { scope: 'notify.read',
+      errors: ['KeyRestricted'],
       description: `Same as the session API. ${restricted}` }) },
-    '/notify-prefs/jobs/{id}/retry': { post: operation('Retry a failed or unknown notification job', okResult, { scope: 'notify.write',
+    '/notify-prefs/jobs/{id}/retry': { post: operation('retryNotification', 'Retry a failed or unknown notification job', okResult, { scope: 'notify.write',
+      errors: ['NotificationNotRetryable', 'KeyRestricted'],
       description: `Same rules as the session API: only failed/unknown mail notification jobs of the key owner, the channel must be enabled; queued, not delivered. ${restricted}` }) },
-    '/notify-prefs/feishu-test': { post: operation('Send a real Feishu test with the saved settings', okResult, { scope: 'notify.write',
+    '/notify-prefs/feishu-test': { post: operation('testFeishuNotification', 'Send a real Feishu test with the saved settings', okResult, { scope: 'notify.write',
+      errors: ['NotificationTestFailed', 'KeyRestricted'],
       description: `Performs an external notification with the saved configuration; failures return an error. ${restricted}` }) },
-    '/notify-prefs/pushdeer-test': { post: operation('Send a real PushDeer test with the saved settings', okResult, { scope: 'notify.write',
+    '/notify-prefs/pushdeer-test': { post: operation('testPushDeerNotification', 'Send a real PushDeer test with the saved settings', okResult, { scope: 'notify.write',
+      errors: ['PushKeyMissing', 'KeyRestricted'],
       description: `Performs an external notification with the saved configuration; failures return an error. ${restricted}` }) },
     '/mailboxes/shares': {
-      get: operation('List grants on mailboxes owned by the key owner', array(ref('MailboxShareGrant')), { scope: 'mailbox.share',
+      get: operation('listMailboxShares', 'List grants on mailboxes owned by the key owner', array(ref('MailboxShareGrant')), { scope: 'mailbox.share',
         description: 'Same as the session API GET /mailboxes/shares. A key restricted to mailboxes or domains only sees mailboxes in its range.' }),
-      put: operation('Replace the grantees of an owned mailbox', ref('MailboxShareGrant'), { scope: 'mailbox.share', request: 'ReplaceMailboxSharesRequest',
+      put: operation('replaceMailboxShares', 'Replace the grantees of an owned mailbox', ref('MailboxShareGrant'), { scope: 'mailbox.share', request: 'ReplaceMailboxSharesRequest',
+        errors: ['ShareOwnMailboxOnly', 'ShareToOwner', 'GranteeMissing', 'MailboxOwnerChanged', 'KeyRestricted'],
         description: 'userIds replaces the whole list; [] revokes all. Grantees are identified by user id only; there is no user search for API keys (ask the user for the id). At most 100 active users, excluding the owner. expectedOwnerId optionally detects stale ownership with 409. Only mailboxes the key owner owns, even for administrator keys. Shares grant read-only access to non-deleted inbound mail. A restricted key gets 403 for mailboxes outside its range.' }),
     },
-    '/mailboxes/shares/batch': { post: operation('Add the same grantees to several owned mailboxes', array(ref('MailboxShareGrant')), { scope: 'mailbox.share', request: 'BatchShareMailboxesRequest',
+    '/mailboxes/shares/batch': { post: operation('shareMailboxes', 'Add the same grantees to several owned mailboxes', array(ref('MailboxShareGrant')), { scope: 'mailbox.share', request: 'BatchShareMailboxesRequest',
+      errors: ['ShareOwnMailboxOnly', 'GranteeMissing', 'BatchStateChanged', 'KeyRestricted'],
       description: 'Appends grantees (by user id) to each listed mailbox owned by the key owner; existing grants are kept. A restricted key gets 403 if any mailbox is outside its range.' }) },
-    '/mailboxes/shares/{mailboxId}/grantees/{userId}': { delete: operation('Revoke one grantee of an owned mailbox', success, { scope: 'mailbox.share',
+    '/mailboxes/shares/{mailboxId}/grantees/{userId}': { delete: operation('revokeMailboxShare', 'Revoke one grantee of an owned mailbox', success, { scope: 'mailbox.share',
+      errors: ['KeyRestricted'],
       description: 'A restricted key gets 403 for mailboxes outside its range.' }) },
   };
 }
@@ -51,7 +59,8 @@ export function accountKeyPaths(): Paths {
 /** 网页会话侧新增的公开路径：/api/forward-confirmations* */
 export function accountSessionPaths(): Paths {
   return {
-    '/forward-confirmations/confirm': { post: operation('Confirm receiving forwarded mail', object({ address: str }), { public: true, request: 'ConfirmForwardRequest',
+    '/forward-confirmations/confirm': { post: operation('confirmForwardTarget', 'Confirm receiving forwarded mail', object({ address: str }), { public: true, request: 'ConfirmForwardRequest',
+      errors: ['ForwardConfirmInvalid', 'ForwardTargetLimit', 'Internal'], example: { address: 'friend@example.net' },
       description: 'Public. The token comes from the confirmation mail sent to a new forwarding target (link /forward/confirm#token=…); after confirmation the address joins the owner’s forwarding targets. Invalid or expired tokens return 404. A user can have at most five targets; 409 when the limit was reached meanwhile.' }) },
   };
 }

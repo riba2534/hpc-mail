@@ -53,6 +53,7 @@ export function Combobox({
   const listRef = useRef<HTMLDivElement>(null);
 
   const selected = options.find((option) => option.value === value) ?? null;
+  const optionId = (index: number) => `${listId}-option-${index}`;
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return options;
@@ -152,6 +153,9 @@ export function Combobox({
               type="search"
               aria-label={searchPlaceholder.replace(/…$/, '')}
               aria-controls={listId}
+              // 焦点一直留在搜索框，键盘高亮项靠 activedescendant 播报
+              aria-autocomplete="list"
+              aria-activedescendant={filtered[active] ? optionId(active) : undefined}
               value={query}
               onChange={(event) => {
                 setQuery(event.target.value);
@@ -170,16 +174,18 @@ export function Combobox({
               <p className="px-2 py-6 text-center text-sm text-ink-tertiary">{emptyText}</p>
             ) : (
               filtered.map((option, index) => (
-                <button
+                // 选项不可聚焦：按下时阻止默认行为，焦点留在搜索框
+                <div
                   key={option.value}
-                  type="button"
+                  id={optionId(index)}
                   role="option"
                   data-index={index}
                   aria-selected={option.value === value}
                   onMouseEnter={() => setActive(index)}
+                  onMouseDown={(event) => event.preventDefault()}
                   onClick={() => commit(option)}
                   className={cn(
-                    'flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm',
+                    'flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm',
                     index === active ? 'bg-accent-soft text-accent' : 'text-ink',
                   )}
                 >
@@ -190,7 +196,7 @@ export function Combobox({
                     )}
                   </span>
                   {option.value === value && <Check className="size-4 shrink-0" />}
-                </button>
+                </div>
               ))
             )}
           </div>

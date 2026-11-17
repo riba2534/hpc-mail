@@ -33,6 +33,8 @@ const frameCsp = (allowRemoteImages: boolean) => [
 const FRAME_BASE_STYLES = `
   :root { color-scheme: light; }
   html, body { margin: 0; min-width: 0; color: #0f172a; background: transparent; }
+  /* 写死最小宽度的模板（如 min-width:600px 的表格）在窄屏上横向滚动，右侧不被裁掉；高度由外层按内容撑开 */
+  html { overflow-x: auto; overflow-y: hidden; }
   body {
     font-family: 'PingFang SC', 'HarmonyOS Sans SC', 'Noto Sans SC', 'Segoe UI', system-ui, -apple-system, 'Microsoft YaHei', sans-serif;
     font-size: 14px;
@@ -108,19 +110,23 @@ export function EmailHtml({
     const resize = () => {
       cancelAnimationFrame(animationFrame)
       animationFrame = requestAnimationFrame(() => {
+        const root = frameDocument.documentElement
+        // 横向放不下时视口底部多出一条滚动条（覆盖式滚动条为 0）：计入高度，末行不被它挡住
+        const scrollbarHeight = root.scrollWidth > root.clientWidth
+          ? Math.max(0, (frameDocument.defaultView?.innerHeight ?? root.clientHeight) - root.clientHeight)
+          : 0
         const contentHeight = Math.ceil(Math.max(
           content.getBoundingClientRect().height,
           content.scrollHeight,
           frameDocument.body.scrollHeight,
-        ))
+        )) + scrollbarHeight
         const height = Math.min(contentHeight, MAX_FRAME_HEIGHT_PX)
         if (height === previousHeight) return
         previousHeight = height
         if (height > 0) iframe.style.height = `${height}px`
         else iframe.style.removeProperty('height')
         const isCapped = contentHeight > MAX_FRAME_HEIGHT_PX
-        frameDocument.documentElement.style.overflowY = isCapped ? 'auto' : 'hidden'
-        iframe.setAttribute('scrolling', isCapped ? 'auto' : 'no')
+        root.style.overflowY = isCapped ? 'auto' : 'hidden'
         if (isCapped) observer?.disconnect()
       })
     }
@@ -147,7 +153,6 @@ export function EmailHtml({
       src="about:blank"
       sandbox={FRAME_SANDBOX}
       referrerPolicy="no-referrer"
-      scrolling="no"
       className={cn('block min-w-0 w-full border-0', className)}
       data-email-html-host
     />

@@ -138,12 +138,13 @@ describe('N10 wait 只带 domain 时按可见地址取数', () => {
 
 /** 在 findNextMessage 命中之后、按 id 读整行（第一个 batch）之前插入一次并发改动 */
 function racing(change: () => Promise<unknown>): Env {
-  let fired = false;
+  // 第一次 batch 是扫描新信（可见地址分流的两条语句同一 batch），第二次是命中后读整行：变化插在两者之间
+  let batches = 0;
   const raced = new Proxy(env.db, {
     get(target, property) {
       if (property === 'batch') {
         return async (statements: D1PreparedStatement[]) => {
-          if (!fired) { fired = true; await change(); }
+          if (++batches === 2) await change();
           return target.batch(statements);
         };
       }

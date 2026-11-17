@@ -7,11 +7,12 @@ import {
   markAllReadRequestSchema,
   waitMessagesQuerySchema,
 } from '@hpc-mail/shared';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
-import { messageViewer, mutationViewer } from '../../lib/message-viewer.js';
+import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer } from '../../lib/message-viewer.js';
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
+import { conditionalDetailResponse } from '../../lib/etag.js';
 import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
 import {
   apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, assertKeyCanUseSender, keyRestriction, requireScope,
@@ -27,14 +28,13 @@ import {
   restoreMessages,
   purgeMessages,
   findNextMessage,
-  getMessageDetail,
+  getMessageDetailConditional,
   listMessages,
   loadAttachmentForViewer,
   loadSourceMessage,
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import type { Context } from 'hono';
 import type { InternalSendMailRequest } from '@hpc-mail/shared';
 import { handleCompose, handleSend } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
@@ -52,7 +52,7 @@ app.get('/', async (c) => {
   // 显式给出范围外的地址或域名直接 403，而不是静默返回空列表
   if (query.address) await assertKeyCanUseAddress(c, query.address);
   if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
-  return ok(c, await listMessages(c.env, viewerFromKey(c, key, query), query));
+  return ok(c, await listMessages(c.env, viewerFromKey(key, query, c), query));
 });
 
 app.post('/', (c) => {
@@ -76,10 +76,11 @@ async function assertSendWithinRestriction(
 ): Promise<void> {
   if (!keyRestriction(c)) return;
   await assertKeyCanUseSender(c, req.from);
-  for (const id of new Set([req.replyToMessageId, req.forwardAttachmentsFrom])) {
+  const sources = [['reply', req.replyToMessageId], ['forward', req.forwardAttachmentsFrom]] as const;
+  for (const [source, id] of sources) {
     if (id === undefined) continue;
-    const source = await loadSourceMessage(c.env, key, id, '引用的原邮件不存在或不可见');
-    await assertKeyCanUseAddress(c, source.address);
+    const row = await loadSourceMessage(c.env, key, id, '引用的原邮件不存在或不可见', source);
+    await assertKeyCanUseAddress(c, row.address);
   }
 }
 
@@ -150,7 +151,9 @@ app.post('/restore', async (c) => {
 app.post('/purge', async (c) => {
   requireScope(c, 'mail.write');
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewer(c, c.get('apiKey')!, req.scope), req.ids, execCtx(c));
+  const viewer = mutationViewer(c, c.get('apiKey')!, req.scope);
+  const purged = await purgeMessages(c.env, viewer, req.ids, execCtx(c));
+  await auditUnclaimedPurge(c, viewer, req.ids, purged);
   return ok(c, { purged, changed: purged });
 });
 
@@ -239,12 +242,14 @@ function waitForPoll(signal: AbortSignal, milliseconds: number): Promise<void> {
 }
 
 function viewerFromKey(
-  c: Context<AppContext>,
   key: { userId: number; role: Viewer['role'] },
   query: { scope?: Viewer['scope']; userId?: number },
+  c: Context<AppContext>,
 ): Viewer {
   const restrict = keyRestriction(c) ?? undefined;
-  return { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId, ...(restrict ? { restrict } : {}) };
+  const viewer: Viewer = { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId, ...(restrict ? { restrict } : {}) };
+  auditUserScopeRead(c, viewer);
+  return viewer;
 }
 
 app.get('/:id/thread', async (c) => {
@@ -267,7 +272,10 @@ app.get('/:id', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
-  return ok(c, await getMessageDetail(c.env, messageViewer(c, key), id, V1_ATTACHMENT_TTL_SECONDS));
+  const ifNoneMatch = c.req.header('If-None-Match');
+  return conditionalDetailResponse(c, await getMessageDetailConditional(c.env, messageViewer(c, key), id, {
+    attachmentTtlSeconds: V1_ATTACHMENT_TTL_SECONDS, ifNoneMatch,
+  }));
 });
 
 app.get('/:id/attachments/:attId', async (c) => {

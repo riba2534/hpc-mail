@@ -15,8 +15,9 @@ import {
 } from './mailbox-policy.js';
 import { hostedSendBlock } from './domain.js';
 import { getSettingsFresh, mergeSettingRows } from './setting.js';
-import { PURGE_MESSAGES_INDEX, purgeStatements } from './message-lifecycle.js';
+import { purgeStatements } from './message-lifecycle.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
+import { ACTOR_NAME_SQL, auditStatement, auditSuffix, type AuditActor } from './audit.js';
 
 type MailboxRow = typeof mailboxes.$inferSelect;
 
@@ -188,7 +189,7 @@ const CLAUDE_SUSPENDED_MESSAGE = '该域名有 Claude 封号记录，不能在 C
  * 顺序：域名存在与授权 → 保留前缀 → 全局上限 → 按域名上限 → Claude 封号（显式选择时）。
  * 管理员同样受 Claude 策略约束；纯函数，所需数据由调用方一次读齐。
  */
-function evaluateClaimPolicy(
+export function evaluateClaimPolicy(
   settings: ClaimSettings,
   user: MailboxPolicyUser,
   owned: OwnedCounts,
@@ -259,7 +260,7 @@ interface ClaimContext {
 const addressOf = (req: ClaimMailboxRequest) => `${req.localPart}@${req.domain}`;
 
 /** 与 getSettingsFresh 同一个合并函数（只读回 domains / mailbox_policy 两行，其余项为默认值且不使用） */
-const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
+export const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
   mergeSettingRows((result?.results ?? []) as { key: string; value: string }[]);
 
 /** 规则所需的全部读取合成一个 D1 batch：认领设置（强一致直读）、用户权限、已认领数、地址占用。 */
@@ -287,7 +288,8 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
   };
 }
 
-interface InsertedMailboxRow {
+/** 原生 SQL 读回的邮箱行（RETURNING 或 SELECT），带历史邮件数 */
+interface MailboxSqlRow {
   id: number;
   address: string;
   domain: string;
@@ -295,6 +297,20 @@ interface InsertedMailboxRow {
   display_name: string;
   created_at: number;
   message_count: number;
+}
+
+const MAILBOX_SQL_COLUMNS = `id, address, domain, user_id, display_name, created_at,
+  (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`;
+
+function fromSqlRow(row: MailboxSqlRow): Mailbox {
+  return serialize({
+    id: Number(row.id),
+    address: row.address,
+    domain: row.domain,
+    userId: Number(row.user_id),
+    displayName: row.display_name,
+    createdAt: new Date(Number(row.created_at)),
+  }, Number(row.message_count));
 }
 
 /** 规则判定 → 占用判定 → 带守卫的 INSERT（RETURNING 直接带回整行与历史邮件数）。成功后更新 context。 */
@@ -307,8 +323,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
 
   const address = addressOf(req);
   if (context.taken.has(address)) throw new AppError('address_taken', '该地址已被占用');
-  const returning = `RETURNING id, address, domain, user_id, display_name, created_at,
-    (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`;
+  const returning = `RETURNING ${MAILBOX_SQL_COLUMNS}`;
   try {
     // Domain revision and quotas are checked in the same write as INSERT. A
     // concurrent domain removal/private toggle must not create a stale claim.
@@ -326,7 +341,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
         )
         .bind(address, req.domain, userId, perDomainLimit, userId, req.domain, perDomainLimit,
           userId, policyUser.role, req.domain, policyUser.role, userId, userId, req.strategy === 'claude' ? 1 : 0, req.domain)
-        .first<InsertedMailboxRow>()
+        .first<MailboxSqlRow>()
       : await env.db
         .prepare(
           `INSERT INTO mailboxes (address, domain, user_id, display_name)
@@ -361,19 +376,12 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
           req.strategy === 'claude' ? 1 : 0,
           req.domain,
         )
-        .first<InsertedMailboxRow>();
+        .first<MailboxSqlRow>();
     if (!inserted) throw await claimGuardError(env, context, req, policy.hosted);
     context.taken.add(address);
     if (!policy.hosted) context.owned.total += 1;
     context.owned.byDomain.set(req.domain, (context.owned.byDomain.get(req.domain) ?? 0) + 1);
-    return serialize({
-      id: Number(inserted.id),
-      address: inserted.address,
-      domain: inserted.domain,
-      userId: Number(inserted.user_id),
-      displayName: inserted.display_name,
-      createdAt: new Date(Number(inserted.created_at)),
-    }, Number(inserted.message_count));
+    return fromSqlRow(inserted);
   } catch (error) {
     if (error instanceof AppError) throw error;
     if (error instanceof Error && error.message.includes('UNIQUE constraint failed: mailboxes.address')) {
@@ -530,12 +538,11 @@ async function claimChunk(env: Env, context: ClaimContext, items: ClaimMailboxRe
     env.db.prepare(`${BATCH_CLAIM_PLAN_SQL}
       INSERT INTO mailboxes (address, domain, user_id, display_name)
       SELECT address, domain, ?2, '' FROM planned WHERE blocked IS NULL AND is_new ORDER BY position
-      RETURNING id, address, domain, user_id, display_name, created_at,
-        (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`).bind(...bindings),
+      RETURNING ${MAILBOX_SQL_COLUMNS}`).bind(...bindings),
   ]);
   return {
     plan: plan!.results as unknown as PlannedClaimRow[],
-    inserted: new Map((inserted!.results as unknown as InsertedMailboxRow[]).map((row) => [row.address, row])),
+    inserted: new Map((inserted!.results as unknown as MailboxSqlRow[]).map((row) => [row.address, row])),
   };
 }
 
@@ -570,11 +577,7 @@ export async function claimMailboxes(
         } else {
           const mailbox = inserted.get(row.address);
           if (!mailbox) throw new Error('批量认领写入结果缺失');
-          result.claimed.push(serialize({
-            id: Number(mailbox.id), address: mailbox.address, domain: mailbox.domain,
-            userId: Number(mailbox.user_id), displayName: mailbox.display_name,
-            createdAt: new Date(Number(mailbox.created_at)),
-          }, Number(mailbox.message_count)));
+          result.claimed.push(fromSqlRow(mailbox));
           context.taken.add(row.address);
           if (!context.hosted.has(item.domain)) context.owned.total++;
           context.owned.byDomain.set(item.domain, (context.owned.byDomain.get(item.domain) ?? 0) + 1);
@@ -605,25 +608,41 @@ function availabilityOf(context: ClaimContext, req: ClaimMailboxRequest): Mailbo
   return context.taken.has(address) ? { address, available: false, reason: 'taken' } : { address, available: true };
 }
 
+/** 邮箱行与所有者用户名（审计写所有者用），一次查询 */
+async function mailboxWithOwner(env: Env, id: number) {
+  const row = await createDb(env).select({ mailbox: mailboxes, ownerName: users.username })
+    .from(mailboxes).leftJoin(users, eq(users.id, mailboxes.userId)).where(eq(mailboxes.id, id)).get();
+  return row && { ...row.mailbox, ownerName: row.ownerName };
+}
+
+export const ownerLabel = (row: { userId: number; ownerName: string | null }) =>
+  `${row.ownerName ?? `user#${row.userId}`} (#${row.userId})`;
+
+/** actor 为审计操作者：管理员改他人邮箱的发件名时记录前后值，自己的邮箱不记 */
 export async function updateMailbox(
   env: Env,
   userId: number,
   id: number,
   displayName: string,
   isAdmin: boolean,
+  actor?: AuditActor,
 ): Promise<Mailbox> {
   const db = createDb(env);
-  const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  const row = await mailboxWithOwner(env, id);
   if (!row || (!isAdmin && row.userId !== userId)) throw new AppError('not_found', '邮箱不存在');
   const result = await db.update(mailboxes).set({ displayName })
     .where(and(eq(mailboxes.id, id), eq(mailboxes.userId, row.userId))).run();
   if (!result.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
-  const [updated] = await db
-    .select({ mailbox: mailboxes, messageCount: messageCountSql })
-    .from(mailboxes)
-    .where(eq(mailboxes.id, id))
-    .all();
-  return serialize(updated!.mailbox, Number(updated!.messageCount));
+  // 审计与读回合进同一个 batch，不多一次往返
+  const audited = isAdmin && actor !== undefined && row.userId !== userId && row.displayName !== displayName;
+  const results = await env.db.batch([
+    ...(audited ? [auditStatement(env, actor, 'mailbox.update', row.address,
+      `发件名「${row.displayName}」→「${displayName}」；所有者 ${ownerLabel(row)}`)] : []),
+    env.db.prepare(`SELECT ${MAILBOX_SQL_COLUMNS} FROM mailboxes WHERE id = ?`).bind(id),
+  ]);
+  const updated = results[results.length - 1]?.results?.[0] as MailboxSqlRow | undefined;
+  if (!updated) throw new AppError('not_found', '邮箱已被释放，请刷新后重试');
+  return fromSqlRow(updated);
 }
 
 /** 不经过释放/重新认领：所有权、审计及旧共享撤销在同一个 D1 事务内完成。 */
@@ -685,9 +704,102 @@ export async function transferMailbox(
 }
 
 /**
+ * 批量写入的前置闸门：violation 查出任一行（某项的前置条件已不成立）就插入 actor_id 为 NULL 的行，
+ * 触发 NOT NULL 约束使整个 batch 事务回滚。闸门之后的语句不必重复这些条件：同一事务里没有别的写入能插进来。
+ */
+export function batchGateStatement(env: Env, violation: string, ...params: unknown[]): D1PreparedStatement {
+  return env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, action) SELECT NULL, 'batch.gate' WHERE EXISTS (${violation})`)
+    .bind(...params);
+}
+
+export function isBatchGateError(error: unknown): boolean {
+  return String(error).includes('NOT NULL constraint failed: admin_audit_logs.actor_id');
+}
+
+/** 待释放的邮箱：读取时的所有者及其用户名（审计用） */
+export interface ReleaseTarget {
+  id: number;
+  address: string;
+  userId: number;
+  ownerName: string | null;
+}
+
+export interface ReleaseOutcome {
+  deletedMessages: number;
+  revokedShares: number;
+}
+
+/** 释放审计：操作者与 detail 末尾的附加说明（如批量标记） */
+export interface ReleaseAudit {
+  actor: AuditActor;
+  note: string;
+}
+
+/**
+ * 释放一组邮箱，全部写入同一个 D1 事务：闸门（每只邮箱仍归读取时的所有者，否则整批回滚）→
+ * [按地址圈定历史邮件并逐地址计数] → 审计（mailbox.release，删除条数在事务内计出）→ [删除邮件] → 撤销共享 → 删除邮箱。
+ * 历史邮件在事务内按地址圈定，授权之后、提交之前刚到的来信也一并删除。
+ */
+export async function releaseTargets(
+  env: Env,
+  targets: readonly ReleaseTarget[],
+  deleteHistory: boolean,
+  audit: ReleaseAudit | null,
+  ctx?: ExecCtx | null,
+): Promise<Map<number, ReleaseOutcome>> {
+  // 每项的 id/所有者/地址作为一个 JSON 参数传入：绑定参数个数不随项数增长
+  const items = JSON.stringify(targets.map((target) => ({
+    id: target.id, userId: target.userId, address: target.address, detail: `原所有者 ${ownerLabel(target)}`,
+  })));
+  const ids = `SELECT json_extract(value, '$.id') FROM json_each(?1)`;
+  const token = deleteHistory ? crypto.randomUUID() : null;
+  const statements = [batchGateStatement(env, `SELECT 1 FROM json_each(?1) j WHERE NOT EXISTS (SELECT 1 FROM mailboxes
+    WHERE id = json_extract(j.value, '$.id') AND user_id = json_extract(j.value, '$.userId'))`, items)];
+  if (token) {
+    statements.push(
+      env.db.prepare(`UPDATE messages SET purge_token = ?2 WHERE address IN (SELECT json_extract(value, '$.address') FROM json_each(?1))`)
+        .bind(items, token),
+      env.db.prepare('SELECT address, COUNT(*) AS n FROM messages WHERE purge_token = ? GROUP BY address').bind(token),
+    );
+  }
+  if (audit) {
+    statements.push(env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+      SELECT ?1, ${ACTOR_NAME_SQL}, 'mailbox.release', json_extract(j.value, '$.address'),
+        json_extract(j.value, '$.detail') || CASE WHEN ?2 IS NULL THEN '；保留历史邮件'
+          ELSE '；永久删除历史邮件 ' || (SELECT COUNT(*) FROM messages WHERE purge_token = ?2
+            AND address = json_extract(j.value, '$.address')) || ' 封' END || ?3, ?4
+      FROM json_each(?5) j`).bind(audit.actor.id, token, `${audit.note}${auditSuffix(audit.actor)}`, audit.actor.ip, items));
+  }
+  if (token) statements.push(...purgeStatements(env, token));
+  const sharesIndex = statements.length;
+  statements.push(
+    env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id IN (${ids}) RETURNING mailbox_id`).bind(items),
+    env.db.prepare(`DELETE FROM mailboxes WHERE id IN (${ids})`).bind(items),
+  );
+  let results: D1Result[];
+  try {
+    results = await env.db.batch(statements);
+  } catch (error) {
+    if (isBatchGateError(error)) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
+    throw error;
+  }
+  const deleted = new Map(((token ? results[2]?.results : undefined) as { address: string; n: number }[] | undefined ?? [])
+    .map((row) => [row.address, Number(row.n)]));
+  const revoked = new Map<number, number>();
+  for (const row of (results[sharesIndex]?.results ?? []) as { mailbox_id: number }[]) {
+    revoked.set(Number(row.mailbox_id), (revoked.get(Number(row.mailbox_id)) ?? 0) + 1);
+  }
+  if (token) await scheduleStorageCleanup(env, ctx, 100);
+  return new Map(targets.map((target) => [target.id, {
+    deletedMessages: deleted.get(target.address) ?? 0, revokedShares: revoked.get(target.id) ?? 0,
+  }]));
+}
+
+/**
  * 释放地址。默认历史邮件不动（随地址回到未认领态，下一个认领者可见）；
  * deleteHistory=true 时同时删除该地址名下全部邮件——堵住「释放后被他人继承验证码/账单」的隐私路径。
  * 元数据与清理台账同一事务提交；传入 ctx 时 R2 删除放进 waitUntil，不阻塞响应。
+ * actor 为审计操作者：管理员释放他人邮箱时，mailbox.release 审计与释放同一事务。
  */
 export async function releaseMailbox(
   env: Env,
@@ -696,27 +808,13 @@ export async function releaseMailbox(
   isAdmin: boolean,
   deleteHistory = false,
   ctx?: ExecCtx | null,
+  actor?: AuditActor,
 ): Promise<{ deletedMessages: number }> {
-  const db = createDb(env);
-  const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  const row = await mailboxWithOwner(env, id);
   if (!row || (!isAdmin && row.userId !== userId)) throw new AppError('not_found', '邮箱不存在');
-  const token = crypto.randomUUID();
-  const statements: D1PreparedStatement[] = [];
-  if (deleteHistory) {
-    statements.push(env.db.prepare(`UPDATE messages SET purge_token = ? WHERE address = ?
-      AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`)
-      .bind(token, row.address, row.id, row.userId));
-    statements.push(...purgeStatements(env, token));
-  }
-  statements.push(env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id = ?
-    AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`).bind(row.id, row.id, row.userId));
-  statements.push(env.db.prepare('DELETE FROM mailboxes WHERE id = ? AND user_id = ?').bind(row.id, row.userId));
-  // One D1 transaction includes every message present at release, including concurrent inbound.
-  const result = await env.db.batch(statements);
-  if (!result[result.length - 1]?.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
-  const deletedMessages = deleteHistory ? (result[1 + PURGE_MESSAGES_INDEX]?.meta.changes ?? 0) : 0;
-  if (deleteHistory) await scheduleStorageCleanup(env, ctx, 100);
-  return { deletedMessages };
+  const audit = isAdmin && actor !== undefined && row.userId !== userId ? { actor, note: '' } : null;
+  const outcome = await releaseTargets(env, [row], deleteHistory, audit, ctx);
+  return { deletedMessages: outcome.get(id)?.deletedMessages ?? 0 };
 }
 
 /** 可用性提示：与认领同一套规则（evaluateClaimPolicy），不可用时给出 reason；不预订地址 */

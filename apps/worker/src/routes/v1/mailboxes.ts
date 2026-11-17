@@ -15,6 +15,7 @@ import {
 } from '../../services/mailbox.js';
 import { listSharedMailboxes } from '../../services/mailbox-share.js';
 import type { Context } from 'hono';
+import { auditActorOf } from '../../services/audit.js';
 import type { AppContext } from '../../types.js';
 
 const app = new Hono<AppContext>();
@@ -94,7 +95,7 @@ app.put('/:id', async (c) => {
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, updateMailboxRequestSchema);
   await assertMailboxInKey(c, id);
-  return ok(c, await updateMailbox(c.env, key.userId, id, req.displayName, key.role === 'admin'));
+  return ok(c, await updateMailbox(c.env, key.userId, id, req.displayName, key.role === 'admin', auditActorOf(c)));
 });
 
 app.delete('/:id', async (c) => {
@@ -102,7 +103,8 @@ app.delete('/:id', async (c) => {
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
   await assertMailboxInKey(c, id);
-  const result = await releaseMailbox(c.env, key.userId, id, key.role === 'admin', parseBooleanFlag(c.req.query('deleteHistory')), execCtx(c));
+  const result = await releaseMailbox(c.env, key.userId, id, key.role === 'admin',
+    parseBooleanFlag(c.req.query('deleteHistory')), execCtx(c), auditActorOf(c));
   return ok(c, { success: true, ...result });
 });
 

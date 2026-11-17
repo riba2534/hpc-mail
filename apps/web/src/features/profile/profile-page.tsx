@@ -90,7 +90,7 @@ export function ProfilePage() {
       setPreview(null);
       toast({ title: '头像已删除', variant: 'success' });
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '删除头像失败' },
   });
 
   const handleFile = async (file: File | undefined) => {

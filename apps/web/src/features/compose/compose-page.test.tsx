@@ -487,10 +487,13 @@ describe('source mail no longer available', () => {
   it('a reply whose original is gone can be sent as a new mail after the user confirms, with a new key', async () => {
     mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
     const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
+    expect(screen.getByRole('heading', { level: 1, name: '回复邮件' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
     expect(mocks.send.mock.calls[0]![0]).toMatchObject({ replyToMessageId: 5 });
     fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
+    // 去掉回复关联后就是一封新邮件，标题随之变化
+    expect(screen.getByRole('heading', { level: 1, name: '写邮件' })).toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 50));
     // 只去掉关联，不自动重发
     expect(mocks.send).toHaveBeenCalledOnce();
@@ -501,6 +504,16 @@ describe('source mail no longer available', () => {
     expect(mocks.send.mock.calls[1]![0]).toEqual(rest);
     expect(mocks.send.mock.calls[1]![1]).not.toBe(mocks.send.mock.calls[0]![1]);
     await screen.findByText('sent page');
+    client.clear();
+  });
+
+  it('a reply-forward whose reply thread is gone (details.source = reply) offers to drop the reply link, not the attachments', async () => {
+    mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404, details: { source: 'reply' } }));
+    const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, forwardAttachmentsFrom: 8, sourceMessageId: 5 });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
+    fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
+    expect(screen.getByText(/将保留原邮件附件/)).toBeInTheDocument();
     client.clear();
   });
 

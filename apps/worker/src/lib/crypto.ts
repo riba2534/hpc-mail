@@ -74,7 +74,7 @@ export function deriveSubkey(secret: string, purpose: SubkeyPurpose): Promise<st
 }
 
 /** 站内详情签名的时间桶：exp 对齐到整点 */
-const ATTACHMENT_BUCKET_SECONDS = 60 * 60;
+export const ATTACHMENT_BUCKET_SECONDS = 60 * 60;
 /**
  * /v1 详情的签名有效期：调用方另有带 Key 鉴权的附件端点，签名 URL 只是临时直链，
  * 保持 5 分钟，Key 吊销后很快失效。
