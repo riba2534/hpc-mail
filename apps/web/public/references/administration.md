@@ -7,6 +7,7 @@
 - [强制过户邮箱](#强制过户邮箱)：把邮箱连同历史转给另一个用户
 - [邀请码](#邀请码)
 - [系统设置与域名](#系统设置与域名)：设置项、外发与中转配额、系统域名
+- [投递回执与抑制名单](#投递回执与抑制名单)：回执订阅状态、抑制名单的查看与解除
 - [Key 与管理审计](#key-与管理审计)
 
 所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的五个 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
@@ -107,6 +108,7 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除；沿用已存 Key 时 baseUrl 的 origin 与路径必须与已保存的一致（协议、主机、端口或路径变化都算换了接口，末尾斜杠视为相同），否则仍提交 `******` 返回 400 `validation_failed`，需要重新填写 apiKey，防止已存的 Key 被发往新地址；清空 baseUrl 可沿用已存 Key |
 | `translation` | `{enabled,dailyCharsPerUser}`；AI 翻译开关与额度。enabled=true 要求 `ai_model` 已配置，同一请求同时提交两者时按合并后的结果校验（翻译开着时不能单独清空模型）；dailyCharsPerUser 0–10000000，每用户每 UTC 日发送给模型的字符数，0 不限，admin 不豁免 |
 | `hosted_domains` | `{enabled,maxPerUser,maxPendingPerUser,maxPendingTotal,pendingDays,autoClaimLimit}`；用户托管域名开关与额度（Worker 还需配置 Cloudflare 凭据，`/api/config` 的 `hostedDomainsEnabled` 反映两者）。maxPerUser 0–1000（0 不限）为普通用户最多拥有的域名数；maxPendingPerUser 1–100 与 maxPendingTotal 1–1000 限制同时等待 NS 生效的数量，保护站长 Cloudflare 账户的添加额度；pendingDays 1–28 天未改 NS 自动删除；autoClaimLimit 0–100000（默认 0 不限）为每个托管域名自动认领的地址上限，设为正数时域内地址达到后未认领新地址的来信拒收，手动认领始终不受限。管理员不受个人上限，受全站等待数限制。全站托管域名、暂停/恢复与凭据健康检查见 `/api/admin/hosted-domains…`，详情、成员、过户、删除复用 `/api/hosted-domains/:id…`（管理员有全部权限），见[邮箱参考](mailboxes-and-domains.md#用户托管域名) |
+| `delivery_events` | `{enabled}`，默认 true；外发投递回执的事件订阅开关。关闭只停止新建订阅，已有订阅的事件仍会回写，见[投递回执与抑制名单](#投递回执与抑制名单) |
 
 外发 dailyRecipients 以每次请求去重后的收件地址计数，不是跨全天同一收件人只计一次；站内/外收件均计入。系统当前策略必须先读取，不把 schema 默认值当线上设置。
 
@@ -117,6 +119,20 @@ AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Wo
 `POST /admin/settings/ai-model-test` 用固定英文示例按翻译格式真实调用一次 AI 模型，返回 `{ok:true,latencyMs,sample}`；body 可省略，`{baseUrl,apiKey,model}` 中未提交或为空的字段、以及 apiKey 为 `******` 时用已保存的 `ai_model`，不要求任何功能已启用，便于保存前验证。沿用已存 apiKey（未填、空串或 `******`）时 baseUrl 的 origin 与路径必须与已保存的一致（末尾斜杠视为相同），否则返回 400 `validation_failed`，要测试新地址需同时填写 apiKey。三项解析后仍缺失返回 400；服务失败返回 500，message 说明 HTTP 状态码、超时或返回格式无效，不回显 Key。测试会产生一次真实外部调用，不计用户额度。
 
 通知/转发已为个人偏好，不在上述系统设置中；通过 `/api/me/notify-prefs` 修改当前管理员的个人通道，不能 PUT 旧全局 `feishu/notify_webhook/gmail_forward` 字段。
+
+## 投递回执与抑制名单
+
+外发投递回执来自 Cloudflare Email Sending 的事件订阅：送达、退信、失败、拒绝、投诉事件按发信域名投递到 Queue `hpc-mail-email-events`，本站据此回写发件的逐收件人结果（见[投递回执](mail.md#投递回执)），退信与投诉的收件人进入抑制名单（见[抑制名单](mail.md#抑制名单)）。设置 `delivery_events.enabled` 开启（默认）且 Worker 有 Cloudflare 凭据时，定时任务每 5 分钟为还没有订阅的系统域名补建订阅、每日核对一次，托管域名开通发信时立即订阅。关闭后不再新建订阅，已有订阅的事件仍会回写。
+
+| 方法与 `/api` 路径 | 契约 |
+|---|---|
+| `GET /admin/delivery-events` | `{enabled,credentials,queue,subscriptions:[{domain,kind,zoneId,subscriptionId,status,lastError,checkedAt}]}`；`kind` 为 `system\|hosted`，`status` 为 `active`（已订阅）或 `error`（建立失败，见 `lastError`，定时任务约 6 小时后重试）。只列定时任务处理过的域名 |
+| `GET /admin/suppressions?q=…&cursor=…&limit=30` | 有效（未过期）的抑制条目，按 id 倒序分页；`q` 按收件地址或发信域名包含匹配，不区分大小写；limit 1–100，默认 30 |
+| `DELETE /admin/suppressions/:id` | 解除一条，`{success:true}`；不存在返回 404 `not_found`；记管理审计 `suppression.delete`（target 为收件地址，detail 为「发信域名 <域名>」） |
+
+抑制条目为 `{id,address,reason,sendingDomain,since,expiresAt,detail,updatedAt}`：`reason` 为 `hard_bounce`（永久退信）、`soft_bounce`（临时失败且重试耗尽）或 `complaint`（被标为垃圾邮件）；`expiresAt` 为 null 表示长期有效，只能由管理员解除；`detail` 是收件服务器的退信说明或投诉类型。条目只拦从 `sendingDomain` 发给该地址的信。解除前先确认对方地址已恢复（例如用户确认邮箱可用），解除后下一次发信才会重新尝试；投诉条目按用户授权处理，不要为了让发信通过而批量解除。解除只删本站条目，Cloudflare 侧的抑制需要在 Cloudflare 控制台另行解除，否则发送仍会被它拒绝。
+
+`credentials:false` 时不会自动建立订阅；没有订阅的域名收不到回执，结果停在 `sent`。建立订阅需要 Worker 的 Cloudflare Token（部署时的 `CF_HOSTED_DOMAINS_TOKEN`）具有 Account → Queues:Edit 权限，系统域名还要求它能读取域名所在的 zone，缺权限时 `lastError` 会给出提示。Token 读不到的系统域名可由站长在 Cloudflare 侧为该域名手动建立同一 Queue 的 email.sending 订阅，下一次重试或每日核对会识别并标为 `active`。
 
 ## Key 与管理审计
 

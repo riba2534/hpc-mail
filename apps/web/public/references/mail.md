@@ -255,6 +255,35 @@ hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,addre
 - **422 `delivery_failed`**：每个收件人都尝试过且都被拒收，什么也没发出。message 为「全部收件人投递失败: …」，`error.details` 为 `{messageId,recipientOutcomes}`，`messageId` 是已记录的发件行（`direction=outbound` 列表里可见）。这次不占当日外发配额。同 Key 重试返回同一个 422；修正收件人后用新 Key 重发。
 - **500 `internal`**：服务端在部分收件人还没尝试时出错（例如附件保存失败）。用同一 Key、同一请求体重试取回结果：可能继续发送并返回 201，也可能是 422 `delivery_failed`，此时其中的收件人可能从未发出过。
 
+#### 投递回执
+
+外部收件人的 `sent` 只表示 Cloudflare 已接受。发信域名订阅了 Cloudflare 投递事件时，收件服务器的最终结果会回写到 `recipientOutcomes`，通常在发送后几秒到几分钟；临时失败在重试期间不回写，重试耗尽记为 `bounced`。各状态：
+
+| `status` | 含义 |
+|---|---|
+| `sent` | Cloudflare 已接受，还没有回执；不代表已进收件箱 |
+| `delivered` | 站内收件人已落库，或外部收件服务器已接收（`event:"delivered"`） |
+| `bounced` | 收件服务器退信（`event:"bounced"`）；`error` 为 SMTP 应答或退信原因，`smtpStatus` 如 `550 5.1.1` |
+| `failed` | 明确失败：发送时被拒（`error` 为原因）；命中本站抑制名单（`code:"recipient_suppressed"`，没有发出，见[抑制名单](#抑制名单)）；或回执为 failed、rejected（`error` 为「Cloudflare 投递失败（原因）」或「Cloudflare 拒绝投递（原因：说明）」） |
+| `complained` | 已送达，但收件人把邮件标为垃圾邮件（`event:"complained"`）；不算失败，没有 `error` |
+| `unknown` | 投递中断，结果未回填，见上文 |
+
+回写过的收件人还带 `event`（最近一次回执：`delivered`、`bounced`、`failed`、`rejected`、`complained`）、`eventAt`（事件时间，ISO 8601）和 `smtpStatus`（事件带应答码时才有）。只采用比已有 `eventAt` 更新的事件，乱序或重复的回执不会把结果改回去。
+
+整封的 `status` 与 `errorDetail` 随回执重算：还有收件人是 `sent` 时仍为 `sent`；没有任何收件人是 `delivered`、`sent`、`complained` 或 `unknown`（全部退信或失败）时变为 `failed`；否则为 `delivered`。`errorDetail` 按带 `error` 的收件人重写为「部分收件人失败: …」或「全部收件人投递失败: …」。所以发送时 201 `sent` 的邮件之后可能变成 `failed`；同一 Idempotency-Key 重放仍返回首次的结果，要看最新状态就重读 `GET /messages/:id` 或 `direction=outbound` 列表，隔几分钟读一次即可，不要高频轮询。
+
+没有订阅的发信域名收不到回执，结果一直停在 `sent`：管理员关闭了 `delivery_events`、Worker 没有配置 Cloudflare 凭据，或该域名的订阅建立失败（管理员可在 `GET /api/admin/delivery-events` 查看）。所以 `sent` 长时间不变不代表失败。
+
+#### 抑制名单
+
+`bounced` 与 `complained` 的收件人会进入本站抑制名单，范围与 Cloudflare 一致：按「收件地址 + 发信域名」记录，只拦从同一发信域名发给该地址的信。期限：投诉长期；硬退信 7 天，地址或域名不存在（增强码 `5.1.1`、`5.1.2`、`5.1.10`）时长期；软退信（临时失败、重试耗尽）24 小时。长期条目只能由管理员解除，见[管理员参考](administration.md#投递回执与抑制名单)。
+
+- **全部收件人都在名单里**：422 `recipient_suppressed`，没有发出，没有创建发件记录，不占当日配额，`Idempotency-Key` 已释放、可以复用。`error.details.suppressed` 每项为 `{address,reason,sendingDomain,since,expiresAt}`，`reason` 为 `hard_bounce|soft_bounce|complaint`，`expiresAt` 为 null 表示需管理员解除。见[错误码](errors.md#recipient_suppressed)。
+- **部分在名单里**：其余收件人照常发送并返回 201，被抑制的收件人为 `{"status":"failed","code":"recipient_suppressed","error":"收件人在 <域名> 的抑制名单中：<原因>，<时间> 自动解除"}`（长期条目结尾为「需管理员解除」）。其余收件人也全部失败时返回 422 `delivery_failed`，`details.recipientOutcomes` 包含被抑制的收件人。
+- [部分失败补发](#部分失败补发)时去掉带 `code:"recipient_suppressed"` 的收件人，再发仍会失败。也不要为绕过名单改用其他发信域名：地址不存在会再次退信，投诉过的人不应再收到这类邮件。
+
+Cloudflare 自己也维护抑制名单：被它抑制的站外收件人在发送时被拒（`failed`，`error` 带原因）或回执为 rejected。本站名单只是提前、逐个收件人地给出明确原因；管理员解除本站条目不会解除 Cloudflare 侧的条目。
+
 ### 幂等与重试
 
 将最终 JSON 保存到私有文件并设 `HPC_SEND_FILE`。下例在发送前创建包含 payload SHA-256 和 Key 的 sidecar，重复运行会保持原 Key；内容改变会终止，避免把编辑后的文件当结果查询。每次新的、已经授权的逻辑发送使用新文件，不能为超时重试改文件名/凭证。

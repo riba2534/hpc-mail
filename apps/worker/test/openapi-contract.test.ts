@@ -10,6 +10,7 @@ import { buildSessionOpenApiSpec } from '../src/routes/api-openapi.js';
 import { buildOpenApiSpec } from '../src/routes/v1/openapi.js';
 import type { Schema } from '../src/routes/openapi-common.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../src/services/hosted-domain.js';
+import { recipientSuppressedError } from '../src/services/suppression.js';
 import skillDoc from '../../web/public/skill.md?raw';
 import llmsDoc from '../../web/public/llms.txt?raw';
 import administrationDoc from '../../web/public/references/administration.md?raw';
@@ -471,7 +472,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
   });
 });
 
-describe('外发投递回执与抑制名单反映在两份 OpenAPI 中', () => {
+describe('外发投递回执与抑制名单反映在两份 OpenAPI 与 Agent 文档中', () => {
   const props = (schema: Schema) => schema.properties as Record<string, Schema>;
   const dataOf = (operation: Schema) => {
     const responses = operation.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>;
@@ -559,6 +560,30 @@ describe('外发投递回执与抑制名单反映在两份 OpenAPI 中', () => {
     }
     for (const path of ['/admin/suppressions', '/admin/suppressions/{id}', '/admin/delivery-events']) expect(specs.v1.paths).not.toHaveProperty(path);
     for (const name of ['EmailSuppression', 'DeliveryEventsOverview']) expect(specs.v1.components.schemas).not.toHaveProperty(name);
+  });
+
+  it('Agent 文档写明投递回执、抑制名单、管理接口与中转转发回执', () => {
+    for (const text of ['422 `recipient_suppressed`', '](references/errors.md#recipient_suppressed)', '`bounced`', '](references/mail.md#投递回执)']) {
+      expect(skillDoc, text).toContain(text);
+    }
+    for (const heading of ['#### 投递回执', '#### 抑制名单']) expect(mailDoc).toContain(`\n${heading}\n`);
+    for (const text of ['| `bounced` |', '| `complained` |', '`event`', '`eventAt`', '`smtpStatus`', '「全部收件人投递失败: …」', '停在 `sent`',
+      'details.suppressed', '`code:"recipient_suppressed"`', '不会解除 Cloudflare 侧的条目']) {
+      expect(mailDoc, text).toContain(text);
+    }
+    // 服务端错误信封里的 docs 链接要能落到 errors.md 的小节
+    expect(recipientSuppressedError([]).hints.docs).toBe('/references/errors.md#recipient_suppressed');
+    expect(errorsDoc).toMatch(/^## recipient_suppressed$/m);
+    for (const text of ['details.suppressed', '`hard_bounce`', '`soft_bounce`', '`complaint`', '`DELETE /api/admin/suppressions/:id`']) expect(errorsDoc, text).toContain(text);
+    for (const text of ['`GET /admin/delivery-events`', '`GET /admin/suppressions?', '`DELETE /admin/suppressions/:id`', '| `delivery_events` |', 'Queues:Edit',
+      'Cloudflare 侧的抑制需要在 Cloudflare 控制台另行解除']) {
+      expect(administrationDoc, text).toContain(text);
+    }
+    expect(notificationsDoc).toContain('「Cloudflare 侧最终投递失败：<SMTP 应答或原因>」');
+    // 回执产生的 Webhook 事件尚未生效，对外文档与规范都不能提
+    for (const doc of [skillDoc, llmsDoc, administrationDoc, attachmentsDoc, authDoc, errorsDoc, mailDoc, mailboxesDoc, notificationsDoc, JSON.stringify(specs)]) {
+      expect(doc).not.toMatch(/mail\.(delivered|bounced)/);
+    }
   });
 });
 
