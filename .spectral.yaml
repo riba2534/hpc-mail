@@ -1,0 +1,61 @@
+# 两份 OpenAPI（/api/openapi.json 与 /v1/openapi.json）的 Spectral 规则集，CI 与部署流水线以 --fail-severity=error 运行：
+#   node apps/worker/scripts/export-openapi.mjs /tmp/openapi
+#   npx --yes @stoplight/spectral-cli@6.17.1 lint /tmp/openapi/api.json /tmp/openapi/v1.json --ruleset .spectral.yaml --fail-severity=error
+# 动词表与 apps/worker/src/routes/openapi-common.ts 的 OPERATION_VERBS 保持一致（openapi-quality 测试会核对）。
+extends: ["spectral:oas"]
+rules:
+  operation-operationId: error
+  operation-operationId-unique: error
+  oas3-valid-media-example: error
+  oas3-valid-schema-example: error
+  hpc-operation-id-verb-noun:
+    description: "operationId 写成「动词+名词」的 camelCase，例如 listMessages、getMessage、claimMailbox"
+    message: "operationId {{value}} 不是「动词+名词」：以 OPERATION_VERBS 中的动词开头，后接大写字母开头的名词"
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch,options,head]"
+    then:
+      field: operationId
+      function: pattern
+      functionOptions:
+        match: "^(?:list|get|create|update|delete|replace|send|claim|release|transfer|check|search|sync|count|wait|mark|star|restore|purge|share|unshare|revoke|remove|upload|download|complete|register|start|enable|disable|change|retry|test|translate|suspend|resume)[A-Z][A-Za-z0-9]*$"
+  hpc-operation-security:
+    description: "每个 operation 显式声明 security（公开接口为 []）"
+    message: "{{path}} 没有声明 security"
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch,options,head]"
+    then:
+      field: security
+      function: defined
+  hpc-success-example:
+    description: "每个成功响应的每种媒体类型都带示例（example 或 examples）"
+    message: "{{path}} 缺少成功示例"
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch,options,head].responses[?(@property.match(/^2/))].content[*]"
+    then:
+      function: xor
+      functionOptions:
+        properties: [example, examples]
+  hpc-error-example:
+    description: "每个 operation 至少有一个带示例的 4xx/5xx 响应（错误信封 { error: { code, message }, requestId }）"
+    message: "{{path}} 没有失败示例"
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch,options,head].responses"
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          not:
+            patternProperties:
+              "^[45][0-9]{2}$":
+                not:
+                  type: object
+                  required: [content]
+                  properties:
+                    content:
+                      type: object
+                      required: [application/json]
+                      properties:
+                        application/json:
+                          anyOf:
+                            - required: [example]
+                            - required: [examples]
