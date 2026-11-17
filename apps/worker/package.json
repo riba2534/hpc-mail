@@ -16,17 +16,17 @@
   },
   "dependencies": {
     "@hpc-mail/shared": "workspace:*",
-    "drizzle-orm": "^0.45.2",
-    "hono": "^4.13.13",
+    "drizzle-orm": "^0.45.4",
+    "hono": "^4.13.19",
     "mimetext": "^3.0.28",
     "postal-mime": "^4.2.1"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.18.4",
-    "@cloudflare/workers-types": "^5.20260714.1",
+    "@cloudflare/vitest-plugin": "^1.8.4",
+    "@cloudflare/workers-types": "^5.20261117.1",
     "drizzle-kit": "^0.31.10",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.10",
-    "wrangler": "^4.110.0"
+    "vitest": "^4.1.12",
+    "wrangler": "^4.164.0"
   }
 }

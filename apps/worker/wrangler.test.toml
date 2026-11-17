@@ -1,9 +1,12 @@
-# 测试专用配置（@cloudflare/vitest-pool-workers 消费）
+# 测试专用配置（@cloudflare/vitest-plugin 消费）
 # 与生产 wrangler.toml 一致，但去掉 miniflare 无法本地模拟的 send_email binding，
 # 以及不需要的 routes/custom_domain。集成测试不发外部邮件，不调 env.email。
 name = "hpc-cloud-mail"
 main = "src/index.ts"
-compatibility_date = "2025-06-04"
+compatibility_date = "2026-11-16"
+# 2026-08-04 起 nodejs_compat 随日期默认开启；本 Worker 不依赖 Node API（mimetext 走 browser 入口），
+# 显式关闭以保持运行时不出现 process/Buffer 等全局、process.env 不注入 secrets。
+compatibility_flags = ["no_nodejs_compat", "no_nodejs_compat_v2"]
 
 [vars]
 # 域名由 settings.domains.list 维护，测试在 setup 里 updateSettings 设置
