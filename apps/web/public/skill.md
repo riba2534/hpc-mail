@@ -24,6 +24,8 @@ hpc '/messages' --get --data-urlencode 'limit=5' | jq '.data.items[] | {id,addre
 
 失败统一返回 `{error:{code,message,fix?,docs?,details?},requestId}`：按 `code` 分支，先照 `fix` 修正，`docs` 指向[错误码说明](references/errors.md)。缺少 scope 是 403 `forbidden`，`fix` 写明缺哪个。共享给你的地址（`kind=shared`）只读，不能发信。账户、通知、管理员功能以及托管域名的删除、成员与过户只能用 JWT：经 `/api/auth/login` 登录后把 `API` 换成 `$BASE/api`、`AUTH` 换成 token，见[鉴权](references/auth-and-http.md)。Key 与 JWT 不能互换；`/api` 的发信路径是 `/messages/send`，没有 `wait`。
 
+支持 MCP 的客户端可直接接入 `https://hpc.email/mcp`（Streamable HTTP，同一把 Key），提供收发、等验证码与地址管理等 10 个工具，见 [MCP](references/mcp.md)。
+
 ## 常用配方
 
 ### ① 等验证码或验证链接

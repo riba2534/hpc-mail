@@ -1,5 +1,5 @@
 import {
-  createHostedDomainRequestSchema, hostedDnsRecordInputSchema, replaceHostedDomainMembersRequestSchema, transferHostedDomainRequestSchema,
+  batchCheckHostedDomainsRequestSchema, batchCreateHostedDomainsRequestSchema, createHostedDomainRequestSchema, hostedDnsRecordInputSchema, replaceHostedDomainMembersRequestSchema, transferHostedDomainRequestSchema,
   updateHostedDomainRequestSchema,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
@@ -9,6 +9,7 @@ import {
   checkHostedDomain, createHostedDomain, deleteHostedDomain, getHostedDomain, listHostedDomainMembers, listMyHostedDomains,
   removeHostedDomainMember, replaceHostedDomainMembers, transferHostedDomain, updateHostedDomain,
 } from '../services/hosted-domain.js';
+import { checkHostedDomains, createHostedDomains } from '../services/hosted-domain-batch.js';
 import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../services/hosted-dns.js';
 import type { AppContext } from '../types.js';
 
@@ -21,6 +22,17 @@ app.get('/', async (c) => ok(c, await listMyHostedDomains(c.env, c.get('user')!)
 app.post('/', async (c) => {
   const req = await parseBody(c, createHostedDomainRequestSchema);
   return ok(c, await createHostedDomain(c.env, c.get('user')!, req.domain, execCtx(c), clientIp(c)), 201);
+});
+
+/** 批量添加与批量立即检测：逐项独立结果，单项规则与单个接口相同 */
+app.post('/batch', async (c) => {
+  const req = await parseBody(c, batchCreateHostedDomainsRequestSchema);
+  return ok(c, await createHostedDomains(c.env, c.get('user')!, req.domains, execCtx(c), clientIp(c)));
+});
+
+app.post('/batch-check', async (c) => {
+  const req = await parseBody(c, batchCheckHostedDomainsRequestSchema);
+  return ok(c, await checkHostedDomains(c.env, c.get('user')!, req.ids));
 });
 
 app.get('/:id', async (c) => ok(c, await getHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')))));

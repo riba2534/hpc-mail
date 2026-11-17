@@ -1,6 +1,6 @@
 import { HOSTED_DOMAIN_STATUSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, hostedDomainPaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
   page, pageQuery, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 
@@ -33,6 +33,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/domains': { get: operation('List configured domains visible to this user', array(str), { description: 'Returns data as an array, unlike /v1/domains data.domains. Ordinary users see public domains or the domains allowed by their dedicated mailboxPolicy. Dedicated policies replace public visibility and quotas; explicitly granted private domains are allowed. Active hosted domains follow the system domains: those the caller owns or was granted, or every active hosted domain for administrators, who may claim addresses on any user’s hosted domain. Adding/managing system domains requires administrator settings; users host their own domains with /hosted-domains; claiming an address is a separate operation.' }) },
     '/identities': { get: operation('List sender identities', ref('SendIdentities'), { description: identitiesDescription }) },
     ...hosted,
+    ...hostedDomainBatchPaths(),
     '/hosted-domains/{id}': {
       ...hosted['/hosted-domains/{id}'],
       put: operation('Set the per-member claim limit', ref('HostedDomain'), { request: 'UpdateHostedDomainRequest', description: 'Owner or administrator.' }),

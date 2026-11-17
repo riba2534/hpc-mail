@@ -126,9 +126,9 @@ simple = { limit = 1, period = 60 }
 binding = "assets"
 directory = "./dist"
 not_found_handling = "single-page-application"
-# Agent 文档必须经过 Worker：补 UTF-8，并阻止缺失文档回退为成功的 SPA HTML。
+# Agent 文档必须经过 Worker：补 UTF-8，并阻止缺失文档回退为成功的 SPA HTML。"/mcp" 是远程 MCP 端点。
 # "/assets/*" 让缺失的哈希资源进 Worker 返回 404；现存文件的 "!/assets/<文件>" 排除规则由部署时注入。
-run_worker_first = ["/api", "/api/*", "/v1", "/v1/*", "/skill.md", "/references/*", "/llms.txt", "/assets/*"]
+run_worker_first = ["/api", "/api/*", "/v1", "/v1/*", "/mcp", "/skill.md", "/references/*", "/llms.txt", "/assets/*"]
 
 # Secrets（wrangler secret put）：
 #   jwt_secret              JWT 签名密钥（必需）

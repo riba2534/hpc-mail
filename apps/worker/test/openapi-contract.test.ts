@@ -18,6 +18,7 @@ import authDoc from '../../web/public/references/auth-and-http.md?raw';
 import errorsDoc from '../../web/public/references/errors.md?raw';
 import mailDoc from '../../web/public/references/mail.md?raw';
 import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
+import mcpDoc from '../../web/public/references/mcp.md?raw';
 import notificationsDoc from '../../web/public/references/notifications.md?raw';
 
 const app = createApp();
@@ -88,9 +89,9 @@ describe('OpenAPI routes and public contracts', () => {
   });
 
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
-    // /api/internal 是部署运维端点（CI 金丝雀与心跳），有意不进公开描述
+    // /api/internal 是部署运维端点（CI 金丝雀与心跳），有意不进公开描述；/mcp 是 JSON-RPC 端点，由 references/mcp.md 描述
     const mounted = [...new Set(app.routes.filter(route => methods.has(route.method.toLowerCase()) && !route.path.includes('*')
-      && !route.path.startsWith('/api/internal/'))
+      && !route.path.startsWith('/api/internal/') && route.path !== '/mcp')
       .map(route => `${route.method} ${route.path.replace(/\/$/, '').replace(/:([^/]+)/g, '{$1}')}`))].sort();
     expect([...operations('api'), ...operations('v1')].sort()).toEqual(mounted);
   });
@@ -469,7 +470,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
 
   it('超过 100 行的参考文件开头有目录', () => {
     const references = { administration: administrationDoc, attachments: attachmentsDoc, auth: authDoc, errors: errorsDoc,
-      mail: mailDoc, mailboxes: mailboxesDoc, notifications: notificationsDoc };
+      mail: mailDoc, mailboxes: mailboxesDoc, mcp: mcpDoc, notifications: notificationsDoc };
     for (const [name, doc] of Object.entries(references)) {
       if (doc.split('\n').length > 100) expect(doc.split('\n').slice(0, 5).join('\n'), name).toContain('## 目录');
     }
@@ -485,7 +486,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     'skill.md': skillDoc, 'llms.txt': llmsDoc,
     'references/administration.md': administrationDoc, 'references/attachments.md': attachmentsDoc,
     'references/auth-and-http.md': authDoc, 'references/errors.md': errorsDoc, 'references/mail.md': mailDoc,
-    'references/mailboxes-and-domains.md': mailboxesDoc, 'references/notifications.md': notificationsDoc,
+    'references/mailboxes-and-domains.md': mailboxesDoc, 'references/mcp.md': mcpDoc, 'references/notifications.md': notificationsDoc,
   };
   /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */
   const documentedAsMissing = ['POST /messages/{id}'];
@@ -632,7 +633,9 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
   it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
     const v1Hosted = Object.fromEntries(Object.entries(specs.v1.paths).filter(([path]) => path.startsWith('/hosted-domains'))
       .map(([path, item]) => [path, Object.keys(item).filter(method => methods.has(method)).sort()]));
-    expect(v1Hosted).toEqual(Object.fromEntries(Object.entries(keyOperations).map(([path, scopes]) => [path, Object.keys(scopes).sort()])));
+    // 批量添加与批量检测（PR5f）由 hosted-domain-batch.test.ts 核对
+    expect(v1Hosted).toEqual({ ...Object.fromEntries(Object.entries(keyOperations).map(([path, scopes]) => [path, Object.keys(scopes).sort()])),
+      '/hosted-domains/batch': ['post'], '/hosted-domains/batch-check': ['post'] });
     expect(Object.keys(specs.v1.paths).filter(path => path.startsWith('/admin'))).toEqual([]);
     for (const [path, method] of [['/hosted-domains/{id}', 'delete'], ['/hosted-domains/{id}', 'put'], ['/hosted-domains/{id}/members', 'put'],
       ['/hosted-domains/{id}/members/{userId}', 'delete'], ['/hosted-domains/{id}/transfer', 'post'], ['/admin/hosted-domains', 'get']] as const) {

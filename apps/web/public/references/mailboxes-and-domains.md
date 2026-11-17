@@ -7,7 +7,7 @@
 - [批量认领](#批量认领)：随机后缀方案、批量可用性、批量认领
 - [释放、历史与共享边界](#释放历史与共享边界)：释放与清除历史、共享的权限范围与管理接口
 - [域名新增、关闭公开和删除](#域名新增关闭公开和删除)：管理员维护系统域名
-- [用户托管域名](#用户托管域名)：把自己的域名接入本站，[用 API Key 接入](#用-api-key-接入)，以及[托管域名的 DNS 解析](#托管域名的-dns-解析)
+- [用户托管域名](#用户托管域名)：把自己的域名接入本站，[用 API Key 接入](#用-api-key-接入)、[批量添加与立即检测](#批量添加与立即检测)，以及[托管域名的 DNS 解析](#托管域名的-dns-解析)
 
 shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发件身份与批量认领在 JWT `/api` 与 Key `/v1` 均可用；共享管理只用 JWT `/api`；用户托管域名的查看、添加、检测与 DNS 解析两者均可用（Key 需 `domain.read`/`domain.write`），删除、成员上限、成员与过户只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
 
@@ -180,6 +180,22 @@ Key `/v1` 开放托管域名的查看、添加、立即检测与 DNS 解析，�
 - 只用 JWT：`DELETE /hosted-domains/:id`（永久删除该域全部邮件）、`PUT /hosted-domains/:id`（`memberLimit`）、成员名单、过户，以及管理员的 `/admin/hosted-domains…`；`/v1` 没有这些路径，返回 404。
 - 管理员的 Key 与管理员 JWT 同权，可以查看和操作任何人的托管域名；但 `GET /v1/hosted-domains` 也只列自己拥有或被共享的，全站列表只在 JWT `GET /api/admin/hosted-domains`。
 - 添加域名与 DNS 记录的增改删写入管理审计，操作人记为「用户名（API Key #id）」，与网页操作区分。
+
+### 批量添加与立即检测
+
+一次添加或检测多个域名：`POST /api/hosted-domains/batch` 请求体 `{"domains":[…]}`，`POST /api/hosted-domains/batch-check` 请求体 `{"ids":[…]}`。API Key 用 `/v1` 下的同名路径，需要 `domain.write`。单次 1–20 项，不能重复（域名不分大小写），否则 400。
+
+- 逐项处理、逐项返回 `{items,succeeded,failed}`：`items` 与请求顺序一致，每项为 `{domain 或 id, ok:true, hostedDomain}` 或 `{domain 或 id, ok:false, error:{code,message,fix?}}`。HTTP 状态恒为 200，按 `items[].ok` 判断。每项的规则与单个添加、单个检测完全相同（权限、409 冲突、额度、审计）。
+- 额度先算后做：开始前读取本分钟的个人次数（添加 5 次、检测 10 次）与全站 Cloudflare 额度，额度外的项不执行、不计数、不调用 Cloudflare，返回 `rate_limited`，message 以「未处理：」开头。约 1 分钟后只重试这些项。
+- 遇到账户级错误即停止：添加遇到 `rate_limited`、`forbidden`（每人托管上限或同时等待生效数上限）、`user_disabled`，检测遇到 `rate_limited`、`user_disabled` 后，其余项不再尝试，返回同一 `code`，message 以「未处理：」开头。其他错误（如 409 已被托管、无权访问的 id 404、成员检测 403）只影响该项。普通用户默认只能有 1 个域名同时等待 NS 生效，批量添加多用于管理员或放宽了该上限的用户。
+- 托管功能关闭或站点缺少 Cloudflare 凭据时，整个请求 403，不逐项返回。
+
+```bash
+# API="$BASE/api"、AUTH 为 JWT；或 API="$BASE/v1"、AUTH 为带 domain.write 的 Key
+jq -n '{domains:["example.com","example.net"]}' |
+  hpc '/hosted-domains/batch' -X POST -H 'Content-Type: application/json' --data-binary @- |
+  jq '.data.items[] | {domain, ok, status:.hostedDomain.status, ns:.hostedDomain.nameServers, error:.error.message}'
+```
 
 ### 托管域名的 DNS 解析
 

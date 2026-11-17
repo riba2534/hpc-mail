@@ -1,15 +1,18 @@
-import { createHostedDomainRequestSchema, hostedDnsRecordInputSchema } from '@hpc-mail/shared';
+import {
+  batchCheckHostedDomainsRequestSchema, batchCreateHostedDomainsRequestSchema, createHostedDomainRequestSchema, hostedDnsRecordInputSchema,
+} from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { clientIp, execCtx, ok, parseBody, parseId, parseRecordId } from '../../lib/http.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
 import { checkHostedDomain, createHostedDomain, getHostedDomain, listMyHostedDomains } from '../../services/hosted-domain.js';
+import { checkHostedDomains, createHostedDomains } from '../../services/hosted-domain-batch.js';
 import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../../services/hosted-dns.js';
 import type { AppContext, AuthUser } from '../../types.js';
 
 type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 
 /**
- * 托管域名（API Key）：查看、添加、立即检测与 DNS 解析，与 /api 同名接口共用 service，权限、额度、限流与审计一致。
+ * 托管域名（API Key）：查看、添加（含批量）、立即检测（含批量）与 DNS 解析，与 /api 同名接口共用 service，权限、额度、限流与审计一致。
  * 删除（永久删除该域全部邮件）、改成员上限、成员管理与过户只能用 JWT，这里不挂载。
  */
 const app = new Hono<AppContext>();
@@ -37,6 +40,19 @@ app.post('/', async (c) => {
   requireScope(c, 'domain.write');
   const req = await parseBody(c, createHostedDomainRequestSchema);
   return ok(c, await createHostedDomain(c.env, await keyActor(c), req.domain, execCtx(c), clientIp(c)), 201);
+});
+
+/** 批量添加与批量立即检测：逐项独立结果，单项规则与单个接口相同 */
+app.post('/batch', async (c) => {
+  requireScope(c, 'domain.write');
+  const req = await parseBody(c, batchCreateHostedDomainsRequestSchema);
+  return ok(c, await createHostedDomains(c.env, await keyActor(c), req.domains, execCtx(c), clientIp(c)));
+});
+
+app.post('/batch-check', async (c) => {
+  requireScope(c, 'domain.write');
+  const req = await parseBody(c, batchCheckHostedDomainsRequestSchema);
+  return ok(c, await checkHostedDomains(c.env, keyViewer(c), req.ids));
 });
 
 app.get('/:id', async (c) => {
