@@ -426,6 +426,13 @@ describe('限定范围的 Key（PR4a）', () => {
     expect(denied.message).toContain('限定了可用的邮箱或域名');
     const mine = await data<Draft>(await call('/v1/drafts', req(me.narrowKey, 'POST', complete(me.address, 'n1@hpc.email'))), 201);
     expect((await failure(await call(`/v1/drafts/${mine.id}`, req(me.narrowKey, 'PATCH', { from: me.other })), 403)).code).toBe('forbidden');
+    // 回复、转发引用的来源邮件同样要在范围内
+    const hidden = (await db.insert(messages).values({ direction: 'inbound', address: me.other, domain: 'hpc.email',
+      fromAddress: 'x@ext.test', subject: 'hidden', preview: '', status: 'received' }).returning({ id: messages.id }))[0]!.id;
+    for (const ref of [{ replyToMessageId: hidden }, { forwardAttachmentsFrom: hidden }]) {
+      expect((await failure(await call('/v1/drafts', req(me.narrowKey, 'POST', complete(me.address, 'n1@hpc.email', ref))), 403)).code).toBe('forbidden');
+      expect((await failure(await call(`/v1/drafts/${mine.id}`, req(me.narrowKey, 'PATCH', ref)), 403)).code).toBe('forbidden');
+    }
     const web = await data<Draft>(await call('/api/drafts', req(me.jwt, 'POST', complete(me.other, 'n2@hpc.email'))), 201);
     const listed = await data<Page<DraftSummary>>(await call('/v1/drafts', req(me.narrowKey, 'GET')));
     expect(listed.items.map((item) => item.id)).toEqual([mine.id]);
