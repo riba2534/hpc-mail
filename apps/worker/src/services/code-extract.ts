@@ -1,9 +1,39 @@
 import { htmlToText, stripInvisible } from '../lib/text.js';
 import { chatJson, isAiModelConfigured, type AiModelConfig } from './ai-provider.js';
 
-/** 验证码上下文关键词 */
-const KEYWORD_REGEX =
-  /(one[-\s]?time\s+(?:password|passcode)|passcode|pass\s?code|security\s?code|otp|access\s?code|login\s?code|authentication\s?code|\bcode\b|\bpin\b|验证码|校验码|动态码|动态密码|确认码|验证代码|口令)/gi;
+/** 码名前的限定词：带上它们的 code 才确定是验证码 */
+const CODE_QUALIFIERS =
+  'verification|verify|security|access|log[-\\s]?in|sign[-\\s]?in|authentication|auth|confirmation|activation|one[-\\s]?time|single[-\\s]?use|temporary|2fa|mfa|two[-\\s]?factor|otp|guard|pin';
+
+/**
+ * 验证码关键词：带限定词的码名（verification code、PIN code、验证码……）与专有说法（OTP、passcode）。
+ * 裸 code / pin 太宽（邮编、优惠码、条码、错误码都叫 code），只在 {@link BARE_CODE_REGEX} 的条件下算。
+ */
+const KEYWORD_REGEX = new RegExp(
+  `\\b(?:(?:${CODE_QUALIFIERS})[-\\s]?code|one[-\\s]?time\\s+(?:password|passcode|pin)|pass\\s?code|otp)\\b|验证码|校验码|动态码|动态密码|确认码|验证代码|口令`,
+  'gi',
+);
+
+/** 这些词修饰的 code 不是验证码（邮编、区号、优惠码、条码、错误码、编号……） */
+const NOT_A_CODE =
+  'zip|postal|post|area|country|dial(?:ing)?|promo(?:tional)?|coupon|discount|voucher|gift|referral|invite|invitation|redemption|offer|sale|source|qr|bar|error|status|exit|response|tracking|product|item|style|colou?r|dress|tax|sort|swift|bank|branch|reference|ref|order';
+const WORD_NOT_A_CODE = `(?!(?:${NOT_A_CODE})\\b)[\\w-]+\\s+`;
+
+/**
+ * 裸 code / PIN 的给码说法：code is / code:、enter (this) code、use this code、your … code。
+ * 前面是 {@link NOT_A_CODE} 里的词时不算；整封信还得有验证语境（{@link VERIFY_CONTEXT_REGEX}），
+ * 否则「Use the code: SAVE20」这类营销文案会把优惠码当成验证码。
+ */
+const BARE_CODE_REGEX = new RegExp([
+  `(?<!\\b(?:${NOT_A_CODE})[-\\s]?)\\b(?:code|pin)\\s*(?:is\\b|was\\b|[:：=])`,
+  `\\b(?:enter|type|input|paste)\\s+(?:(?:this|the|your|following|below)\\s+){0,2}(?:${WORD_NOT_A_CODE})?(?:code|pin)\\b`,
+  `\\buse\\s+(?:this|the|your|following)\\s+(?:${WORD_NOT_A_CODE})?(?:code|pin)\\b`,
+  `\\byour\\s+(?:${WORD_NOT_A_CODE}){0,2}(?:code|pin)\\b`,
+].join('|'), 'gi');
+
+/** 验证语境：主题或正文（URL 之外）出现这些词时，裸 code / PIN 的给码说法才算关键词 */
+const VERIFY_CONTEXT_REGEX =
+  /\b(?:verif\w*|sign(?:ing)?[-\s]?(?:in|up)|log(?:ging)?[-\s]?in|authenticat\w*|2fa|mfa|two[-\s]?factor|one[-\s]?time|confirm\w*)\b|验证|登录|登入|确认/i;
 
 /** 明确表示“点击链接/按钮完成验证”的文案，不应把 URL token 当作验证码。 */
 const LINK_ONLY_REGEX =
@@ -36,10 +66,11 @@ export const CODE_SCAN_BODY_CHARS = 16 * 1024;
 /**
  * AI 兜底的前置过滤：去掉 URL 后，主题或正文里得出现验证码相关词才把邮件外发给模型。
  * 比 KEYWORD_REGEX 宽（含 verification、one-time、2FA 及德/西/意/俄/日/韩常见说法），
- * 只决定「值不值得问模型」，不参与定位码。
+ * 只决定「值不值得问模型」，不参与定位码。code 不要求前面是词边界（德语 Bestätigungscode、
+ * 荷兰语 verificatiecode 都是合成词），只排除 barcode、encode、zipcode 这类英文合成词。
  */
 const AI_HINT_REGEX =
-  /\b(?:otp|passcode|pin|2fa|mfa|verification|verify|one[-\s]?time|two[-\s]?factor|authenticat\w*)\b|(?:code|codice|c[oó]digo|kod|kodu|kode)s?\b|验证|校验码|动态码|动态密码|确认码|口令|驗證|認証|確認コード|ワンタイム|인증|코드|код/i;
+  /\b(?:otp|passcode|pin|2fa|mfa|verification|verify|one[-\s]?time|two[-\s]?factor|authenticat\w*)\b|(?<!\b(?:bar|en|de|uni|qr|zip|post|promo|op|short|pseudo|re|trans|geo|hash|byte|sub|micro|source|dress|area))(?:code|codice|c[oó]digo|kod|kodu|kode)s?\b|验证|校验码|动态码|动态密码|确认码|口令|驗證|認証|確認コード|ワンタイム|인증|코드|код/i;
 
 /** 模型只看主题与正文前 6000 字符 */
 const AI_CODE_BODY_CHARS = 6000;
@@ -146,9 +177,59 @@ function shortCodeNextToKeyword(text: string, keywords: KeywordHit[], index: num
   return colonAt - before.end >= 0 && colonAt - before.index <= SHORT_CODE_COLON_WINDOW;
 }
 
+/** 码后面最近的关键词（起点不早于码的结尾）；无则 null */
+function keywordAfter(keywords: KeywordHit[], index: number): KeywordHit | null {
+  let lo = 0;
+  let hi = keywords.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (keywords[mid]!.index < index) lo = mid + 1;
+    else hi = mid;
+  }
+  return keywords[lo] ?? null;
+}
+
+const KEYWORD_AFTER_GAP = /^[\s:：=\-]*(?:is|为|是)?\s*(?:your\s+)?$/i;
+
+/** 码紧贴关键词：「verification code: 2048」或「2048 is your verification code」 */
+function adjacentToKeyword(text: string, keywords: KeywordHit[], index: number, end: number): boolean {
+  const before = keywordBefore(keywords, index);
+  if (before && index - before.end <= 12 && SHORT_CODE_GAP.test(text.slice(before.end, index))) return true;
+  const after = keywordAfter(keywords, end);
+  return !!after && after.index - end <= 16 && KEYWORD_AFTER_GAP.test(text.slice(end, after.index));
+}
+
+/**
+ * 候选前面紧挨着的标注：编号（#、No.、PR、订单、工单）与邮编直接相邻；电话标注与候选之间只隔着
+ * 号码的其他分段。都要求紧挨着，「your email address: 482913」「on your phone: 482913」这类真码不受影响。
+ */
+const NUMBER_LABEL_BEFORE =
+  /(?:#|№|\b(?:no|nr|pr|pull\s+request|issue|order|ticket|invoice|case)\b\.?|订单|工单|单号|编号|发票)\s*(?:#|no\.?|number|id|号码?)?\s*[:：]?\s*$/i;
+const ZIP_LABEL_BEFORE = /(?:\b(?:zip|postal|post)(?:[\s-]?code)?|\bpostcode|邮编|邮政编码)\s*[:：]?\s*$/i;
+const PHONE_BEFORE = /(?:\b(?:phone|tel|fax|mobile|call(?:\s+us)?(?:\s+at)?)\b\.?|电话|手机|传真)[\s:：.+()\d-]*\d[\s.)-]*$/i;
+/** 电话号码的分段：415-555-0123、(415) 555 0123、+1 415 …，以及邮编 +4（94103-1234） */
+const NUMBER_GROUP_BEFORE = /(?:\d[-.]|\(\d{2,4}\)\s?|\+\d{1,3}[\s-])$/;
+const NUMBER_GROUP_AFTER = /^[-.]\d/;
+/** 美国州名缩写 + 5 位邮编（CA 94103），区分大小写 */
+const STATE_BEFORE = /\b[A-Z]{2}\s+$/;
+const YEAR = /^(?:19|20)\d{2}$/;
+
+/**
+ * 候选落在编号、邮编、地址、电话的上下文里，或是 1900–2099 的年份（紧贴关键词的除外）：
+ * 营销截止日期、版权年份、PR/订单号、门店邮编离「code」很近，一度被当成验证码，还挡住了 AI 兜底。
+ */
+function notACode(text: string, keywords: KeywordHit[], value: string, index: number): boolean {
+  const end = index + value.length;
+  const before = text.slice(Math.max(0, index - 48), index);
+  if ([NUMBER_LABEL_BEFORE, ZIP_LABEL_BEFORE, PHONE_BEFORE, NUMBER_GROUP_BEFORE].some((pattern) => pattern.test(before))) return true;
+  if (NUMBER_GROUP_AFTER.test(text.slice(end, end + 2))) return true;
+  if (value.length === 5 && /^\d+$/.test(value) && STATE_BEFORE.test(before)) return true;
+  return YEAR.test(value) && !adjacentToKeyword(text, keywords, index, end);
+}
+
 /**
  * 收集候选：4-8 位纯数字，6-8 位大写字母数字混合（至少含一位数字与一位字母），
- * 以及紧贴关键词的 5 位大写短码。
+ * 以及紧贴关键词的 5 位大写短码；排除编号、邮编、电话与年份（见 {@link notACode}）。
  */
 function collectCandidates(text: string, excluded: Range[], keywords: KeywordHit[]): Candidate[] {
   const out: Candidate[] = [];
@@ -156,13 +237,13 @@ function collectCandidates(text: string, excluded: Range[], keywords: KeywordHit
   const digit = /(?<![\w])(\d{4,8})(?![\w])/g;
   let m: RegExpExecArray | null;
   while ((m = digit.exec(text)) !== null) {
-    if (inUrl(m.index)) continue;
+    if (inUrl(m.index) || notACode(text, keywords, m[1]!, m.index)) continue;
     out.push({ value: m[1]!, index: m.index });
   }
   inUrl = rangeCursor(excluded);
   const alnum = /(?<![\w])([A-Z0-9]{5,8})(?![\w])/g;
   while ((m = alnum.exec(text)) !== null) {
-    if (inUrl(m.index)) continue;
+    if (inUrl(m.index) || notACode(text, keywords, m[1]!, m.index)) continue;
     const v = m[1]!;
     if (v.length === 5) {
       if (isShortCodeShape(v) && shortCodeNextToKeyword(text, keywords, m.index)) out.push({ value: v, index: m.index });
@@ -170,6 +251,26 @@ function collectCandidates(text: string, excluded: Range[], keywords: KeywordHit
       out.push({ value: v, index: m.index });
     }
   }
+  return out;
+}
+
+/**
+ * URL 之外的关键词位置，按起点排序。有验证语境时并入裸 code / PIN 的给码说法；
+ * 被另一处命中整段包住的去掉，保证起点与终点同时递增（{@link keywordBefore} 按终点二分）。
+ */
+function keywordHits(corpus: string, inUrl: (index: number) => boolean): KeywordHit[] {
+  const hits: KeywordHit[] = [];
+  const regexes = VERIFY_CONTEXT_REGEX.test(withoutUrls(corpus)) ? [KEYWORD_REGEX, BARE_CODE_REGEX] : [KEYWORD_REGEX];
+  for (const regex of regexes) {
+    regex.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(corpus)) !== null) {
+      if (!inUrl(match.index)) hits.push({ index: match.index, end: match.index + match[0].length });
+    }
+  }
+  hits.sort((a, b) => a.index - b.index || b.end - a.end);
+  const out: KeywordHit[] = [];
+  for (const hit of hits) if (!out.length || hit.end > out[out.length - 1]!.end) out.push(hit);
   return out;
 }
 
@@ -201,14 +302,7 @@ export function extractCodeByRegex(
   const corpus = corpusOf(subject, body);
   const cutTail = truncatedTail(body, options);
   const excluded = urlRanges(corpus);
-  const inUrl = rangeCursor(excluded);
-  const keywords: KeywordHit[] = [];
-  let km: RegExpExecArray | null;
-  KEYWORD_REGEX.lastIndex = 0;
-  while ((km = KEYWORD_REGEX.exec(corpus)) !== null) {
-    if (inUrl(km.index)) continue;
-    keywords.push({ index: km.index, end: km.index + km[0].length });
-  }
+  const keywords = keywordHits(corpus, rangeCursor(excluded));
   if (keywords.length === 0) return '';
 
   let best: { value: string; distance: number } | null = null;
@@ -242,6 +336,20 @@ export function resolveVerificationCode(
 ): string {
   if (storedCode) return storedCode;
   return extractCodeByRegex(subject, body, options);
+}
+
+/** 纯文本段的可见字符少于这么多时视为占位文案 */
+const PLACEHOLDER_TEXT_CHARS = 40;
+
+/**
+ * 提码看的正文。纯文本段只是占位（很短，或不含任何验证码说法，如「请用支持 HTML 的客户端查看」）
+ * 而 HTML 存在时，码只在 HTML 里，改看 HTML 转出的文本；否则沿用 plain（text 优先的正文视图）。
+ */
+export function codeScanBody(text: string, html: string, plain: string): string {
+  if (!text || !html) return plain;
+  const visible = withoutUrls(stripInvisible(text.slice(0, CODE_SCAN_BODY_CHARS))).replace(/\s+/g, ' ').trim();
+  if (visible.length >= PLACEHOLDER_TEXT_CHARS && keywordHits(visible, () => false).length) return plain;
+  return htmlToText(html);
 }
 
 interface AiCodeInput {

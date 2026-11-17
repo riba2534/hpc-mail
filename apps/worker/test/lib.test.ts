@@ -151,11 +151,11 @@ describe('code-extract 正则', () => {
     expect(resolveVerificationCode(subject, preview, '482913', { bodyTruncated: true })).toBe('482913');
   });
   /**
-   * 只让点链接的邮件里顺带提到 code（「不要把链接或 code 转给别人」），旁边的请求编号会被当成码；
+   * 只让点链接的邮件里顺带提到 PIN code（「不要把链接或 PIN code 转给别人」），旁边的请求编号会被当成码；
    * 读取时不再按摘要清空，收件时就得按全文判定。
    */
   it('link-only 邮件里顺带提到的 code 不把旁边的编号当成验证码', () => {
-    const tail = 'This link expires in 15 minutes. Never share this link or code with anyone.\nRequest ID: 48291734';
+    const tail = 'This link expires in 15 minutes. Never share this link or PIN code with anyone.\nRequest ID: 48291734';
     expect(extractCodeByRegex('Your secure link to Example is here', `Click the link below to securely sign in to Example.\nhttps://app.example.com/magic-link?token=AbCdEfGhIjKlMnOpQrStUvWx\n${tail}`)).toBe('');
     expect(extractCodeByRegex('Account notice', tail)).toBe('48291734');
   });
@@ -270,16 +270,18 @@ describe('code-extract 正则', () => {
      * 一度用摘要里的年份/订单号盖掉收件时按完整正文存下的码。
      */
     it.each([
-      ['年份', 'Signed in on November 17, 2026 from a new device.'],
-      ['订单号', 'Order #20261117 is waiting for you to sign in on a new device.'],
-    ])('摘要里的%s不覆盖第 160 字之后的已存验证码', (_name, lead) => {
+      // 年份与 # 编号不再算候选，摘要单看也提不出
+      ['年份', 'Signed in on November 17, 2026 from a new device.', ''],
+      ['订单号', 'Order #20261117 is waiting for you to sign in on a new device.', ''],
+      ['设备编号', 'Device 55012345 signed in to your account from a new browser.', '55012345'],
+    ])('摘要里的%s不覆盖第 160 字之后的已存验证码', (_name, lead, previewCode) => {
       const subject = 'Your verification code';
       const body = `${lead}\nWe need to confirm it is really you before the checkout can continue, so please enter the code below within ten minutes.\nYour verification code is 482913.`;
       const preview = makePreview(body, '');
       expect(body.indexOf('482913')).toBeGreaterThan(PREVIEW_LIMIT);
       expect(extractCodeByRegex(subject, body)).toBe('482913');
-      // 摘要单独看确实会提出日期或订单里的数字
-      expect(extractCodeByRegex(subject, preview, { bodyTruncated: true })).not.toBe('');
+      // 摘要单独看提出的是开头的编号（或什么都提不出）
+      expect(extractCodeByRegex(subject, preview, { bodyTruncated: true })).toBe(previewCode);
       expect(resolveVerificationCode(subject, preview, '482913', { bodyTruncated: true })).toBe('482913');
     });
 
