@@ -1,5 +1,6 @@
 export * from './constants.js';
 export * from './envelope.js';
+export * from './attachment-types.js';
 export * from './schemas/auth.js';
 export * from './schemas/mailbox.js';
 export * from './schemas/mailbox-policy.js';
