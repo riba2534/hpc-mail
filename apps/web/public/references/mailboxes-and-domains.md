@@ -7,9 +7,9 @@
 - [批量认领](#批量认领)：随机后缀方案、批量可用性、批量认领
 - [释放、历史与共享边界](#释放历史与共享边界)：释放与清除历史、共享的权限范围与管理接口
 - [域名新增、关闭公开和删除](#域名新增关闭公开和删除)：管理员维护系统域名
-- [用户托管域名](#用户托管域名)：把自己的域名接入本站，以及[托管域名的 DNS 解析](#托管域名的-dns-解析)
+- [用户托管域名](#用户托管域名)：把自己的域名接入本站，[用 API Key 接入](#用-api-key-接入)，以及[托管域名的 DNS 解析](#托管域名的-dns-解析)
 
-shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发件身份与批量认领在 JWT `/api` 与 Key `/v1` 均可用；共享管理与用户托管域名只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
+shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发件身份与批量认领在 JWT `/api` 与 Key `/v1` 均可用；共享管理只用 JWT `/api`；用户托管域名的查看、添加、检测与 DNS 解析两者均可用（Key 需 `domain.read`/`domain.write`），删除、成员上限、成员与过户只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
 
 ## 发现域名与邮箱
 
@@ -141,9 +141,9 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 ## 用户托管域名
 
-`GET /api/config` 的 `hostedDomainsEnabled` 为 true 时，任何登录用户都能把自己的域名托管到本站（JWT 专用，Key 无对应接口）。站点在站长的 Cloudflare 账户建 zone，用户在注册商把 NS 改成返回的两条。原 DNS 服务商的记录不会自动迁移，网站、域名验证等常用记录用下文的 [DNS 解析](#托管域名的-dns-解析) 接口补建，最好在改 NS 之前补好。
+`GET /api/config` 的 `hostedDomainsEnabled` 为 true 时，任何登录用户都能把自己的域名托管到本站，用 JWT `/api` 或带 `domain.read`/`domain.write` 的 Key `/v1`（Key 可用的范围见[用 API Key 接入](#用-api-key-接入)）。站点在站长的 Cloudflare 账户建 zone，用户在注册商把 NS 改成返回的两条。原 DNS 服务商的记录不会自动迁移，网站、域名验证等常用记录用下文的 [DNS 解析](#托管域名的-dns-解析) 接口补建，最好在改 NS 之前补好。
 
-| 路径（JWT `/api`） | 说明 |
+| 路径（JWT `/api`；Key `/v1` 的范围见[下节](#用-api-key-接入)） | 说明 |
 |---|---|
 | `GET /hosted-domains` | 自己拥有（`role:"owner"`）与被共享（`role:"member"`）的域名；管理员全站用 `GET /admin/hosted-domains?status=&q=` |
 | `POST /hosted-domains` | `{domain}`，填已注册的根域名 → 201，`status:"pending"`、`nameServers` 两条、`originalNameServers`、`warnings`（如需先关闭 DNSSEC）、`expiresAt`（到期未改 NS 自动删除） |
@@ -163,11 +163,29 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
 - 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；全站 Cloudflare 调用额度见下文 DNS 解析的限流说明：添加时占位计 2 次（额度不足直接 429），开通前的后台预配置再计 5 次；删除计 2 次，只计数不会因额度被拒。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
 
+### 用 API Key 接入
+
+Key `/v1` 开放托管域名的查看、添加、立即检测与 DNS 解析，路径、请求与响应和 JWT `/api` 相同，调用同一套服务：权限、添加额度、每人与全站限流、全站 Cloudflare 调用额度、`pending` 期间的规则、功能开关与凭据检查、DNS 冲突规则都与本节和下节一致。接入流程见[入口指南](../skill.md)的配方⑦。
+
+| 方法与 `/v1` 路径 | Key scope |
+|---|---|
+| `GET /hosted-domains`、`GET /hosted-domains/:id` | `domain.read` |
+| `GET /hosted-domains/:id/dns-records` | `domain.read` |
+| `POST /hosted-domains`、`POST /hosted-domains/:id/check` | `domain.write` |
+| `POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` |
+
+- 缺 scope 返回 403 `forbidden`，`fix` 写明缺哪个；scope 在解析请求体和任何计数之前检查，不占用限流与 Cloudflare 额度。已有的 Key 不会自动获得这两个 scope，由用户在网页 API Key 页面勾选（或用 JWT `PUT /api/api-keys/:id` 修改 `scopes`）。
+- 每人限流按用户计数，网页与该用户的所有 Key 合计：添加每分钟 5 次、检测 10 次、DNS 解析 30 次；全站每分钟 150 次 Cloudflare 调用同样共用。
+- 功能未开启或站点缺少 Cloudflare 凭据时，添加与检测返回 403，可先读公开的 `GET /api/config` 的 `hostedDomainsEnabled`；DNS 解析只要求凭据。
+- 只用 JWT：`DELETE /hosted-domains/:id`（永久删除该域全部邮件）、`PUT /hosted-domains/:id`（`memberLimit`）、成员名单、过户，以及管理员的 `/admin/hosted-domains…`；`/v1` 没有这些路径，返回 404。
+- 管理员的 Key 与管理员 JWT 同权，可以查看和操作任何人的托管域名；但 `GET /v1/hosted-domains` 也只列自己拥有或被共享的，全站列表只在 JWT `GET /api/admin/hosted-domains`。
+- 添加域名与 DNS 记录的增改删写入管理审计，操作人记为「用户名（API Key #id）」，与网页操作区分。
+
 ### 托管域名的 DNS 解析
 
-所有者与管理员直接读写该域名在站长 Cloudflare 账户中的 zone（JWT `/api`，Key 无对应接口）。只做 DNS 解析，A/AAAA/CNAME 一律以 `proxied:false` 写入，不开启 Cloudflare 代理。
+所有者与管理员直接读写该域名在站长 Cloudflare 账户中的 zone（JWT `/api`，或带 `domain.read`/`domain.write` 的 Key `/v1`，路径相同）。只做 DNS 解析，A/AAAA/CNAME 一律以 `proxied:false` 写入，不开启 Cloudflare 代理。
 
-| 路径（JWT `/api`） | 说明 |
+| 路径（`/api` 与 `/v1` 相同） | 说明 |
 |---|---|
 | `GET /hosted-domains/:id/dns-records` | 全部记录（含邮箱与只读记录），按 `name`（`@` 在最前）、`type`、`content` 排序 |
 | `POST /hosted-domains/:id/dns-records` | 新增 → 201，返回该记录 |
@@ -189,7 +207,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - A/AAAA/CNAME/TXT 用 `content`；MX 用 `content` 与 `priority`；SRV 用 `srv:{priority,weight,port,target}`，`name` 写成 `_服务._协议[.子域]`；CAA 用 `caa:{flags,tag,value}`，`flags` 为 0 或 128，`tag` 为 `issue|issuewild|iodef`。
 
 ```bash
-# API="$BASE/api"，AUTH 为所有者或管理员 JWT；HPC_HOSTED_ID 来自 GET /hosted-domains
+# JWT：API="$BASE/api"；Key（domain.read/domain.write）：API="$BASE/v1"。AUTH 属于所有者或管理员；HPC_HOSTED_ID 来自 GET /hosted-domains
 hpc "/hosted-domains/$HPC_HOSTED_ID/dns-records" | jq '.data[] | {id,type,name,content,kind}'
 for HPC_DNS_RECORD in \
   '{"type":"A","name":"www","ttl":1,"content":"203.0.113.10"}' \
