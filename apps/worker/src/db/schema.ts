@@ -2,7 +2,7 @@ import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import {
   DNSSEC_STATES, SYSTEM_DOMAIN_ONBOARDING_MODES, SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_STEP_STATES, SYSTEM_DOMAIN_ZONE_ORIGINS,
-  type MessageRecipients, type RecipientOutcome, type SystemDomainAck, type SystemDomainChangeKind, type SystemDomainCheck,
+  type MessageAuth, type MessageRecipients, type RecipientOutcome, type SystemDomainAck, type SystemDomainChangeKind, type SystemDomainCheck,
   type SystemDomainOnboardingState, type SystemDomainVerdict, type SystemDomainWriteStep, type UserMailboxPolicy, type UserNotifyPrefs,
 } from '@hpc-mail/shared';
 
@@ -97,6 +97,8 @@ export const messages = sqliteTable(
     verificationCode: text('verification_code').notNull().default(''),
     /** 收件时识别出的验证/登录链接（仅 http/https，≤2048）；识别不到或历史邮件为空串 */
     verificationLink: text('verification_link').notNull().default(''),
+    /** 收件时采信的发件认证结果（lib/auth-results.ts）；null=没有可信结果（历史邮件、站内互投、发件） */
+    auth: text('auth', { mode: 'json' }).$type<MessageAuth>(),
     messageId: text('message_id'),
     inReplyTo: text('in_reply_to'),
     references: text('references').notNull().default(''),
