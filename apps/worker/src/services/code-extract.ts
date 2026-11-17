@@ -207,9 +207,11 @@ export function extractCodeByRegex(
 }
 
 /**
- * 读取时校验已存验证码：明确的 link-only 邮件清掉旧版误识别值；其余情况已存值优先——
- * 它是收件时按完整正文（或 AI 兜底）得出的，读取时手里只有摘要，摘要里的年份、订单号
- * 离关键词更近，重提会盖掉第 160 字之后的真码。只有已存值为空的历史行才用摘要重提。
+ * 读取时的验证码：已存值原样返回——它是收件时按完整正文（或 AI 兜底）得出的，link-only
+ * 判定也在那时按全文做过（正则只认 URL 之外关键词旁的候选，AI 兜底前有 wantsAiCode 过滤）。
+ * 读取时手里只有主题和 160 字摘要：摘要里的年份、订单号离关键词更近，「Click the button
+ * below」一类开头也会让摘要像 link-only，按摘要重提或清空都会弄丢第 160 字之后的真码。
+ * 只有已存值为空的历史行才用摘要重提。
  *
  * body 是摘要这类截断文本时要带上 `bodyTruncated`，否则被切短的码会被当成完整码
  * （6 位码在摘要边界上只剩 5 位）。
@@ -220,8 +222,6 @@ export function resolveVerificationCode(
   storedCode: string,
   options: CodeExtractOptions = {},
 ): string {
-  const corpus = corpusOf(subject, body);
-  if (LINK_ONLY_REGEX.test(corpus) && !EXPLICIT_CODE_REGEX.test(withoutUrls(corpus))) return '';
   if (storedCode) return storedCode;
   return extractCodeByRegex(subject, body, options);
 }

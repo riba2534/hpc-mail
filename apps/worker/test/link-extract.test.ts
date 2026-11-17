@@ -85,7 +85,7 @@ https://www.example.cn/user/activate?code=8f14e45fceea167a5a36dedd4bea2543。链
 });
 
 /**
- * 仿造的 Claude 安全登录邮件（结构仿照真实模板，内容全部虚构）：主题不含 verify/sign in，
+ * 仿造的 Claude 安全登录邮件（结构仿照真实模板，内容全部虚构）：主题只说 secure link、不含 verify/sign in，
  * 引导句在 to 与登录动词之间多一个词或用 -ing 形式，按钮包在 SES 点击追踪长链接里。
  */
 describe('验证链接提取：Claude 安全登录链接', () => {
@@ -102,6 +102,7 @@ describe('验证链接提取：Claude 安全登录链接', () => {
       <a href="${privacy}">Privacy Policy</a>
     </td></tr></table>`;
   const subject = 'Your secure link to Claude.ai is here | 2026-11-17';
+  const from = 'no-reply-q1@mail.anthropic.com';
 
   it.each([
     ['to 后插入一个词', 'Click the link below to securely sign in to Claude.ai.'],
@@ -109,26 +110,40 @@ describe('验证链接提取：Claude 安全登录链接', () => {
   ])('引导句%s：取按钮的追踪链接，页脚隐私链接不入选', (_name, lead) => {
     const html = template(lead);
     const text = `Your secure link to Claude.ai\n\n${lead}\n\n${magic}\n\nIf you didn't request this email, you can safely ignore it.`;
-    expect(extractVerificationLink({ subject, html, fromAddress: 'no-reply-q1@mail.anthropic.com' })).toBe(magic);
-    expect(extractVerificationLink({ subject: 'Claude.ai | 2026-11-17', text, html, fromAddress: 'no-reply-q1@mail.anthropic.com' })).toBe(magic);
+    expect(extractVerificationLink({ subject, html, fromAddress: from })).toBe(magic);
+    expect(extractVerificationLink({ subject, text, html, fromAddress: from })).toBe(magic);
   });
 
-  it('正文没有引导句时，主题里的 secure link 也算意图', () => {
-    const html = template('Here it is.');
-    expect(extractVerificationLink({ subject, html, fromAddress: 'no-reply-q1@mail.anthropic.com' })).toBe(magic);
+  it('弱意图要主题与正文同时具备：只有主题的 secure link、或主题与账号登录无关时都不放行', () => {
+    expect(extractVerificationLink({ subject, html: template('Here it is.'), fromAddress: from })).toBe('');
+    expect(extractVerificationLink({ subject: 'Claude.ai | 2026-11-17', html: template('Click the link below to securely sign in to Claude.ai.'), fromAddress: from })).toBe('');
+  });
+
+  /** 正文有弱意图句式、按钮与路径也像登录，但主题与账号登录无关：主干不认，这里同样不认 */
+  it.each([
+    ['周报', 'Your weekly report is ready',
+      '<p>Your team report for Nov 10–16 is ready. Use the button below to quickly log in and review the numbers.</p><a href="https://app.metrics.example/login?next=/reports">Log in to dashboard</a>'],
+    ['会议邀请', "You're invited: Product roadmap webinar, Nov 20",
+      '<p>Seats are limited. Click the button below to quickly confirm your seat.</p><a href="https://events.example.com/webinars/42/confirm?attendee=a1b2c3d4e5f6">Confirm</a>'],
+    ['促销', 'Last chance: 30% off ends tonight',
+      '<p>Tap the button to continue signing in and claim your discount before midnight.</p><a href="https://shop.example.com/signin?promo=FALL30">Sign in to claim</a>'],
+    ['账单', 'Your November invoice from Acme',
+      '<p>Your invoice is ready. You can view it any time through this secure link.</p><a href="https://billing.example.com/login?invoice=INV-2026-11">Sign in to view invoice</a>'],
+  ])('%s邮件不当作验证链接', (_name, mailSubject, html) => {
+    expect(extractVerificationLink({ subject: mailSubject, html: `${html}${footer}` })).toBe('');
   });
 
   it('只凭弱意图时，按钮文字不含动作词的链接不入选（即使路径带 token 且与发件域相同）', () => {
-    const html = `<p>Tap the button below to quickly sign in and claim 20% off your next order.</p>
-      <a href="https://shop.example.com/login?next=%2Fsale&amp;ref=AbCdEfGhIjKlMnOpQrStUvWx">Claim 20% off</a>${footer}`;
-    expect(extractVerificationLink({ subject: 'Members save more this week', html, fromAddress: 'deals@shop.example.com' })).toBe('');
+    const html = `<p>Use the button below to continue signing in to Example.</p>
+      <a href="https://app.example.com/login?next=%2Fhome&amp;ref=AbCdEfGhIjKlMnOpQrStUvWx">Open Example</a>${footer}`;
+    expect(extractVerificationLink({ subject: 'Your secure link to Example is here', html, fromAddress: 'no-reply@app.example.com' })).toBe('');
   });
 
   it('只凭弱意图时，按钮是「登录」但路径没有验证特征的链接不入选', () => {
-    const html = `<a href="https://files.example.com/account">Log in</a>
-      <p>Share files with a secure link. Start your free trial of Pro today.</p>
-      <a href="https://files.example.com/pricing?plan=pro">Start free trial</a>${footer}`;
-    expect(extractVerificationLink({ subject: 'Share files with a secure link — try Pro free', html, fromAddress: 'news@files.example.com' })).toBe('');
+    const html = `<a href="https://app.example.com/account">Log in</a>
+      <p>Use the button below to continue signing in to Example.</p>
+      <a href="https://app.example.com/pricing?plan=pro">Start free trial</a>${footer}`;
+    expect(extractVerificationLink({ subject: 'Your secure link to Example is here', html, fromAddress: 'news@app.example.com' })).toBe('');
   });
 });
 

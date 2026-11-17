@@ -133,7 +133,22 @@ describe('code-extract 正则', () => {
       'Persona Identities, Inc. 981 Mission Street, San Francisco, CA 94103',
     ].join('\n');
     expect(extractCodeByRegex('Anthropic one-time link', body)).toBe('');
-    expect(resolveVerificationCode('Anthropic one-time link', body, 'VGHH62D')).toBe('');
+    // 收件时存的是空值；读取时按摘要重提同样不认 URL 里的 token
+    expect(resolveVerificationCode('Anthropic one-time link', makePreview(body, ''), '')).toBe('');
+  });
+
+  /**
+   * 主题像登录、开头是「Click the button below」、真码在第 160 字之后：摘要单看像 link-only，
+   * 一度在读取时把收件时按全文存下的码清空，列表、wait、线程和详情都看不到。
+   */
+  it('已存验证码读取时原样返回，不按摘要的 link-only 文案清空', () => {
+    const subject = 'Confirm your sign-in';
+    const body = 'Click the button below to finish signing in to your account. If the button does not work on this device, '
+      + 'you can also complete the sign-in from the app on your phone or computer.\nOr enter this code: 482913';
+    const preview = makePreview(body, '');
+    expect(body.indexOf('482913')).toBeGreaterThan(PREVIEW_LIMIT);
+    expect(extractCodeByRegex(subject, body)).toBe('482913');
+    expect(resolveVerificationCode(subject, preview, '482913', { bodyTruncated: true })).toBe('482913');
   });
   it('URL 内的 code 关键词不能激活附近邮编或年份', () => {
     const body = 'Click the link below: https://example.test/verify?code=A1B2C3\nAddress 94103, year 2026.';

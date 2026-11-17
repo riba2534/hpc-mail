@@ -710,9 +710,15 @@ async function assertVisible(db: Db, viewer: Viewer, row: VisibilityRow): Promis
 /**
  * 发信引用的来源邮件（转发附件、回复线程头）：与详情同一可见口径——发件人自己的 mine 范围
  * （认领 + 共享来的未删除收件），管理员另含未认领地址；不按角色整体放行，管理员也拿不到
- * 其他用户的私有邮件。不可见与不存在同为 404，不暴露 id 是否存在。
+ * 其他用户的私有邮件。不可见与不存在同为 404 source_unavailable，不暴露 id 是否存在；
+ * 与发件邮箱不存在等 not_found 区分开，调用方据此去掉引用后可作为新邮件发送。
  */
-export async function loadSourceMessage(env: Env, sender: { userId: number; role: Role }, id: number) {
+export async function loadSourceMessage(
+  env: Env,
+  sender: { userId: number; role: Role },
+  id: number,
+  unavailableMessage: string,
+) {
   const db = createDb(env);
   const row = await db
     .select({
@@ -726,8 +732,13 @@ export async function loadSourceMessage(env: Env, sender: { userId: number; role
     .from(messages)
     .where(eq(messages.id, id))
     .get();
-  if (!row) throw new AppError('not_found', '邮件不存在');
-  await assertVisible(db, { userId: sender.userId, role: sender.role }, row);
+  if (!row) throw new AppError('source_unavailable', unavailableMessage);
+  try {
+    await assertVisible(db, { userId: sender.userId, role: sender.role }, row);
+  } catch (error) {
+    if (error instanceof AppError && error.code === 'not_found') throw new AppError('source_unavailable', unavailableMessage);
+    throw error;
+  }
   return row;
 }
 
@@ -780,10 +791,15 @@ export async function getMessageContent(
   return { subject: row.subject, ...(await fullBody(env, row)) };
 }
 
+/**
+ * 邮件详情。attachmentTtlSeconds 不传时附件与 CID 内联图的签名按整点对齐（站内页面，1–2 小时）；
+ * /v1 传短 TTL，签名 URL 不能比 Key 本身的有效期拖得更久。
+ */
 export async function getMessageDetail(
   env: Env,
   viewer: Viewer,
   id: number,
+  attachmentTtlSeconds?: number,
 ): Promise<MessageDetail> {
   const db = createDb(env);
   const row = await loadVisible(env, viewer, id);
@@ -800,7 +816,7 @@ export async function getMessageDetail(
 
   const attachmentMetas = await Promise.all(
     attRows.map(async (a) => {
-      const { exp, sig } = await signAttachment(env.jwt_secret, a.id);
+      const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
       return {
         id: a.id,
         filename: a.filename,
