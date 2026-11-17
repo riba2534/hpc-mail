@@ -34,7 +34,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
 import { useIsMobile } from '@/lib/use-media-query';
-import { LoadMoreFooter } from '../load-more-footer';
+import { LoadMoreFooter } from '@/components/load-more-footer';
 import { adminMailboxesQueryOptions } from './admin-mailboxes';
 import { TransferMailboxDialog } from './transfer-mailbox-dialog';
 import { AddressShareDialog } from './address-share-dialog';

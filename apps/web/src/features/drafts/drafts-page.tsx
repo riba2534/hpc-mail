@@ -4,6 +4,7 @@ import { Clock, FilePen, MoreHorizontal, PenLine, Send, Trash2 } from 'lucide-re
 import { useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { PageHeader } from '@/components/page-header';
+import { LoadMoreFooter } from '@/components/load-more-footer';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -237,13 +238,7 @@ export function DraftsPage() {
               );
             })}
           </CardList>
-          {hasNextPage && (
-            <div className="mt-3 text-center">
-              <Button variant="secondary" size="sm" loading={isFetchingNextPage} onClick={() => fetchNextPage()}>
-                加载更多
-              </Button>
-            </div>
-          )}
+          <LoadMoreFooter auto={false} hasNextPage={hasNextPage} isFetchingNextPage={isFetchingNextPage} onLoadMore={() => void fetchNextPage()} />
         </>
       )}
 

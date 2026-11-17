@@ -31,7 +31,7 @@ import {
 } from '@/features/hosted-domains/hosted-domain-meta';
 import { adminHostedDomainApi } from '@/features/hosted-domains/hosted-domains-api';
 import { storeHostedDomain } from '@/features/hosted-domains/use-hosted-domains';
-import { LoadMoreFooter } from '../load-more-footer';
+import { LoadMoreFooter } from '@/components/load-more-footer';
 import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 const ALL_STATUSES = 'all';
