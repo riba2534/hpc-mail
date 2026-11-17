@@ -9,7 +9,7 @@ rules:
   oas3-valid-media-example: error
   oas3-valid-schema-example: error
   hpc-operation-id-verb-noun:
-    description: operationId 写成「动词+名词」的 camelCase，例如 listMessages、getMessage、claimMailbox
+    description: "operationId 写成「动词+名词」的 camelCase，例如 listMessages、getMessage、claimMailbox"
     message: "operationId {{value}} 不是「动词+名词」：以 OPERATION_VERBS 中的动词开头，后接大写字母开头的名词"
     severity: error
     given: "$.paths[*][get,put,post,delete,patch,options,head]"
@@ -19,7 +19,7 @@ rules:
       functionOptions:
         match: "^(?:list|get|create|update|delete|replace|send|claim|release|transfer|check|search|sync|count|wait|mark|star|restore|purge|share|unshare|revoke|remove|upload|download|complete|register|start|enable|disable|change|retry|test|translate|suspend|resume)[A-Z][A-Za-z0-9]*$"
   hpc-operation-security:
-    description: 每个 operation 显式声明 security（公开接口为 []）
+    description: "每个 operation 显式声明 security（公开接口为 []）"
     message: "{{path}} 没有声明 security"
     severity: error
     given: "$.paths[*][get,put,post,delete,patch,options,head]"
@@ -27,7 +27,7 @@ rules:
       field: security
       function: defined
   hpc-success-example:
-    description: 每个成功响应的每种媒体类型都带示例（example 或 examples）
+    description: "每个成功响应的每种媒体类型都带示例（example 或 examples）"
     message: "{{path}} 缺少成功示例"
     severity: error
     given: "$.paths[*][get,put,post,delete,patch,options,head].responses[?(@property.match(/^2/))].content[*]"
@@ -36,7 +36,7 @@ rules:
       functionOptions:
         properties: [example, examples]
   hpc-error-example:
-    description: 每个 operation 至少有一个带示例的 4xx/5xx 响应（错误信封 { error: { code, message }, requestId }）
+    description: "每个 operation 至少有一个带示例的 4xx/5xx 响应（错误信封 { error: { code, message }, requestId }）"
     message: "{{path}} 没有失败示例"
     severity: error
     given: "$.paths[*][get,put,post,delete,patch,options,head].responses"
