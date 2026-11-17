@@ -292,3 +292,52 @@ export function updateDnsRecord(
 export async function deleteDnsRecord(creds: CloudflareCredentials, zoneId: string, recordId: string): Promise<void> {
   await cf(creds, 'DELETE', `/zones/${zoneId}/dns_records/${recordId}`);
 }
+
+// ---------------------------------------------------------------------------
+// Queues 事件订阅（外发投递回执）。接口与 wrangler queues subscription create 相同，
+// 需要 Token 有 Account → Queues:Edit（或 Workers Scripts:Edit）。
+
+export interface CfEmailSendingSource {
+  type: 'email.sending';
+  zone_id: string;
+  domain: string;
+}
+
+export interface CfEventSubscription {
+  id: string;
+  name: string;
+  enabled: boolean;
+  source: { type: string; zone_id?: string; domain?: string };
+  destination: { type: 'queues.queue'; queue_id: string };
+  events: string[];
+}
+
+/** 按名称取账户里的 Queue；不存在返回 null */
+export async function findQueue(creds: CloudflareCredentials, name: string): Promise<{ queue_id: string; queue_name: string } | null> {
+  const query = new URLSearchParams({ name });
+  const queues = await cf<{ queue_id: string; queue_name: string }[]>(creds, 'GET', `/accounts/${creds.accountId}/queues?${query}`);
+  return queues.find((queue) => queue.queue_name === name) ?? null;
+}
+
+const SUBSCRIPTION_MAX_PAGES = 20;
+
+/** 投递到某个 Queue 的全部事件订阅 */
+export async function listQueueSubscriptions(creds: CloudflareCredentials, queueId: string): Promise<CfEventSubscription[]> {
+  const items: CfEventSubscription[] = [];
+  for (let page = 1; page <= SUBSCRIPTION_MAX_PAGES; page++) {
+    const query = new URLSearchParams({ queue_id: queueId, page: String(page), per_page: '50' });
+    const res = await cfFetch<CfEventSubscription[]>(creds, 'GET', `/accounts/${creds.accountId}/event_subscriptions/subscriptions?${query}`);
+    items.push(...(res.result ?? []));
+    if (!res.result?.length || page >= (res.result_info?.total_pages ?? 1)) break;
+  }
+  return items;
+}
+
+export function createEventSubscription(creds: CloudflareCredentials, body: {
+  name: string; source: CfEmailSendingSource; queueId: string; events: readonly string[];
+}): Promise<CfEventSubscription> {
+  return cf<CfEventSubscription>(creds, 'POST', `/accounts/${creds.accountId}/event_subscriptions/subscriptions`, {
+    name: body.name, enabled: true, source: body.source,
+    destination: { type: 'queues.queue', queue_id: body.queueId }, events: body.events,
+  });
+}

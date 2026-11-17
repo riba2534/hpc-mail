@@ -120,7 +120,9 @@ export function buildForward(message: MessageDetail): ComposeInitial {
  */
 export function buildResend(message: MessageDetail, failedOnly = false): ComposeInitial {
   const outcomes = message.recipientOutcomes ?? [];
-  const failures = new Set(outcomes.filter((outcome) => outcome.status === 'failed').map((outcome) => outcome.address.toLowerCase()));
+  // 投递回执的退信与发送时被拒一样算失败（对方已恢复时可直接重试；仍在抑制名单里会得到明确错误）
+  const failures = new Set(outcomes.filter((outcome) => outcome.status === 'failed' || outcome.status === 'bounced')
+    .map((outcome) => outcome.address.toLowerCase()));
   const unconfirmed = failedOnly ? outcomes.filter((outcome) => outcome.status === 'unknown').map((outcome) => outcome.address) : [];
   const recipients = (addresses: string[]) => failedOnly ? addresses.filter((address) => failures.has(address.toLowerCase())) : addresses;
   const to = recipients(message.recipients.to);

@@ -11,6 +11,7 @@ import type { Env } from '../types.js';
 import { dayWindow, releaseCounters, reserveCounters, type CounterLimit } from './rate-counter.js';
 import { retainExternalAttachments } from './external-attachment.js';
 import { injectAttachmentLinks } from './attachment-links.js';
+import { saveDeliveryRefs } from './delivery-refs.js';
 import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT, recordDeliveryResult, type ForwardMode } from './notification-jobs.js';
 import type { NotifyOwner } from './notify-prefs.js';
 import { getSettings } from './setting.js';
@@ -56,9 +57,9 @@ export async function relayMarker(env: Env): Promise<string> {
 /**
  * 中转转发：原生 forward() 仅对 Email Routing 已验证 destination 生效，目标未验证时
  * 降级为 send_email binding 以 no-reply@收件域名 重新打包发送——保留原始标题/正文/附件，
- * Reply-To 指回原发件人，正文顶部加转发元信息块。
+ * Reply-To 指回原发件人，正文顶部加转发元信息块。返回 send() 给出的 Cloudflare 消息 ID（投递回执据此关联）。
  */
-async function relayForward(env: Env, target: string, mail: ForwardMail): Promise<void> {
+async function relayForward(env: Env, target: string, mail: ForwardMail): Promise<string | null> {
   // 动态 import：`cloudflare:email`/`mimetext` 静态加载会让 vitest 的 workerd 崩（同 outbound.ts）
   const [{ EmailMessage }, { createMimeMessage }] = await Promise.all([
     import('cloudflare:email'),
@@ -141,7 +142,7 @@ async function relayForward(env: Env, target: string, mail: ForwardMail): Promis
   // mimetext 的 Reply-To Setter 只允许单个 Mailbox；最终原文添加完整地址列表。
   const raw = msg.asRaw();
   const replyHeader = replies.length ? `Reply-To: ${replies.map(normalizeEmail).join(', ')}\r\n` : '';
-  await env.email.send(new EmailMessage(sender, target, foldMimeHeaders(replyHeader + raw)));
+  return (await env.email.send(new EmailMessage(sender, target, foldMimeHeaders(replyHeader + raw))))?.messageId || null;
 }
 
 /** 中转转发的日计数：全站一格（subject `instance`），未认领地址的来信另共用一格（subject `unclaimed`），按天窗口 */
@@ -241,6 +242,7 @@ export async function forwardReceivedMail(
     let status: 'succeeded' | 'failed' | 'skipped' = 'succeeded';
     let detail = '';
     let forwardMode: ForwardMode = '';
+    let providerMessageId: string | null = null;
     try {
       const limits: CounterLimit[] = [
         { scope: 'fwd-domain', subject: mail.domain, window, limit: FORWARD_DOMAIN_DAILY_LIMIT },
@@ -265,7 +267,7 @@ export async function forwardReceivedMail(
           } else {
             forwardMode = 'relay';
             try {
-              await relayForward(env, target, mail);
+              providerMessageId = await relayForward(env, target, mail);
             } catch (error) {
               await releaseQuota(env, relay.taken);
               throw error;
@@ -282,6 +284,11 @@ export async function forwardReceivedMail(
       try { await recordDeliveryResult(env, { userId, messageId: mail.messageId,
         channel: 'forward', target, status, error: detail, forwardMode }); }
       catch (error) { console.error('转发结果记录失败:', error); }
+    }
+    // 中转在 Cloudflare 侧的最终结果（退信等）经投递回执回写到上面的转发记录；原生 forward() 没有回执
+    if (forwardMode === 'relay' && status === 'succeeded') {
+      await saveDeliveryRefs(env, { kind: 'forward', messageId: mail.messageId, sender: `no-reply@${mail.domain}`,
+        rfcMessageId: null, ownerIds: userIds, targets: [{ recipient: target, providerMessageId }] });
     }
   }
 }

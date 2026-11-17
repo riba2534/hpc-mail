@@ -122,6 +122,10 @@ name = "rl_api_key_1"
 namespace_id = "72001"
 simple = { limit = 1, period = 60 }
 
+# 外发投递回执（可选，默认不启用）：设置 GitHub Variable DELIVERY_EVENTS_QUEUE（队列名）后，
+# CI 在部署前确保 Queue 存在，并向本文件注入 [vars] delivery_events_queue 与对应的 [[queues.consumers]]
+# （scripts/ensure-delivery-queue.mjs）。这里不写 consumer：wrangler deploy 遇到不存在的队列会直接失败
+
 [assets]
 binding = "assets"
 directory = "./dist"

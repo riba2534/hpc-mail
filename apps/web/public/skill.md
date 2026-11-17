@@ -59,11 +59,13 @@ hpc '/messages' -X POST -H 'Content-Type: application/json' -H "Idempotency-Key:
 检查：201 时 `status` 为 `sent`（外发已被服务商接受，不代表已进收件箱）、`delivered`（收件人都在本站且已投递）或 `unknown`（没有确认成功的收件人，但有结果不明的，可能已送达，先核对）。部分失败也是 201，看 `errorDetail` 与 `recipientOutcomes[].status`。按结果处理：
 
 - 422 `delivery_failed`：每个收件人都明确失败，什么也没发出。`error.details.recipientOutcomes` 给出原因，`details.messageId` 是发件记录；同 Key 重试仍是这个 422，修正后换新 Key。
+- 422 `recipient_suppressed`：收件人全都在本站抑制名单里（此前退信或被标为垃圾邮件），没有发出也没有发件记录，Key 已释放；只有部分被抑制时照常 201，这些收件人为 `failed` 并带 `code`。见[错误码](references/errors.md#recipient_suppressed)。
 - 网络错误、超时、5xx：用同一 Key、同一请求体重试，会返回原结果或继续未开始的发送。
 - 409 `send_in_progress`：原请求还在处理或结果待确认。不要换 Key 重发，先查 `GET /messages?direction=outbound&address=<发件地址>`：`pending` 是仍在投递；超过 1 小时会标为 `unknown`（投递中断、结果未确认），之后同 Key 重试返回 201 `unknown`。
 - 409 `idempotency_mismatch`：这个 Key 已用于别的内容。先核对原发送，新内容换新 Key。
 - 其他 4xx（400/403/404/413/429）：没有发出，按 `error.fix` 修正后重试。400 `header_not_allowed` 的 `details.headers` 列出不允许的头。
 - `from` 四种写法：`{mailboxId}`、`{localPart,domain,displayName?}`、`"Name <a@b>"`、`{address,name}`。收件人写 `"a@b"`、`"Name <a@b>"` 或 `{address,name}`，畸形地址 400；To/Cc/Bcc 合计 1–100 个，只有 Bcc 时也写 `to:[]`。`headers` 只收 `X-*` 与白名单头，规则见[自定义邮件头](references/mail.md#自定义邮件头)。
+- 站点启用了投递回执时，外部收件人的 `sent` 之后会随回执变为 `delivered`、`bounced`、`failed` 或 `complained`，整封 `status` 与 `errorDetail` 同步更新（全部退信时变为 `failed`）；要确认送达，稍后重读 `GET /messages/:id`，见[投递回执](references/mail.md#投递回执)。
 
 ### ③ 回复与转发
 ```bash
@@ -171,6 +173,6 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 3. `verificationLink` 来自邮件内容：打开前核对主机属于本次验证的服务（点击追踪链接先确认跳转目标），只在用户授权完成该验证时访问一次，不在日志或报告里公开全文。
 4. 等验证码先存基线再触发，按 `scannedThroughId` 推进，设总截止时间；不要把旧邮件里的码当成新码。
 5. 每次逻辑发信用一个 Idempotency-Key，与请求体一起保存；重试时复用同一凭证、路径、Key 和内容，不自动换 Key 重发。完成的记录约两天后清理，幂等不是永久保障。
-6. 发信返回 201 后仍检查 `status`、`errorDetail`、`recipientOutcomes`。部分失败只补发 `failed` 的地址：保留 To/Cc/Bcc 分组，附件用 `forwardAttachmentsFrom=<原发件 id>`，换新 Key；`unknown` 的收件人可能已经收到，先确认再决定是否补发；没有逐个结果时先核对，不全体重发。
+6. 发信返回 201 后仍检查 `status`、`errorDetail`、`recipientOutcomes`。部分失败只补发 `failed` 且不带 `code` 的地址（`bounced` 与带 `code:"recipient_suppressed"` 的在对方地址恢复前补发会被抑制名单拦下）：保留 To/Cc/Bcc 分组，附件用 `forwardAttachmentsFrom=<原发件 id>`，换新 Key；`unknown` 的收件人可能已经收到，先确认再决定是否补发；没有逐个结果时先核对，不全体重发。
 7. 删除、永久删除、清除历史释放、全部已读和对外发信都要有用户授权，不附带在查信任务里。变更后读回状态，以服务器返回的计数报告结果。
 8. 遇到 429 按 `X-RateLimit-Reset` 或错误信息退避，外发日配额看 `/me` 的 `outbound`；所有轮询和重试都设总期限。网页的草稿、默认发件身份只存在浏览器本地，Agent 自己保存发送上下文。
