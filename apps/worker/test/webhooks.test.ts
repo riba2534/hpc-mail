@@ -211,6 +211,25 @@ describe('Webhook v2 事件投递', () => {
     expect(after).toMatchObject({ status: 'active', consecutiveFailures: 0 });
   });
 
+  it('所属用户停用后不再生成新投递，待重试的投递也不再外发（A3）', async () => {
+    const user = await account('disabled');
+    const endpoint = await data<CreatedWebhookEndpoint>(await create(user.jwt, { includeBody: true }), 201);
+    const hits = receiver(() => 503);
+    await receive(user.box.address, 'before disable');
+    expect(hits).toHaveLength(1);
+    const pending = (await data<Page<WebhookDelivery>>(await request(`/api/webhooks/${endpoint.id}/deliveries`, { headers: auth(user.jwt) }))).items[0]!;
+    expect(pending.status).toBe('pending');
+    await env.db.prepare("UPDATE users SET status = 'disabled' WHERE id = ?").bind(user.id).run();
+    await receive(user.box.address, 'after disable');
+    const count = await env.db.prepare('SELECT COUNT(*) AS n FROM webhook_deliveries WHERE endpoint_id = ?').bind(endpoint.id).first<{ n: number }>();
+    expect(count!.n).toBe(1);
+    await env.db.prepare('UPDATE webhook_deliveries SET next_attempt_at = 0 WHERE id = ?').bind(pending.id).run();
+    await processWebhookDeliveries(env, { ids: [pending.id] });
+    expect(hits).toHaveLength(1);
+    const row = await env.db.prepare('SELECT status, last_error FROM webhook_deliveries WHERE id = ?').bind(pending.id).first<{ status: string; last_error: string }>();
+    expect(row).toMatchObject({ status: 'failed', last_error: expect.stringContaining('停用') });
+  });
+
   it('发信成功与失败分别发 mail.sent / mail.failed，同一封只发一次', async () => {
     const user = await account('sent');
     await data(await create(user.jwt, { events: ['mail.sent', 'mail.failed'] }), 201);

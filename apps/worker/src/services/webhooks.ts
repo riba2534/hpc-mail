@@ -49,6 +49,7 @@ const RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 3_600_000, 5 * 3_6
 const PROCESSING_LEASE_MS = 2 * 60_000;
 const SOURCE_GONE = '源邮件已永久删除，不再投递';
 const ENDPOINT_GONE = '端点已停用或删除，不再投递';
+const OWNER_DISABLED = '端点所属用户已停用，不再投递';
 const USER_AGENT = 'HPC-Mail-Webhooks/1.0';
 
 interface EndpointRow {
@@ -260,8 +261,12 @@ export async function testWebhookEndpoint(env: Env, userId: number, id: number):
 
 // ———————————————————————— 事件入队 ————————————————————————
 
-/** 端点是否订阅该事件、过滤是否命中：addresses 与 domains 都为空不过滤，否则命中其一即可 */
+/**
+ * 端点是否订阅该事件、过滤是否命中：addresses 与 domains 都为空不过滤，否则命中其一即可。
+ * 所属用户停用后不再产生新投递（与其他通知渠道一致）
+ */
 const MATCH_SQL = `status = 'active' AND EXISTS (SELECT 1 FROM json_each(events) WHERE value = ?)
+  AND EXISTS (SELECT 1 FROM users AS hook_owner WHERE hook_owner.id = webhook_endpoints.user_id AND hook_owner.status = 'active')
   AND ((json_array_length(addresses) = 0 AND json_array_length(domains) = 0)
     OR EXISTS (SELECT 1 FROM json_each(addresses) WHERE value = ?)
     OR EXISTS (SELECT 1 FROM json_each(domains) WHERE value = ?))`;
@@ -473,11 +478,12 @@ async function deliverOne(env: Env, id: number): Promise<'succeeded' | 'failed' 
     env.db.prepare(`UPDATE webhook_deliveries SET status = 'processing', attempts = attempts + 1,
         last_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND next_attempt_at <= ? RETURNING *`)
       .bind(startedAt, startedAt, id, startedAt),
-    env.db.prepare('SELECT * FROM webhook_endpoints WHERE id = (SELECT endpoint_id FROM webhook_deliveries WHERE id = ?)').bind(id),
+    env.db.prepare(`SELECT e.*, u.status AS owner_status FROM webhook_endpoints e LEFT JOIN users u ON u.id = e.user_id
+      WHERE e.id = (SELECT endpoint_id FROM webhook_deliveries WHERE id = ?)`).bind(id),
   ]);
   const claimed = claimResult?.results?.[0] as DeliveryRow | undefined;
   if (!claimed) return null;
-  const endpoint = endpointResult?.results?.[0] as EndpointRow | undefined;
+  const endpoint = endpointResult?.results?.[0] as (EndpointRow & { owner_status: string | null }) | undefined;
   const finish = (status: WebhookDeliveryStatus, fields: { error?: string; httpStatus?: number | null; next?: number; payload?: string }) =>
     env.db.prepare(`UPDATE webhook_deliveries SET status = ?, last_error = ?, last_http_status = ?, next_attempt_at = ?, payload = ?, updated_at = ?
       WHERE id = ? AND status = 'processing' AND attempts = ?`)
@@ -486,6 +492,11 @@ async function deliverOne(env: Env, id: number): Promise<'succeeded' | 'failed' 
   // 端点停用时保留载荷：重新启用后可以手动重试
   if (!endpoint || endpoint.status !== 'active') {
     await finish('failed', { error: ENDPOINT_GONE }).run();
+    return 'failed';
+  }
+  // 所属用户已停用：自动重试与手动重试都不再外发（停用用户的其他通知渠道同样不投递）
+  if (endpoint.owner_status !== 'active') {
+    await finish('failed', { error: OWNER_DISABLED }).run();
     return 'failed';
   }
   let payload = claimed.payload;
