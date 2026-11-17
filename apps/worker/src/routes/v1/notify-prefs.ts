@@ -20,11 +20,9 @@ app.use('*', apiKeyAuth);
 
 const ACCOUNT_WIDE = '作用于全部来信的通知配置';
 
-async function keyOwner(c: Context<AppContext>): Promise<{ id: number; username: string }> {
-  const userId = c.get('apiKey')!.userId;
-  const row = await c.env.db.prepare('SELECT username FROM users WHERE id = ?').bind(userId).first<{ username: string }>();
-  if (!row) throw new AppError('unauthorized', 'API Key 无效');
-  return { id: userId, username: row.username };
+function keyOwner(c: Context<AppContext>): { id: number; username: string } {
+  const key = c.get('apiKey')!;
+  return { id: key.userId, username: key.username };
 }
 
 app.get('/', async (c) => {
@@ -72,7 +70,7 @@ for (const channel of ['feishu', 'pushdeer'] as const) {
   app.post(`/${channel}-test`, async (c) => {
     requireScope(c, 'notify.write');
     assertKeyUnrestricted(c, ACCOUNT_WIDE);
-    await sendNotifyTest(c.env, await keyOwner(c), channel);
+    await sendNotifyTest(c.env, keyOwner(c), channel);
     return ok(c, { ok: true });
   });
 }

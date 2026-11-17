@@ -39,6 +39,7 @@ interface ApiKeyRecord {
   last_used_at: number | null;
   user_status: UserStatus | null;
   role: Role | null;
+  username: string | null;
 }
 
 /**
@@ -49,7 +50,7 @@ interface ApiKeyRecord {
 async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ settings: Settings; record: ApiKeyRecord | null }> {
   if (!keyHash) return { settings: await getSettings(env), record: null };
   const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.allowed_mailbox_ids, k.allowed_domains,
-      k.rate_limit, k.status, k.expires_at, k.last_used_at, u.status AS user_status, u.role
+      k.rate_limit, k.status, k.expires_at, k.last_used_at, u.status AS user_status, u.role, u.username
     FROM api_keys k LEFT JOIN users u ON u.id = k.user_id WHERE k.key_hash = ? AND k.status <> 'revoked'`).bind(keyHash);
   const query = settingsQuery(env);
   if ('cached' in query) return { settings: query.cached, record: await keyStatement.first<ApiKeyRecord>() };
@@ -109,6 +110,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     c.set('apiKey', {
       id: row.id,
       userId: row.userId,
+      username: record.username ?? '',
       // 管理员能力要 Key 显式带 admin scope；没有它的管理员 Key 按普通用户执行
       role: row.role === 'admin' && row.scopes.includes('admin') ? 'admin' : 'user',
       scopes: row.scopes,

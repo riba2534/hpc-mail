@@ -45,6 +45,8 @@ export interface AuthUser {
 export interface ApiKeyContext {
   id: number;
   userId: number;
+  /** 所属用户的用户名（鉴权时连表读出），供写操作审计 */
+  username: string;
   /** 执行角色：所属用户是管理员且 Key 带 admin scope 时为 admin，否则 user */
   role: Role;
   scopes: ApiScope[];
