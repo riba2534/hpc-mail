@@ -1,6 +1,7 @@
 import {
   MAX_BODY_BYTES,
   domainSchema,
+  formatMailAddress,
   localPartSchema,
   type ForwardMessageRequest,
   type MailAddress,
@@ -10,9 +11,9 @@ import {
 } from '@hpc-mail/shared';
 import { chunk } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
-import { htmlToText } from '../lib/text.js';
+import { escapeHtml, htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
-import { escapeHtml } from './attachment-links.js';
+import { bodyBytes } from './mail-body.js';
 import { loadSourceContent } from './message.js';
 import type { SendMailInput } from './outbound.js';
 
@@ -35,9 +36,6 @@ export function fromRequiredError(address: string): AppError {
   });
 }
 
-const utf8 = new TextEncoder();
-const bytesOf = (value: string) => utf8.encode(value).byteLength;
-
 /** 主题前缀：已带同类前缀不重复加；超出主题上限时截断 */
 function prefixed(subject: string, prefix: 'Re' | 'Fwd'): string {
   const trimmed = subject.trim() || '(无主题)';
@@ -49,9 +47,7 @@ function formatTime(date: Date): string {
   return `${date.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
-function formatSender(source: Source): string {
-  return source.fromName ? `${source.fromName} <${source.fromAddress}>` : source.fromAddress;
-}
+const formatSender = (source: Source) => formatMailAddress({ address: source.fromAddress, name: source.fromName });
 
 /** 原 HTML 只取 body 内部，去掉脚本；没有 body 时整段使用 */
 function htmlInner(html: string): string {
@@ -103,13 +99,13 @@ function attachQuote(
       : `<div>${bodyHtml}</div>`;
     return { text, html: `${user.html}${user.html ? '<br><br>' : ''}${headerHtml}<br>${quoted}` };
   };
-  const fits = (body: { text: string; html: string }) => bytesOf(body.text) + bytesOf(body.html) <= MAX_BODY_BYTES;
+  const fits = (body: { text: string; html: string }) => bodyBytes(body.text, body.html) <= MAX_BODY_BYTES;
   const full = build(quote.text, quote.html ? htmlInner(quote.html) : null);
   if (fits(full)) return full;
   const plain = build(quote.text, null);
   if (fits(plain)) return plain;
   // UTF-8 最多 4 字节/字符，「> 」前缀每行再加 2 字节：按保守比例截断原文，再核对一次
-  const budget = MAX_BODY_BYTES - bytesOf(user.text) - bytesOf(user.html) - BODY_MARGIN;
+  const budget = MAX_BODY_BYTES - bodyBytes(user.text, user.html) - BODY_MARGIN;
   const share = withHtml ? 3 : 1;
   const truncated = build(quote.text.slice(0, Math.max(0, Math.floor(budget / share / 6))), null, `\n${TRUNCATED}`);
   if (fits(truncated)) return truncated;

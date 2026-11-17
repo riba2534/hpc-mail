@@ -6,7 +6,7 @@ import { deriveSubkey, hmacSha256Base64 } from '../lib/crypto.js';
 import { chunk } from '../lib/d1.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
-import { convertHtmlToText, type MailText } from '../lib/text.js';
+import { convertHtmlToText, escapeHtml, type MailText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { dayWindow, releaseCounters, reserveCounters, type CounterLimit } from './rate-counter.js';
 import { retainExternalAttachments } from './external-attachment.js';
@@ -24,14 +24,6 @@ export interface ForwardAttachment {
   disposition: string;
 }
 
-const HTML_ESCAPES: Record<string, string> = {
-  '&': '&amp;',
-  '<': '&lt;',
-  '>': '&gt;',
-  '"': '&quot;',
-  "'": '&#39;',
-};
-const escapeHtml = (s: string): string => s.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
 const RELAY_TEXT_TRUNCATED = '（正文过长，纯文本版本只包含开头部分，完整内容请查看 HTML 版本）';
 
 export interface ForwardMail {
