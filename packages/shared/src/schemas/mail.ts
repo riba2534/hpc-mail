@@ -171,9 +171,17 @@ export const contentIdSchema = z.preprocess(
 export const attachmentDispositionSchema = z.enum(['attachment', 'inline']);
 export type AttachmentDisposition = z.infer<typeof attachmentDispositionSchema>;
 
+/** 附件与上传的 MIME 类型 */
+const mimeTypeSchema = z.string().trim().min(3).max(128);
+/** 内联参数：base64 附件、URL 附件与上传 token 引用都可以带 */
+const inlinePartShape = {
+  contentId: contentIdSchema.optional(),
+  disposition: attachmentDispositionSchema.optional(),
+};
+
 export const sendAttachmentSchema = z.object({
   filename: attachmentFilenameSchema,
-  contentType: z.string().trim().min(3).max(128),
+  contentType: mimeTypeSchema,
   /**
    * base64 编码内容。允许含空白：`base64 file.pdf`、Python `base64.encodebytes()`、
    * `openssl base64` 产出的都是 76 字符折行的多行 base64，直接拒掉等于逼调用方
@@ -185,8 +193,7 @@ export const sendAttachmentSchema = z.object({
     .transform((v) => v.replace(/\s+/g, ''))
     .refine((v) => /^[A-Za-z0-9+/]+={0,2}$/.test(v) && v.length % 4 !== 1 &&
       (!v.endsWith('=') || v.length % 4 === 0), '附件需为合法 base64'),
-  contentId: contentIdSchema.optional(),
-  disposition: attachmentDispositionSchema.optional(),
+  ...inlinePartShape,
   /** 与 url 互斥：带 url 的项是 URL 附件 */
   url: z.never().optional(),
 });
@@ -200,9 +207,8 @@ export const urlAttachmentSchema = z.object({
   // 这里只看形状；完整解析与 SSRF 检查在服务端拉取前做
   url: z.string().trim().max(2048).regex(/^https:\/\/[^\s/?#@]+(?:[/?#]\S*)?$/i, 'url 必须是 https:// 开头的完整地址'),
   filename: attachmentFilenameSchema.optional(),
-  contentType: z.string().trim().min(3).max(128).optional(),
-  contentId: contentIdSchema.optional(),
-  disposition: attachmentDispositionSchema.optional(),
+  contentType: mimeTypeSchema.optional(),
+  ...inlinePartShape,
   /** 与 content 互斥 */
   content: z.never().optional(),
 });
@@ -228,8 +234,7 @@ export const attachmentTokenRefSchema = z.union([
   z.string().min(1).max(128),
   z.object({
     token: z.string().min(1).max(128),
-    contentId: contentIdSchema.optional(),
-    disposition: attachmentDispositionSchema.optional(),
+    ...inlinePartShape,
   }),
 ]).transform((value) => (typeof value === 'string' ? { token: value } : value));
 export type AttachmentTokenRef = z.infer<typeof attachmentTokenRefSchema>;
@@ -591,7 +596,7 @@ export interface BatchSendResult {
 /** 大文件分片上传：初始化（创建 R2 multipart upload） */
 export const initMultipartUploadSchema = z.object({
   filename: attachmentFilenameSchema,
-  mimeType: z.string().trim().min(3).max(128),
+  mimeType: mimeTypeSchema,
   size: z.number().int().positive().max(MAX_ATTACHMENT_FILE_BYTES, '单文件超过上限'),
 });
 export type InitMultipartUploadRequest = z.infer<typeof initMultipartUploadSchema>;
