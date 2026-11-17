@@ -149,6 +149,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 | `POST /hosted-domains` | `{domain}`，填已注册的根域名 → 201，`status:"pending"`、`nameServers` 两条、`originalNameServers`、`warnings`（如需先关闭 DNSSEC）、`expiresAt`（到期未改 NS 自动删除） |
 | `GET /hosted-domains/:id` | 进度：`status` 与 `steps:{nameServers,routing,catchAll,sending}`（各为 waiting/ready/error）、`lastError`、`checkedAt` |
 | `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态；每人每分钟最多 10 次（被节流、无权限的也计），超出或全站 Cloudflare 额度用完返回 429；真正触发复查时计 4 次全站额度，托管功能关闭或站点缺少 Cloudflare 凭据时不计 |
+| `POST /hosted-domains/:id/reconnect` | 所有者或管理员，只用于 `status:"moved"`（其他状态 409）：zone 还在时请 Cloudflare 复查 NS 并核对一次（NS 改回后恢复）；Cloudflare 已删除 zone（NS 改走约 7 天后）时新建 zone，域名回到 `pending` 并返回新的 `nameServers`，地址、历史邮件、成员保留，不设到期删除。站长账户里有别处建的同名 zone 时 409。与添加共用每人每分钟 5 次 |
 | `PUT /hosted-domains/:id` | `{memberLimit}`：每位成员在该域最多认领数，0 不限 |
 | `GET` / `PUT /hosted-domains/:id/members` | 成员名单；PUT `{userIds,expectedOwnerId}` 整体替换（已禁用的现有成员可保留，新增的须为启用中的用户），选人用 `GET /mailboxes/share-users` |
 | `DELETE /hosted-domains/:id/members/:userId` | 移除成员；成员传自己的 id 即退出共享。已认领的地址保留 |
@@ -156,7 +157,10 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 | `DELETE /hosted-domains/:id` | 不可逆：立即拒收，随后永久删除该域全部邮件、释放全部地址并删除 zone。先在注册商把 NS 改回 `originalNameServers`：改回之前其他用户无法在本站添加这个域名（见下文添加限制） |
 | `/hosted-domains/:id/dns-records…` | 所有者或管理员管理 DNS 解析，见 [托管域名的 DNS 解析](#托管域名的-dns-解析) |
 
-状态：`pending` 等待改 NS → NS 生效后系统自动开通收件与发信（`provisioning`）→ `active`。`error` 为开通或巡检未通过（自动重试），`moved` 为 NS 已不再指向本站，`suspended` 为管理员暂停（拒收、禁止发信与新认领），`deleting` 为删除中。定时任务约每 5 分钟推进一次。
+状态：`pending` 等待改 NS → NS 生效后系统自动开通收件与发信（`provisioning`）→ `active`。`error` 为开通或巡检未通过（自动重试），`moved` 为 NS 已不再指向本站，`suspended` 为管理员暂停（拒收、禁止发信与新认领），`deleting` 为删除中。定时任务约每 5 分钟推进一次；等待 NS 的域名添加后 1 小时内约每 4 分钟查一次，1 天内约每 15 分钟，之后约每小时（用户说改好后调 `check`）。
+
+- `moved`：转入时按所有者的个人通知偏好（飞书、PushDeer）提醒一次。期间拒收；zone 仍在时约每 30 分钟复查，NS 改回后自动恢复；Cloudflare 通常在 NS 改走约 7 天后删除 zone，之后用 `POST /hosted-domains/:id/reconnect` 重新接入，地址与历史保留。
+- 曾生效的域名在 Cloudflare 里查不到 zone 时，先转为 `error`（照常收信）并在 `lastError` 说明，间隔 25 分钟以上复核仍查不到才转为 `moved`（`steps.nameServers` 为 error）；判定前会确认站点凭据仍能看到其他 zone，凭据权限变窄时不会误判。
 
 - 权限：所有者与管理员可查看进度、管理成员、过户、删除；管理员还能在任何人的托管域名下认领地址，并像其他邮箱一样用 `/admin/mailboxes/:id/transfer`、`/admin/mailbox-shares` 过户或共享其中的地址（含自动认领给所有者的地址）；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；自动认领默认不限数量（`hosted_domains.autoClaimLimit` 为 0），管理员设了正数上限时，域内地址达到上限后未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
@@ -171,7 +175,7 @@ Key `/v1` 开放托管域名的查看、添加、立即检测与 DNS 解析，�
 |---|---|
 | `GET /hosted-domains`、`GET /hosted-domains/:id` | `domain.read` |
 | `GET /hosted-domains/:id/dns-records` | `domain.read` |
-| `POST /hosted-domains`、`POST /hosted-domains/:id/check` | `domain.write` |
+| `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/reconnect` | `domain.write` |
 | `POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` |
 
 - 缺 scope 返回 403 `forbidden`，`fix` 写明缺哪个；scope 在解析请求体和任何计数之前检查，不占用限流与 Cloudflare 额度。已有的 Key 不会自动获得这两个 scope，由用户在网页 API Key 页面勾选（或用 JWT `PUT /api/api-keys/:id` 修改 `scopes`）。
