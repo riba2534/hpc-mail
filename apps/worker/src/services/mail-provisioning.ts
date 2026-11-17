@@ -113,6 +113,8 @@ export interface MailApplyResult {
   error: string;
   /** 写入后复读得到的分项状态 */
   snapshot: MailStepSnapshot;
+  /** 收到 Cloudflare 429 时的 retry-after 秒数（没有该头时为 0），调用方据此设置全局退避 */
+  retryAfter?: number;
 }
 
 /**
