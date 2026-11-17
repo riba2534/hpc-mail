@@ -33,7 +33,7 @@
 
 ## forbidden-scope
 
-API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺哪个。`GET /v1/me` 查看当前 Key 的 scopes；Key 不能给自己加 scope，要由用户在网页的 API Key 页面（或用 JWT 调 `PUT /api/api-keys/:id`）修改，或换用带该 scope 的 Key。带 `replyToMessageId` 或 `forwardAttachmentsFrom` 发信时除 `mail.send` 外还需要 `mail.read`；`GET /v1/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
+API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺哪个。`GET /v1/me` 查看当前 Key 的 scopes；Key 不能给自己加 scope，要由用户在网页的 API Key 页面（或用 JWT 调 `PUT /api/api-keys/:id`）修改，或换用带该 scope 的 Key。带 `replyToMessageId` 或 `forwardAttachmentsFrom` 发信时除 `mail.send` 外还需要 `mail.read`；`GET /v1/identities` 需要 `mail.send` 或 `mailbox.read` 之一。托管域名接口查看需要 `domain.read`，添加、检测与改 DNS 需要 `domain.write`。
 
 ## forbidden-sender
 

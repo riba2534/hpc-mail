@@ -9,7 +9,7 @@
 - [系统设置与域名](#系统设置与域名)：设置项、外发与中转配额、系统域名
 - [Key 与管理审计](#key-与管理审计)
 
-所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的五个 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
+所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
 
 ## 用户与邮件审阅
 

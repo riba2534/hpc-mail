@@ -52,7 +52,7 @@ async function actor(username: string, role: 'admin' | 'user' = 'user') {
   return { id: user!.id, jwt, key: await keyFor(jwt, [...API_SCOPES]) };
 }
 async function keyFor(jwt: string, scopes: ApiScope[]) {
-  return (await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `k-${scopes.join('-') || 'none'}`, scopes, rateLimit: 600 })), 201)).key;
+  return (await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `k-${scopes.join('-') || 'none'}`.slice(0, 64), scopes, rateLimit: 600 })), 201)).key;
 }
 async function own(userId: number, address: string) {
   return (await db.insert(mailboxes).values({ address, domain: address.split('@')[1]!, userId }).returning().get())!;

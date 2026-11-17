@@ -69,7 +69,7 @@ hpc '/auth/me'
 
 ## Key-only 与长期自动化
 
-已有 `hpcm_` Key 可直接访问 `/v1`，无需 bootstrap 登录。Key 的所属用户当前角色、状态、邮箱归属/共享仍决定访问权；scopes 不是管理员权限。系统关闭开放 API、Key 被禁用/吊销/过期、来源 IP 不匹配均会拒绝；已吊销的 Key 与不存在的 Key 一样返回 401 `unauthorized`。用户改密码（默认）或管理员重置该用户密码时，其全部 Key 被吊销，需要重新创建。Key 不能创建 Key、改密码、配置个人通知或管理用户/域名/共享。
+已有 `hpcm_` Key 可直接访问 `/v1`，无需 bootstrap 登录。Key 的所属用户当前角色、状态、邮箱归属/共享仍决定访问权；scopes 不是管理员权限。系统关闭开放 API、Key 被禁用/吊销/过期、来源 IP 不匹配均会拒绝；已吊销的 Key 与不存在的 Key 一样返回 401 `unauthorized`。用户改密码（默认）或管理员重置该用户密码时，其全部 Key 被吊销，需要重新创建。Key 不能创建 Key、改密码、配置个人通知或管理用户/系统域名/共享；托管域名可以用 Key 查看、添加、检测和改 DNS，删除、成员与过户仍只用 JWT。
 
 | Scope | 能力 |
 |---|---|
@@ -78,6 +78,8 @@ hpc '/auth/me'
 | `mail.send` | 发信及独立附件上传/取消上传；发件身份 `GET /v1/identities` |
 | `mailbox.read` | 自有/共享邮箱列表、地址可用性（含批量）、随机后缀方案；发件身份 `GET /v1/identities` |
 | `mailbox.write` | 认领（含批量）、邮箱显示名、释放及可选清除历史 |
+| `domain.read` | 自己拥有或被共享的托管域名列表、接入进度，托管域名的 DNS 记录 |
+| `domain.write` | 接入（添加）托管域名、立即检测、增改删 DNS 记录；见[用 API Key 接入](mailboxes-and-domains.md#用-api-key-接入) |
 
 `GET /v1/identities` 有 `mail.send` 或 `mailbox.read` 其中之一即可，返回能用哪些地址发信，见[发件身份](mailboxes-and-domains.md#发件身份)。
 
@@ -97,7 +99,7 @@ hpc '/me' | jq '.data'
 
 `GET /v1/status` 返回 `{status:"operational",userId,role,scopes}`；`GET /v1/domains` 返回 `{domains:[...]}`，是当前可认领的域名；均只需任一有效 Key，无独立 scope。域名范围：普通用户默认是公开的系统域名，管理员为其设置了专属邮箱权限时改为专属名单中的系统域名（可含非公开域名）；管理员看到配置中的全部系统域名。系统域名之后附上已生效的托管域名：普通用户为自己拥有或作为成员的，管理员为全部。已从列表移除、但仍有存量邮箱的旧域名不在其中，需从邮箱列表发现。
 
-要创建 Key，先用 JWT 登录且完成必要 2FA，再经 `/api/api-keys` 操作。只按任务授予最小 scopes，用户仅要查验证码时通常选 `mail.read`；若还要认领可加 `mailbox.read/mailbox.write`，无需自动加 `mail.send`。新建和长期保留 Key 应符合用户对自动化的授权。
+要创建 Key，先用 JWT 登录且完成必要 2FA，再经 `/api/api-keys` 操作。只按任务授予最小 scopes，用户仅要查验证码时通常选 `mail.read`；若还要认领可加 `mailbox.read/mailbox.write`，无需自动加 `mail.send`；要用 API 接入自有域名时加 `domain.read/domain.write`，`domain.write` 能改该用户托管域名的 DNS，不需要时不授予。新建和长期保留 Key 应符合用户对自动化的授权。
 
 ```bash
 # 当前 API="$BASE/api"、AUTH 为 JWT；完整 key 仅在创建成功时返回一次
@@ -117,7 +119,7 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 | `DELETE /api-keys/:id` | 吊销，不能通过重新启用恢复；`{success:true}` |
 | `GET /api-keys/:id/logs?cursor=…&limit=30` | 自己 Key 的调用审计分页 |
 
-`name` 1–64 字符；`scopes` 非空且只接受上表五个；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；`path` 是归一化后的路由（数字 ID 段写成 `:id`，最长 256 字符）。被拒绝的请求（Key 禁用或过期、IP 不在白名单、用户停用、超出限流）同一 Key 每分钟最多记一条，其余只计数；已吊销的 Key 不再记录。保留约 90 天。
+`name` 1–64 字符；`scopes` 非空且只接受上表中的值，已有 Key 不会自动获得新增的 scope；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；`path` 是归一化后的路由（数字 ID 段写成 `:id`，最长 256 字符）。被拒绝的请求（Key 禁用或过期、IP 不在白名单、用户停用、超出限流）同一 Key 每分钟最多记一条，其余只计数；已吊销的 Key 不再记录。保留约 90 天。
 
 ## 错误与限流
 

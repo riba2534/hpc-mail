@@ -1,6 +1,6 @@
 ---
 name: hpc-mail
-description: 通过 HTTP API 操作 HPC Mail 多域名邮箱（默认 https://hpc.email，也适用于自部署实例）：查收和搜索邮件，等待并读取验证码与验证链接，按 afterId 增量同步新邮件；从自己有发信权限的地址发信、回复（含站外邮件）和转发，支持显示名、抄送密送、Reply-To、自定义邮件头、HTML、附件与内联图片；认领、批量认领和释放邮箱地址。用户提供了 hpcm_ 开头的 API Key，要求用 HPC Mail 收发邮件或管理其中的邮箱地址，或目标邮箱已确认属于该实例时使用；普通邮箱请求不能据此推断属于 HPC Mail。登录、通知和托管域名等会话功能见 references。
+description: 通过 HTTP API 操作 HPC Mail 多域名邮箱（默认 https://hpc.email，也适用于自部署实例）：查收和搜索邮件，等待并读取验证码与验证链接，按 afterId 增量同步新邮件；从自己有发信权限的地址发信、回复（含站外邮件）和转发，支持显示名、抄送密送、Reply-To、自定义邮件头、HTML、附件与内联图片；认领、批量认领和释放邮箱地址；接入自有域名（托管域名与 DNS 解析）。用户提供了 hpcm_ 开头的 API Key，要求用 HPC Mail 收发邮件、管理其中的邮箱地址或接入自己的域名，或目标邮箱已确认属于该实例时使用；普通邮箱请求不能据此推断属于 HPC Mail。登录、通知等会话功能见 references。
 ---
 
 # HPC Mail
@@ -22,7 +22,7 @@ hpc '/identities' | jq '.data.identities[] | {mailboxId,address,kind,canSend,rea
 hpc '/messages' --get --data-urlencode 'limit=5' | jq '.data.items[] | {id,address,fromAddress,subject,verificationCode}'
 ```
 
-失败统一返回 `{error:{code,message,fix?,docs?,details?},requestId}`：按 `code` 分支，先照 `fix` 修正，`docs` 指向[错误码说明](references/errors.md)。缺少 scope 是 403 `forbidden`，`fix` 写明缺哪个。共享给你的地址（`kind=shared`）只读，不能发信。账户、通知、托管域名、管理员功能只能用 JWT：经 `/api/auth/login` 登录后把 `API` 换成 `$BASE/api`、`AUTH` 换成 token，见[鉴权](references/auth-and-http.md)。Key 与 JWT 不能互换；`/api` 的发信路径是 `/messages/send`，没有 `wait`。
+失败统一返回 `{error:{code,message,fix?,docs?,details?},requestId}`：按 `code` 分支，先照 `fix` 修正，`docs` 指向[错误码说明](references/errors.md)。缺少 scope 是 403 `forbidden`，`fix` 写明缺哪个。共享给你的地址（`kind=shared`）只读，不能发信。账户、通知、管理员功能以及托管域名的删除、成员与过户只能用 JWT：经 `/api/auth/login` 登录后把 `API` 换成 `$BASE/api`、`AUTH` 换成 token，见[鉴权](references/auth-and-http.md)。Key 与 JWT 不能互换；`/api` 的发信路径是 `/messages/send`，没有 `wait`。
 
 ## 常用配方
 
@@ -121,15 +121,26 @@ SINCE=$MAX   # 所有页处理完才推进基线
 - 摘要已含 `preview`、`verificationCode`、`verificationLink`。只有需要正文或附件时才读详情，每封读一次并按 id 缓存，不要定时重拉同一封详情。处理完可用 `POST /messages/read` 标记已读（需要 `mail.write`）。
 - 持续监听用不带过滤的 `wait` 循环：每次返回最早一封新来信，以 `scannedThroughId` 作为下一轮的 `afterId`，不要高频轮询列表。`cursor` 只用服务器返回的值，伪造或截断的返回 400。
 
+### ⑦ 接入自有域名
+```bash
+HD=$(jq -n '{domain:"example.com"}' |   # 用户已注册的根域名，不是子域名；Key 需要 domain.read 与 domain.write
+  hpc '/hosted-domains' -X POST -H 'Content-Type: application/json' --data-binary @-)
+HD_ID=$(jq -er '.data.id' <<<"$HD"); jq '.data | {status,nameServers,warnings,expiresAt}' <<<"$HD"   # 把 NS 告诉用户
+hpc "/hosted-domains/$HD_ID/check" -X POST | jq '.data | {status,steps}'   # 用户说 NS 改好后调一次
+hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之后每隔几分钟查一次进度
+```
+
+检查：201 返回 `status:"pending"`。请用户在注册商把 NS 换成 `nameServers` 里的两条，`warnings` 提示 DNSSEC 时先关闭，并在 `expiresAt` 前改好，过期未改自动删除。原 DNS 记录不会迁移，网站、域名验证等记录用 `POST /hosted-domains/:id/dns-records` 补建，最好在改 NS 之前。NS 生效要几分钟到 48 小时，定时任务约每 5 分钟推进一次：用户说改好后调一次 `check`，之后低频轮询 `GET /hosted-domains/:id`，不要紧循环（`check` 15 秒内重复调用只返回当前状态，每人每分钟最多 10 次）。`status:"active"` 时收发都已开通（`steps.sending:"ready"`）：该域出现在 `GET /domains`，按配方⑤认领地址、按配方②发信；来信到未认领地址会自动认领给所有者。功能未开启返回 403，删除域名、成员与过户只能用 JWT，见[用 API Key 接入](references/mailboxes-and-domains.md#用-api-key-接入)。
+
 ## 身份与权限模型
 
 1. 登录用户名不是邮箱地址。一个账户可以认领多个 `localPart@domain`，邮件按完整地址归属；认领即可看到该地址的全部历史，包括认领之前收到的。
 2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
 3. 共享给你的地址（`kind=shared`，`reason=shared_readonly`）对普通用户只读：可读来信、设个人星标、作为回复或转发的来源；不能发信、删除、标记已读或释放。已读状态属于所有者，未读数与 `unread=1` 只统计自己认领的地址。
 4. 管理员可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 列出可用任意前缀发信的系统域名；不能推断任意外部域名可用。
-5. scope：`mail.read` 读邮件、等待、下载附件；`mail.write` 标记已读、星标、删除与恢复；`mail.send` 发信与上传附件；`mailbox.read` 查看邮箱、可用性与随机后缀；`mailbox.write` 认领（含批量）、改显示名、释放。`/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
+5. scope：`mail.read` 读邮件、等待、下载附件；`mail.write` 标记已读、星标、删除与恢复；`mail.send` 发信与上传附件；`mailbox.read` 查看邮箱、可用性与随机后缀；`mailbox.write` 认领（含批量）、改显示名、释放；`domain.read` 查看自己的托管域名、接入进度与 DNS 记录；`domain.write` 添加托管域名、立即检测、增改删 DNS 记录，能改该用户托管域名的解析，按需授予。`/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
 6. 管理员的列表默认也只看自己的邮箱：未认领地址用 `scope=unclaimed`，只读审阅某个用户用 `scope=user&userId=`。
-7. Key 不能用于 `/api`，也不能管理 Key、改密码、配置通知或托管域名。用户改密码时默认吊销本人全部 Key，管理员重置密码时一律吊销；之后这些 Key 返回 401。
+7. Key 不能用于 `/api`，也不能管理 Key、改密码、配置通知，不能删除托管域名、改成员上限、管理成员或过户。用户改密码时默认吊销本人全部 Key，管理员重置密码时一律吊销；之后这些 Key 返回 401。
 
 ## 能力地图（路径相对 `/v1`）
 
@@ -146,8 +157,10 @@ SINCE=$MAX   # 所有页处理完才推进基线
 | 上传附件、分片、取消 | `POST /uploads`、`POST /uploads/multipart`、`DELETE /uploads/:token` | `mail.send` | [attachments](references/attachments.md) |
 | 我的邮箱、共享给我的、可用性、随机后缀 | `GET /mailboxes`、`GET /mailboxes/shared`、`GET /mailboxes/availability`、`POST /mailboxes/availability/batch`、`GET /mailboxes/random-plan` | `mailbox.read` | [mailboxes](references/mailboxes-and-domains.md) |
 | 认领、批量认领、改显示名、释放 | `POST /mailboxes`、`POST /mailboxes/batch`、`PUT /mailboxes/:id`、`DELETE /mailboxes/:id` | `mailbox.write` | [mailboxes](references/mailboxes-and-domains.md) |
+| 托管域名列表与接入进度、DNS 记录 | `GET /hosted-domains`、`GET /hosted-domains/:id`、`GET /hosted-domains/:id/dns-records` | `domain.read` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
+| 接入自有域名、立即检测、增改删 DNS 记录 | `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
 
-只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；共享管理、托管域名与 DNS 见 [mailboxes](references/mailboxes-and-domains.md)；个人通知与转发见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
+只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；共享管理以及托管域名的删除、成员与过户见 [mailboxes](references/mailboxes-and-domains.md)；个人通知与转发见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
 
 ## 完成标准与安全
 

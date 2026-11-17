@@ -1,5 +1,5 @@
 import {
-  ALLOWED_CUSTOM_HEADERS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
+  ALLOWED_CUSTOM_HEADERS, API_SCOPES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
   MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, internalSendMailSchema,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
@@ -80,7 +80,10 @@ describe('OpenAPI routes and public contracts', () => {
     expect(caaResponse.tag).toEqual({ type: 'string' });
     const caaInput = (((input.oneOf as Schema[]).at(-1)!.properties as Record<string, Schema>).caa!.properties as Record<string, Schema>);
     expect(caaInput.tag).toMatchObject({ enum: ['issue', 'issuewild', 'iodef'] });
-    expect(specs.v1.paths).not.toHaveProperty('/hosted-domains/{id}/dns-records');
+    // /v1 的 DNS 解析与 /api 同一份记录 id 参数与请求体
+    const path = '/hosted-domains/{id}/dns-records/{recordId}';
+    expect(specs.v1.paths[path]!.parameters).toEqual(specs.api.paths[path]!.parameters);
+    expect(specs.v1.components.schemas.HostedDnsRecordInput).toEqual(input);
   });
 
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
@@ -543,7 +546,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     expect(frontmatter).not.toBeNull();
     expect([...frontmatter![1]!].length).toBeLessThanOrEqual(1024);
     expect(frontmatter![1]).not.toMatch(/管理员|admin/i);
-    expect(skillDoc.split('\n').length).toBeLessThanOrEqual(170);
+    expect(skillDoc.split('\n').length).toBeLessThanOrEqual(200);
     for (const recipe of ['①', '②', '③', '④', '⑤', '⑥']) expect(skillDoc).toMatch(new RegExp(`^### ${recipe} `, 'm'));
     for (const field of ['scannedThroughId', 'recipientOutcomes', 'Idempotency-Key', 'send_in_progress', 'idempotency_mismatch', 'afterId', 'nextCursor']) {
       expect(skillDoc).toContain(field);
@@ -566,5 +569,78 @@ describe('Agent docs reference only real endpoints and anchors', () => {
       }
     }
     expect(broken).toEqual([]);
+  });
+});
+
+describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文档', () => {
+  /** /v1 只开放这八个托管域名操作，读写分别要求 domain.read / domain.write */
+  const keyOperations: Record<string, Record<string, string>> = {
+    '/hosted-domains': { get: 'domain.read', post: 'domain.write' },
+    '/hosted-domains/{id}': { get: 'domain.read' },
+    '/hosted-domains/{id}/check': { post: 'domain.write' },
+    '/hosted-domains/{id}/dns-records': { get: 'domain.read', post: 'domain.write' },
+    '/hosted-domains/{id}/dns-records/{recordId}': { put: 'domain.write', delete: 'domain.write' },
+  };
+
+  it('八个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
+    let checked = 0;
+    for (const [path, scopes] of Object.entries(keyOperations)) {
+      expect(specs.v1.paths[path]!.parameters, path).toEqual(specs.api.paths[path]!.parameters);
+      for (const [method, scope] of Object.entries(scopes)) {
+        const label = `${method.toUpperCase()} ${path}`;
+        const v1 = specs.v1.paths[path]![method]!;
+        const api = specs.api.paths[path]![method]!;
+        expect(v1['x-required-scopes'], label).toEqual([scope]);
+        expect(api, label).not.toHaveProperty('x-required-scopes');
+        expect(v1.responses, label).toEqual(api.responses);
+        expect(v1.requestBody, label).toEqual(api.requestBody);
+        expect(v1.parameters, label).toEqual(api.parameters);
+        checked++;
+      }
+    }
+    expect(checked).toBe(8);
+  });
+
+  it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
+    const v1Hosted = Object.fromEntries(Object.entries(specs.v1.paths).filter(([path]) => path.startsWith('/hosted-domains'))
+      .map(([path, item]) => [path, Object.keys(item).filter(method => methods.has(method)).sort()]));
+    expect(v1Hosted).toEqual(Object.fromEntries(Object.entries(keyOperations).map(([path, scopes]) => [path, Object.keys(scopes).sort()])));
+    expect(Object.keys(specs.v1.paths).filter(path => path.startsWith('/admin'))).toEqual([]);
+    for (const [path, method] of [['/hosted-domains/{id}', 'delete'], ['/hosted-domains/{id}', 'put'], ['/hosted-domains/{id}/members', 'put'],
+      ['/hosted-domains/{id}/members/{userId}', 'delete'], ['/hosted-domains/{id}/transfer', 'post'], ['/admin/hosted-domains', 'get']] as const) {
+      expect(specs.api.paths[path]?.[method], `${method} ${path}`).toBeDefined();
+    }
+    // 两份规格只在认证相关措辞上不同：/v1 写明管理员 Key 的范围与审计记法，/api 保持原说明
+    expect(specs.v1.paths['/hosted-domains']!.get!.description).toContain('/api/admin/hosted-domains');
+    expect(specs.v1.paths['/hosted-domains/{id}']!.get!.description).toContain('JWT-only');
+    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
+      ['/hosted-domains/{id}/dns-records/{recordId}', 'put'], ['/hosted-domains/{id}/dns-records/{recordId}', 'delete']] as const) {
+      expect(specs.v1.paths[path]![method]!.description, `${method} ${path}`).toContain('API Key #id');
+      expect(specs.api.paths[path]![method]!.description, `${method} ${path}`).not.toContain('API Key');
+    }
+    expect(specs.api.paths['/hosted-domains']!.post!.description).toMatch(/^Requires \/config hostedDomainsEnabled\. /);
+  });
+
+  it('/status 的 scopes 枚举取自 shared API_SCOPES，info 写明可以用 domain.write 接入域名', () => {
+    const data = ((specs.v1.paths['/status']!.get!.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>)['200']!
+      .content['application/json']!.schema.properties.data);
+    expect(((data.properties as Record<string, Schema>).scopes!.items as Schema).enum).toEqual([...API_SCOPES]);
+    expect(specs.v1.info.description).not.toContain('Users cannot create arbitrary domains');
+    expect(specs.v1.info.description).toContain('domain.write');
+  });
+
+  it('Agent 文档写明配方⑦、两个新 scope 与只用 JWT 的边界', () => {
+    expect(skillDoc).toMatch(/^### ⑦ 接入自有域名$/m);
+    for (const text of ['POST /hosted-domains', 'POST /hosted-domains/:id/check', 'GET /hosted-domains/:id', 'POST /hosted-domains/:id/dns-records',
+      'nameServers', 'expiresAt', 'steps.sending', '`domain.read`', '`domain.write`']) {
+      expect(skillDoc, text).toContain(text);
+    }
+    // 每个 scope 在鉴权参考的 scope 表里都有一行
+    for (const scope of API_SCOPES) expect(authDoc, scope).toContain(`\n| \`${scope}\` |`);
+    expect(mailboxesDoc).toContain('\n### 用 API Key 接入\n');
+    for (const [name, doc] of Object.entries({ mailboxesDoc, authDoc, administrationDoc })) {
+      expect(doc, name).not.toMatch(/Key 无对应接口|五个 ?scopes?|上表五个/);
+    }
+    expect(llmsDoc).toContain('mail/mailbox/domain scopes');
   });
 });

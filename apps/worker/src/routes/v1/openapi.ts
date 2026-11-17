@@ -1,6 +1,6 @@
-import { MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
+import { API_SCOPES, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, identitiesDescription, int, listQuery,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, hostedDomainPaths, identitiesDescription, int, listQuery,
   mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths,
   usedSchemas, type Paths,
 } from '../openapi-common.js';
@@ -10,7 +10,7 @@ export function buildOpenApiSpec(origin: string) {
   const paths: Paths = {
     '/openapi.json': { get: specificationOperation() },
     '/status': { get: operation('Check API key access', object({ status: { type: 'string', const: 'operational' }, userId: positiveId,
-      role: { type: 'string', enum: ['admin', 'user'] }, scopes: array({ type: 'string', enum: ['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'] }) }),
+      role: { type: 'string', enum: ['admin', 'user'] }, scopes: array({ type: 'string', enum: [...API_SCOPES] }) }),
       { description: 'Requires an active API key and enabled API. No additional scope. This confirms access, not end-to-end mail delivery. userId identifies the key owner; GET /identities lists the addresses this key can send from, and GET /me adds key details, rate limits and today’s outbound usage. Revoked keys, including those revoked by a password change or administrator password reset, return 401 like unknown keys.' }) },
     '/me': { get: operation('Describe this API key, its owner, limits and today’s outbound usage', ref('ApiKeySelf'), {
       description: 'Requires an active API key and enabled API. No additional scope. Read-only self-inspection: key metadata (never the key itself), owner, per-key and per-user request limits, the wait poll limit, and today’s (UTC) outbound quota usage with resetsAt. Administrators are exempt from the outbound quota (exempt=true, limits 0).' }) },
@@ -18,13 +18,14 @@ export function buildOpenApiSpec(origin: string) {
       description: `${identitiesDescription} Requires mail.send or mailbox.read (either one); otherwise 403 forbidden.` }),
       'x-required-scopes-any-of': ['mail.send', 'mailbox.read'] } },
     '/domains': { get: operation('List configured domains available to this user', object({ domains: array(str) }),
-      { description: 'Domains the key owner may claim new addresses on. No additional scope. Ordinary users see public domains or their dedicated mailboxPolicy domains, including explicitly granted private domains; administrators see all configured domains. Active hosted domains follow the system domains: those the key owner owns or was granted (see the session API /hosted-domains), or every active hosted domain for administrators. Claim only a returned domain. Removed domains remain usable for existing owned mailbox identities but are absent from this new-claim list.' }) },
+      { description: 'Domains the key owner may claim new addresses on. No additional scope. Ordinary users see public domains or their dedicated mailboxPolicy domains, including explicitly granted private domains; administrators see all configured domains. Active hosted domains follow the system domains: those the key owner owns or was granted (see GET /hosted-domains), or every active hosted domain for administrators. Claim only a returned domain. Removed domains remain usable for existing owned mailbox identities but are absent from this new-claim list.' }) },
     '/mailboxes': {
       get: operation('List owned mailboxes', array(ref('Mailbox')), { scope: 'mailbox.read', parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator-only, explicit all=1 lists every owner. Default lists caller-owned mailboxes.')] }),
       post: operation('Claim a mailbox in an existing configured domain', ref('Mailbox'), { request: 'ClaimMailboxRequest', scope: 'mailbox.write', status: 201,
         description: 'Use a domain returned by GET /domains. Does not register a domain or provision DNS. Ordinary users obey system reserved-prefix restrictions and their effective public or dedicated domain/total/per-domain quotas. Dedicated policies replace public limits. Claiming inherits all historical mail at this address. A concurrent domain or user permission change returns 409. Existing owned mailboxes remain usable after permissions tighten. Optional strategy=claude rejects any domain with a historical Claude suspension with 403 forbidden, including for administrators and hosted domains; checked atomically at insertion. Omitted or uniform preserves ordinary claims.' }),
     },
     ...mailboxBatchPaths({ read: 'mailbox.read', write: 'mailbox.write' }),
+    ...hostedDomainPaths({ read: 'domain.read', write: 'domain.write' }),
     '/mailboxes/shared': { get: operation('List inboxes shared with the caller', array(ref('SharedMailbox')), { scope: 'mailbox.read',
       description: 'Read-only inbound access. Shares do not grant send/delete/forward-notification rights. The read state of shared mail belongs to the owner: readers cannot change it, and it is excluded from their unread count and unread=1 list filter. Stars are personal.' }) },
     '/mailboxes/availability': { get: operation('Check address availability', ref('MailboxAvailability'), { scope: 'mailbox.read', parameters: [
@@ -80,11 +81,11 @@ export function buildOpenApiSpec(origin: string) {
     ...uploadPaths('mail.send'),
   };
   return {
-    openapi: '3.1.0', info: specInfo('HPC Mail Open API', `API-key mail/mailbox automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; requests already over a key or user limit do not count toward the instance limit. 429 rate_limited messages tell the scopes apart: API 调用频率超限 is this key, API 调用频率超限（账户级） is all keys of the same user combined, and API 总调用频率超限 is the whole site. Users cannot create arbitrary domains. Management, notification preferences, sessions and 2FA use the related JWT API. Every response carries X-Request-ID; ${clientRequestIdRule}.`),
+    openapi: '3.1.0', info: specInfo('HPC Mail Open API', `API-key mail, mailbox and hosted-domain automation. Bearer hpcm_ keys are distinct from JWT sessions. Keys are limited by owner, scope, expiry, IP allowlist and per-key/user/instance rates; requests already over a key or user limit do not count toward the instance limit. 429 rate_limited messages tell the scopes apart: API 调用频率超限 is this key, API 调用频率超限（账户级） is all keys of the same user combined, and API 总调用频率超限 is the whole site. With domain.write a key can host a domain its owner has registered (POST /hosted-domains returns the nameservers to set at the registrar), check setup and manage the domain’s DNS records; a missing scope returns 403 forbidden before the body is parsed or any limit is counted. Deleting a hosted domain, memberLimit, members and transfer, as well as management, notification preferences, sessions and 2FA, use the related JWT API. Every response carries X-Request-ID; ${clientRequestIdRule}.`),
     servers: [{ url: `${origin}/v1` }], security: [{ apiKey: [] }],
     externalDocs: { description: 'Agent usage guide and authentication workflows', url: `${origin}/skill.md` },
     'x-relatedApis': [{ url: `${origin}/api/openapi.json`, description: 'JWT session and administration API' }],
-    tags: [{ name: 'Mail', description: 'Mail and mailbox operations. Required scopes are listed in x-required-scopes.' }],
+    tags: [{ name: 'Mail', description: 'Mail, mailbox and hosted-domain operations. Required scopes are listed in x-required-scopes.' }],
     components: { securitySchemes: { apiKey: { type: 'http', scheme: 'bearer', bearerFormat: 'hpcm_ followed by 64 hexadecimal characters' } }, schemas: usedSchemas(paths) },
     paths: describePaths(paths),
   };
