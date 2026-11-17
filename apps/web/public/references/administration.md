@@ -111,18 +111,18 @@ jq -n --argjson owner "$HPC_OWNER_ID" \
 
 运维脚本（批量建邮箱、共享、过户、释放，查归属、托管域名与 Claude 状态）用管理员 Key 调 `/v1/admin/*`，不要直连 D1 写 SQL：这些接口与 `/api/admin/*` 一样逐项校验、在事务里提交并写管理审计。
 
-**管理员 Key** 是管理员账户创建、勾选 `admin` scope（网页「管理员能力」）的 API Key，IP 白名单与有效期可选。`GET /v1/me` 的 `key.effectiveRole` 为 `admin` 才能调用；普通用户的 Key、没带 `admin` 的管理员 Key 一律 403 `forbidden`，`fix` 写明怎么创建。除 `admin` 外不需要其他 scope，限流同其他 `/v1` 请求。写操作每项一行管理审计，操作人是 Key 所属管理员的用户名，detail 末尾为 `批量请求 <请求 id>（API Key #id）`。shell 示例复用[入口指南](../skill.md)，设 `API="$BASE/v1"`、`AUTH` 为管理员 Key。
+**管理员 Key** 是管理员账户创建、勾选 `admin` scope（网页「管理员能力」）的 API Key，IP 白名单与有效期可选。`GET /v1/me` 的 `key.effectiveRole` 为 `admin`、且没有设置 `allowedMailboxIds` 与 `allowedDomains`（不限范围）才能调用；普通用户的 Key、没带 `admin` 的管理员 Key、限定了邮箱或域名的管理员 Key 一律 403 `forbidden`，`fix` 写明怎么处理。除 `admin` 外，每个接口还要下表 scope 列里的读写 scope：写入要 `mailbox.write`，查邮箱、用户与托管域名要 `mailbox.read`，Claude 查询要 `mail.read`，缺少时 403，message 写明缺哪个。只带 `mailbox.read`、`mail.read` 与 `admin` 的 Key 是只读的管理员 Key。限流同其他 `/v1` 请求。写操作每项一行管理审计，操作人是 Key 所属管理员的用户名，detail 末尾为 `批量请求 <请求 id>（API Key #id）`。shell 示例复用[入口指南](../skill.md)，设 `API="$BASE/v1"`、`AUTH` 为管理员 Key。
 
 ### 写入
 
-| 方法与路径 | body | 作用 |
-|---|---|---|
-| `POST /v1/admin/mailboxes/batch/claim` | `{userId,items:[{localPart,domain,strategy?}],shareUserIds?}` | 为该用户认领，规则同[批量邮箱操作](#批量邮箱操作)，返回 `{claimed,taken,notAttempted,stoppedBy,shares}`。`shareUserIds` 非空时把本次 `claimed` 的邮箱共享给这些用户，`shares` 为逐项结果；不给或为 `[]` 时 `shares:null` |
-| `POST /v1/admin/mailboxes/batch/release` | `{items:[{address,expectedOwnerId?}],deleteHistory?}` | 释放并撤销共享；`deleteHistory:true` 同时永久删除这些地址的全部历史邮件 |
-| `POST /v1/admin/mailboxes/batch/transfer` | `{userId,items:[{address,expectedOwnerId}]}` | 过户给同一用户，保留历史、撤销旧共享 |
-| `POST /v1/admin/mailboxes/batch/share` | `{userIds,items:[{address,expectedOwnerId?}]}` | 把这批用户追加进每个邮箱的共享名单，不加入所有者 |
-| `POST /v1/admin/mailboxes/batch/unshare` | 同 share | 从每个邮箱的名单移除这批用户 |
-| `PUT /v1/admin/mailboxes/shares` | `{userIds,items:[{address,expectedOwnerId?}]}` | 把每个邮箱的共享名单**精确替换**为 `userIds`，`[]` 清空；每项同时带 `addedShares` 与 `revokedShares` |
+| 方法与路径 | scope | body | 作用 |
+|---|---|---|---|
+| `POST /v1/admin/mailboxes/batch/claim` | `admin` + `mailbox.write` | `{userId,items:[{localPart,domain,strategy?}],shareUserIds?}` | 为该用户认领，规则同[批量邮箱操作](#批量邮箱操作)，返回 `{claimed,taken,notAttempted,stoppedBy,shares}`。`shareUserIds` 非空时把本次 `claimed` 的邮箱共享给这些用户，`shares` 为逐项结果；不给或为 `[]` 时 `shares:null` |
+| `POST /v1/admin/mailboxes/batch/release` | `admin` + `mailbox.write` | `{items:[{address,expectedOwnerId?}],deleteHistory?}` | 释放并撤销共享；`deleteHistory:true` 同时永久删除这些地址的全部历史邮件 |
+| `POST /v1/admin/mailboxes/batch/transfer` | `admin` + `mailbox.write` | `{userId,items:[{address,expectedOwnerId}]}` | 过户给同一用户，保留历史、撤销旧共享 |
+| `POST /v1/admin/mailboxes/batch/share` | `admin` + `mailbox.write` | `{userIds,items:[{address,expectedOwnerId?}]}` | 把这批用户追加进每个邮箱的共享名单，不加入所有者 |
+| `POST /v1/admin/mailboxes/batch/unshare` | `admin` + `mailbox.write` | 同 share | 从每个邮箱的名单移除这批用户 |
+| `PUT /v1/admin/mailboxes/shares` | `admin` + `mailbox.write` | `{userIds,items:[{address,expectedOwnerId?}]}` | 把每个邮箱的共享名单**精确替换**为 `userIds`，`[]` 清空；每项同时带 `addedShares` 与 `revokedShares` |
 
 每次 1–100 项，地址不能重复；`userIds`、`shareUserIds` 最多 100 个。除认领外返回 `{results,done,unchanged,failed}`，results 与 items 同序，每项 `status` 为 `done`、`unchanged`（已是目标状态；超时重试时上次已完成的项也报它）或 `failed`（`error:{code,message}`：`not_found` 邮箱不存在，`conflict` 所有者与 `expectedOwnerId` 不符；替换名单时 `userIds` 含该邮箱所有者为 `validation_failed`）。事务语义和整批 400/404/409 同[批量邮箱操作](#批量邮箱操作)，409 时重新读取再执行。
 
@@ -130,15 +130,15 @@ jq -n --argjson owner "$HPC_OWNER_ID" \
 
 ### 查询
 
-列表参数逗号分隔，去空白与重复后 1–200 项，超出或格式错误返回 400 `validation_failed`。`data` 直接是数组，查询不写审计。
+列表参数逗号分隔（也可重复参数），每项先规整（转小写、去空白）再去重，去重后 1–200 项，超出或格式错误返回 400 `validation_failed`。`data` 直接是数组，查询不写审计。
 
-| 方法与路径 | 参数 | 返回 `data` |
-|---|---|---|
-| `GET /v1/admin/mailboxes` | `addresses` 或 `domain`，二选一 | 已认领邮箱 `[{id,address,domain,ownerId,ownerUsername,grantees:[{userId,username}],createdAt}]`，按 address 排序；未认领或不存在的地址不出现；`domain` 返回该域全部已认领邮箱，不分页 |
-| `GET /v1/admin/users` | `usernames` | `[{id,username,role,status,mailboxPolicy,mailboxPolicyRevision,createdAt}]`，按 username 排序；不存在的用户名不出现；`mailboxPolicy:null` 表示使用公共配置 |
-| `GET /v1/admin/hosted-domains` | `domains`、`owner`（用户名），都可选 | `[{id,domain,ownerId,ownerUsername,status,zoneStatus,routingStatus,sendingStatus,catchAllReady,ready,createdAt}]`，按 id 排序；都不给返回全站，同时给取交集，`owner` 不存在返回 `[]`；`ready:true` 表示收发都已就绪 |
-| `GET /v1/admin/claude/domains` | `domains` | 每个后缀一项、与请求同序：`{domain,addresses,paid,suspended,suspendedAddresses:[{address,suspendedAt}]}`，即有 Claude 账号事实或收据的地址数、付费数、封号数与封号地址，`paid` 与地址视图同一口径；没有记录的后缀计数为 0 |
-| `GET /v1/admin/claude/addresses` | `addresses` | 每个地址一项、与请求同序：`{address,domain,known,firstSeenAt,paid,suspended,suspendedAt,anthropicMails,lastAnthropicMailAt,loginLinkMails,receipts,tier}`；没有 Anthropic 来信的地址 `known:false` |
+| 方法与路径 | scope | 参数 | 返回 `data` |
+|---|---|---|---|
+| `GET /v1/admin/mailboxes` | `admin` + `mailbox.read` | `addresses` 或 `domain`，二选一 | 已认领邮箱 `[{id,address,domain,ownerId,ownerUsername,grantees:[{userId,username}],createdAt}]`，按 address 排序；未认领或不存在的地址不出现；`domain` 返回该域全部已认领邮箱，不分页 |
+| `GET /v1/admin/users` | `admin` + `mailbox.read` | `usernames` | `[{id,username,role,status,mailboxPolicy,mailboxPolicyRevision,createdAt}]`，按 username 排序；不存在的用户名不出现；`mailboxPolicy:null` 表示使用公共配置 |
+| `GET /v1/admin/hosted-domains` | `admin` + `mailbox.read` | `domains`、`owner`（用户名），都可选 | `[{id,domain,ownerId,ownerUsername,status,zoneStatus,routingStatus,sendingStatus,catchAllReady,ready,createdAt}]`，按 id 排序；都不给返回全站，同时给取交集，`owner` 不存在返回 `[]`；`ready:true` 表示收发都已就绪 |
+| `GET /v1/admin/claude/domains` | `admin` + `mail.read` | `domains` | 每个后缀一项、与请求同序：`{domain,addresses,paid,suspended,suspendedAddresses:[{address,suspendedAt}]}`，即有 Claude 账号事实或收据的地址数、付费数、封号数与封号地址，`paid` 与地址视图同一口径；没有记录的后缀计数为 0 |
+| `GET /v1/admin/claude/addresses` | `admin` + `mail.read` | `addresses` | 每个地址一项、与请求同序：`{address,domain,known,firstSeenAt,paid,suspended,suspendedAt,anthropicMails,lastAnthropicMailAt,loginLinkMails,receipts,tier}`；没有 Anthropic 来信的地址 `known:false` |
 
 Claude 状态的口径：
 

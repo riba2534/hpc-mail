@@ -1,6 +1,6 @@
 import { MAX_ADMIN_LOOKUP, userMailboxPolicySchema } from '@hpc-mail/shared';
 import {
-  adminKeyRule, array, bool, date, fromZod, int, nullable, object, operation, positiveId, query, ref, registerSchemas, roleEnum, str,
+  adminKeyOperation, adminKeyRule, array, bool, date, fromZod, int, nullable, object, positiveId, query, ref, registerSchemas, roleEnum, str,
   userStatusEnum, type Paths,
 } from '../../openapi-common.js';
 import { AT } from '../../openapi-examples.js';
@@ -22,11 +22,11 @@ registerSchemas({
 /** /v1/admin/users 与 /v1/admin/hosted-domains：按用户名查用户、查托管域名及其就绪状态 */
 export function adminDirectoryPaths(): Paths {
   return {
-    '/admin/users': { get: operation('listAdminUsers', 'Look up users by username', array(ref('AdminUserView')), { scope: 'admin',
+    '/admin/users': { get: adminKeyOperation('listAdminUsers', 'Look up users by username', array(ref('AdminUserView')), 'mailbox.read', {
       parameters: [query('usernames', { type: 'string', minLength: 1 }, `Comma-separated usernames, or repeat the parameter; 1–${MAX_ADMIN_LOOKUP} distinct names, case-insensitive.`, true)],
       example: [{ id: 3, username: 'alice', role: 'user', status: 'active', mailboxPolicy: null, mailboxPolicyRevision: 0, createdAt: AT }],
       description: `${adminKeyRule} Sorted by username. Usernames that do not exist are absent from the result, so compare by username to find them. One database round trip.` }) },
-    '/admin/hosted-domains': { get: operation('listAdminHostedDomains', 'Look up hosted domains and whether they are ready', array(ref('AdminHostedDomainView')), { scope: 'admin',
+    '/admin/hosted-domains': { get: adminKeyOperation('listAdminHostedDomains', 'Look up hosted domains and whether they are ready', array(ref('AdminHostedDomainView')), 'mailbox.read', {
       parameters: [
         query('domains', { type: 'string', minLength: 1 }, `Comma-separated domains, or repeat the parameter; 1–${MAX_ADMIN_LOOKUP} distinct domains.`),
         query('owner', { type: 'string', minLength: 1 }, 'Only domains owned by this username; an unknown username returns an empty array.')],

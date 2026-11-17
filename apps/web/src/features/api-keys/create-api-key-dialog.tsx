@@ -345,7 +345,7 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
                     )}
                     {scopes.includes('admin') && (
                       <p className="text-xs text-caution">
-                        「管理员能力」让这把密钥能看全站邮件、用任意邮箱发信，并调用管理员运维接口（/v1/admin）。
+                        「管理员能力」让这把密钥能看全站邮件、用任意邮箱发信，并调用管理员运维接口（/v1/admin，需不限范围，写操作另勾选「管理邮箱」、查询勾选「读取邮箱」）。
                         不勾选时，你的密钥与普通用户的权限相同。
                       </p>
                     )}

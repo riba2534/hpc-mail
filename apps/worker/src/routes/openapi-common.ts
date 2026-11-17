@@ -1006,8 +1006,13 @@ export function usedSchemas(paths: Paths): Record<string, Schema> {
   visit(paths);
   return Object.fromEntries([...names].sort().map(name => [name, schemas[name]! ]));
 }
-/** /v1/admin 运维接口的鉴权说明：管理员账户的 Key 且带 admin scope */
-export const adminKeyRule = 'Requires an administrator key: an administrator account’s key with the admin scope (GET /v1/me shows key.effectiveRole admin); other keys get 403 forbidden.';
+/** /v1/admin 运维接口的鉴权说明：管理员账户的 Key，带 admin scope 且不限范围，另要该接口的读写 scope */
+export const adminKeyRule = 'Requires an unrestricted administrator key: an administrator account’s key with the admin scope and empty allowedMailboxIds and allowedDomains (GET /v1/me shows key.effectiveRole admin), plus the other scope in x-required-scopes; other keys get 403 forbidden.';
+/** /v1/admin 的接口：x-required-scopes 同时列出 admin 与该接口的读写 scope，两个都要 */
+export function adminKeyOperation(operationId: OperationId, summary: string, data: Schema, scope: string, options: OperationOptions = {}): Operation {
+  return { ...operation(operationId, summary, data, { ...options, scope, errors: [...(options.errors ?? []), 'ForbiddenScopeAdmin'] }),
+    'x-required-scopes': ['admin', scope] };
+}
 export const identitiesDescription = 'Which addresses the caller can send from. identities lists caller-owned mailboxes (kind=owned) with canSend and reason, then mailboxes shared with the caller (kind=shared). For ordinary users shared entries are always canSend=false with reason=shared_readonly; for administrators they follow the same domain rules as owned ones. Use a canSend=true entry as from (mailboxId or address). domains lists domains where any local part may be used: for administrators system domains, hosted domains whose sending is ready, and removed (legacy) domains that still have claimed mailboxes; for ordinary users the hosted domains they own whose sending is ready (kind=hosted, the address is claimed for the owner when sending). Administrators may also send from any other claimed mailbox by mailboxId; those are not listed.';
 /** 批量认领、批量可用性与随机后缀方案：会话与 API Key 两套接口同形，API Key 另需 scope */
 export function mailboxBatchPaths(scopes?: { read: string; write: string }): Paths {

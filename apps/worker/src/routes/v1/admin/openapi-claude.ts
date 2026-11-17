@@ -1,6 +1,6 @@
 import { CLAUDE_TIERS, MAX_ADMIN_LOOKUP } from '@hpc-mail/shared';
 import {
-  array, bool, date, domainName, int, nullable, object, operation, positiveId, query, ref, registerSchemas, str, type Paths,
+  adminKeyOperation, adminKeyRule, array, bool, date, domainName, int, nullable, object, positiveId, query, ref, registerSchemas, str, type Paths,
 } from '../../openapi-common.js';
 
 const tier = { ...nullable({ type: 'string', enum: [...CLAUDE_TIERS] }),
@@ -40,7 +40,7 @@ registerSchemas({
   }),
 });
 
-const trust = 'Requires an administrator account key with the admin scope; read-only. Facts and receipts only come from authenticated official Anthropic mail (exact sender domain allowlist, DKIM aligned with the sender, the address in the To header); mail received before authentication results were recorded (2026-11-17) counts by sender domain and subject. They survive permanent deletion of the mail.';
+const trust = `${adminKeyRule} Read-only. Facts and receipts only come from authenticated official Anthropic mail (exact sender domain allowlist, DKIM aligned with the sender, the address in the To header); mail received before authentication results were recorded (2026-11-17) counts by sender domain and subject. They survive permanent deletion of the mail.`;
 const lookup = (name: string, example: string) => query(name, { type: 'string', minLength: 1, examples: [example] },
   `Comma-separated ${name}, 1–${MAX_ADMIN_LOOKUP} after trimming and de-duplication; matched case-insensitively.`, true);
 
@@ -55,14 +55,14 @@ const addressExample = { address: 'alice@example.org', domain: 'example.org', kn
 export function adminClaudePaths(): Paths {
   return {
     '/admin/claude/domains': {
-      get: operation('listClaudeDomainFacts', 'Summarize Claude account facts per domain', array(ref('ClaudeDomainFacts')), {
-        scope: 'admin', parameters: [lookup('domains', 'example.org,unused.example')],
+      get: adminKeyOperation('listClaudeDomainFacts', 'Summarize Claude account facts per domain', array(ref('ClaudeDomainFacts')), 'mail.read', {
+        parameters: [lookup('domains', 'example.org,unused.example')],
         example: [domainExample, { domain: 'unused.example', addresses: 0, paid: 0, suspended: 0, suspendedAddresses: [] }],
         description: `One entry per requested domain, in request order; a domain without any fact returns zero counts. suspendedAddresses is ordered by suspension time. ${trust}` }),
     },
     '/admin/claude/addresses': {
-      get: operation('listClaudeAddressFacts', 'Read Claude facts, sign-in mail and receipts per address', array(ref('ClaudeAddressFacts')), {
-        scope: 'admin', parameters: [lookup('addresses', 'alice@example.org,new@example.org')],
+      get: adminKeyOperation('listClaudeAddressFacts', 'Read Claude facts, sign-in mail and receipts per address', array(ref('ClaudeAddressFacts')), 'mail.read', {
+        parameters: [lookup('addresses', 'alice@example.org,new@example.org')],
         example: [addressExample, { address: 'new@example.org', domain: 'example.org', known: false, firstSeenAt: null, paid: false, suspended: false,
           suspendedAt: null, anthropicMails: 0, lastAnthropicMailAt: null, loginLinkMails: 0, receipts: [], tier: null }],
         description: `One entry per requested address, in request order; an address with no Anthropic mail, fact or receipt returns known=false. anthropicMails, lastAnthropicMailAt and loginLinkMails count mail still stored (trash included) by sender domain; receipts are parsed from receipt mail (amount, currency, card last four) and kept after the mail is deleted. ${trust}` }),

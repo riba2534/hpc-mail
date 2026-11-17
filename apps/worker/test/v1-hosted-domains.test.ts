@@ -399,7 +399,10 @@ describe('/v1 接入自有域名', () => {
     // /v1/admin 只对管理员 Key 开放；那里没有暂停，GET /v1/admin/hosted-domains 是只读查询（不是 JWT 的管理列表）
     expect((await errorOf(await v1('POST', `/admin/hosted-domains/${site.id}/suspend`, owner.key), 403)).code).toBe('forbidden');
     expect((await errorOf(await v1('POST', `/admin/hosted-domains/${site.id}/suspend`, admin.key), 404)).code).toBe('not_found');
-    expect((await data<{ id: number }[]>(await v1('GET', `/admin/hosted-domains?domains=${site.domain}`, admin.key))).map((item) => item.id))
+    // 查询另要 mailbox.read：只带域名 scope 的管理员 Key 403，补上后返回该域名
+    expect((await errorOf(await v1('GET', `/admin/hosted-domains?domains=${site.domain}`, admin.key), 403)).message).toBe('需要 API scope: mailbox.read');
+    const reader = await f.actor('admin-reader', ['mailbox.read', 'admin'], 'admin');
+    expect((await data<{ id: number }[]>(await v1('GET', `/admin/hosted-domains?domains=${site.domain}`, reader.key))).map((item) => item.id))
       .toEqual([site.id]);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, site.id)).get())
       .toMatchObject({ status: 'active', userId: owner.id, memberLimit: 0 });
