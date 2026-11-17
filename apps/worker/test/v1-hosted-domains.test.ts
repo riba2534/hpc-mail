@@ -390,14 +390,17 @@ describe('/v1 接入自有域名', () => {
       ['PUT', `/hosted-domains/${site.id}/members`, { userIds: [], expectedOwnerId: owner.id }],
       ['DELETE', `/hosted-domains/${site.id}/members/${other.id}`, undefined],
       ['POST', `/hosted-domains/${site.id}/transfer`, { userId: other.id, expectedOwnerId: owner.id, includeMailboxes: true }],
-      ['GET', '/admin/hosted-domains', undefined],
-      ['POST', `/admin/hosted-domains/${site.id}/suspend`, undefined],
     ] as const;
     for (const key of [owner.key, admin.key]) {
       for (const [method, path, body] of jwtOnly) {
         expect((await errorOf(await v1(method, path, key, body), 404)).code, `${method} ${path}`).toBe('not_found');
       }
     }
+    // /v1/admin 只对管理员 Key 开放；那里没有暂停，GET /v1/admin/hosted-domains 是只读查询（不是 JWT 的管理列表）
+    expect((await errorOf(await v1('POST', `/admin/hosted-domains/${site.id}/suspend`, owner.key), 403)).code).toBe('forbidden');
+    expect((await errorOf(await v1('POST', `/admin/hosted-domains/${site.id}/suspend`, admin.key), 404)).code).toBe('not_found');
+    expect((await data<{ id: number }[]>(await v1('GET', `/admin/hosted-domains?domains=${site.domain}`, admin.key))).map((item) => item.id))
+      .toEqual([site.id]);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, site.id)).get())
       .toMatchObject({ status: 'active', userId: owner.id, memberLimit: 0 });
     expect(await db.select().from(hostedDomainMembers).where(eq(hostedDomainMembers.domainId, site.id)).all()).toHaveLength(1);
