@@ -10,7 +10,7 @@ import {
   CloudflareApiError, cloudflareCredentials, createDnsRecord, deleteDnsRecord, getDnsRecord, listDnsRecords, updateDnsRecord,
   type CfDnsRecord, type CloudflareCredentials,
 } from './cloudflare.js';
-import { loadAccess, requireManage } from './hosted-domain.js';
+import { HOSTED_DNS_SITE_RATE_SCOPE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE, loadAccess, requireManage } from './hosted-domain.js';
 import { counterResult, counterStatement, minuteWindow } from './rate-counter.js';
 
 /**
@@ -22,13 +22,8 @@ type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 
 /** 每位用户每分钟的解析请求计数（四个接口共用，管理员也计） */
 export const HOSTED_DNS_RATE_SCOPE = 'hosted_dns';
-/**
- * 全站每分钟由解析功能发出的 Cloudflare 调用数。所有托管域名共用站长的 Token（全局 1200 次/5 分钟），
- * 这里只限制本功能占用的份额（150 次/分钟，即 5 分钟 750 次），给定时开通、立即检测和控制台留出余量；
- * 只有能走到 Cloudflare 的请求才计入，按各接口实际的调用次数加权。
- */
-export const HOSTED_DNS_SITE_RATE_SCOPE = 'hosted_dns_site';
-export const MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE = 150;
+/** 全站 Cloudflare 调用额度与添加域名、立即检测共用，定义在 hosted-domain.ts；OpenAPI 描述从这里引用 */
+export { HOSTED_DNS_SITE_RATE_SCOPE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE };
 /** 每种操作的 Cloudflare 调用次数：列表 1；新增先列表再 POST；修改、删除先 GET 再写入 */
 const CF_CALLS = { list: 1, create: 2, update: 2, delete: 2 } as const;
 type DnsOperation = keyof typeof CF_CALLS;

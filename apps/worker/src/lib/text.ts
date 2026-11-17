@@ -36,14 +36,59 @@ function safeChar(code: number): string {
   return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
 }
 
+/**
+ * htmlToText 只处理开头这么多字符。收件解析在 SMTP Ack 前同步转换，输入来自任意外部发件人；
+ * 下游最多用到提码 16KB、通知 4000 字、验证链接 200KB 原文，512KB 绰绰有余。
+ */
+export const HTML_TO_TEXT_MAX_CHARS = 512 * 1024;
+
+/** 内容不算正文的元素：开标签与闭标签之间整段丢弃 */
+const RAW_BLOCK_OPEN = /<(script|style|head|template)\b[^>]*>/gi;
+
+/**
+ * 只处理最后一个 `>` 之前的部分：之后不可能有完整标签，`<[^>]+>` 这类正则在没有 `>` 的长串上
+ * 会对每个 `<` 都扫到结尾，退化成平方耗时（64KB 的 `<a <a …` 约 0.7 秒，256KB 约 12 秒）。
+ * 前一步替换可能删掉末尾的 `>`，所以每一步都重新切分。
+ */
+function withinMarkup(source: string, transform: (markup: string) => string): string {
+  const end = source.lastIndexOf('>') + 1;
+  return transform(source.slice(0, end)) + source.slice(end);
+}
+
+/**
+ * 剥离 script/style/head/template 整段，线性实现。等价的单条正则 `<(…)[^>]*>[\s\S]*?<\/\1\s*>`
+ * 遇到没有闭标签的开标签会从每个开标签扫到结尾，重复的 `<style>` 即可平方退化；
+ * 这里某种标签找不到闭标签后，之后同名的开标签也不可能再闭合，直接跳过。
+ */
+function stripRawBlocks(source: string): string {
+  const unclosed = new Set<string>();
+  const open = new RegExp(RAW_BLOCK_OPEN.source, 'gi');
+  let out = '';
+  let kept = 0;
+  for (let match = open.exec(source); match; match = open.exec(source)) {
+    const name = match[1]!.toLowerCase();
+    if (unclosed.has(name)) continue;
+    const close = new RegExp(`</${name}\\s*>`, 'gi');
+    close.lastIndex = open.lastIndex;
+    const closed = close.exec(source);
+    if (!closed) {
+      unclosed.add(name);
+      continue;
+    }
+    out += `${source.slice(kept, match.index)} `;
+    kept = open.lastIndex = closed.index + closed[0].length;
+  }
+  return out + source.slice(kept);
+}
+
 /** 无依赖的 HTML → 纯文本（收件解析与摘要用，禁止引入 linkedom 等重依赖） */
 export function htmlToText(html: string | undefined | null): string {
-  return String(html || '')
-    .replace(/<(script|style|head|template)[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(p|div|tr|li|h[1-6])>/gi, '\n')
-    .replace(INLINE_TAG, '')
-    .replace(/<[^>]+>/g, ' ')
+  let source = withinMarkup(String(html || '').slice(0, HTML_TO_TEXT_MAX_CHARS), stripRawBlocks);
+  source = withinMarkup(source, (markup) => markup.replace(/<br\s*\/?>/gi, '\n'));
+  source = withinMarkup(source, (markup) => markup.replace(/<\/(p|div|tr|li|h[1-6])>/gi, '\n'));
+  source = withinMarkup(source, (markup) => markup.replace(INLINE_TAG, ''));
+  source = withinMarkup(source, (markup) => markup.replace(/<[^>]+>/g, ' '));
+  return source
     .replace(/&nbsp;/gi, ' ')
     .replace(ZERO_WIDTH_ENTITY, '')
     // 数字实体先于 &amp; 解码，避免把 `&amp;#8203;` 这种字面量当成零宽空格

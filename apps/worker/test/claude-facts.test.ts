@@ -51,6 +51,26 @@ describe('Claude 地址事实归纳', () => {
     expect(facts.drip).toMatchObject({ paid: false, suspended: false });
   });
 
+  it('官方发件人按整个发件域精确比对：伪造的相似发件人不留事实，Safeguards 的 Intercom 域名照常计入', async () => {
+    const domain = domainOf();
+    const ban = 'Your account has been suspended';
+    await receive(`a@${domain}`, 'anthropic-safeguards@evil.example', ban);
+    await receive(`b@${domain}`, 'no-reply@anthropic-safeguards.evil.example', ban);
+    await receive(`c@${domain}`, 'x@anthropic.com.evil.example', ban);
+    await receive(`d@${domain}`, 'no-reply@mail.anthropic.com.evil.example', ban);
+    await receive(`e@${domain}`, 'no-reply@evil-mail.anthropic.com', ban);
+    await receive(`f@${domain}`, 'no-reply@sub.email.claude.com', 'Welcome to Claude');
+    await receive(`g@${domain}`, '"no-reply@mail.anthropic.com"@evil.example', ban);
+    await receive(`ok@${domain}`, 'appeals@anthropic-safeguards.intercom-mail.com', ban);
+    await receive(`up@${domain}`, 'No-Reply@Mail.Anthropic.COM', ban);
+
+    await harvestRecentClaudeFacts(env, 0);
+    const facts = await factsOf(domain);
+    expect(Object.keys(facts).sort()).toEqual(['ok', 'up']);
+    expect(facts.ok).toMatchObject({ suspended: true });
+    expect(facts.up).toMatchObject({ suspended: true });
+  });
+
   it('重复归纳幂等；标志只增不减，邮件没了统计仍在', async () => {
     const domain = domainOf();
     const ban = await receive(`a@${domain}`, 'no-reply@mail.anthropic.com', 'Your account has been suspended');
