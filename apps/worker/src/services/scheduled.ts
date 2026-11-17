@@ -13,6 +13,7 @@ import { chunk } from '../lib/d1.js';
 import type { Env } from '../types.js';
 import { API_REJECT_SCOPE, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
+import { REAUTH_FAIL_SCOPE } from './reauth.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
 import {
@@ -251,12 +252,13 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'counters', async () => {
     await purgeCounters(env, [
       OUTBOUND_QUOTA_SCOPE, 'fwd-domain', 'fwd-target', FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, 'ai-extract', TRANSLATE_CHARS_SCOPE,
+      'fwd-confirm',
     ], dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
     ], minuteWindow(1) - 120);
-    await purgeCounters(env, ['login-fail', LOGIN_ACCOUNT_SCOPE], minuteWindow(15) - 8);
+    await purgeCounters(env, ['login-fail', LOGIN_ACCOUNT_SCOPE, REAUTH_FAIL_SCOPE], minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });
 }

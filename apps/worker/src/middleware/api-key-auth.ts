@@ -38,6 +38,8 @@ interface ApiKeyRecord {
   user_id: number;
   scopes: string;
   allowed_ips: string;
+  allowed_mailbox_ids: string;
+  allowed_domains: string;
   rate_limit: number;
   status: 'active' | 'disabled' | 'revoked';
   expires_at: number | null;
@@ -52,7 +54,7 @@ interface ApiKeyRecord {
  */
 async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ settings: Settings; record: ApiKeyRecord | null }> {
   if (!keyHash) return { settings: await getSettings(env), record: null };
-  const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.rate_limit, k.status, k.expires_at,
+  const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.allowed_mailbox_ids, k.allowed_domains, k.rate_limit, k.status, k.expires_at,
       u.status AS user_status, u.role
     FROM api_keys k LEFT JOIN users u ON u.id = k.user_id WHERE k.key_hash = ? AND k.status <> 'revoked'`).bind(keyHash);
   const query = settingsQuery(env);
@@ -88,6 +90,8 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     userId: record.user_id,
     scopes: JSON.parse(record.scopes) as ApiScope[],
     allowedIps: JSON.parse(record.allowed_ips) as string[],
+    allowedMailboxIds: JSON.parse(record.allowed_mailbox_ids) as number[],
+    allowedDomains: JSON.parse(record.allowed_domains) as string[],
     rateLimit: Number(record.rate_limit),
     status: record.status,
     expiresAt: record.expires_at === null ? null : new Date(Number(record.expires_at)),
@@ -113,6 +117,8 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
       userId: row.userId,
       role: row.role ?? 'user',
       scopes: row.scopes,
+      allowedMailboxIds: row.allowedMailboxIds,
+      allowedDomains: row.allowedDomains,
     });
 
     // 查到 key 之后的四次写合进一个 batch：Key 级窗口计数、用户级与实例级总桶、last_used。
@@ -223,4 +229,35 @@ export function requireScope(c: Context<AppContext>, scope: ApiScope): void {
       docs: '/references/errors.md#forbidden-scope',
     });
   }
+}
+
+/** Key 限定范围；null 表示不限（含不经过 API Key 的请求） */
+export interface KeyRestriction {
+  mailboxIds: number[];
+  domains: string[];
+}
+
+/**
+ * 当前请求的 Key 限定范围。地址可用的判定（全站统一）：地址的域名在 domains 中，
+ * 或该地址当前的认领行 id 在 mailboxIds 中；未认领地址只看域名。
+ * TODO(PR4a-keys)：实现
+ */
+export function keyRestriction(c: Context<AppContext>): KeyRestriction | null {
+  void c;
+  return null;
+}
+
+/** 地址不在 Key 限定范围内时 403 forbidden（docs: /references/errors.md#key-restricted）。TODO(PR4a-keys)：实现 */
+export async function assertKeyCanUseAddress(c: Context<AppContext>, address: string): Promise<void> {
+  void c; void address;
+}
+
+/** 域名不在 Key 限定的 domains 中时 403（只限定了邮箱的 Key 不能使用任何域名级能力，如认领）。TODO(PR4a-keys)：实现 */
+export function assertKeyCanUseDomain(c: Context<AppContext>, domain: string): void {
+  void c; void domain;
+}
+
+/** 已知认领行时的判定（免一次查询）：id 在 mailboxIds 或 domain 在 domains 中。TODO(PR4a-keys)：实现 */
+export function assertKeyCanUseMailbox(c: Context<AppContext>, mailbox: { id: number; domain: string }): void {
+  void c; void mailbox;
 }

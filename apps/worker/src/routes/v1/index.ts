@@ -8,8 +8,11 @@ import { getVisibleDomains } from '../../services/domain.js';
 import { listSendIdentities } from '../../services/identities.js';
 import type { AppContext } from '../../types.js';
 import { createUploadRoutes } from '../uploads.js';
+import v1MailboxShares from './mailbox-shares.js';
 import v1Mailboxes from './mailboxes.js';
 import v1Messages from './messages.js';
+import v1NotifyPrefs from './notify-prefs.js';
+import v1Webhooks from './webhooks.js';
 import { buildOpenApiSpec } from './openapi.js';
 
 const app = new Hono<AppContext>();
@@ -57,8 +60,12 @@ app.get('/domains', apiKeyAuth, async (c) => {
 /** OpenAPI 描述（公开，无需 key） */
 app.get('/openapi.json', (c) => c.json(buildOpenApiSpec(new URL(c.req.url).origin)));
 
+// 共享管理先于 /mailboxes 挂载：/mailboxes/shares 不能落进 /mailboxes/:id
+app.route('/mailboxes/shares', v1MailboxShares);
 app.route('/mailboxes', v1Mailboxes);
 app.route('/messages', v1Messages);
+app.route('/notify-prefs', v1NotifyPrefs);
+app.route('/webhooks', v1Webhooks);
 app.route('/uploads', createUploadRoutes(apiKeyAuth, async (c, next) => {
   requireScope(c, 'mail.send');
   await next();

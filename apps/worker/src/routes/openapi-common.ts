@@ -448,6 +448,13 @@ export function specificationOperation(): Operation {
     200: { description: 'Raw OpenAPI 3.1 document, without a data envelope', content: { 'application/json': { schema: document } } },
   } };
 }
+/** 分文件维护的路径（如 openapi-webhooks.ts）在模块加载时登记自己的组件 schema，避免都挤进上面的对象 */
+export function registerSchemas(extra: Record<string, Schema>): void {
+  for (const [name, schema] of Object.entries(extra)) {
+    if (name in schemas && schemas[name] !== schema) throw new Error(`OpenAPI schema ${name} 重复登记`);
+    schemas[name] = schema;
+  }
+}
 /** Emit only schemas actually reachable from these routes, so imported tool contracts stay focused. */
 export function usedSchemas(paths: Paths): Record<string, Schema> {
   const names = new Set<string>();

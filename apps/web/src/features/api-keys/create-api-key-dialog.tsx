@@ -30,6 +30,11 @@ const SCOPE_LABELS: Record<ApiScope, string> = {
   'mail.send': '发送邮件',
   'mailbox.read': '读取邮箱',
   'mailbox.write': '管理邮箱',
+  'mailbox.share': '管理共享',
+  'webhook.write': '配置 Webhook',
+  'notify.read': '读取通知配置',
+  'notify.write': '修改通知配置',
+  admin: '管理员能力',
 };
 
 type ScopePreset = 'read' | 'send' | 'full' | 'custom';
@@ -41,7 +46,7 @@ export const SCOPE_PRESETS: ReadonlyArray<{
 }> = [
   { value: 'read', label: '只读收信', scopes: ['mail.read', 'mailbox.read'] },
   { value: 'send', label: '收发信', scopes: ['mail.read', 'mail.write', 'mail.send', 'mailbox.read'] },
-  { value: 'full', label: '完全访问', scopes: API_SCOPES },
+  { value: 'full', label: '完全访问', scopes: API_SCOPES.filter((scope) => scope !== 'admin') },
 ];
 
 const DEFAULT_SCOPES = SCOPE_PRESETS[0]!.scopes;

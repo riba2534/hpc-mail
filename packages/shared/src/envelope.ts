@@ -69,6 +69,10 @@ export const ERROR_CODES = [
   'header_not_allowed',
   /** 全部收件人被明确拒收，没有任何一份投递成功：422，details 带发件行 id 与逐收件人结果；同 Key 重放返回同样的错误 */
   'delivery_failed',
+  /** 敏感操作（创建 API Key、新增转发目标、开关两步验证）需要在请求里带当前密码 password：403 */
+  'reauth_required',
+  /** 重新验证时当前密码错误：403（不是 401，网页会话不会因此被清掉）；15 分钟内失败 5 次后 429 */
+  'reauth_failed',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -94,5 +98,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   source_unavailable: 404,
   header_not_allowed: 400,
   delivery_failed: 422,
+  reauth_required: 403,
+  reauth_failed: 403,
   internal: 500,
 };

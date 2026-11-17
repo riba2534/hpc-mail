@@ -36,8 +36,12 @@ export interface AuthUser {
 export interface ApiKeyContext {
   id: number;
   userId: number;
+  /** 执行角色：所属用户是管理员且 Key 带 admin scope 时为 admin，否则 user */
   role: Role;
   scopes: ApiScope[];
+  /** 限定的邮箱认领行 id 与域名；两者都为空表示不限（见 middleware/api-key-auth.ts 的 keyRestriction） */
+  allowedMailboxIds: number[];
+  allowedDomains: string[];
 }
 
 export interface AppVariables {

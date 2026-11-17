@@ -49,6 +49,8 @@ function serialize(row: ApiKeyRow, ownerUsername?: string): ApiKeySummary {
     expiresAt: row.expiresAt ? row.expiresAt.toISOString() : null,
     lastUsedAt: row.lastUsedAt ? row.lastUsedAt.toISOString() : null,
     createdAt: row.createdAt.toISOString(),
+    allowedMailboxIds: row.allowedMailboxIds,
+    allowedDomains: row.allowedDomains,
     ...(ownerUsername !== undefined ? { ownerUsername } : {}),
   };
 }
@@ -66,10 +68,14 @@ function normalizeExpiry(value: string | undefined): Date | null {
  * 创建 Key。authEpoch 传入会话令牌的用户鉴权版本（uepoch）时，插入条件同时要求用户的
  * auth_version 仍等于它：改密会递增版本并吊销全部 Key，与之并发的旧令牌请求不能在吊销后再插入新 Key。
  */
+/** 服务层入参：密码重新验证在路由里做；限定范围缺省为不限 */
+export type CreateApiKeyParams = Omit<CreateApiKeyRequest, 'password' | 'allowedMailboxIds' | 'allowedDomains'>
+  & Partial<Pick<CreateApiKeyRequest, 'allowedMailboxIds' | 'allowedDomains'>>;
+
 export async function createApiKey(
   env: Env,
   userId: number,
-  req: CreateApiKeyRequest,
+  req: CreateApiKeyParams,
   authEpoch?: number,
 ): Promise<CreatedApiKey> {
   const db = createDb(env);
@@ -166,6 +172,8 @@ export async function getApiKeySelf(env: Env, keyId: number, userId: number, now
       id: key.id, name: key.name, keyPrefix: key.keyPrefix, keySuffix: key.keySuffix, scopes: key.scopes as ApiScope[],
       rateLimit: key.rateLimit, allowedIps: key.allowedIps,
       expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null, createdAt: key.createdAt.toISOString(),
+      allowedMailboxIds: key.allowedMailboxIds, allowedDomains: key.allowedDomains,
+      effectiveRole: user.role === 'admin' && (key.scopes as ApiScope[]).includes('admin') ? 'admin' : 'user',
     },
     user,
     limits: { userRequestsPerMinute: MAX_API_USER_REQUESTS_PER_MINUTE, waitPollsPerMinute: MAX_WAIT_POLLS_PER_USER_PER_MINUTE },
