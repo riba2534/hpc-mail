@@ -28,6 +28,8 @@ import type {
   ListMessagesQuery,
   LoginRequest,
   MarkAllReadRequest,
+  ApiMarkReadRequest,
+  MarkReadResult,
   LoginResponse,
   Mailbox,
   MailboxAvailability,
@@ -151,8 +153,10 @@ export const messageApi = {
       headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
     }),
   unreadCount: () => api.get<{ unread: number }>('/messages/unread-count'),
-  markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed') =>
-    api.post<{ changed: number }, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
+  /** includeUnread：个人视图的响应顺带带回标记后的未读数，省掉一次 unread-count 请求 */
+  markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed', includeUnread = false) =>
+    api.post<MarkReadResult, ApiMarkReadRequest>('/messages/read', { ids, isRead, ...(includeUnread ? { includeUnread } : {}) },
+      { query: { scope } }),
   /** 按筛选（domain/address/q）收窄范围的全部已读；只处理自己认领的地址 */
   markAllRead: (body: MarkAllReadRequest = {}) =>
     api.post<{ changed: number }, MarkAllReadRequest>('/messages/read-all', body),
