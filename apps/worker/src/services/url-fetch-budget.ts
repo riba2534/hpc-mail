@@ -1,7 +1,7 @@
 import { MAX_URL_ATTACHMENT_BUFFER_BYTES, MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE } from '@hpc-mail/shared';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
-import { counterResult, counterStatement, minuteWindow } from './rate-counter.js';
+import { counterResult, counterStatement, minuteWindow, type CounterGuard } from './rate-counter.js';
 
 /** URL 附件拉取次数：按用户每分钟一格（count=拉取的 URL 个数），发信、批量的每一项与草稿共用 */
 export const URL_FETCH_SCOPE = 'url-fetch';
@@ -18,9 +18,9 @@ export function newUrlBufferBudget(): UrlBufferBudget {
   return { remaining: MAX_URL_ATTACHMENT_BUFFER_BYTES };
 }
 
-/** 占用 count 次拉取额度的语句（与同一请求里的其他计数合进一个 batch） */
-export function urlFetchStatement(env: Env, userId: number, count: number, window: number): D1PreparedStatement {
-  return counterStatement(env, URL_FETCH_SCOPE, String(userId), window, count);
+/** 占用 count 次拉取额度的语句（与同一请求里的其他计数合进一个 batch）；guard 不成立时不写入、结果无行 */
+export function urlFetchStatement(env: Env, userId: number, count: number, window: number, guard?: CounterGuard): D1PreparedStatement {
+  return counterStatement(env, URL_FETCH_SCOPE, String(userId), window, count, 0, guard);
 }
 
 /** 读占用语句的结果：超过每分钟上限时退回本次占用并抛 429 */
@@ -35,10 +35,14 @@ export async function settleUrlFetch(env: Env, userId: number, count: number, wi
   });
 }
 
-/** 单独占用拉取额度（草稿保存时在拉取前调用）；extra 是要与它合进同一次往返的其他语句，返回它们的结果 */
-export async function reserveUrlFetches(env: Env, userId: number, count: number, extra: D1PreparedStatement[] = []): Promise<D1Result[]> {
+/**
+ * 单独占用拉取额度（草稿保存时在拉取前调用）。guard 是调用方自己的前置条件（如草稿数上限），与计数同一条语句判断：
+ * 不成立时什么也不写、返回 false，由调用方拒绝——被拒的请求不占额度，也不用再退回。
+ */
+export async function reserveUrlFetches(env: Env, userId: number, count: number, guard?: CounterGuard): Promise<boolean> {
   const window = minuteWindow(1);
-  const [own, ...rest] = await env.db.batch([urlFetchStatement(env, userId, count, window), ...extra]);
-  await settleUrlFetch(env, userId, count, window, own);
-  return rest;
+  const result = await urlFetchStatement(env, userId, count, window, guard).all();
+  if (guard && !counterResult(result)) return false;
+  await settleUrlFetch(env, userId, count, window, result);
+  return true;
 }

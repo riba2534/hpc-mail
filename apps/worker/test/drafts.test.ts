@@ -1,5 +1,5 @@
 import {
-  MAX_DRAFTS_PER_USER, type ApiScope, type CreatedApiKey, type Draft, type DraftSummary, type MessageSummary, type Page,
+  MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFTS_PER_USER, type ApiScope, type CreatedApiKey, type Draft, type DraftSummary, type MessageSummary, type Page,
   type SingleUploadResult,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
@@ -178,6 +178,19 @@ describe('草稿的增删改查与权限', () => {
     expect([retexted.text, retexted.html]).toEqual(['plain', html]);
     const rehtml = await data<Draft>(await call(`/v1/drafts/${htmlOnly.id}`, req(me.key, 'PATCH', { html: '<p>x</p>' })));
     expect([rehtml.text, rehtml.html]).toEqual(['plain', '<p>x</p>']);
+  });
+
+  it("CR1'：只改一段正文时，与沿用的另一段合计超过 1 MiB 返回 400，什么也不写（普通草稿与创建同一口径）", async () => {
+    const me = await account('draft-body-cap');
+    const created = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { text: 'a'.repeat(1_000_000) })), 201);
+    const before = await row(created.id);
+    const tooBig = await failure(await call(`/v1/drafts/${created.id}`, req(me.key, 'PATCH', { html: `<p>${'b'.repeat(100_000)}</p>` })), 400);
+    expect(tooBig).toMatchObject({ code: 'validation_failed', message: '正文 UTF-8 字节合计超过上限' });
+    expect(await row(created.id)).toMatchObject({ status: 'draft', version: 1, bodyR2Key: before!.bodyR2Key });
+    expect((await data<Draft>(await call(`/v1/drafts/${created.id}`, req(me.key, 'GET')))).html).toBe('');
+    // 两段一起换、合计在上限内照常保存
+    const replaced = await data<Draft>(await call(`/v1/drafts/${created.id}`, req(me.key, 'PATCH', { text: '', html: `<p>${'b'.repeat(100_000)}</p>` })));
+    expect([replaced.text.length, replaced.html.length]).toEqual([0, 100_007]);
   });
 });
 
@@ -509,6 +522,40 @@ describe('到点按安排者的有效权限发送（CR2/CR3/A23）', () => {
     await dispatch();
     expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('API Key 已失效') });
   });
+
+  it("CR3'：定时失败（保留 send_at）的草稿被另一把 Key 改写，立即发送中断后经租约恢复重排时，到点复核的是改写者", async () => {
+    const admin = await account('sched-failed-admin', USER_SCOPES, 'admin');
+    const victim = await account('sched-failed-victim');
+    const [box] = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, victim.address));
+    // 管理员在网页安排的定时信到点失败：status=failed，send_at 仍在，安排者是网页会话（NULL）
+    const draft = await data<Draft>(await call('/api/drafts', req(admin.jwt, 'POST', complete(admin.address, 'sf-a@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await db.update(drafts).set({ status: 'failed', sendAt: new Date(Date.now() - MINUTE), errorDetail: '收件人全部被拒收' }).where(eq(drafts.id, draft.id));
+    // 名下不带 admin scope 的 Key 改写发件人（不带 sendAt，状态仍是 failed）
+    await data(await call(`/v1/drafts/${draft.id}`, req(admin.key, 'PATCH', { from: { mailboxId: box!.id }, to: ['sf-b@hpc.email'] })));
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', scheduledByKeyId: admin.keyId });
+    // 这把 Key 立即发送：认领之后、写回之前被中断，租约到期后按定时规则重排
+    await db.update(drafts).set({ status: 'sending', attempt: 1, claimedAt: new Date(Date.now() - DRAFT_SENDING_LEASE_MS - MINUTE) })
+      .where(eq(drafts.id, draft.id));
+    await dispatch();
+    await makeDue(draft.id);
+    await dispatch();
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', messageId: null });
+    expect(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.address, victim.address), eq(messages.direction, 'outbound'))))
+      .toEqual([]);
+
+    // 普通用户：改写者的 Key 吊销后，重排的这封不再发出
+    const me = await account('sched-failed-user');
+    const own = await data<Draft>(await call('/api/drafts', req(me.jwt, 'POST', complete(me.address, 'sf-c@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await db.update(drafts).set({ status: 'failed', sendAt: new Date(Date.now() - MINUTE) }).where(eq(drafts.id, own.id));
+    await data(await call(`/v1/drafts/${own.id}`, req(me.key, 'PATCH', { to: ['sf-d@hpc.email'] })));
+    await db.update(apiKeys).set({ status: 'revoked' }).where(eq(apiKeys.id, me.keyId));
+    await db.update(drafts).set({ status: 'sending', attempt: 1, claimedAt: new Date(Date.now() - DRAFT_SENDING_LEASE_MS - MINUTE) })
+      .where(eq(drafts.id, own.id));
+    await dispatch();
+    await makeDue(own.id);
+    await dispatch();
+    expect(await row(own.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('API Key 已失效') });
+  });
 });
 
 describe('草稿接口的未知字段（E2）', () => {
@@ -522,6 +569,18 @@ describe('草稿接口的未知字段（E2）', () => {
     const patched = await failure(await call(`/v1/drafts/${draft.id}`, req(me.key, 'PATCH', { body: 'x' })), 400);
     expect(patched.fix).toContain('body 应写成 text 或 html');
     expect(await row(draft.id)).toMatchObject({ version: 1 });
+  });
+
+  it("E2'：立即发送带未知字段（想定时的 sendAt、写错的 version）返回 400，不会提前发出或跳过版本锁", async () => {
+    const me = await account('draft-strict-send');
+    const draft = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 's2@hpc.email'))), 201);
+    const early = await failure(await call(`/v1/drafts/${draft.id}/send`, req(me.key, 'POST', { sendAt: inMinutes(60) })), 400);
+    expect(early).toMatchObject({ code: 'validation_failed', message: '立即发送不接受字段：sendAt' });
+    expect(early.fix).toContain('PATCH /drafts/:id');
+    const typo = await failure(await call(`/api/drafts/${draft.id}/send`, req(me.jwt, 'POST', { version: draft.version + 5 })), 400);
+    expect(typo.fix).toContain('version 应写成 expectedVersion');
+    expect(await row(draft.id)).toMatchObject({ status: 'draft', version: draft.version, messageId: null });
+    expect(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.address, me.address), eq(messages.direction, 'outbound')))).toEqual([]);
   });
 });
 
@@ -547,6 +606,18 @@ describe('草稿里的 URL 附件（A12）', () => {
       expect((await failure(await call('/v1/drafts', req(me.key, 'POST', { attachments: [{ url: 'https://files.example.com/b.pdf' }] })), 409)).code)
         .toBe('draft_limit_reached');
       expect(fetchMock).not.toHaveBeenCalled();
+      // A12'：被拒的这次没有拉取，不占拉取额度（草稿数守卫与计数同一条语句，超限时不写入）
+      const fetches = async () => (await env.db.prepare(`SELECT SUM(count) AS n FROM rate_counters WHERE scope = 'url-fetch' AND subject = ?`)
+        .bind(String(me.id)).first<{ n: number }>())!.n;
+      expect(await fetches()).toBe(1);
+      // base64 合计已超总额时同样在拉取、计数之前拒绝
+      const [huge] = await db.insert(draftAttachments).values({ userId: me.id, token: 'draft-url-limit-huge', filename: 'h.bin', mimeType: 'application/octet-stream',
+        size: MAX_ATTACHMENT_TOTAL_BYTES, r2Key: `draft/${me.id}/huge`, status: 'ready' }).returning({ token: draftAttachments.token });
+      expect((await failure(await call(`/v1/drafts/${saved.id}`, req(me.key, 'PATCH', { attachmentTokens: [huge!.token],
+        attachments: [{ filename: 'a.txt', contentType: 'text/plain', content: btoa('aaa') }, { url: 'https://files.example.com/c.pdf' }] })), 413)).code)
+        .toBe('payload_too_large');
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(await fetches()).toBe(1);
     } finally {
       vi.unstubAllGlobals();
     }

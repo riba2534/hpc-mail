@@ -9,7 +9,10 @@ import {
   listMessagesQuerySchema,
   MAX_BATCH_SEND_ITEMS,
   sendAtProblem,
+  sendDraftRequestSchema,
   sendRequestFingerprint,
+  type DraftRequestBody,
+  type SendDraftRequest,
   type StoredDraftContent,
 } from '../src/index.js';
 
@@ -110,6 +113,42 @@ describe('服务端草稿', () => {
     expect(issue.params?.fix).toContain('草稿可用的字段：from, to');
     expect(firstMessage(draftInputSchema, { foo: 1, bar: 2 })).toBe('草稿不接受字段：foo, bar');
     expect(draftInputSchema.parse({ subject: 's', sendAt: null })).toEqual({ subject: 's', sendAt: null });
+  });
+
+  it("E2'：与 Object.prototype 同名的字段不会查到原型上的函数当提示", () => {
+    for (const key of ['toString', 'constructor', 'hasOwnProperty', 'valueOf']) {
+      const result = draftInputSchema.safeParse(JSON.parse(`{"${key}": 1}`));
+      expect(result.success, key).toBe(false);
+      const issue = result.error!.issues[0]! as { message: string; params?: { fix?: string } };
+      expect(issue.message, key).toBe(`草稿不接受字段：${key}`);
+      expect(issue.params?.fix, key).not.toContain('应写成');
+      expect(issue.params?.fix, key).not.toContain('native code');
+    }
+  });
+
+  it("E2'：立即发送的请求体同样拒绝未知字段并给出提示，不会丢掉 sendAt、version 后照常发出", () => {
+    expect(sendDraftRequestSchema.parse({})).toEqual({});
+    expect(sendDraftRequestSchema.parse({ expectedVersion: 3 })).toEqual({ expectedVersion: 3 });
+    const fixOf = (input: unknown) => {
+      const result = sendDraftRequestSchema.safeParse(input);
+      expect(result.success).toBe(false);
+      return result.error!.issues[0]! as { message: string; params?: { fix?: string; docs?: string } };
+    };
+    const scheduled = fixOf({ sendAt: '2026-11-18T09:00:00+08:00' });
+    expect(scheduled.message).toBe('立即发送不接受字段：sendAt');
+    expect(scheduled.params?.fix).toContain('PATCH /drafts/:id');
+    expect(fixOf({ version: 3 }).params?.fix).toContain('version 应写成 expectedVersion');
+    expect(fixOf({ to: ['b@x.io'] }).params?.fix).toContain('PATCH /drafts/:id');
+    expect(fixOf({ toString: 1 }).params?.fix).not.toContain('native code');
+  });
+
+  it("E2'：请求体类型不带索引签名，前端写错字段名编译期就报错", () => {
+    // @ts-expect-error scheduledAt 不是草稿字段（DraftRequestBody 带索引签名时这里不报错，typecheck 失败）
+    const body: DraftRequestBody = { subject: 's', scheduledAt: '2026-11-18T09:00:00Z' };
+    // @ts-expect-error version 不是立即发送的字段
+    const send: SendDraftRequest = { version: 3 };
+    expect(draftInputSchema.safeParse(body).success).toBe(false);
+    expect(sendDraftRequestSchema.safeParse(send).success).toBe(false);
   });
 
   it('sendAt 最早 1 分钟后、最晚 30 天内', () => {
