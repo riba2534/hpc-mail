@@ -38,7 +38,7 @@ const totpValid = (code) => [-1, 0, 1].some((w) => totp(TOTP_SECRET, Math.floor(
 let S; // 当前场景状态
 const reset = (overrides = {}) => {
   S = {
-    adminTotp: false, adminLoginError: null, require2fa: false, oldHomepages: 0, userCanAdmin: false,
+    adminTotp: false, adminLoginError: null, require2fa: false, oldHomepages: 0, padAssetHeaders: 0, userCanAdmin: false,
     heartbeatAfter: 1, heartbeatOk: true, hangs: {},
     sessions: new Map(), hits: [], homepageHits: 0, sends: [], canaryPolls: 0, healthPolls: 0, logins: [],
     ...overrides,
@@ -88,7 +88,12 @@ function handle(req, body) {
     S.homepageHits += 1;
     return [200, { 'content-type': 'text/html' }, html(S.homepageHits <= S.oldHomepages ? 'index-OLD00000.js' : 'index-NEW11111.js')];
   }
-  if (path === '/assets/index-NEW11111.js') return [200, { 'content-type': 'application/javascript', 'cache-control': 'public, max-age=31536000, immutable' }, ''];
+  if (path === '/assets/index-NEW11111.js') {
+    // padAssetHeaders：在长缓存头之后追加大量响应头，让 `curl | tr | grep -q` 在 grep 提前退出后必然触发 SIGPIPE
+    const headers = { 'content-type': 'application/javascript', 'cache-control': 'public, max-age=31536000, immutable' };
+    for (let i = 0; i < S.padAssetHeaders; i += 1) headers[`x-pad-${i}`] = 'p'.repeat(24);
+    return [200, headers, ''];
+  }
   if (path.startsWith('/assets/') || path === '/references/missing-smoke-document.md') return [404, { 'content-type': 'text/plain; charset=utf-8' }, 'not found'];
   if (path === '/sw.js') return [200, { 'content-type': 'text/javascript', 'cache-control': 'no-cache' }, ''];
   if (path === '/skill.md') return [200, { 'content-type': 'text/markdown; charset=utf-8' }, '---\nname: hpc-mail\n---\n'];
@@ -311,6 +316,13 @@ test('smoke：首页引用旧资源 404 时带缓存击穿重试', async () => {
   assert.equal(r.status, 0, r.output);
   assert.equal((r.output.match(/带缓存击穿重取首页/g) ?? []).length, 2, r.output);
   assert.ok(S.hits.some((h) => h.path.startsWith('/?smoke-cache-bust=')), '重试应带缓存击穿参数');
+});
+
+test('smoke：响应头很多时检查长缓存不受 pipefail 与 grep -q 提前退出的竞态影响', async () => {
+  // 旧写法 `curl | tr | grep -qi` 在 grep 匹配后提前退出，tr 写剩余输出时收到 SIGPIPE，pipefail 下整条判失败
+  reset({ padAssetHeaders: 2500 });
+  const r = await smoke();
+  assert.equal(r.status, 0, r.output);
 });
 
 test('smoke：旧资源持续 404 时重试 5 次后失败', async () => {

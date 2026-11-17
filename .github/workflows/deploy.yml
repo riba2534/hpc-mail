@@ -357,7 +357,9 @@ jobs:
           restored=unverified
           if [ -n "$PREVIOUS_BUILD" ]; then
             for i in $(seq 1 18); do
-              if curl -sS --max-time 10 -D - -o /dev/null "$BASE_URL/api/config" | tr -d '\r' | grep -qi "^x-hpc-build: $PREVIOUS_BUILD$"; then
+              # 响应头先读进变量再匹配，避免 pipefail 下 grep -q 提前退出导致上游 SIGPIPE 误判
+              config_headers=$(curl -sS --max-time 10 -D - -o /dev/null "$BASE_URL/api/config" | tr -d '\r' || true)
+              if grep -qi "^x-hpc-build: $PREVIOUS_BUILD$" <<<"$config_headers"; then
                 restored=yes
                 break
               fi
