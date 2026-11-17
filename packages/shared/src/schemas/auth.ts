@@ -64,6 +64,8 @@ export type RegisterRequest = z.infer<typeof registerRequestSchema>;
 export const changePasswordRequestSchema = z.object({
   oldPassword: z.string().min(1).max(PASSWORD_MAX_LENGTH),
   newPassword: passwordSchema,
+  /** 改密时一并吊销本人全部 API Key（默认吊销：账号可能已泄露，旧 Key 不应继续有效） */
+  revokeApiKeys: z.boolean().default(true),
 });
 export type ChangePasswordRequest = z.infer<typeof changePasswordRequestSchema>;
 
