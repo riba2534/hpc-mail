@@ -723,9 +723,11 @@ function unreadCountQuery(db: Db, userId: number, role: Role, cap?: number, rest
     isNull(messages.deletedAt),
     restrictCondition(restrict),
   );
-  if (cap === undefined) return db.select({ value: count() }).from(messages).where(where);
+  // 列名写成 value：markMessagesAndCount 把它放进原生 batch，按列名取结果
+  const value = count().as('value');
+  if (cap === undefined) return db.select({ value }).from(messages).where(where);
   const capped = db.select({ one: sql`1`.as('one') }).from(messages).where(where).limit(cap).as('capped');
-  return db.select({ value: count() }).from(capped);
+  return db.select({ value }).from(capped);
 }
 
 /** 近期联系人：从可见邮件聚合收件人(outbound)与发件人(inbound)地址，供写信自动补全 */
@@ -1248,9 +1250,31 @@ export async function markMessages(
   ids: number[],
   isRead: boolean,
 ): Promise<number> {
+  return (await markMessagesAndCount(env, viewer, ids, isRead)).changed;
+}
+
+/**
+ * 同 markMessages；给了 unreadCap 时在同一个 batch（同一事务）里接着数标记后调用者自己的未读数
+ * （同 countUnread 口径，封顶），详情页标已读不必再单独请求一次未读数。
+ */
+export async function markMessagesAndCount(
+  env: Env,
+  viewer: Viewer,
+  ids: number[],
+  isRead: boolean,
+  unreadCap?: number,
+): Promise<{ changed: number; unread?: number }> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  return runInChunks(env, ids, (batch) => db.update(messages).set({ isRead }).where(scopedIdsCondition(db, scope, batch, viewer.restrict)));
+  const updates = chunk(ids).map((batch) =>
+    d1Statement(env, db.update(messages).set({ isRead }).where(scopedIdsCondition(db, scope, batch, viewer.restrict))));
+  const count = unreadCap === undefined
+    ? undefined : d1Statement(env, unreadCountQuery(db, viewer.userId, viewer.role, unreadCap, viewer.restrict));
+  const statements = count ? [...updates, count] : updates;
+  if (!statements.length) return { changed: 0 };
+  const results = await env.db.batch<{ value: number }>(statements);
+  const changed = results.slice(0, updates.length).reduce((sum, result) => sum + (result.meta.changes ?? 0), 0);
+  return count ? { changed, unread: Number(results.at(-1)!.results[0]?.value ?? 0) } : { changed };
 }
 
 /**

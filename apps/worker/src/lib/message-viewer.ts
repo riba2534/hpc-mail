@@ -25,9 +25,27 @@ export function messageViewer(
   if (actor.role !== 'admin' && scope !== undefined && scope !== 'mine') {
     throw new AppError('forbidden', '无权使用该可见范围');
   }
-  const restrict = keyRestriction(c) ?? undefined;
-  const viewer: Viewer = { ...actor, scope, targetUserId: query.userId, ...(restrict ? { restrict } : {}) };
+  const viewer = scopedViewer(c, actor, scope, query.userId);
   if (!mutation) auditUserScopeRead(c, viewer);
+  return viewer;
+}
+
+function scopedViewer(c: Context<AppContext>, actor: { userId: number; role: Viewer['role'] }, scope: Viewer['scope'], targetUserId?: number): Viewer {
+  const restrict = keyRestriction(c) ?? undefined;
+  return { ...actor, scope, targetUserId, ...(restrict ? { restrict } : {}) };
+}
+
+/**
+ * 列表：scope/userId 已随列表查询一起解析校验（越权范围由 listMessages 的 resolveScope 拒绝），
+ * 同样带上 API Key 的限定范围，管理员读他人邮件时记审计。
+ */
+export function listViewer(
+  c: Context<AppContext>,
+  actor: { userId: number; role: Viewer['role'] },
+  query: { scope?: Viewer['scope']; userId?: number },
+): Viewer {
+  const viewer = scopedViewer(c, actor, query.scope, query.userId);
+  auditUserScopeRead(c, viewer);
   return viewer;
 }
 

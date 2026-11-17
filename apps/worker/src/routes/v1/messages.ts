@@ -15,7 +15,7 @@ import {
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
-import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer } from '../../lib/message-viewer.js';
+import { auditUnclaimedPurge, listViewer, messageViewer, mutationViewer } from '../../lib/message-viewer.js';
 import { runLimited } from '../../lib/concurrency.js';
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
@@ -58,7 +58,7 @@ app.get('/', async (c) => {
   // 显式给出范围外的地址或域名直接 403，而不是静默返回空列表
   if (query.address) await assertKeyCanUseAddress(c, query.address);
   if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
-  return ok(c, await listMessages(c.env, viewerFromKey(key, query, c), query));
+  return ok(c, await listMessages(c.env, listViewer(c, { userId: key.userId, role: key.role }, query), query));
 });
 
 app.post('/', (c) => {
@@ -275,17 +275,6 @@ function waitForPoll(signal: AbortSignal, milliseconds: number): Promise<void> {
     signal.addEventListener('abort', complete, { once: true });
     if (signal.aborted) complete();
   });
-}
-
-function viewerFromKey(
-  key: { userId: number; role: Viewer['role'] },
-  query: { scope?: Viewer['scope']; userId?: number },
-  c: Context<AppContext>,
-): Viewer {
-  const restrict = keyRestriction(c) ?? undefined;
-  const viewer: Viewer = { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId, ...(restrict ? { restrict } : {}) };
-  auditUserScopeRead(c, viewer);
-  return viewer;
 }
 
 app.get('/:id/thread', async (c) => {
