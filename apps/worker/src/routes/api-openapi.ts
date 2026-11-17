@@ -1,7 +1,7 @@
 import { HOSTED_DOMAIN_STATUSES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, identitiesDescription, idempotencyHeader, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
-  page, pageQuery, query, ref, scopeQuery, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mutationQuery, object, okResult, operation,
+  page, pageQuery, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
 
@@ -98,8 +98,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/messages': { get: operation('List mail with cursor pagination', ref('SessionMessagePage'), { parameters: listQuery, description: 'unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt. Inbound summaries carry verificationLink (empty when none was detected).' }) },
     '/messages/sync': { get: operation('Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: listQuery,
       description: 'Lightweight polling for the list view: accepts the same filters as GET /messages (cursor and afterId are ignored). Refetch the list only when head differs from the head returned with its first page.' }) },
-    '/messages/send': { post: operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', status: 201, parameters: [idempotencyHeader],
-      description: 'HTTP 201 may contain partial or total delivery failure. Inspect status/errorDetail/recipientOutcomes; retry only failed recipients. sent means provider acceptance, not confirmed destination-inbox delivery. Use base64 attachments or draft attachmentTokens; source forwarding attachments count toward the total. Large external attachments become independent 90-day signed links.' }) },
+    '/messages/send': { post: sendMailOperation() },
     '/messages/read': { post: operation('Mark selected owned messages read/unread', changed, { request: 'MarkReadRequest', parameters: mutationQuery,
       description: 'Changes only mail at addresses the caller owns (or unclaimed addresses with administrator scope=unclaimed). Shared mail is silently skipped; changed counts actual matches.' }) },
     '/messages/read-all': { post: operation('Mark incoming messages read, optionally narrowed by filters', changed, { parameters: mutationQuery, request: 'MarkAllReadRequest', requestRequired: false,

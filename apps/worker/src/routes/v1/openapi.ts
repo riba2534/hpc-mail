@@ -1,7 +1,7 @@
 import { MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, identitiesDescription, idempotencyHeader, int, listQuery,
-  mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, specInfo, specificationOperation, str, uploadPaths,
+  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, identitiesDescription, int, listQuery,
+  mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths,
   usedSchemas, type Paths,
 } from '../openapi-common.js';
 
@@ -38,9 +38,7 @@ export function buildOpenApiSpec(origin: string) {
     '/messages': {
       get: operation('List incoming or outgoing mail', ref('MessagePage'), { scope: 'mail.read', parameters: listQuery,
         description: 'Descending cursor pagination. Use nextCursor exactly as returned; null ends the page stream. Shared inboxes only add non-trash inbound visibility. afterId supports incremental polling, but process all relevant results before advancing. unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt.' }),
-      post: { ...operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope: 'mail.send', status: 201, parameters: [idempotencyHeader],
-        description: 'HTTP 201 can represent partial or total recipient failure: always inspect status, errorDetail and recipientOutcomes. Retry only failed recipients; preserve BCC, body and attachments explicitly. Provider-accepted sent is not proof of recipient inbox delivery. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. There is no separate reply or forward endpoint (POST /messages/{id} does not exist): set replyToMessageId or forwardAttachmentsFrom here, which additionally requires mail.read (403 without it); a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.' }),
-        'x-conditional-scopes': [{ scope: 'mail.read', when: 'replyToMessageId or forwardAttachmentsFrom is present' }] },
+      post: sendMailOperation('mail.send'),
     },
     '/messages/wait': { get: operation('Wait for the earliest new incoming message matching optional filters', object({
       message: { anyOf: [ref('MessageSummary'), ref('MessageDetail'), { type: 'null' }],
