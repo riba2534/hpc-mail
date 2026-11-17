@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { ok } from '../../lib/http.js';
 import {
-  apiKeyAuth, keyRestriction, requireAnyScope, requireScope, restrictionAllowsDomain, restrictionAllowsMailbox,
+  apiKeyAuth, filterWithinKey, keyRestriction, requireAnyScope, requireScope, restrictionAllowsDomain,
 } from '../../middleware/api-key-auth.js';
 import { getApiKeySelf } from '../../services/api-key.js';
 import { getVisibleDomains } from '../../services/domain.js';
@@ -51,7 +51,7 @@ app.get('/identities', apiKeyAuth, async (c) => {
   if (!restriction) return ok(c, result);
   // 限定了范围的 Key 只列范围内的身份；任意前缀的系统域名只保留 allowedDomains 里的
   return ok(c, {
-    identities: result.identities.filter((item) => restrictionAllowsMailbox(restriction, { id: item.mailboxId, domain: item.domain })),
+    identities: filterWithinKey(c, result.identities, (item) => item.mailboxId),
     domains: result.domains.filter((item) => restrictionAllowsDomain(restriction, item.domain)),
   });
 });

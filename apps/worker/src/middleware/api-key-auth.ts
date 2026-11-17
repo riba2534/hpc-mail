@@ -196,7 +196,7 @@ export function restrictionAllowsDomain(restriction: KeyRestriction, domain: str
 }
 
 /** 已知认领行时的判定：id 在 mailboxIds 或 domain 在 domains 中 */
-export function restrictionAllowsMailbox(restriction: KeyRestriction, mailbox: { id: number; domain: string }): boolean {
+function restrictionAllowsMailbox(restriction: KeyRestriction, mailbox: { id: number; domain: string }): boolean {
   return restriction.mailboxIds.includes(mailbox.id) || restrictionAllowsDomain(restriction, mailbox.domain);
 }
 
@@ -227,6 +227,20 @@ export function assertKeyCanUseMailbox(c: Context<AppContext>, mailbox: { id: nu
   }
 }
 
+/** 按 id 确认邮箱都在 Key 范围内（一次查询，不限范围的 Key 不查库）；不存在的放过，交给调用方按原口径报错 */
+export async function assertKeyCanUseMailboxIds(c: Context<AppContext>, ids: readonly number[]): Promise<void> {
+  if (!keyRestriction(c) || !ids.length) return;
+  const { results } = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id IN (SELECT value FROM json_each(?))')
+    .bind(JSON.stringify(ids)).all<{ id: number; domain: string; address: string }>();
+  for (const box of results) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
+}
+
+/** 限定了范围的 Key 只看得到范围内的邮箱（列表按认领行 id 与域名收窄；不限范围时原样返回） */
+export function filterWithinKey<T extends { domain: string }>(c: Context<AppContext>, list: T[], idOf: (item: T) => number): T[] {
+  const restriction = keyRestriction(c);
+  return restriction ? list.filter((item) => restrictionAllowsMailbox(restriction, { id: idOf(item), domain: item.domain })) : list;
+}
+
 /**
  * 发件地址在 Key 范围内：from 解析后的 mailboxId 或 localPart+domain。发件邮箱不存在时放过，交给发信流程按原口径报 404。
  */
@@ -235,12 +249,7 @@ export async function assertKeyCanUseSender(
   from: { mailboxId?: number; localPart?: string; domain?: string },
 ): Promise<void> {
   if (!keyRestriction(c)) return;
-  if (from.mailboxId !== undefined) {
-    const box = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id = ?')
-      .bind(from.mailboxId).first<{ id: number; domain: string; address: string }>();
-    if (box) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
-    return;
-  }
+  if (from.mailboxId !== undefined) return assertKeyCanUseMailboxIds(c, [from.mailboxId]);
   if (from.localPart && from.domain) await assertKeyCanUseAddress(c, `${from.localPart}@${from.domain}`);
 }
 
