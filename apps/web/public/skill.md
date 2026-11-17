@@ -147,7 +147,7 @@ SINCE=$MAX   # 所有页处理完才推进基线
 | 我的邮箱、共享给我的、可用性、随机后缀 | `GET /mailboxes`、`GET /mailboxes/shared`、`GET /mailboxes/availability`、`POST /mailboxes/availability/batch`、`GET /mailboxes/random-plan` | `mailbox.read` | [mailboxes](references/mailboxes-and-domains.md) |
 | 认领、批量认领、改显示名、释放 | `POST /mailboxes`、`POST /mailboxes/batch`、`PUT /mailboxes/:id`、`DELETE /mailboxes/:id` | `mailbox.write` | [mailboxes](references/mailboxes-and-domains.md) |
 
-只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；共享管理、托管域名与 DNS 见 [mailboxes](references/mailboxes-and-domains.md)；个人通知与转发见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
+只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；共享管理、托管域名与 DNS 见 [mailboxes](references/mailboxes-and-domains.md)；个人通知与转发见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
 
 ## 完成标准与安全
 

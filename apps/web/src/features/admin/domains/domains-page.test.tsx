@@ -6,6 +6,8 @@ const mocks = vi.hoisted(() => ({ get: vi.fn(), update: vi.fn(async (patch) => (
 vi.mock('@/api/resources', () => ({ adminApi: { getSettings: mocks.get, updateSettings: mocks.update, domainStatus: vi.fn(async () => ({resolved:false})), domainClaudeStats: mocks.stats } }));
 vi.mock('@/features/mailboxes/use-mailboxes', () => ({useMailboxesQuery: () => ({data: []})}));
 vi.mock('@/components/ui/toast', () => ({toast: mocks.toast}));
+// 可接入卡片有独立测试（cloudflare-zones-card.test.tsx），这里只占位
+vi.mock('./cloudflare-zones-card', () => ({CloudflareZonesCard: () => <div data-testid="cf-zones-card" />}));
 import { DomainsPage } from './domains-page';
 import { ApiError } from '@/api/errors';
 
@@ -17,6 +19,7 @@ describe('domain configuration safety', () => {
     const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
     render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
     await screen.findByRole('button', {name:'重新加载'});
+    fireEvent.click(screen.getByRole('button', {name:/手动添加/}));
     expect(screen.getByRole('button', {name:'添加'})).toBeDisabled();
     fireEvent.click(screen.getByRole('button', {name:'添加'}));
     expect(mocks.update).not.toHaveBeenCalled();
@@ -31,6 +34,7 @@ describe('domain configuration safety', () => {
     mocks.get.mockImplementation(() => new Promise(() => {})); mocks.update.mockClear();
     const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
     render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
+    fireEvent.click(screen.getByRole('button', {name:/手动添加/}));
     expect(screen.getByRole('button', {name:'添加'})).toBeDisabled();
     expect(screen.getByPlaceholderText('example.com')).toBeDisabled();
     fireEvent.submit(screen.getByRole('button', {name:'添加'}).closest('form')!);
@@ -44,6 +48,7 @@ describe('domain configuration safety', () => {
     render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
     await screen.findByText('还没有配置收件域名');
     const calls = mocks.get.mock.calls.length;
+    fireEvent.click(screen.getByRole('button', {name:/手动添加/}));
     fireEvent.change(screen.getByPlaceholderText('example.com'), {target:{value:'new.example'}});
     fireEvent.click(screen.getByRole('button', {name:'添加'}));
     await waitFor(() => expect(mocks.get.mock.calls.length).toBeGreaterThan(calls));
@@ -121,7 +126,21 @@ describe('domain configuration safety', () => {
     render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
     await screen.findByText('old.example');
     expect(await screen.findByText(/Claude 统计暂时加载失败/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', {name:/手动添加/}));
     expect(screen.getByRole('button', {name:'添加'})).toBeEnabled();
+    client.clear();
+  });
+  it('手动添加默认收起，可接入卡片在系统域名列表下方；移除说明不会停止 Cloudflare 路由', async () => {
+    mocks.get.mockResolvedValue({domains:{revision:1,list:[{domain:'old.example',public:false,perUserLimit:0}]}});
+    const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
+    await screen.findByText('old.example');
+    const toggle = screen.getByRole('button', {name:/手动添加/});
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByPlaceholderText('example.com')).toBeNull();
+    expect(screen.getByTestId('cf-zones-card')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', {name:'移除 old.example'}));
+    expect(await screen.findByText(/移除不会停止 Cloudflare 的收件路由/)).toBeInTheDocument();
     client.clear();
   });
 });

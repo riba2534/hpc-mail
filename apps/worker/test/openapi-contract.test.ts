@@ -1,4 +1,6 @@
 import {
+  SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_SEVERITIES, SYSTEM_DOMAIN_VERDICTS, SYSTEM_DOMAIN_WRITE_STEPS,
+  SYSTEM_DOMAIN_ZONE_CATEGORIES,
   ALLOWED_CUSTOM_HEADERS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
   MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, internalSendMailSchema,
 } from '@hpc-mail/shared';
@@ -81,6 +83,36 @@ describe('OpenAPI routes and public contracts', () => {
     const caaInput = (((input.oneOf as Schema[]).at(-1)!.properties as Record<string, Schema>).caa!.properties as Record<string, Schema>);
     expect(caaInput.tag).toMatchObject({ enum: ['issue', 'issuewild', 'iodef'] });
     expect(specs.v1.paths).not.toHaveProperty('/hosted-domains/{id}/dns-records');
+  });
+
+  it('系统域名一键接入：9 个管理员接口只在 /api，枚举与 shared 一致，409 带 details.precheck', () => {
+    const ops = operations('api').filter((op) => op.includes('/admin/system-domains'));
+    expect(ops.sort()).toEqual([
+      'GET /api/admin/system-domains/onboardings', 'GET /api/admin/system-domains/onboardings/{id}', 'GET /api/admin/system-domains/precheck',
+      'GET /api/admin/system-domains/zones', 'POST /api/admin/system-domains/onboardings', 'POST /api/admin/system-domains/onboardings/{id}/cancel',
+      'POST /api/admin/system-domains/onboardings/{id}/check', 'POST /api/admin/system-domains/onboardings/{id}/confirm',
+      'PUT /api/admin/system-domains/hidden-zones',
+    ]);
+    expect(operations('v1').some((op) => op.includes('system-domains'))).toBe(false);
+    for (const [path, item] of Object.entries(specs.api.paths).filter(([path]) => path.startsWith('/admin/system-domains'))) {
+      for (const [method, op] of Object.entries(item)) if (methods.has(method)) expect((op as Schema)['x-required-role'], path).toBe('admin');
+    }
+    const schema = (name: string) => specs.api.components.schemas[name]!.properties as Record<string, Schema>;
+    expect(schema('SystemDomainOnboarding').state!.enum).toEqual([...SYSTEM_DOMAIN_ONBOARDING_STATES]);
+    expect(schema('SystemDomainCheck').severity!.enum).toEqual([...SYSTEM_DOMAIN_SEVERITIES]);
+    expect((schema('SystemDomainCheck').ack!.anyOf as Schema[])[0]!.enum).toEqual([...SYSTEM_DOMAIN_ACKS]);
+    expect(schema('SystemDomainPrecheck').verdict!.enum).toEqual([...SYSTEM_DOMAIN_VERDICTS]);
+    expect(((schema('SystemDomainPrecheck').steps!.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual([...SYSTEM_DOMAIN_WRITE_STEPS]);
+    expect(schema('SystemDomainZone').category!.enum).toEqual([...SYSTEM_DOMAIN_ZONE_CATEGORIES]);
+    const post = specs.api.paths['/admin/system-domains/onboardings']!.post as Schema;
+    expect(Object.keys(post.responses as Schema)).toContain('201');
+    expect(String(post.description)).toContain('error.details.precheck');
+    const details = ((specs.api.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).details!;
+    expect(details.properties as Record<string, Schema>).toHaveProperty('precheck');
+    // /v1 的错误信封不引入管理员 schema
+    expect(specs.v1.components.schemas).not.toHaveProperty('SystemDomainPrecheck');
+    expect(administrationDoc).toContain('## 系统域名一键接入');
+    for (const ack of SYSTEM_DOMAIN_ACKS) expect(administrationDoc).toContain(`\`${ack}\``);
   });
 
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
@@ -402,7 +434,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
       for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
       expect(envelope.required).toEqual(['code', 'message']);
-      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'precheck']);
       expect(error.docs).toMatchObject({ format: 'uri' });
     }
   });

@@ -13,6 +13,10 @@ import {
   ALLOWED_CUSTOM_HEADERS, MAX_CUSTOM_HEADER_VALUE_BYTES, MAX_CUSTOM_NON_X_HEADERS, MAX_CUSTOM_HEADERS_TOTAL_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_SEND_REQUEST_BYTES, MAX_REPLY_TO, MAX_DISPLAY_NAME_LENGTH,
   EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES,
+  DNSSEC_STATES, SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_CHANGE_KINDS, SYSTEM_DOMAIN_CHECK_KEYS, SYSTEM_DOMAIN_ONBOARDING_MODES,
+  SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_SEVERITIES, SYSTEM_DOMAIN_STEP_STATES, SYSTEM_DOMAIN_VERDICTS, SYSTEM_DOMAIN_WRITE_STEPS,
+  SYSTEM_DOMAIN_ZONE_CATEGORIES, SYSTEM_DOMAIN_ZONE_ORIGINS, cancelSystemDomainOnboardingRequestSchema, confirmSystemDomainOnboardingRequestSchema,
+  createSystemDomainOnboardingRequestSchema, updateSystemDomainHiddenZonesRequestSchema,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 
@@ -172,6 +176,78 @@ const delivery = object({ id: positiveId, messageId: nullable(positiveId), targe
   attempts: int, maxAttempts: positiveId, lastError: str, lastHttpStatus: nullable(int), createdAt: date, updatedAt: date,
   nextAttemptAt: date, lastAttemptAt: nullable(date),
 });
+/** 系统域名一键接入（管理员 JWT）：响应结构与 shared/schemas/system-domain.ts 一致 */
+function systemDomainSchemas(): Record<string, Schema> {
+  const enumOf = (values: readonly string[], description?: string): Schema => ({ type: 'string', enum: [...values], ...(description ? { description } : {}) });
+  const record = object({ type: str, name: { ...str, description: 'Full DNS name.' }, content: str, priority: nullable(int), ttl: nullable(int) });
+  const step = object({ state: enumOf(SYSTEM_DOMAIN_STEP_STATES,
+    'unknown: not read yet or the read failed (never treated as absent); waiting: prerequisites not met; missing: confirmed absent, will be written; ready; conflict: needs confirmation or blocked; error: a write failed deterministically.'), detail: str });
+  const steps = object({ zone: step, routing: step, catchAll: step, sending: step });
+  const registrar = { ...nullable(object({ name: nullable(str), cloudflare: nullable(bool) })),
+    description: 'Registrar from RDAP, display only; null fields mean unknown.' };
+  const state = enumOf(SYSTEM_DOMAIN_ONBOARDING_STATES,
+    'creating_zone: zone creation in flight or unconfirmed (resolved by name within about 10 minutes); awaiting_ns: waiting for nameservers; needs_confirmation: changes need administrator confirmation, not advanced automatically; blocked: a blocker or environment problem, rechecked read-only every 30 minutes and resumed automatically; configuring: writing Cloudflare configuration; finalizing: adding to the system domain list; cancelling; completed / cancelled / failed are terminal.');
+  const summaryFields = {
+    id: positiveId, domain: domainName, mode: enumOf(SYSTEM_DOMAIN_ONBOARDING_MODES), state, steps,
+    errorCode: { ...str, description: 'Machine-readable reason such as mx_removed_routing_pending, provision_timeout, list_full, occupied, cf_transient; empty when none.' },
+    lastError: str, updatedAt: date, nextCheckAt: nullable(date), cancelRequested: bool,
+  };
+  return {
+    SystemDomainCheck: object({
+      key: enumOf(SYSTEM_DOMAIN_CHECK_KEYS), state: enumOf(['ok', 'missing', 'conflict', 'unknown']),
+      severity: enumOf(SYSTEM_DOMAIN_SEVERITIES, 'none: nothing to do; info: notice only; confirm: must be accepted with ack; blocker: fix it and check again.'),
+      ack: { ...nullable(enumOf(SYSTEM_DOMAIN_ACKS)), description: 'For severity=confirm: the value to put in accept.' },
+      danger: { ...bool, description: 'Dangerous confirmation shown in red, e.g. deleting third-party MX records.' },
+      title: str, current: nullable(str), proposed: nullable(str), impact: str, records: array(record),
+    }),
+    SystemDomainPrecheck: object({
+      mode: enumOf(SYSTEM_DOMAIN_ONBOARDING_MODES), domain: domainName, zoneId: nullable(str), zoneStatus: nullable(str), checkedAt: date,
+      checks: array(ref('SystemDomainCheck')),
+      steps: { ...array(object({ kind: enumOf(SYSTEM_DOMAIN_WRITE_STEPS), detail: str })), description: 'Planned Cloudflare writes in execution order.' },
+      requiredAcks: array(enumOf(SYSTEM_DOMAIN_ACKS)),
+      verdict: enumOf(SYSTEM_DOMAIN_VERDICTS, 'ready: can be onboarded with no confirmation; confirm: needs the requiredAcks; blocked: has a blocker or a failed read; pending: zone exists but is not active yet.'),
+      fingerprint: { ...str, description: 'Send back unchanged with accept; the server re-checks Cloudflare and compares.' },
+      registrar, nameServers: array(str), dnssec: { ...nullable(enumOf(DNSSEC_STATES)), description: 'unknown means the check failed, not that DNSSEC is off.' },
+    }),
+    SystemDomainChange: object({
+      seq: positiveId, kind: enumOf(SYSTEM_DOMAIN_CHANGE_KINDS), status: enumOf(['started', 'done', 'unknown', 'failed']), at: date,
+      target: nullable(str), before: { ...nullable(str), description: 'Value before the write (catch-all, SPF, deleted MX), for manual restore.' }, error: nullable(str),
+    }),
+    SystemDomainOnboarding: object({
+      ...summaryFields,
+      zoneId: nullable(str),
+      zoneOrigin: enumOf(SYSTEM_DOMAIN_ZONE_ORIGINS, 'created: created by this task (deletable only when cancelled before activation); linked: existing zone; unknown: found by name after a timed-out creation. linked and unknown zones are never deleted.'),
+      zoneStatus: str, nameServers: array(str), originalNameServers: array(str), originalRegistrar: str,
+      dnssec: enumOf(DNSSEC_STATES), precheck: nullable(ref('SystemDomainPrecheck')), accepted: array(enumOf(SYSTEM_DOMAIN_ACKS)),
+      changes: { ...array(ref('SystemDomainChange')), description: 'Append-only ledger of Cloudflare writes; nothing is rolled back automatically.' },
+      canDeleteZone: bool, createdBy: str, createdAt: date, stateChangedAt: date, checkedAt: nullable(date), activatedAt: nullable(date),
+      finishedAt: nullable(date), dashboardUrl: { ...nullable(str), description: 'Cloudflare dashboard link (contains the account id).' },
+    }),
+    SystemDomainOnboardingSummary: object(summaryFields),
+    SystemDomainZone: object({
+      zoneId: str, name: domainName, status: str, type: nullable(str), paused: bool,
+      category: enumOf(SYSTEM_DOMAIN_ZONE_CATEGORIES, 'available: can be onboarded; onboarding: has an active task; system: already a system domain; hosted: hosted by a user; inconsistent: hosted record with a different zone id (read-only warning).'),
+      hidden: bool, owner: nullable(object({ userId: positiveId, username: str, isAdmin: bool })),
+      onboarding: nullable(ref('SystemDomainOnboardingSummary')),
+      readiness: nullable(object({
+        verdict: enumOf([...SYSTEM_DOMAIN_VERDICTS, 'unchecked'], 'unchecked: not prechecked in this response (at most 10 per request); run GET /admin/system-domains/precheck.'),
+        confirmCount: int, reasons: array(str), registrar, checkedAt: nullable(date),
+      })),
+    }),
+    SystemDomainZonesView: object({
+      configured: { ...bool, description: 'Whether the Worker has Cloudflare credentials; false returns empty lists.' },
+      zones: array(ref('SystemDomainZone')), others: array(ref('SystemDomainZone')), unlistedTasks: array(ref('SystemDomainOnboardingSummary')),
+      counts: object({ available: int, onboarding: int, system: int, hosted: int, inconsistent: int, hostedByAdmin: int, hidden: int }),
+      complete: { ...bool, description: 'false when the Cloudflare zone list was truncated.' }, hiddenRevision: int,
+    }),
+    SystemDomainHiddenZones: object({ hiddenZones: array(domainName), revision: int }),
+    CreateSystemDomainOnboardingRequest: fromZod(createSystemDomainOnboardingRequestSchema),
+    ConfirmSystemDomainOnboardingRequest: fromZod(confirmSystemDomainOnboardingRequestSchema),
+    CancelSystemDomainOnboardingRequest: fromZod(cancelSystemDomainOnboardingRequestSchema),
+    UpdateSystemDomainHiddenZonesRequest: fromZod(updateSystemDomainHiddenZonesRequestSchema),
+  };
+}
+
 export const schemas: Record<string, Schema> = {
   Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
     description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient was attempted and rejected, nothing was delivered; details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422.' },
@@ -182,7 +258,8 @@ export const schemas: Record<string, Schema> = {
       headers: { ...array(str), description: 'header_not_allowed and header value errors: offending header names as written in the request.' },
       messageId: { ...positiveId, description: 'delivery_failed: id of the recorded outbound message (visible in direction=outbound lists).' },
       recipientOutcomes: { ...array(recipientOutcome), description: 'delivery_failed: per-recipient results, all failed.' },
-    }, ['headers', 'messageId', 'recipientOutcomes']), description: 'Optional structured data, present only on the codes above.' },
+      precheck: { type: 'object', description: 'Session API system-domain onboarding 409 only: the latest precheck (SystemDomainPrecheck in /api/openapi.json) with confirmation items, blockers and fingerprint; confirm with its fingerprint and accept, then retry.' },
+    }, ['headers', 'messageId', 'recipientOutcomes', 'precheck']), description: 'Optional structured data, present only on the codes above.' },
   }, ['fix', 'docs', 'details']),
     requestId: { ...str, description: `Same value as the X-Request-ID response header, which every response carries; ${clientRequestIdRule}, anything else is replaced by a server-generated UUID.` } }),
   MessageSummary: messageSummary,
@@ -327,6 +404,7 @@ export const schemas: Record<string, Schema> = {
     schema.description = 'Selected by type. name is relative (@ for the root, www, _dmarc, *.dev) or a full name ending with the domain. ttl is 1 (automatic) or 60–86400 seconds. A/AAAA/CNAME/TXT use content, MX uses content and priority, SRV uses srv, CAA uses caa. comment is optional (empty clears it on update).';
     return schema;
   })(),
+  ...systemDomainSchemas(),
   CreateHostedDomainRequest: fromZod(createHostedDomainRequestSchema), UpdateHostedDomainRequest: fromZod(updateHostedDomainRequestSchema),
   ReplaceHostedDomainMembersRequest: fromZod(replaceHostedDomainMembersRequestSchema), TransferHostedDomainRequest: fromZod(transferHostedDomainRequestSchema),
   TranslateMessageRequest: (() => {
