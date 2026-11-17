@@ -1,5 +1,5 @@
 import {
-  API_SCOPES, ERROR_CODES, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
+  API_SCOPES, ERROR_CODES, MAX_BATCH_CLAIM, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
   SETTING_SCHEMAS, batchMailboxRequestSchema, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
   internalSendMailSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
@@ -86,15 +86,22 @@ const messageSummary = object({
   id: positiveId, direction: { type: 'string', enum: ['inbound', 'outbound'] }, address: str, domain: str,
   fromAddress: str, fromName: str, subject: str, preview: str, verificationCode: str,
   verificationLink: { type: 'string', maxLength: 2048, description: 'Inbound only: the most likely http/https verification, sign-in, activation or password-reset link detected at receipt; empty string when none qualified (and for mail received before detection existed). Advisory and attacker-controllable: check the link host matches the expected service before opening it.' },
-  status: { type: 'string', description: 'Inbound: pending, received or degraded. Outbound: pending, sent, delivered or failed. sent means the provider accepted at least one external delivery; it is not proof of arrival in the destination inbox.' },
-  errorDetail: str, recipientOutcomes: array(object({ address: str, status: { type: 'string', enum: ['delivered', 'sent', 'failed'] }, error: str }, ['error'])),
-  recipientsTo: array(str), isRead: bool, isStarred: bool, hasAttachments: bool, size: int, createdAt: date,
+  status: { type: 'string', description: 'Inbound: pending, received or degraded. Outbound: pending, sent, delivered, failed or unknown. sent means the provider accepted at least one external delivery; it is not proof of arrival in the destination inbox. pending: delivery still in progress, results not yet recorded. unknown: delivery was interrupted and some recipients may already have received it; check recipientOutcomes before resending.' },
+  errorDetail: str, recipientOutcomes: array(object({ address: str, status: { type: 'string', enum: ['delivered', 'sent', 'failed', 'unknown'] }, error: str }, ['error'])),
+  recipientsTo: array(str), isRead: bool, isStarred: bool,
+  hasAttachments: { ...bool, description: 'Whether the message has real attachments. Inline parts with a Content-ID (embedded images such as logos) are not counted.' },
+  size: int, createdAt: date,
   deletedAt: { ...date, description: 'Only in trash=1 lists: when the message entered the trash. Trash is purged seven days later.' },
 }, ['recipientOutcomes', 'recipientsTo', 'verificationLink', 'deletedAt']);
 const { deletedAt: _deletedAt, ...summaryProperties } = messageSummary.properties as Record<string, Schema>;
 const attachment = object({ id: positiveId, filename: str, mimeType: str, size: int, contentId: str, disposition: str,
-  url: { ...str, description: 'Signed download URL, possibly relative to the site origin. Session-API detail URLs are aligned to the hour and valid for 1–2 hours; /v1 detail URLs expire after 5 minutes. Read the message again for a fresh URL, or download with credentials instead.' } });
-const mailbox = object({ id: positiveId, address: str, domain: str, userId: positiveId, ownerUsername: str, displayName: str, messageCount: int, createdAt: date }, ['ownerUsername']);
+  inline: { ...bool, description: 'True when bodyHtml references this part as cid:<contentId> and the reference was replaced by its url, so it is already shown inline; clients need not list it again as an attachment.' },
+  url: { ...str, description: 'Signed download URL, possibly relative to the site origin. Session-API detail URLs are aligned to the hour and valid for 1–2 hours; /v1 detail URLs expire after 5 minutes. Read the message again for a fresh URL, or download with credentials instead.' } }, ['inline']);
+const mailbox = object({ id: positiveId, address: str, domain: str, userId: positiveId, ownerUsername: str, displayName: str, messageCount: int, createdAt: date,
+  canSend: { ...bool, description: 'Returned by mailbox lists: whether this mailbox’s domain can currently send (always true on system domains; hosted domains need an active domain with sending ready). Only reflects the domain; sending also requires owning the mailbox (administrators excepted).' } },
+['ownerUsername', 'canSend']);
+const sendIdentityReason = { type: 'string', enum: ['hosted_sending_not_ready', 'hosted_domain_unavailable', 'shared_readonly'],
+  description: 'hosted_sending_not_ready: the hosted domain’s sending is not ready yet; hosted_domain_unavailable: the hosted domain is suspended, moved or being deleted; shared_readonly: a mailbox shared with the caller is read-only and can never send.' };
 const user = object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] }, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
 const { twoFactorEnabled: _twoFactorEnabled, ...adminUserProperties } = user.properties as Record<string, Schema>;
 const apiKey = object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: array({ type: 'string', enum: API_SCOPES }), rateLimit: positiveId,
@@ -123,6 +130,31 @@ export const schemas: Record<string, Schema> = {
   UserSearchResults: object({ items: array(object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] } })), hasMore: bool }),
   MailboxTransferResult: object({ mailbox: ref('Mailbox'), previousUserId: positiveId, transferred: bool, revokedShares: int }),
   SharedMailbox: object({ mailboxId: positiveId, address: str, domain: str, displayName: str, ownerUsername: str }),
+  SendIdentities: object({
+    identities: { ...array(object({
+      kind: { type: 'string', enum: ['owned', 'shared'], description: 'owned: claimed by the caller; shared: shared with the caller (read-only).' },
+      mailboxId: positiveId, address: str, domain: str, displayName: str,
+      canSend: { ...bool, description: 'Use as from (mailboxId or address) only when true.' },
+      reason: { ...nullable(sendIdentityReason), description: 'Why canSend is false; null when it can send.' },
+    })), description: 'Caller-owned mailboxes first, then mailboxes shared with the caller, each sorted by address. Administrators may still send from any mailbox by mailboxId; those are not listed.' },
+    domains: { ...array(object({ domain: str, kind: { type: 'string', const: 'system' }, anyLocalPart: { type: 'boolean', const: true } })),
+      description: 'Domains where any local part may be used as from (localPart+domain or "Name <any@domain>"). Only administrators get entries: every configured system domain. Empty for ordinary users.' },
+  }),
+  ApiKeySelf: object({
+    key: object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: array({ type: 'string', enum: API_SCOPES }),
+      rateLimit: { ...positiveId, description: 'Requests per minute for this key.' }, allowedIps: array(str), expiresAt: nullable(date), createdAt: date }),
+    user: object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] } }),
+    limits: object({
+      userRequestsPerMinute: { ...positiveId, description: 'Requests per minute across all keys of this user.' },
+      waitPollsPerMinute: { ...positiveId, description: 'GET /messages/wait polls per user per minute.' },
+    }),
+    outbound: { ...object({
+      sent: { ...int, description: 'Sends counted today (UTC).' }, recipients: { ...int, description: 'Recipients counted today (UTC).' },
+      dailyLimit: { ...int, description: '0 means unlimited.' }, dailyRecipientLimit: { ...int, description: '0 means unlimited.' },
+      exempt: { ...bool, description: 'Administrators are not subject to the outbound quota; limits are returned as 0.' },
+      resetsAt: { ...date, description: 'Next UTC midnight, when the daily counters reset.' },
+    }), description: 'Today’s outbound quota usage of the key owner (all keys and the web combined): each send adds 1 to sent and its unique recipients to recipients; a send where every recipient failed is given back. Nothing is counted for administrators or while both limits are 0.' },
+  }),
   MailboxShareGrant: object({ mailboxId: positiveId, address: str, domain: str, displayName: str,
     ownerUserId: positiveId, ownerUsername: str,
     grantees: array(object({ userId: positiveId, username: str, grantedAt: date, status: { type: 'string', enum: ['active', 'disabled'] } })) }),
@@ -275,7 +307,7 @@ export const query = (name: string, schema: Schema, description?: string, requir
 export const scopeQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed', 'user'] }, 'Default mine. unclaimed/user are administrator-only; user requires userId. Shared inboxes add read-only inbound visibility.'),
   query('userId', positiveId, 'Required for administrator scope=user; mutations cannot modify another owner’s mail.')];
 export const mutationQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed'] }, 'Default mine; unclaimed requires administrator. Query or JSON body scope are accepted; conflicting values return 400.')];
-export const pageQuery = [query('cursor', { type: 'string', maxLength: 128 }, 'Opaque server nextCursor. Omit on first page; null means no next page.'), query('limit', { type: 'integer', minimum: 1, maximum: 100, default: 30 })];
+export const pageQuery = [query('cursor', { type: 'string', maxLength: 128 }, 'Opaque server nextCursor. Omit on first page; null means no next page. A cursor that is present but cannot be decoded returns 400 validation_failed instead of silently restarting from the first page.'), query('limit', { type: 'integer', minimum: 1, maximum: 100, default: 30 })];
 export const listQuery = [query('direction', { type: 'string', enum: ['inbound', 'outbound'] }), query('domain', str), query('address', str),
   ...['unread', 'starred', 'trash'].map(name => query(name, { type: 'string', enum: ['1', 'true', '0', 'false'] })),
   query('q', { type: 'string', maxLength: 256 }, 'Literal substring search in subject/from/body; Unicode is supported.'),
@@ -343,6 +375,20 @@ export function usedSchemas(paths: Paths): Record<string, Schema> {
   };
   visit(paths);
   return Object.fromEntries([...names].sort().map(name => [name, schemas[name]! ]));
+}
+export const identitiesDescription = 'Which addresses the caller can send from. identities lists caller-owned mailboxes (kind=owned) with canSend and reason, then mailboxes shared with the caller (kind=shared, always canSend=false, reason=shared_readonly). Use a canSend=true entry as from (mailboxId or address). domains lists system domains where any local part may be used; only administrators get entries. Administrators may still send from any claimed mailbox by mailboxId; those are not listed.';
+/** 批量认领、批量可用性与随机后缀方案：会话与 API Key 两套接口同形，API Key 另需 scope */
+export function mailboxBatchPaths(scopes?: { read: string; write: string }): Paths {
+  return {
+    '/mailboxes/batch': { post: operation('Claim several addresses in order', ref('BatchClaimMailboxResult'), { request: 'BatchMailboxRequest', scope: scopes?.write,
+      description: 'Same rules as POST /mailboxes, applied to each item in request order. Each item accepts optional strategy; claude rechecks current suspension facts inside the write transaction and stops with forbidden when a domain has any historical suspension. An already-claimed address is skipped into taken and the batch continues; any other error stops the batch, keeps the addresses already claimed and reports stoppedBy with the remaining items in notAttempted.' }) },
+    '/mailboxes/availability/batch': { post: operation('Check availability of several addresses', array(ref('MailboxAvailability')), { request: 'BatchMailboxRequest', scope: scopes?.read,
+      description: 'Advisory only, same rules as GET /mailboxes/availability. Results follow request order.' }) },
+    '/mailboxes/random-plan': { get: operation('Allocate random suffixes for a batch claim', ref('ClaimPlan'), { scope: scopes?.read,
+      parameters: [query('count', { type: 'integer', minimum: 1, maximum: MAX_BATCH_CLAIM }, 'Number of addresses to allocate.', true),
+        query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: only zero-suspension domains, balanced by Claude accounts plus pending claims.', true)],
+      description: 'Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy excludes every domain with any historical Claude suspension from both items and pool, regardless of paid status or deprecated thresholds. It balances accounts plus recent pending claims and stops at claim_random.dailyLimit or claim quotas without spilling over to suspended domains. Generate prefixes, then pass strategy=claude on each item for availability and actual claims, including after manual suffix changes. Claims atomically recheck suspension facts; a plan does not reserve eligibility.' }) },
+  };
 }
 export function uploadPaths(scope?: string): Paths {
   const binaryBody = { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } };

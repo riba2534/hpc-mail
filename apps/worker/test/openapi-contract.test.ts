@@ -308,6 +308,62 @@ describe('Phase-0 hardening is reflected in both OpenAPI documents', () => {
   });
 });
 
+describe('Agent 接口第 1 期反映在 OpenAPI 中', () => {
+  const dataOf = (operation: Schema) => {
+    const responses = operation.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>;
+    return responses['200']!.content['application/json']!.schema.properties.data;
+  };
+
+  it('发件身份、/v1/me 与邮箱 canSend', () => {
+    expect(dataOf(specs.api.paths['/identities']!.get!)).toEqual({ $ref: '#/components/schemas/SendIdentities' });
+    const identities = specs.v1.paths['/identities']!.get!;
+    expect(dataOf(identities)).toEqual({ $ref: '#/components/schemas/SendIdentities' });
+    expect(identities['x-required-scopes-any-of']).toEqual(['mail.send', 'mailbox.read']);
+    const entry = ((specs.v1.components.schemas.SendIdentities!.properties as Record<string, Schema>).identities!.items as Schema).properties as Record<string, Schema>;
+    expect((entry.reason!.anyOf as Schema[])[0]!.enum).toEqual(['hosted_sending_not_ready', 'hosted_domain_unavailable', 'shared_readonly']);
+    const me = specs.v1.paths['/me']!.get!;
+    expect(me).not.toHaveProperty('x-required-scopes');
+    expect(dataOf(me)).toEqual({ $ref: '#/components/schemas/ApiKeySelf' });
+    expect(specs.v1.components.schemas.ApiKeySelf!.required).toEqual(['key', 'user', 'limits', 'outbound']);
+    expect(specs.api.components.schemas).not.toHaveProperty('ApiKeySelf');
+    for (const spec of Object.values(specs)) {
+      expect(spec.components.schemas.Mailbox!.properties).toHaveProperty('canSend');
+      expect(spec.components.schemas.Mailbox!.required).not.toContain('canSend');
+    }
+  });
+
+  it('批量认领、批量可用性、随机后缀方案在 /v1 按 scope 开放，与 /api 同形', () => {
+    const scopes = { '/mailboxes/batch': ['post', 'mailbox.write'], '/mailboxes/availability/batch': ['post', 'mailbox.read'], '/mailboxes/random-plan': ['get', 'mailbox.read'] } as const;
+    for (const [path, [method, scope]] of Object.entries(scopes)) {
+      const v1 = specs.v1.paths[path]![method]!;
+      const api = specs.api.paths[path]![method]!;
+      expect(v1['x-required-scopes'], path).toEqual([scope]);
+      expect(api, path).not.toHaveProperty('x-required-scopes');
+      expect(v1.responses, path).toEqual(api.responses);
+      expect(v1.requestBody, path).toEqual(api.requestBody);
+      expect(v1.parameters, path).toEqual(api.parameters);
+    }
+  });
+
+  it('wait 的多地址、domain、include=body，内联附件标记与非法 cursor', () => {
+    const wait = specs.v1.paths['/messages/wait']!.get!;
+    const params = Object.fromEntries((wait.parameters as Array<{ name: string; schema: Schema; description?: string }>).map(param => [param.name, param]));
+    expect(params.address!.description).toContain('repeat the parameter');
+    expect(params.domain!.schema).toMatchObject({ type: 'string', pattern: expect.any(String) });
+    expect(params.include!.schema).toEqual({ type: 'string', enum: ['body'] });
+    const message = (dataOf(wait).properties as Record<string, Schema>).message!;
+    expect(message.anyOf).toEqual([{ $ref: '#/components/schemas/MessageSummary' }, { $ref: '#/components/schemas/MessageDetail' }, { type: 'null' }]);
+    for (const spec of Object.values(specs)) {
+      expect((spec.components.schemas.Attachment!.properties as Record<string, Schema>).inline).toMatchObject({ type: 'boolean' });
+      const outcome = ((spec.components.schemas.MessageSummary!.properties as Record<string, Schema>).recipientOutcomes!.items as Schema).properties as Record<string, Schema>;
+      expect(outcome.status!.enum).toContain('unknown');
+    }
+    const cursors = [specs.v1.paths['/messages']!.get!, specs.api.paths['/messages']!.get!, specs.api.paths['/admin/audit-logs']!.get!, specs.api.paths['/api-keys/{id}/logs']!.get!]
+      .map(operation => (operation.parameters as Array<{ name: string; description: string }>).find(param => param.name === 'cursor')!.description);
+    for (const description of cursors) expect(description).toContain('400 validation_failed');
+  });
+});
+
 /**
  * Agent 文档里写到的端点必须真实存在：skill.md 的 hpc 调用按 /v1 核对，
  * 「`METHOD /path`」与带 /v1、/api 前缀的路径按对应规格核对，相对链接与锚点必须能解析。
