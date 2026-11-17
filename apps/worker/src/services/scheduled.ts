@@ -28,8 +28,14 @@ import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotific
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 import { releaseDraftStatements } from './upload.js';
 import { markStaleOutbound } from './outbound-recovery.js';
+import { repairPendingInbound } from './inbound-repair.js';
 import { offloadMailBodies } from './body-offload.js';
 import { dispatchDueDrafts, purgeSentDrafts } from './drafts.js';
+import { cleanupDeliveryRefs } from './delivery-events.js';
+import { syncDeliveryEventSubscriptions } from './event-subscriptions.js';
+import { cleanupExpiredSuppressions } from './suppression.js';
+import { syncDueOnboarding } from './system-domain.js';
+import { SYSTEM_DOMAIN_CF_SCOPE, SYSTEM_DOMAIN_CF_WINDOW_MINUTES } from './zone-catalog.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -197,6 +203,8 @@ export async function runScheduled(env: Env, maintenance = true, cron = maintena
 }
 
 async function runRegular(env: Env, report: StepReport[]): Promise<void> {
+  // 停在 pending 超过 15 分钟的入站信用 R2 原文重走收件；排在通知补录之前，修不了而转为 degraded 的本轮就能补入通知
+  await step(report, 'inbound.repair', () => repairPendingInbound(env));
   await step(report, 'notification.repair', () => repairUnqueuedNotifications(env));
   await step(report, 'notification.process', async () => (await processNotificationJobs(env)).processed);
   // Recover a metadata purge interrupted between reservation and transaction completion.
@@ -213,12 +221,19 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   // 历史正文分批搬到 R2（放在清理之前：本轮没被引用的对象登记后同一轮就能回收）
   await step(report, 'bodies.offload', () => offloadMailBodies(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
+  // 系统域名接入由管理员发起、数量很少（每轮最多 3 条，墙钟 20 秒），先于托管同步，不被它占满 Cloudflare 额度
+  await step(report, 'system_domains.onboarding', () => syncDueOnboarding(env));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
+  // 投递回执订阅：只为新域名或失败超过 6 小时的域名调用 Cloudflare，其余时候只读本地记录
+  await step(report, 'delivery_events.subscriptions', () => syncDeliveryEventSubscriptions(env));
 }
 
 async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'claude_facts.catchup', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_CATCHUP_MS));
   await step(report, 'notification.cleanup', () => cleanupNotificationJobs(env));
+  // 每日核对 Cloudflare 上的投递回执订阅（被删除的重建），并清理过期的回执对应关系与抑制条目
+  await step(report, 'delivery_events.verify', () => syncDeliveryEventSubscriptions(env, { verify: true }));
+  await step(report, 'delivery_events.cleanup', async () => await cleanupDeliveryRefs(env) + await cleanupExpiredSuppressions(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
   const staleWindow = Math.floor(Date.now() / 60000) - 120;
@@ -281,6 +296,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
       CANARY_RATE_SCOPE,
     ], minuteWindow(1) - 120);
+    await purgeCounters(env, SYSTEM_DOMAIN_CF_SCOPE, minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES) - 24);
     await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });

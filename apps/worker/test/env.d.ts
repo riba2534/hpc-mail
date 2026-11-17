@@ -1,5 +1,5 @@
-/// <reference types="@cloudflare/vitest-pool-workers/types" />
-import type { D1Migration } from '@cloudflare/vitest-pool-workers/config';
+/// <reference types="@cloudflare/vitest-plugin/types" />
+import type { D1Migration } from '@cloudflare/vitest-plugin';
 import type { Env as WorkerEnv } from '../src/types.js';
 
 declare global {

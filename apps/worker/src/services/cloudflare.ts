@@ -20,9 +20,13 @@ export function cloudflareCredentials(env: Env): CloudflareCredentials | null {
 
 /** Cloudflare API 失败：status 为 HTTP 状态（0 表示网络错误或超时），codes 为响应里的错误码 */
 export class CloudflareApiError extends Error {
-  constructor(readonly status: number, readonly codes: number[], message: string) {
+  /** 429 时响应头 retry-after 的秒数（没有该头为 undefined） */
+  readonly retryAfter?: number;
+
+  constructor(readonly status: number, readonly codes: number[], message: string, retryAfter?: number) {
     super(message);
     this.name = 'CloudflareApiError';
+    if (retryAfter !== undefined) this.retryAfter = retryAfter;
   }
 
   has(...codes: number[]): boolean {
@@ -60,7 +64,9 @@ async function cfFetch<T>(creds: CloudflareCredentials, method: string, path: st
   if (!res.ok || !payload?.success) {
     const errors = payload?.errors ?? [];
     const detail = errors.map((e) => `${e.code} ${e.message}`).join('; ');
-    throw new CloudflareApiError(res.status, errors.map((e) => Number(e.code)), detail || `HTTP ${res.status}`);
+    const retryAfter = Number(res.headers.get('retry-after'));
+    throw new CloudflareApiError(res.status, errors.map((e) => Number(e.code)), detail || `HTTP ${res.status}`,
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
   }
   return payload;
 }
@@ -73,6 +79,10 @@ export interface CfZone {
   id: string;
   name: string;
   status: 'initializing' | 'pending' | 'active' | 'moved';
+  /** full / partial / secondary / internal；Email Routing 需要 full */
+  type?: string;
+  paused?: boolean;
+  account?: { id: string; name?: string };
   name_servers?: string[];
   original_name_servers?: string[] | null;
   original_registrar?: string | null;
@@ -83,17 +93,37 @@ export interface CfZone {
 export interface CfRouting {
   enabled: boolean;
   status: 'ready' | 'unconfigured' | 'misconfigured' | 'misconfigured/locked' | 'unlocked';
+  name?: string;
+  support_subaddress?: boolean;
 }
 
 export interface CfCatchAll {
+  id?: string;
+  name?: string;
   enabled?: boolean;
+  matchers?: { type: string }[];
   actions?: { type: string; value?: string[] }[];
+  /** api：经 API 或控制台配置；wrangler：由某个 Worker 的 wrangler `addresses` 管理 */
+  source?: 'api' | 'wrangler' | string;
+}
+
+/** Email Routing 规则（专用地址规则；catch-all 另有接口） */
+export interface CfRoutingRule {
+  id: string;
+  name?: string;
+  enabled: boolean;
+  priority?: number;
+  matchers: { type: string; field?: string; value?: string }[];
+  actions: { type: string; value?: string[] }[];
+  source?: string;
 }
 
 export interface CfSendingSubdomain {
   tag: string;
   name: string;
   enabled?: boolean;
+  dkim_selector?: string;
+  return_path_domain?: string;
 }
 
 export interface CfSendingDnsStatus {
@@ -111,6 +141,14 @@ const maybeMissing = (error: unknown) => error instanceof CloudflareApiError
 /** 超时、网络错误、5xx 与限流：结果不确定，调用方应保留原状态稍后重试 */
 export function isTransientCloudflareError(error: unknown): boolean {
   return !(error instanceof CloudflareApiError) || error.status === 0 || error.status === 429 || error.status >= 500;
+}
+
+/**
+ * 写请求的结果不明：超时、网络错误、5xx，或 2xx/3xx 但响应体不可解析。写入可能已经生效，调用方必须先读远端再决定。
+ * 429 表示请求未被处理，不算结果不明。
+ */
+export function isOutcomeUnknown(error: unknown): boolean {
+  return !(error instanceof CloudflareApiError) || error.status === 0 || (error.status > 0 && error.status < 400) || error.status >= 500;
 }
 
 async function confirmMissing(creds: CloudflareCredentials, zoneId: string, name: string, error: unknown): Promise<void> {
@@ -174,11 +212,16 @@ export function getCatchAll(creds: CloudflareCredentials, zoneId: string): Promi
 }
 
 export function putCatchAll(creds: CloudflareCredentials, zoneId: string): Promise<CfCatchAll> {
+  return putCatchAllWorker(creds, zoneId, creds.workerName);
+}
+
+/** catch-all 整体替换为投递到指定 Worker（PUT 本身幂等） */
+export function putCatchAllWorker(creds: CloudflareCredentials, zoneId: string, workerName: string): Promise<CfCatchAll> {
   return cf<CfCatchAll>(creds, 'PUT', `/zones/${zoneId}/email/routing/rules/catch_all`, {
-    name: `Catch-all → ${creds.workerName}`,
+    name: `Catch-all → ${workerName}`,
     enabled: true,
     matchers: [{ type: 'all' }],
-    actions: [{ type: 'worker', value: [creds.workerName] }],
+    actions: [{ type: 'worker', value: [workerName] }],
   });
 }
 
@@ -238,6 +281,56 @@ export async function countZones(creds: CloudflareCredentials): Promise<{ total:
 }
 
 // ---------------------------------------------------------------------------
+// 分页列表：complete=false 表示没有取全，调用方不能据此判定「不存在」
+
+export interface CfPage<T> {
+  items: T[];
+  complete: boolean;
+  total: number | null;
+}
+
+async function listPages<T>(creds: CloudflareCredentials, path: string, params: Record<string, string>, perPage: number, maxPages: number): Promise<CfPage<T>> {
+  const items: T[] = [];
+  let total: number | null = null;
+  for (let page = 1; page <= maxPages; page++) {
+    const query = new URLSearchParams({ ...params, page: String(page), per_page: String(perPage) });
+    const res = await cfFetch<T[]>(creds, 'GET', `${path}?${query}`);
+    const batch = res.result ?? [];
+    items.push(...batch);
+    total = res.result_info?.total_count ?? total;
+    const pages = res.result_info?.total_pages;
+    if (batch.length < perPage || (pages !== undefined && page >= pages)) return { items, complete: true, total };
+  }
+  return { items, complete: false, total };
+}
+
+/** 账户中 Token 可见的 zone（按名称排序）；默认最多 10 页（500 个），搜索在本地进行 */
+export function listAccountZones(creds: CloudflareCredentials, opts: { status?: CfZone['status']; maxPages?: number } = {}): Promise<CfPage<CfZone>> {
+  return listPages<CfZone>(creds, '/zones', {
+    'account.id': creds.accountId, order: 'name', direction: 'asc', ...(opts.status ? { status: opts.status } : {}),
+  }, 50, opts.maxPages ?? 10);
+}
+
+/** Email Routing 专用地址规则；每个域名最多 200 条，加上子域的规则，默认最多读 6 页 */
+export function listRoutingRules(creds: CloudflareCredentials, zoneId: string, maxPages = 6): Promise<CfPage<CfRoutingRule>> {
+  return listPages<CfRoutingRule>(creds, `/zones/${zoneId}/email/routing/rules`, {}, 50, maxPages);
+}
+
+/**
+ * 预检用的精确 DNS 查询（name.exact / name.endswith 不区分大小写），必须看 complete：
+ * 取不全时视为未知，不要用会静默截断的 listDnsRecords。
+ */
+export function queryDnsRecords(
+  creds: CloudflareCredentials, zoneId: string, filter: { exact?: string; endsWith?: string; type?: string }, maxPages = 5,
+): Promise<CfPage<CfDnsRecord>> {
+  const params: Record<string, string> = {};
+  if (filter.exact) params['name.exact'] = filter.exact;
+  if (filter.endsWith) params['name.endswith'] = filter.endsWith;
+  if (filter.type) params.type = filter.type;
+  return listPages<CfDnsRecord>(creds, `/zones/${zoneId}/dns_records`, params, 100, maxPages);
+}
+
+// ---------------------------------------------------------------------------
 // DNS 记录
 
 export interface CfDnsRecord {
@@ -291,4 +384,53 @@ export function updateDnsRecord(
 
 export async function deleteDnsRecord(creds: CloudflareCredentials, zoneId: string, recordId: string): Promise<void> {
   await cf(creds, 'DELETE', `/zones/${zoneId}/dns_records/${recordId}`);
+}
+
+// ---------------------------------------------------------------------------
+// Queues 事件订阅（外发投递回执）。接口与 wrangler queues subscription create 相同，
+// 需要 Token 有 Account → Queues:Edit（或 Workers Scripts:Edit）。
+
+export interface CfEmailSendingSource {
+  type: 'email.sending';
+  zone_id: string;
+  domain: string;
+}
+
+export interface CfEventSubscription {
+  id: string;
+  name: string;
+  enabled: boolean;
+  source: { type: string; zone_id?: string; domain?: string };
+  destination: { type: 'queues.queue'; queue_id: string };
+  events: string[];
+}
+
+/** 按名称取账户里的 Queue；不存在返回 null */
+export async function findQueue(creds: CloudflareCredentials, name: string): Promise<{ queue_id: string; queue_name: string } | null> {
+  const query = new URLSearchParams({ name });
+  const queues = await cf<{ queue_id: string; queue_name: string }[]>(creds, 'GET', `/accounts/${creds.accountId}/queues?${query}`);
+  return queues.find((queue) => queue.queue_name === name) ?? null;
+}
+
+const SUBSCRIPTION_MAX_PAGES = 20;
+
+/** 投递到某个 Queue 的全部事件订阅 */
+export async function listQueueSubscriptions(creds: CloudflareCredentials, queueId: string): Promise<CfEventSubscription[]> {
+  const items: CfEventSubscription[] = [];
+  for (let page = 1; page <= SUBSCRIPTION_MAX_PAGES; page++) {
+    const query = new URLSearchParams({ queue_id: queueId, page: String(page), per_page: '50' });
+    const res = await cfFetch<CfEventSubscription[]>(creds, 'GET', `/accounts/${creds.accountId}/event_subscriptions/subscriptions?${query}`);
+    items.push(...(res.result ?? []));
+    if (!res.result?.length || page >= (res.result_info?.total_pages ?? 1)) break;
+  }
+  return items;
+}
+
+export function createEventSubscription(creds: CloudflareCredentials, body: {
+  name: string; source: CfEmailSendingSource; queueId: string; events: readonly string[];
+}): Promise<CfEventSubscription> {
+  return cf<CfEventSubscription>(creds, 'POST', `/accounts/${creds.accountId}/event_subscriptions/subscriptions`, {
+    name: body.name, enabled: true, source: body.source,
+    destination: { type: 'queues.queue', queue_id: body.queueId }, events: body.events,
+  });
 }

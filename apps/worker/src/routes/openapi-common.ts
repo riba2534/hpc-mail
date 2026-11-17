@@ -1,7 +1,7 @@
 import {
   API_SCOPES, ERROR_CODES, MAX_BATCH_CLAIM, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
   SETTING_SCHEMAS, batchMailboxRequestSchema, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
-  internalSendMailSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
+  internalSendMailSchema, apiMarkReadRequestSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, userMailboxPolicySchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
@@ -17,6 +17,12 @@ import {
   MAX_HOSTED_DOMAIN_BATCH, batchCreateHostedDomainsRequestSchema, batchCheckHostedDomainsRequestSchema,
   MAX_ATTACHMENT_FILE_BYTES, URL_ATTACHMENT_MAX_REDIRECTS, URL_ATTACHMENT_TIMEOUT_MS,
   MAX_BATCH_SEND_ITEMS, DRAFT_STATUSES, MAX_DRAFTS_PER_USER, SENT_DRAFT_RETENTION_DAYS, draftInputSchema,
+  DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, SUPPRESSION_REASONS,
+  LIST_PAGE_DEFAULT_LIMIT, LIST_PAGE_MAX_LIMIT,
+  DNSSEC_STATES, SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_CHANGE_KINDS, SYSTEM_DOMAIN_CHECK_KEYS, SYSTEM_DOMAIN_ONBOARDING_MODES,
+  SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_SEVERITIES, SYSTEM_DOMAIN_STEP_STATES, SYSTEM_DOMAIN_VERDICTS, SYSTEM_DOMAIN_WRITE_STEPS,
+  SYSTEM_DOMAIN_ZONE_CATEGORIES, SYSTEM_DOMAIN_ZONE_ORIGINS, cancelSystemDomainOnboardingRequestSchema, confirmSystemDomainOnboardingRequestSchema,
+  createSystemDomainOnboardingRequestSchema, updateSystemDomainHiddenZonesRequestSchema,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
@@ -152,14 +158,29 @@ for (const schema of [settingsResponse, settingsUpdate]) {
     claimFields[name] = { ...claimFields[name], deprecated: true, description: 'Compatibility only; ignored for eligibility. Any historical Claude suspension always excludes the domain.' };
   }
   properties.translation!.description = 'AI translation switch and quota. Enabling requires a configured ai_model (checked against the merged result when both are submitted). dailyCharsPerUser limits characters sent per user per UTC day, administrators included; 0 is unlimited.';
+  properties.delivery_events!.description = `Outbound delivery receipts, default true. Takes effect only on deployments that enabled receipts (the operator set the GitHub Variable DELIVERY_EVENTS_QUEUE, e.g. ${DELIVERY_EVENTS_QUEUE}, so CI created the Queue and attached its consumer; GET /admin/delivery-events shows queue null otherwise). Then, with Cloudflare credentials on the Worker, the scheduled task subscribes every system domain (missing subscriptions every 5 minutes, all verified daily) and each hosted domain as soon as its sending is ready to Cloudflare Email Sending events (delivered, bounced, failed, rejected, complained). Receipts update recipientOutcomes and outbound status; bounces and complaints add the recipient to the suppression list. false stops creating new subscriptions; events from existing subscriptions are still applied. Domains without a subscription get no receipts and stay sent.`;
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
 notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webhook.secret and pushdeer.pushkey are returned as ******; plaintext secrets are never returned. In updates ****** preserves the secret (for PushDeer only while the endpoint keeps the same origin and path, ignoring a trailing slash, with an empty endpoint meaning the official one; otherwise 400 validation_failed asks for the pushkey again) and an explicit empty string clears it. Enabled configurations must have valid complete endpoints/keys/forward addresses. These are mail-owner notifications; shared mailbox readers do not receive owner notifications.';
 /** 逐收件人结果：发件摘要与 delivery_failed 错误的 details 共用 */
 const recipientOutcome = { ...object({ address: str,
-  status: { type: 'string', enum: ['delivered', 'sent', 'failed', 'unknown'],
-    description: 'delivered: stored for a recipient on this site; sent: accepted by the provider for an external recipient (not proof of inbox arrival); failed: rejected, see error; unknown: delivery was interrupted and the result was never recorded, so the recipient may already have it: confirm before resending.' },
-  error: str }, ['error']), description: 'Result for one unique recipient address.' };
+  status: { type: 'string', enum: ['delivered', 'sent', 'failed', 'unknown', 'bounced', 'complained'],
+    description: 'sent: accepted by Cloudflare for an external recipient, no delivery receipt yet (not proof of inbox arrival). delivered: stored for a recipient on this site, or the external receiving server accepted it (event delivered). failed: a definite failure: rejected when sending (see error), on this site’s suppression list (code recipient_suppressed, never sent), or a Cloudflare failed/rejected receipt. bounced: the receiving server bounced it (event bounced; error is the SMTP reply or bounce reason, smtpStatus e.g. 550 5.1.1). complained: delivered, but the recipient marked it as spam (event complained); not a failure and has no error. unknown: delivery was interrupted and the result was never recorded, so the recipient may already have it: confirm before resending. External sent results are updated by Cloudflare delivery receipts, usually seconds to minutes after sending; temporary failures are retried without an update and end as bounced when retries run out. Sending domains without an event subscription get no receipts and stay sent.' },
+  error: str,
+  code: { type: 'string', enum: ['recipient_suppressed'],
+    description: 'Machine-readable reason. recipient_suppressed: the address is on this site’s suppression list for the sender’s domain after an earlier bounce or spam complaint, so nothing was sent to it; error says why and when the entry expires.' },
+  event: { type: 'string', enum: DELIVERY_EVENT_TYPES,
+    description: 'External recipients: the latest Cloudflare delivery event applied. failed and rejected both give status failed. Only events newer than eventAt are applied, so out-of-order or duplicate events never roll a result back.' },
+  eventAt: { ...date, description: 'When that event happened.' },
+  smtpStatus: { ...str, description: 'SMTP reply code from the receiving server, e.g. 550 5.1.1; omitted when the event has none.' },
+}, ['error', 'code', 'event', 'eventAt', 'smtpStatus']), description: 'Result for one unique recipient address.' };
+const suppressedRecipient: Schema = { ...object({ address: str,
+  reason: { type: 'string', enum: SUPPRESSION_REASONS,
+    description: 'hard_bounce: permanent bounce (mailbox or domain unavailable); soft_bounce: temporary failures until retries ran out; complaint: the recipient marked mail as spam.' },
+  sendingDomain: { ...str, description: 'Only mail sent from this domain to the address is blocked.' },
+  since: { ...date, description: 'When the address entered the list.' },
+  expiresAt: { ...nullable(date), description: 'Automatic removal: 24 hours for soft_bounce, 7 days for hard_bounce. null means long-term until an administrator removes it: complaints, and hard bounces for a nonexistent mailbox or domain (5.1.1, 5.1.2, 5.1.10).' } }),
+  description: 'A recipient on this site’s suppression list, added by a Cloudflare bounced or complained receipt. Scoped like Cloudflare to the recipient address and the sending domain.' };
 const authResult = { type: 'string', enum: MAIL_AUTH_RESULTS, description: 'RFC 8601 result; unrecognized values are reported as none.' };
 const messageAuth = { ...nullable(object({
   spf: { ...authResult, description: 'SPF result for the envelope sender (MAIL FROM).' },
@@ -173,7 +194,7 @@ const messageSummary = object({
   fromAddress: str, fromName: str, subject: str, preview: str, verificationCode: str,
   verificationLink: { type: 'string', maxLength: 2048, description: 'Inbound only: the most likely http/https verification, sign-in, activation or password-reset link detected at receipt; empty string when none qualified (and for mail received before detection existed). Advisory and attacker-controllable: check the link host matches the expected service before opening it.' },
   status: { type: 'string', 'x-inbound-values': ['pending', 'received', 'degraded'], 'x-outbound-values': OUTBOUND_STATUSES,
-    description: `Inbound: pending (attachments still being stored), received or degraded (parsing or attachments partly failed; see errorDetail and hasRaw). Outbound: ${OUTBOUND_STATUSES.join(', ')}. pending: delivery in progress, per-recipient results are filled in as each finishes. sent: the provider accepted at least one external recipient; not proof of arrival in the destination inbox. delivered: every recipient is on this site and the copies are stored. failed: every recipient failed. unknown: still pending an hour after creation (delivery interrupted), recorded results are kept and the rest are unknown; some recipients may already have the mail, so confirm before resending. A send response is never failed (that is 422 delivery_failed); errorDetail describes partial failures. Very old rows may carry other values; treat them as unknown.` },
+    description: `Inbound: pending (attachments still being stored), received or degraded (parsing or attachments partly failed; see errorDetail and hasRaw). Outbound: ${OUTBOUND_STATUSES.join(', ')}. pending: delivery in progress, per-recipient results are filled in as each finishes. sent: the provider accepted at least one external recipient; not proof of arrival in the destination inbox. delivered: every recipient is on this site and the copies are stored. failed: every recipient failed. unknown: still pending an hour after creation (delivery interrupted), recorded results are kept and the rest are unknown; some recipients may already have the mail, so confirm before resending. A send response is never failed (that is 422 delivery_failed); errorDetail describes partial failures. Very old rows may carry other values; treat them as unknown. After sending, Cloudflare delivery receipts for external recipients update status and errorDetail: status stays sent while any recipient is still sent, becomes failed when no recipient is delivered, sent, complained or unknown (all bounced or failed), and is otherwise delivered; errorDetail is rebuilt from the recipients that have an error. A message returned as 201 sent can therefore later read failed; replaying its Idempotency-Key still returns the first response, so read the message again for the current status.` },
   errorDetail: str, recipientOutcomes: { ...array(recipientOutcome), description: 'Outbound only: one entry per unique recipient across to/cc/bcc.' },
   recipientsTo: array(str), isRead: bool, isStarred: bool,
   hasAttachments: { ...bool, description: 'Whether the message has real attachments. Inline parts with a Content-ID (embedded images such as logos) are not counted.' },
@@ -199,6 +220,78 @@ const delivery = object({ id: positiveId, messageId: nullable(positiveId), targe
   attempts: int, maxAttempts: positiveId, lastError: str, lastHttpStatus: nullable(int), createdAt: date, updatedAt: date,
   nextAttemptAt: date, lastAttemptAt: nullable(date),
 });
+/** 系统域名一键接入（管理员 JWT）：响应结构与 shared/schemas/system-domain.ts 一致 */
+function systemDomainSchemas(): Record<string, Schema> {
+  const enumOf = (values: readonly string[], description?: string): Schema => ({ type: 'string', enum: [...values], ...(description ? { description } : {}) });
+  const record = object({ type: str, name: { ...str, description: 'Full DNS name.' }, content: str, priority: nullable(int), ttl: nullable(int) });
+  const step = object({ state: enumOf(SYSTEM_DOMAIN_STEP_STATES,
+    'unknown: not read yet or the read failed (never treated as absent); waiting: prerequisites not met; missing: confirmed absent, will be written; ready; conflict: needs confirmation or blocked; error: a write failed deterministically.'), detail: str });
+  const steps = object({ zone: step, routing: step, catchAll: step, sending: step });
+  const registrar = { ...nullable(object({ name: nullable(str), cloudflare: nullable(bool) })),
+    description: 'Registrar from RDAP, display only; null fields mean unknown.' };
+  const state = enumOf(SYSTEM_DOMAIN_ONBOARDING_STATES,
+    'creating_zone: zone creation in flight or unconfirmed (resolved by name within about 10 minutes); awaiting_ns: waiting for nameservers; needs_confirmation: changes need administrator confirmation, not advanced automatically; blocked: a blocker or environment problem, rechecked read-only every 30 minutes and resumed automatically; configuring: writing Cloudflare configuration; finalizing: adding to the system domain list; cancelling; completed / cancelled / failed are terminal.');
+  const summaryFields = {
+    id: positiveId, domain: domainName, mode: enumOf(SYSTEM_DOMAIN_ONBOARDING_MODES), state, steps,
+    errorCode: { ...str, description: 'Machine-readable reason such as mx_removed_routing_pending, provision_timeout, list_full, occupied, cf_transient; empty when none.' },
+    lastError: str, updatedAt: date, nextCheckAt: nullable(date), cancelRequested: bool,
+  };
+  return {
+    SystemDomainCheck: object({
+      key: enumOf(SYSTEM_DOMAIN_CHECK_KEYS), state: enumOf(['ok', 'missing', 'conflict', 'unknown']),
+      severity: enumOf(SYSTEM_DOMAIN_SEVERITIES, 'none: nothing to do; info: notice only; confirm: must be accepted with ack; blocker: fix it and check again.'),
+      ack: { ...nullable(enumOf(SYSTEM_DOMAIN_ACKS)), description: 'For severity=confirm: the value to put in accept.' },
+      danger: { ...bool, description: 'Dangerous confirmation shown in red, e.g. deleting third-party MX records.' },
+      title: str, current: nullable(str), proposed: nullable(str), impact: str, records: array(record),
+    }),
+    SystemDomainPrecheck: object({
+      mode: enumOf(SYSTEM_DOMAIN_ONBOARDING_MODES), domain: domainName, zoneId: nullable(str), zoneStatus: nullable(str), checkedAt: date,
+      checks: array(ref('SystemDomainCheck')),
+      steps: { ...array(object({ kind: enumOf(SYSTEM_DOMAIN_WRITE_STEPS), detail: str })), description: 'Planned Cloudflare writes in execution order.' },
+      requiredAcks: array(enumOf(SYSTEM_DOMAIN_ACKS)),
+      verdict: enumOf(SYSTEM_DOMAIN_VERDICTS, 'ready: can be onboarded with no confirmation; confirm: needs the requiredAcks; blocked: has a blocker or a failed read; pending: zone exists but is not active yet.'),
+      fingerprint: { ...str, description: 'Send back unchanged with accept; the server re-checks Cloudflare and compares.' },
+      registrar, nameServers: array(str), dnssec: { ...nullable(enumOf(DNSSEC_STATES)), description: 'unknown means the check failed, not that DNSSEC is off.' },
+    }),
+    SystemDomainChange: object({
+      seq: positiveId, kind: enumOf(SYSTEM_DOMAIN_CHANGE_KINDS), status: enumOf(['started', 'done', 'unknown', 'failed']), at: date,
+      target: nullable(str), before: { ...nullable(str), description: 'Value before the write (catch-all, SPF, deleted MX), for manual restore.' }, error: nullable(str),
+    }),
+    SystemDomainOnboarding: object({
+      ...summaryFields,
+      zoneId: nullable(str),
+      zoneOrigin: enumOf(SYSTEM_DOMAIN_ZONE_ORIGINS, 'created: created by this task (deletable only when cancelled before activation); linked: existing zone; unknown: found by name after a timed-out creation. linked and unknown zones are never deleted.'),
+      zoneStatus: str, nameServers: array(str), originalNameServers: array(str), originalRegistrar: str,
+      dnssec: enumOf(DNSSEC_STATES), precheck: nullable(ref('SystemDomainPrecheck')), accepted: array(enumOf(SYSTEM_DOMAIN_ACKS)),
+      changes: { ...array(ref('SystemDomainChange')), description: 'Append-only ledger of Cloudflare writes; nothing is rolled back automatically.' },
+      canDeleteZone: bool, createdBy: str, createdAt: date, stateChangedAt: date, checkedAt: nullable(date), activatedAt: nullable(date),
+      finishedAt: nullable(date), dashboardUrl: { ...nullable(str), description: 'Cloudflare dashboard link (contains the account id).' },
+    }),
+    SystemDomainOnboardingSummary: object(summaryFields),
+    SystemDomainZone: object({
+      zoneId: str, name: domainName, status: str, type: nullable(str), paused: bool,
+      category: enumOf(SYSTEM_DOMAIN_ZONE_CATEGORIES, 'available: can be onboarded; onboarding: has an active task; system: already a system domain; hosted: hosted by a user; inconsistent: hosted record with a different zone id (read-only warning).'),
+      hidden: bool, owner: nullable(object({ userId: positiveId, username: str, isAdmin: bool })),
+      onboarding: nullable(ref('SystemDomainOnboardingSummary')),
+      readiness: nullable(object({
+        verdict: enumOf([...SYSTEM_DOMAIN_VERDICTS, 'unchecked'], 'unchecked: not prechecked in this response (at most 10 per request); run GET /admin/system-domains/precheck.'),
+        confirmCount: int, reasons: array(str), registrar, checkedAt: nullable(date),
+      })),
+    }),
+    SystemDomainZonesView: object({
+      configured: { ...bool, description: 'Whether the Worker has Cloudflare credentials; false returns empty lists.' },
+      zones: array(ref('SystemDomainZone')), others: array(ref('SystemDomainZone')), unlistedTasks: array(ref('SystemDomainOnboardingSummary')),
+      counts: object({ available: int, onboarding: int, system: int, hosted: int, inconsistent: int, hostedByAdmin: int, hidden: int }),
+      complete: { ...bool, description: 'false when the Cloudflare zone list was truncated.' }, hiddenRevision: int,
+    }),
+    SystemDomainHiddenZones: object({ hiddenZones: array(domainName), revision: int }),
+    CreateSystemDomainOnboardingRequest: fromZod(createSystemDomainOnboardingRequestSchema),
+    ConfirmSystemDomainOnboardingRequest: fromZod(confirmSystemDomainOnboardingRequestSchema),
+    CancelSystemDomainOnboardingRequest: fromZod(cancelSystemDomainOnboardingRequestSchema),
+    UpdateSystemDomainHiddenZonesRequest: fromZod(updateSystemDomainHiddenZonesRequestSchema),
+  };
+}
+
 /** 批量托管域名的结果：items 与请求顺序一一对应，每项成功带最新视图，失败带与错误信封相同的 code/message/fix */
 function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
   const error = object({ code: { type: 'string', enum: ERROR_CODES }, message: str, fix: str, docs: str }, ['fix', 'docs']);
@@ -245,7 +338,7 @@ const draft = object({ ...draftSummaryProperties, replyTo: array(ref('MailAddres
 
 /** 错误信封里的 error 对象：统一错误信封与批量发送的逐项结果共用 */
 const errorObjectSchema: Schema = object({ code: { type: 'string', enum: ERROR_CODES,
-    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. attachment_url_forbidden (400): a URL attachment points to a disallowed address (not https, credentials, non-443 port, private/loopback/link-local/metadata/reserved IP or a hostname resolving to one, or this site); details.url names it. attachment_url_fetch_failed (422): fetching a URL attachment failed (DNS, timeout, non-2xx, too many redirects, empty or length mismatch); details.url names it. draft_state_conflict (409): the draft status does not allow the operation (sending cannot be changed or deleted, sent cannot be changed) or expectedVersion is stale; details.draftStatus and details.draftVersion give the current state. draft_limit_reached (409): too many unsent drafts; send or delete some first.' },
+    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. recipient_suppressed (422): every recipient is on this site’s suppression list for the sender’s domain after an earlier bounce or spam complaint; nothing was sent, no outbound message was recorded, no quota was used and the Idempotency-Key is released; details.suppressed lists each address with its reason and expiry. attachment_url_forbidden (400): a URL attachment points to a disallowed address (not https, credentials, non-443 port, private/loopback/link-local/metadata/reserved IP or a hostname resolving to one, or this site); details.url names it. attachment_url_fetch_failed (422): fetching a URL attachment failed (DNS, timeout, non-2xx, too many redirects, empty or length mismatch); details.url names it. draft_state_conflict (409): the draft status does not allow the operation (sending cannot be changed or deleted, sent cannot be changed) or expectedVersion is stale; details.draftStatus and details.draftVersion give the current state. draft_limit_reached (409): too many unsent drafts; send or delete some first.' },
     message: { ...str, description: 'Human-readable Chinese explanation; wording may change.' },
     fix: { ...str, description: 'Optional: one actionable correction, e.g. which scope to add or which endpoint to call first.' },
     docs: { type: 'string', format: 'uri', description: 'Optional: absolute URL of the matching section in /references/errors.md on this site.' },
@@ -256,7 +349,9 @@ const errorObjectSchema: Schema = object({ code: { type: 'string', enum: ERROR_C
       url: { ...str, description: 'attachment_url_forbidden, attachment_url_fetch_failed and URL-attachment payload_too_large: the offending address, possibly a redirect target.' },
       draftStatus: { type: 'string', enum: ['draft', 'scheduled', 'sending', 'sent', 'failed'], description: 'draft_state_conflict: the draft’s current status.' },
       draftVersion: { ...positiveId, description: 'draft_state_conflict: the draft’s current version.' },
-    }, ['headers', 'messageId', 'recipientOutcomes', 'url', 'draftStatus', 'draftVersion']), description: 'Optional structured data, present only on the codes above.' },
+      suppressed: { ...array(ref('SuppressedRecipient')), description: 'recipient_suppressed: every recipient with its suppression entry.' },
+      precheck: { type: 'object', description: 'Session API system-domain onboarding 409 only: the latest precheck (SystemDomainPrecheck in /api/openapi.json) with confirmation items, blockers and fingerprint; confirm with its fingerprint and accept, then retry.' },
+    }, ['headers', 'messageId', 'recipientOutcomes', 'url', 'draftStatus', 'draftVersion', 'suppressed', 'precheck']), description: 'Optional structured data, present only on the codes above.' },
   }, ['fix', 'docs', 'details']);
 export const schemas: Record<string, Schema> = {
   Error: object({ error: errorObjectSchema,
@@ -345,6 +440,21 @@ export const schemas: Record<string, Schema> = {
     statusCode: int, ip: str, durationMs: int, createdAt: date }),
     description: 'One row per accepted request. Rejected requests (disabled or expired key, IP not allowed, disabled user, rate limited) are recorded at most once per key per minute; revoked keys are treated as unknown and never logged.' },
   AdminAuditLog: object({ id: positiveId, actorName: str, action: str, target: str, detail: str, ip: str, createdAt: date }),
+  SuppressedRecipient: suppressedRecipient,
+  EmailSuppression: { ...object({ ...(suppressedRecipient.properties as Record<string, Schema>), id: positiveId,
+    detail: { ...str, description: 'Bounce text from the receiving server, or the complaint type.' }, updatedAt: date }),
+    description: 'An active (unexpired) suppression entry.' },
+  DeliveryEventsOverview: object({
+    enabled: { ...bool, description: 'Setting delivery_events.enabled. When false no new subscriptions are created; events from existing subscriptions are still applied.' },
+    credentials: { ...bool, description: 'The Worker has Cloudflare credentials (cf_api_token and cf_account_id); without them no subscription is created automatically.' },
+    queue: { ...nullable(str), description: `Cloudflare Queue the events are delivered to, as configured at deploy time (e.g. ${DELIVERY_EVENTS_QUEUE}). null: this deployment has not enabled delivery receipts (GitHub Variable DELIVERY_EVENTS_QUEUE unset), so no subscription is created, sends do not check the suppression list and the enabled switch has no effect.` },
+    subscriptions: { ...array(object({ domain: str,
+      kind: { type: 'string', enum: ['system', 'hosted'], description: 'system: a configured system domain; hosted: a user-hosted domain with sending ready.' },
+      zoneId: str, subscriptionId: nullable(str),
+      status: { type: 'string', enum: ['active', 'error'], description: 'active: subscribed; error: creating the subscription failed (see lastError) and is retried by the scheduled task about every 6 hours.' },
+      lastError: str, checkedAt: nullable(date) })),
+    description: 'One item per sending domain the scheduled task has processed, sorted by domain. A domain without an active subscription gets no delivery receipts, so its results stay sent.' },
+  }),
   Invite: object({ id: positiveId, code: str, maxUses: positiveId, usedCount: int, expiresAt: nullable(date), note: str, createdAt: date,
     status: { type: 'string', enum: ['usable', 'exhausted', 'expired', 'revoked'] }, usedBy: array(str) }),
   Settings: settingsResponse, DomainEntry: domainEntry, NotifyPrefs: notifyPrefs,
@@ -413,6 +523,7 @@ export const schemas: Record<string, Schema> = {
     schema.description = 'Selected by type. name is relative (@ for the root, www, _dmarc, *.dev) or a full name ending with the domain. ttl is 1 (automatic) or 60–86400 seconds. A/AAAA/CNAME/TXT use content, MX uses content and priority, SRV uses srv, CAA uses caa. comment is optional (empty clears it on update).';
     return schema;
   })(),
+  ...systemDomainSchemas(),
   CreateHostedDomainRequest: fromZod(createHostedDomainRequestSchema), UpdateHostedDomainRequest: fromZod(updateHostedDomainRequestSchema),
   ReplaceHostedDomainMembersRequest: fromZod(replaceHostedDomainMembersRequestSchema), TransferHostedDomainRequest: fromZod(transferHostedDomainRequestSchema),
   BatchCreateHostedDomainsRequest: fromZod(batchCreateHostedDomainsRequestSchema), BatchCheckHostedDomainsRequest: fromZod(batchCheckHostedDomainsRequestSchema),
@@ -452,7 +563,14 @@ export const schemas: Record<string, Schema> = {
   }),
   ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
-  MarkReadRequest: fromZod(markReadRequestSchema), MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
+  MarkReadRequest: fromZod(markReadRequestSchema),
+  ApiMarkReadRequest: (() => {
+    const schema = fromZod(apiMarkReadRequestSchema);
+    (schema.properties as Record<string, Schema>).includeUnread = { ...(schema.properties as Record<string, Schema>).includeUnread,
+      description: 'true: in the caller’s own view (no scope or scope=mine) the response also carries unread, the same capped count as GET /messages/unread-count after this change.' };
+    return schema;
+  })(),
+  MessageIdsRequest: fromZod(deleteMessagesRequestSchema), StarMessagesRequest: fromZod(starMessagesRequestSchema),
   MarkAllReadRequest: (() => {
     const schema = fromZod(markAllReadRequestSchema);
     schema.description = 'All fields optional; {} or an empty body marks every unread, non-trash inbound message in the caller’s own claimed mailboxes. domain/address/q narrow the range; q uses the list search semantics (case-insensitive substring of subject, sender address/name, recipients and the first 4 KB of the body text). Mail shared with the caller is never changed. Administrators use scope=unclaimed for unclaimed addresses. Unknown fields are ignored.';
@@ -501,7 +619,7 @@ export const listQuery = [query('direction', { type: 'string', enum: ['inbound',
   ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'),
   ...listFilterQuery, ...pageQuery];
 export const idempotencyHeader = { name: 'Idempotency-Key', in: 'header', required: false,
-  description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed exactly as first returned (201 with the original summary, including status unknown, or the same 422 delivery_failed when every recipient definitely failed) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it. After 422 delivery_failed, correct the recipients and use a new key. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key; confirm unknown recipients before resending to them. Outbound mail still pending an hour after creation is marked unknown, after which the same key replays 201 with status unknown; in the rare case the final result cannot be stored, the same key keeps returning 409 send_in_progress until then. Completed keys are retained at least two days.',
+  description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed exactly as first returned (201 with the original summary, including status unknown, or the same 422 delivery_failed when every recipient definitely failed) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it; so does 422 recipient_suppressed, which creates no outbound record and uses no quota. After 422 delivery_failed, correct the recipients and use a new key. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key; confirm unknown recipients before resending to them. Outbound mail still pending an hour after creation is marked unknown, after which the same key replays 201 with status unknown; in the rare case the final result cannot be stored, the same key keeps returning 409 send_in_progress until then. Completed keys are retained at least two days.',
   schema: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$' } };
 export const success = object({ success: { const: true, type: 'boolean' } });
 export const changed = object({ changed: int });
@@ -530,14 +648,14 @@ export function sendMailOperation(scope?: string): Operation {
   const keyScopes = scope
     ? ` API keys need ${scope}; replyToMessageId or forwardAttachmentsFrom additionally require mail.read (403 without it).` : '';
   const base = operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope, status: 201, parameters: [idempotencyHeader],
-    description: `HTTP 201 means at least one recipient succeeded (status sent or delivered), or none succeeded but at least one result is uncertain (status unknown: provider timeout or network error, possibly delivered; also an interrupted send replayed after an hour). Only a definite provider rejection (destination not verified, sending domain not ready, invalid address, limit exceeded and the like) counts as failed; anything else is unknown. Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; confirm unknown recipients before resending; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient definitely failed (or the server failed before delivery started) the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported, and {url} attachments are fetched by the server (https only, SSRF-checked, size, timeout and redirect limits). Large external attachments become signed links valid for 90 days independently of sent-mail deletion. There is no separate reply or forward endpoint (POST /messages/{id} does not exist): set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
+    description: `HTTP 201 means at least one recipient succeeded (status sent or delivered), or none succeeded but at least one result is uncertain (status unknown: provider timeout or network error, possibly delivered; also an interrupted send replayed after an hour). Only a definite provider rejection (destination not verified, sending domain not ready, invalid address, limit exceeded and the like) counts as failed; anything else is unknown. Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; confirm unknown recipients before resending; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient definitely failed (or the server failed before delivery started) the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery; on deployments with delivery receipts enabled, Cloudflare receipts later update recipientOutcomes (delivered, bounced, failed, complained) and status, so read the message again to confirm delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported, and {url} attachments are fetched by the server (https only, SSRF-checked, size, timeout and redirect limits). Large external attachments become signed links valid for 90 days independently of sent-mail deletion. There is no separate reply or forward endpoint (POST /messages/{id} does not exist): set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
   const error = (description: string) => ({ description, content: { 'application/json': { schema: ref('Error') } } });
   return { ...base,
     responses: { ...(base.responses as Record<string, unknown>),
       400: error('validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, a hosted-domain sender whose sending is not ready, or attachment_url_forbidden for a disallowed URL attachment (details.url).'),
       403: error('forbidden: the API key lacks a scope (fix names it), or the sender identity is not allowed (fix points to GET /identities); shared mailboxes never send.'),
       413: error(`payload_too_large: request body over ${MAX_SEND_REQUEST_BYTES / 1024 / 1024} MiB (rejected before parsing), base64 attachments over ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB combined, or all attachments over ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB. Upload large files and use attachmentTokens.`),
-      422: error('delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key. attachment_url_fetch_failed: a URL attachment could not be fetched (details.url); nothing was sent and the same key may be retried.'),
+      422: error('delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key. recipient_suppressed: every recipient is on this site’s suppression list for the sender’s domain (an earlier bounce or spam complaint), so nothing was sent, no outbound message was recorded and no quota was used; details.suppressed lists address, reason, sendingDomain, since and expiresAt (null: until an administrator removes it), and the Idempotency-Key is released for reuse. When only some recipients are suppressed the others are sent (201) and each suppressed recipient has status failed with code recipient_suppressed; if every other recipient fails too, the response is 422 delivery_failed whose recipientOutcomes include the suppressed ones. attachment_url_fetch_failed: a URL attachment could not be fetched (details.url); nothing was sent and the same key may be retried.'),
       429: error('rate_limited: request rate, or the daily outbound mail/recipient quota (GET /v1/me shows usage).'),
       500: error('internal: the server failed before every recipient was attempted. Retry the identical request with the same Idempotency-Key to fetch the result: it may be 201, or 422 delivery_failed whose recipientOutcomes show recipients that were never attempted.'),
     },
@@ -688,3 +806,19 @@ export function uploadPaths(scope?: string): Paths {
       description: 'Own draft only. Aborts unfinished multipart uploads or deletes the completed draft object. R2 failure keeps the durable reference for cleanup.' }) },
   };
 }
+
+/** 可选分页的列表：出现 cursor 或 limit 即返回 Page，都不出现时返回旧版完整数组 */
+const pageSwitch = 'Presence of cursor or limit (even empty) switches the response from the full array to a page {items, nextCursor}.';
+export const optionalPageQuery = [
+  query('cursor', { type: 'string', maxLength: 128 }, `${pageSwitch} Pass the previous nextCursor unchanged; empty means the first page; null nextCursor means no next page. A cursor that is present but cannot be decoded returns 400 validation_failed.`),
+  query('limit', { type: 'integer', minimum: 1, maximum: LIST_PAGE_MAX_LIMIT, default: LIST_PAGE_DEFAULT_LIMIT }, `${pageSwitch} Items per page.`),
+];
+export const arrayOrPage = (items: Schema): Schema => ({ oneOf: [
+  { ...array(items), title: 'Full array (neither cursor nor limit present)' },
+  { ...page(items), title: 'Page (cursor or limit present)' },
+] });
+export const mailboxSearchQuery = [
+  query('q', { type: 'string', maxLength: 254 }, 'Case-insensitive literal substring of the address or the owner username (no wildcards).'),
+  query('domain', domainName, 'Exact domain.'),
+];
+export const mailboxListDescription = 'Ordered by mailbox id, newest first. q and domain filter in both response forms. Without cursor and limit the response stays the complete array, as before; scripts listing every mailbox with all=1 should page with limit and nextCursor instead.';

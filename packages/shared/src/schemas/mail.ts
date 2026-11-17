@@ -21,6 +21,7 @@ import type { ApiErrorBody, IssueErrorParams, Page } from '../envelope.js';
 import { MAX_MAIL_ADDRESS_INPUT_LENGTH, parseMailAddress, type MailAddress } from '../mail-address.js';
 import { checkCustomHeaders } from '../mail-headers.js';
 import { domainSchema, localPartSchema } from './mailbox.js';
+import type { DeliveryEventType } from './delivery-events.js';
 
 export const emailAddressSchema = z
   .string()
@@ -626,6 +627,21 @@ export const markReadRequestSchema = z.object({
 });
 export type MarkReadRequest = z.infer<typeof markReadRequestSchema>;
 
+/**
+ * /api（网页会话）专用：includeUnread=true 且是个人视图时，响应带回标记后的未读数（与 GET /api/messages/unread-count
+ * 同口径、同封顶），详情页标已读后不必再请求一次未读数。/v1 的 /read 仍用 markReadRequestSchema，契约不变。
+ */
+export const apiMarkReadRequestSchema = markReadRequestSchema.extend({
+  includeUnread: z.boolean().optional(),
+});
+export type ApiMarkReadRequest = z.infer<typeof apiMarkReadRequestSchema>;
+
+export interface MarkReadResult {
+  changed: number;
+  /** 仅 /api 请求带 includeUnread=true 且为个人视图时返回 */
+  unread?: number;
+}
+
 export const deleteMessagesRequestSchema = z.object({
   ids: z.array(z.number().int().positive()).min(1).max(500),
   scope: mutationScopeSchema,
@@ -644,13 +660,22 @@ export const starMessagesRequestSchema = z.object({
 export type StarMessagesRequest = z.infer<typeof starMessagesRequestSchema>;
 
 /**
- * 逐收件人结果：sent 已被 Cloudflare 接受（外部）；delivered 已落库（站内）；failed 明确失败（error 为原因）；
+ * 逐收件人结果：sent 已被 Cloudflare 接受（外部）；delivered 已落库（站内）或外部收件服务器已接收（投递事件回写）；
+ * failed 明确失败（error 为原因）；bounced 收件服务器退信；complained 已送达但收件人标记为垃圾邮件；
  * unknown 投递中断、结果未回填（由定时任务标记，可能已送达，补发前先向收件人确认）。
  */
 export interface RecipientOutcome {
   address: string;
-  status: 'delivered' | 'sent' | 'failed' | 'unknown';
+  status: 'delivered' | 'sent' | 'failed' | 'unknown' | 'bounced' | 'complained';
   error?: string;
+  /** 机器可读原因：recipient_suppressed 命中本站抑制名单，没有发出 */
+  code?: 'recipient_suppressed';
+  /** 外部收件人：最近一次回写的 Cloudflare 投递事件 */
+  event?: DeliveryEventType;
+  /** 该事件发生的时间（ISO 8601） */
+  eventAt?: string;
+  /** 收件服务器的 SMTP 应答码，如 "550 5.1.1"；事件不带时省略 */
+  smtpStatus?: string;
 }
 
 /** /api 列表页：首页（无 cursor）附带 head 指纹，与 /messages/sync 同算法，只用于比较首页是否变化 */

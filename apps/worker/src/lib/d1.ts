@@ -1,8 +1,9 @@
 /**
- * D1 单条查询最多 **100 个绑定参数**（Cloudflare 平台硬限），超出即整条语句被拒。
- * 本地/CI 的 vitest-pool-workers 走 better-sqlite3（上限 32766）测不出来，
- * 只有线上真 D1 报 `too many SQL variables`——凡是把数组展开成 IN (?,?,…) 的
- * 查询都必须按此分批。
+ * D1 单条查询最多 **100 个绑定参数**（Cloudflare 平台硬限），超出即整条语句被拒（`too many SQL variables`），
+ * 所在 batch 整体失败。本地测试用的 D1 同样按 100 拒绝（test/d1-param-limit.test.ts 有哨兵测试），
+ * 超限只要被测试走到就会暴露，所以满额输入（100 个 id、50 个邀请码等）要有对应用例。
+ * 凡是把数组展开成 IN (?,?,…) 或多行 VALUES 的语句都必须分批或改用 json_each；
+ * drizzle 会把带默认值的列也作为参数绑定，多行插入按每行实际参数数计算批大小。
  */
 export const D1_MAX_BOUND_PARAMS = 100;
 

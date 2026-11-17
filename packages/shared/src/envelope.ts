@@ -1,4 +1,6 @@
 import type { RecipientOutcome } from './schemas/mail.js';
+import type { SuppressedRecipient } from './schemas/delivery-events.js';
+import type { SystemDomainPrecheck } from './schemas/system-domain.js';
 
 /** 成功：HTTP 2xx + { data }；失败：HTTP 4xx/5xx + { error, requestId } */
 export interface ApiSuccess<T> {
@@ -17,6 +19,10 @@ export interface ApiErrorDetails {
   /** draft_state_conflict：草稿当前状态与版本 */
   draftStatus?: string;
   draftVersion?: number;
+  /** recipient_suppressed：命中抑制名单的收件人（全部收件人都在名单里，没有创建发件记录） */
+  suppressed?: SuppressedRecipient[];
+  /** 系统域名接入 409：最新预检（需确认项、阻断项与指纹），确认后带 fingerprint 与 accept 重试 */
+  precheck?: SystemDomainPrecheck;
 }
 
 export interface ApiErrorBody {
@@ -82,6 +88,8 @@ export const ERROR_CODES = [
   'attachment_url_forbidden',
   /** URL 附件拉取失败：DNS 解析失败、超时、非 2xx、重定向过多或内容为空：422，details.url 为出错的地址 */
   'attachment_url_fetch_failed',
+  /** 全部收件人都在本站抑制名单里（此前退信或投诉）：422，没有发信也不占配额，details.suppressed 列出原因与解除时间 */
+  'recipient_suppressed',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -111,5 +119,6 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   draft_limit_reached: 409,
   attachment_url_forbidden: 400,
   attachment_url_fetch_failed: 422,
+  recipient_suppressed: 422,
   internal: 500,
 };

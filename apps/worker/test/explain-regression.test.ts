@@ -9,6 +9,9 @@ import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js
 import { purgeStatements } from '../src/services/message-lifecycle.js';
 import { DUE_DRAFTS_CLAIM_SQL, STALE_DRAFTS_SQL } from '../src/services/drafts.js';
 import { CLEANUP_JOBS_SQL } from '../src/services/storage-cleanup.js';
+import { anyOnboardingSql, hostedTakenSql, onboardingActiveSql } from '../src/services/domain-occupancy.js';
+import { syncDueOnboarding } from '../src/services/system-domain.js';
+import { occupancyFacts } from '../src/services/zone-catalog.js';
 import {
   countUnread, findNextMessage, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
 } from '../src/services/message.js';
@@ -483,7 +486,7 @@ describe('执行计划回归：列表筛选（since/until/from/to/hasCode/hasAtt
             expect(page.plan, name).toMatch(view === '全部' ? /idx_messages_address_deleted_id \(address=\? AND deleted_at=\? AND id>\?\)/ : /rowid>\?/);
             expect(page.plan, name).toContain('SEARCH b USING COVERING INDEX idx_messages_created_id (created_at>?)');
           }
-          if (filter.hasAttachments) expect(page.plan, name).toMatch(/SEARCH attachments USING (COVERING )?INDEX \w+ \(message_id=\?\)/);
+          if (filter.hasAttachments) expect(page.plan, name).toMatch(/SEARCH attachments (EXISTS )?USING (COVERING )?INDEX \w+ \(message_id=\?\)/);
         }
       }
     }
@@ -532,5 +535,27 @@ describe('执行计划回归：草稿派发与对象清理', () => {
   it('对象清理判断草稿正文引用时走 idx_drafts_body_r2', async () => {
     const cleanup = await plan(CLEANUP_JOBS_SQL, [Date.now(), 100]);
     expect(cleanup).toMatch(/SEARCH drafts USING COVERING INDEX idx_drafts_body_r2 \(body_r2_key=\?\)/);
+  });
+});
+
+describe('执行计划回归：系统域名接入', () => {
+  const planOf = async (sql: string, ...params: unknown[]) =>
+    (await env.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...params).all<{ detail: string }>()).results.map((row) => row.detail).join(' | ');
+
+  it('同名互斥按域名走部分唯一索引与托管唯一索引（表达式与索引的 WHERE 一致）', async () => {
+    expect(await planOf(`SELECT ${onboardingActiveSql('?1')}`, 'x.test')).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(await planOf(`SELECT ${anyOnboardingSql('?1')}`, '["x.test"]')).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(await planOf(`SELECT ${hostedTakenSql('?1')}`, 'x.test')).toMatch(/hosted_domains_domain_unique \(domain=\?\)/);
+    const facts = await capturePlans((e) => occupancyFacts(e, 'x.test', 1));
+    expect(facts).toHaveLength(1);
+    expect(facts[0]!.plan).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(facts[0]!.plan).toMatch(/hosted_domains_domain_unique \(domain=\?\)/);
+  });
+
+  it('定时任务按 (state, next_check_at) 索引取到期任务', async () => {
+    const plans = await capturePlans((e) => syncDueOnboarding({ ...e, cf_api_token: 't', cf_account_id: 'a' }));
+    expect(plans).toHaveLength(1);
+    expect(plans[0]!.plan).toMatch(/idx_system_onboarding_due \(state=\? AND next_check_at<\?\)/);
+    expect(plans[0]!.plan).not.toMatch(/SCAN system_domain_onboarding\b/);
   });
 });

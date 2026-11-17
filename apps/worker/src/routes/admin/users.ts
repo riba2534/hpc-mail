@@ -24,7 +24,7 @@ app.put('/:id', async (c) => {
   const acting = c.get('user')!;
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, updateUserRequestSchema);
-  const { user: updated, revokedApiKeys } = await updateUser(c.env, acting.id, id, req, execCtx(c));
+  const { user: updated, revokedApiKeys } = await updateUser(c.env, acting.id, id, req);
   const changes: string[] = [];
   if (req.status) changes.push(req.status === 'disabled' ? '禁用' : '启用');
   if (req.role) changes.push(`角色→${req.role}`);

@@ -121,6 +121,7 @@ jobs:
           CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
           PLACEMENT_REGION: ${{ vars.PLACEMENT_REGION }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
         run: |
           set -euo pipefail
           sed -i \
@@ -142,6 +143,8 @@ jobs:
           else
             echo '::notice::未设置 PLACEMENT_REGION，跳过 placement 注入'
           fi
+          # 可选的外发投递回执：设置了 Variable DELIVERY_EVENTS_QUEUE 才注入 Worker 变量与 Queue consumer，未设置时只在 Summary 记一行
+          node scripts/ensure-delivery-queue.mjs --inject wrangler.toml
           # 现存哈希资源由边缘直出、不绕到 placement 区域；缺失文件仍经 Worker 返回 404（build:assets 已在前面执行）
           node scripts/inject-asset-routes.mjs
           rules=$(grep -E '^run_worker_first' wrangler.toml | grep -o '"[^"]*"' | wc -l)
@@ -149,6 +152,16 @@ jobs:
           echo "run_worker_first 共 $rules 条，静态资源排除 $excluded 条"
           [ "$rules" -le 100 ] || { echo '::error::run_worker_first 超过 Cloudflare 100 条上限'; exit 1; }
           grep -E '^run_worker_first' wrangler.toml | grep -q '"/assets/\*"' || { echo '::error::run_worker_first 缺少 /assets/* 兜底规则'; exit 1; }
+
+      # 启用了投递回执时，在迁移与发布之前只读预检一次（按名称列 Queue）：Token 没有 Queues 权限就在这里失败，
+      # Job Summary 写明缺 Account → Queues:Edit。日志只有队列名与错误码，不含账户 id
+      - name: 投递回执权限预检
+        if: vars.DELIVERY_EVENTS_QUEUE != ''
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
+        run: node scripts/ensure-delivery-queue.mjs --check
 
       - name: 部署预演（dry-run）
         working-directory: apps/worker
@@ -238,6 +251,16 @@ jobs:
           echo "::add-mask::$smoke_password"
           echo "::add-mask::$canary_token"
           { echo "SMOKE_PASSWORD=$smoke_password"; echo "CANARY_TOKEN=$canary_token"; } >> "$GITHUB_ENV"
+
+      # 注入的 consumer 引用的 Queue 必须先存在，否则 wrangler deploy 直接失败。创建失败时在发布前中止（线上仍是旧版本，
+      # 不触发回滚），Job Summary 写明原因。日志只有队列名与错误码，不含账户 id
+      - name: 确保投递回执 Queue 存在
+        if: vars.DELIVERY_EVENTS_QUEUE != ''
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
+        run: node scripts/ensure-delivery-queue.mjs
 
       # secrets 随代码进同一个版本：部署后逐个 secret put 会各自生成新版本，回滚目标随之失真
       - name: 部署 Worker（代码与 secrets 同一版本）

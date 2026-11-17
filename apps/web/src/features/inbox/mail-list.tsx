@@ -44,8 +44,8 @@ import { useStarMutation } from './use-star';
 
 /** 距已加载末尾不足这么多行就开始拉下一页（用户已开始滚动时） */
 const PREFETCH_ROWS = 20;
-/** 悬停/聚焦行这么久才预取详情，划过不算 */
-const DETAIL_PREFETCH_DELAY_MS = 100;
+/** 悬停/聚焦行这么久才预取详情：鼠标扫过列表不读正文，停下来看才算 */
+const DETAIL_PREFETCH_DELAY_MS = 250;
 
 const SHARED_READ_ONLY = '共享给你的邮件只读，不能改变已读状态';
 
@@ -193,13 +193,26 @@ export function MailList({
   );
 
   // ---- 悬停/聚焦行时预取详情（GET 无副作用；已读由详情页单独 POST）----
+  // 同一时间只保留一个悬停预取：新的开始前取消上一个仍在途、且没有页面在用的预取
   const prefetchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const prefetching = useRef<number | null>(null);
   const handleOpenIntent = useCallback(
     (id: number | null) => {
       globalThis.clearTimeout(prefetchTimer.current);
       if (id === null) return;
       prefetchTimer.current = globalThis.setTimeout(() => {
-        void queryClient.prefetchQuery(messageDetailQueryOptions(id, mailView));
+        const previous = prefetching.current;
+        if (previous !== null && previous !== id) {
+          const { queryKey } = messageDetailQueryOptions(previous, mailView);
+          const query = queryClient.getQueryCache().find({ queryKey, exact: true });
+          if (query?.state.fetchStatus === 'fetching' && query.getObserversCount() === 0) {
+            void queryClient.cancelQueries({ queryKey, exact: true });
+          }
+        }
+        prefetching.current = id;
+        void queryClient.prefetchQuery(messageDetailQueryOptions(id, mailView)).finally(() => {
+          if (prefetching.current === id) prefetching.current = null;
+        });
       }, DETAIL_PREFETCH_DELAY_MS);
     },
     [queryClient, mailView],

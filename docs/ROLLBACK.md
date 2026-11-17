@@ -6,10 +6,10 @@
 
 ## 一次发布的顺序
 
-1. 测试、类型检查、构建、依赖审计，注入 Cloudflare 资源配置，`wrangler deploy --dry-run`。
+1. 测试、类型检查、构建、依赖审计，注入 Cloudflare 资源配置，`wrangler deploy --dry-run`。设置了 Variable `DELIVERY_EVENTS_QUEUE`（启用外发投递回执）时，注入配置后还会只读预检 Token 的 Queues 权限，缺权限在这里失败。
 2. **记录回滚基线**：迁移前的 D1 Time Travel 书签、当前承载流量的 Worker 版本 id、当前线上 build（`X-HPC-Build`），写进 Job Summary。
 3. 应用 D1 迁移并校验迁移数量；引导管理员与冒烟账号 `ci-smoke`。
-4. **发布 Worker**：`wrangler deploy --secrets-file` 把代码和 secrets 发布成同一个版本。
+4. **发布 Worker**：启用了投递回执时先确保 Queue 存在（失败即中止，线上仍是旧版本）；`wrangler deploy --secrets-file` 把代码和 secrets 发布成同一个版本。
 5. 验证新版本：等待 `X-HPC-Build` 等于本次提交 → `scripts/smoke.sh` 冒烟 → 收件金丝雀 → cron 心跳。
 6. 第 4、5 步任一失败，或运行在发布之后被取消 → **自动回滚 Worker**。
 
