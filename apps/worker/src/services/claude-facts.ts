@@ -3,7 +3,7 @@ import type { Env } from '../types.js';
 /**
  * 由官方来信归纳每个收件地址的 Claude 账号事实（claude_address_facts），供随机后缀按封号风险分配。
  *
- * 口径：只认通过认证的官方来信（见 AUTHENTIC）；欢迎信、收据、订阅确认、封号信或任意 Claude 产品邮件算账号，
+ * 口径：只认通过认证的官方来信（见 CLAUDE_AUTHENTIC）；欢迎信、收据、订阅确认、封号信或任意 Claude 产品邮件算账号，
  * 只有登录魔法链接的不算。归纳幂等且单调：标志只会由否变是、时间取最早，cron 窗口重叠或永久删除前补归纳都可以重复执行。
  * 界面上写作「根据历史来信判定」。
  *
@@ -23,19 +23,21 @@ const CLAUDE_OFFICIAL_SENDER_DOMAINS = [
 ] as const;
 
 /** 第一个 @ 之后的部分；含多个 @ 的畸形地址取出的不是合法域名，不会命中白名单 */
-const SENDER_DOMAIN = `lower(substr(from_address, instr(from_address, '@') + 1))`;
-const OFFICIAL = `${SENDER_DOMAIN} IN (${CLAUDE_OFFICIAL_SENDER_DOMAINS.map((domain) => `'${domain}'`).join(', ')})`;
+export const SENDER_DOMAIN = `lower(substr(from_address, instr(from_address, '@') + 1))`;
+export const CLAUDE_OFFICIAL_SENDER = `${SENDER_DOMAIN} IN (${CLAUDE_OFFICIAL_SENDER_DOMAINS.map((domain) => `'${domain}'`).join(', ')})`;
 const SUSPENDED = `subject LIKE 'Your account has been suspended%'`;
+/** Anthropic 收据来信的主题（services/claude-receipts.ts 按同一主题解析收据） */
+export const CLAUDE_RECEIPT_SUBJECT = `subject LIKE 'Your receipt from Anthropic%'`;
 /**
  * 认证口径：Cloudflare 的 DKIM 通过、签名域与发件域相同或为其父域、From/To/Subject 头各只有一个（auth.aligned），
  * 且收件地址出现在 To 头里——正版的官方邮件被原样重投到别的地址时 DKIM 照样通过，To 头却还是原来的收件人。
  */
 const DKIM_DOMAIN = `json_extract(auth, '$.dkimDomain')`;
-const AUTHENTIC = `json_extract(auth, '$.dkim') = 'pass' AND json_extract(auth, '$.aligned') = 1
+export const CLAUDE_AUTHENTIC = `(json_extract(auth, '$.dkim') = 'pass' AND json_extract(auth, '$.aligned') = 1
     AND instr(${DKIM_DOMAIN}, '.') > 0
     AND (${SENDER_DOMAIN} = ${DKIM_DOMAIN} OR substr(${SENDER_DOMAIN}, -length(${DKIM_DOMAIN}) - 1) = '.' || ${DKIM_DOMAIN})
-    AND EXISTS (SELECT 1 FROM json_each(recipients, '$.to') WHERE value = address)`;
-const PAID = `(subject LIKE 'Your receipt from Anthropic%' OR subject LIKE '%subscription is confirmed%')`;
+    AND EXISTS (SELECT 1 FROM json_each(recipients, '$.to') WHERE value = address))`;
+const PAID = `(${CLAUDE_RECEIPT_SUBJECT} OR subject LIKE '%subscription is confirmed%')`;
 const ACCOUNT = `(${SUSPENDED} OR ${PAID} OR subject LIKE 'Welcome to Claude%' OR ${SENDER_DOMAIN} = 'email.claude.com')`;
 
 /**
@@ -46,7 +48,7 @@ export function harvestSql(scope: string, index: 'idx_messages_created_id' | 'id
   return `INSERT INTO claude_address_facts (address, domain, paid, suspended, first_seen_at, suspended_at)
   SELECT address, domain, MAX(${PAID}), MAX(${SUSPENDED}), MIN(created_at), MIN(CASE WHEN ${SUSPENDED} THEN created_at END)
   FROM messages INDEXED BY ${index}
-  WHERE ${scope} AND direction = 'inbound' AND send_channel <> 'internal' AND ${OFFICIAL} AND ${AUTHENTIC}
+  WHERE ${scope} AND direction = 'inbound' AND send_channel <> 'internal' AND ${CLAUDE_OFFICIAL_SENDER} AND ${CLAUDE_AUTHENTIC}
   GROUP BY address HAVING MAX(${ACCOUNT}) = 1
   ON CONFLICT(address) DO UPDATE SET
     paid = MAX(claude_address_facts.paid, excluded.paid),
@@ -66,3 +68,4 @@ export async function harvestRecentClaudeFacts(env: Env, sinceMs: number): Promi
   const result = await env.db.prepare(harvestSql('created_at >= ?', 'idx_messages_created_id')).bind(sinceMs).run();
   return result.meta.changes ?? 0;
 }
+

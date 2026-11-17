@@ -114,15 +114,21 @@ describe('inbox list toolbar and rows',()=>{
     expect(screen.getByRole('checkbox',{name:'选择：sender@example.com - mail-2'})).toHaveAttribute('aria-checked','false');
     client.clear();
   });
-  it('a verification link on a different domain is only a warning that leads to the detail page',async()=>{
-    mocks.items=[mail(1,{fromAddress:'service@paypal.example',verificationLink:'https://login-secure-check.example/verify'})];
+  it('when the sender failed SPF/DKIM the row offers no one-click verification link; the detail page shows the warning',()=>{
+    mocks.items=[mail(1,{fromAddress:'security@bank.example',verificationLink:'https://bank.example/verify',
+      auth:{spf:'fail',dkim:'fail',dkimDomain:'evil.example',dmarc:'fail',aligned:false}})];
     const client=show(inbox,'inbox');
     expect(screen.queryByRole('link',{name:/打开验证链接/})).toBeNull();
-    expect(screen.getByText('链接域名不一致')).toBeInTheDocument();
-    expect(document.querySelector('a[href^="https://login-secure-check.example"]')).toBeNull();
-    const row=screen.getByRole('link',{name:'service@paypal.example，mail-1，验证链接域名与发件人不一致'});
-    fireEvent.click(row);
-    expect(await screen.findByText(/detail \/mail\/1/)).toBeInTheDocument();
+    expect(document.querySelector('a[href^="https://bank.example/verify"]')).toBeNull();
+    client.clear();
+  });
+  it('a verification link on a different domain is shown like any other, with no mismatch warning',()=>{
+    mocks.items=[mail(1,{fromAddress:'service@paypal.example',verificationLink:'https://login-secure-check.example/verify'})];
+    const client=show(inbox,'inbox');
+    const link=screen.getByRole('link',{name:'打开验证链接 login-secure-check.example'});
+    expect(link).toHaveAttribute('href','https://login-secure-check.example/verify');
+    expect(screen.queryByText(/不一致/)).toBeNull();
+    expect(screen.getByRole('link',{name:'service@paypal.example，mail-1'})).toBeInTheDocument();
     client.clear();
   });
   it('keyboard: j moves focus, x selects, e deletes, o opens with list context',async()=>{

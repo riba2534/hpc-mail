@@ -92,15 +92,14 @@ function RecipientLine({ label, addresses }: { label: string; addresses: string[
 }
 
 function VerificationLinkBanner({ message }: { message: MessageDetail }) {
-  const link = inspectVerificationLink(message.verificationLink, message.fromAddress);
+  const link = inspectVerificationLink(message.verificationLink);
   if (!link) return null;
   const unverifiedSender = senderAuthFailed(message.auth);
-  const caution = link.mismatch || unverifiedSender;
   return (
     <div
       className={cn(
         'flex flex-col gap-2 rounded-lg border px-4 py-3',
-        caution ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
+        unverifiedSender ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
       )}
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -108,20 +107,14 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
           <p className="text-xs font-medium text-ink-secondary">验证链接</p>
           <p className="truncate text-sm text-ink" title={link.href}>{link.hostname}</p>
         </div>
-        <Button asChild size="sm" variant={caution ? 'secondary' : 'primary'}>
+        <Button asChild size="sm" variant={unverifiedSender ? 'secondary' : 'primary'}>
           <a href={link.href} target="_blank" rel="noopener noreferrer">
             <ExternalLink className="size-4" />
             打开验证链接
           </a>
         </Button>
       </div>
-      {link.mismatch && (
-        <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
-          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
-          链接域名与发件人不一致，请确认后再打开
-        </p>
-      )}
-      {!link.mismatch && unverifiedSender && (
+      {unverifiedSender && (
         <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           发件人未通过验证，请确认后再打开

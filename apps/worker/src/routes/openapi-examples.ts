@@ -8,7 +8,7 @@ import { missingScopeHints } from '../lib/errors.js';
  * 两份 OpenAPI 的示例数据。成功示例按响应 schema 由这里的组件示例拼出（见 openapi-common 的 exampleOf），
  * 失败示例放进 components.examples，operation 用 $ref 引用；message 取自实现里真实抛出的文案。
  */
-const AT = '2026-11-17T08:30:00.000Z';
+export const AT = '2026-11-17T08:30:00.000Z';
 const LATER = '2026-11-17T08:31:12.000Z';
 const ATTACHMENT_URL = '/api/attachments/77?exp=1795251600&sig=9b1f0c7e4d2a6b8c3e5f7a9d1c3b5e7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b';
 
@@ -291,9 +291,8 @@ export const ERROR_EXAMPLES = {
   ReauthRateLimited: { code: 'rate_limited', message: '密码验证失败次数过多，请 15 分钟后再试' },
   WrongTotpCode: { code: 'validation_failed', message: '验证码错误，请重试' },
   AdminScopeForbidden: { code: 'forbidden', message: '只有管理员可以授予 admin scope' },
-  AdminScopeRules: { code: 'validation_failed', message: '带 admin scope 的 Key 必须设置 IP 白名单' },
   NotifyNeedsAdminScope: { code: 'forbidden', message: '管理员的通知配置也推送未认领地址的来信，需要带 admin scope 的 API Key',
-    fix: '改用带 admin scope 的 Key（需 IP 白名单、有效期不超过 90 天），或请用户在网页「个人设置 - 转发与通知」修改', docs: '/references/notifications.md' },
+    fix: '改用带 admin scope 的管理员 Key，或请用户在网页「个人设置 - 转发与通知」修改', docs: '/references/notifications.md' },
   KeyRestricted: { code: 'forbidden', message: '这把 API Key 限定了可用的邮箱或域名，不能访问 bob@example.org',
     fix: 'GET /v1/me 查看 key.allowedMailboxIds 与 key.allowedDomains；换用覆盖它的 Key，或请用户在网页「API Key」页面调整范围',
     docs: '/references/errors.md#key-restricted' },

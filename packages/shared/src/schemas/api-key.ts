@@ -3,7 +3,6 @@ import {
   type Role,
   API_SCOPES,
   DEFAULT_API_RATE_LIMIT,
-  MAX_ADMIN_KEY_TTL_DAYS,
   MAX_API_RATE_LIMIT,
   MAX_KEY_ALLOWED_DOMAINS,
   MAX_KEY_ALLOWED_MAILBOXES,
@@ -28,30 +27,12 @@ const allowedMailboxIdsSchema = z.array(z.number().int().positive()).max(MAX_KEY
 const allowedDomainsSchema = z.array(domainSchema).max(MAX_KEY_ALLOWED_DOMAINS)
   .transform((domains) => [...new Set(domains)]);
 
-/** admin scope 的硬性要求：IP 白名单非空，且有效期不超过 MAX_ADMIN_KEY_TTL_DAYS 天 */
-export const ADMIN_KEY_TTL_MS = MAX_ADMIN_KEY_TTL_DAYS * 86_400_000;
-export function adminKeyIssues(
-  key: { scopes?: readonly string[]; allowedIps?: readonly string[]; expiresAt?: string | null },
-  now = Date.now(),
-): { path: 'allowedIps' | 'expiresAt'; message: string }[] {
-  if (!key.scopes?.includes('admin')) return [];
-  const issues: { path: 'allowedIps' | 'expiresAt'; message: string }[] = [];
-  if (!key.allowedIps?.length) issues.push({ path: 'allowedIps', message: '带 admin scope 的 Key 必须设置 IP 白名单' });
-  const expires = key.expiresAt ? Date.parse(key.expiresAt) : NaN;
-  if (!Number.isFinite(expires)) {
-    issues.push({ path: 'expiresAt', message: `带 admin scope 的 Key 必须设置有效期（不超过 ${MAX_ADMIN_KEY_TTL_DAYS} 天）` });
-  } else if (expires > now + ADMIN_KEY_TTL_MS) {
-    issues.push({ path: 'expiresAt', message: `带 admin scope 的 Key 有效期不能超过 ${MAX_ADMIN_KEY_TTL_DAYS} 天` });
-  }
-  return issues;
-}
-
 export const createApiKeyRequestSchema = z.object({
   name: z.string().trim().min(1).max(64),
   scopes: z.array(z.enum(API_SCOPES)).min(1),
   rateLimit: z.number().int().min(1).max(MAX_API_RATE_LIMIT).default(DEFAULT_API_RATE_LIMIT),
   allowedIps: z.array(ipOrCidrSchema).max(32).default([]),
-  /** ISO 时间；不传则永不过期（带 admin scope 时必填且不超过 90 天） */
+  /** ISO 时间；不传则永不过期 */
   expiresAt: z.iso.datetime({ offset: true }).optional(),
   /** 只允许访问这些邮箱（认领行 id）；与 allowedDomains 都为空表示不限 */
   allowedMailboxIds: allowedMailboxIdsSchema.default([]),
@@ -59,8 +40,6 @@ export const createApiKeyRequestSchema = z.object({
   allowedDomains: allowedDomainsSchema.default([]),
   /** 当前登录密码：创建 Key 前重新验证（缺失 403 reauth_required，错误 403 reauth_failed） */
   password: currentPasswordSchema,
-}).superRefine((value, ctx) => {
-  for (const issue of adminKeyIssues(value)) ctx.addIssue({ code: 'custom', path: [issue.path], message: issue.message });
 });
 export type CreateApiKeyRequest = z.infer<typeof createApiKeyRequestSchema>;
 export type CreateApiKeyInput = z.input<typeof createApiKeyRequestSchema>;
@@ -72,7 +51,7 @@ export const updateApiKeyRequestSchema = z
     rateLimit: z.number().int().min(1).max(MAX_API_RATE_LIMIT).optional(),
     allowedIps: z.array(ipOrCidrSchema).max(32).optional(),
     status: z.enum(['active', 'disabled']).optional(),
-    /** 续期：ISO 时间；显式传 null 表示改为永不过期（带 admin scope 时不允许） */
+    /** 续期：ISO 时间；显式传 null 表示改为永不过期 */
     expiresAt: z.iso.datetime({ offset: true }).nullable().optional(),
     /** 整体替换；[] 表示取消该维度的限定 */
     allowedMailboxIds: allowedMailboxIdsSchema.optional(),

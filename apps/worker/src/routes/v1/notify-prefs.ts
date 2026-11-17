@@ -41,7 +41,7 @@ function assertCanRouteMail(c: Context<AppContext>): void {
   const key = c.get('apiKey')!;
   if (key.accountRole === 'admin' && key.role !== 'admin') {
     throw new AppError('forbidden', '管理员的通知配置也推送未认领地址的来信，需要带 admin scope 的 API Key', {
-      fix: '改用带 admin scope 的 Key（需 IP 白名单、有效期不超过 90 天），或请用户在网页「个人设置 - 转发与通知」修改',
+      fix: '改用带 admin scope 的管理员 Key，或请用户在网页「个人设置 - 转发与通知」修改',
       docs: '/references/notifications.md',
     });
   }

@@ -262,7 +262,7 @@ export const mailboxAddressSchema = z
     return at > 0 && localPartSchema.safeParse(value.slice(0, at)).success && domainSchema.safeParse(value.slice(at + 1)).success;
   }, '邮箱地址格式非法');
 
-const userIdSchema = z.number().int().positive();
+export const userIdSchema = z.number().int().positive();
 
 /** 同一批里重复的地址会让逐项结果含糊（第二项看到的是第一项的结果），直接拒绝整批 */
 function uniqueAddresses<T extends { address: string }>(items: T[], ctx: z.RefinementCtx) {

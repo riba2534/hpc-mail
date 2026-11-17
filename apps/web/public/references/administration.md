@@ -6,13 +6,14 @@
 - [用户专属邮箱权限](#用户专属邮箱权限)：按用户限定可认领域名与额度
 - [强制过户邮箱](#强制过户邮箱)：把邮箱连同历史转给另一个用户
 - [批量邮箱操作](#批量邮箱操作)：批量认领、释放、过户、共享与取消共享
+- [管理员 Key 运维接口](#管理员-key-运维接口)：用管理员 API Key 批量建邮箱、共享、过户、释放，查用户、托管域名与 Claude 状态
 - [邀请码](#邀请码)
 - [系统设置与域名](#系统设置与域名)：设置项、外发与中转配额、系统域名
 - [投递回执与抑制名单](#投递回执与抑制名单)：回执订阅状态、抑制名单的查看与解除
 - [系统域名一键接入](#系统域名一键接入)：把站长 Cloudflare 账户里的域名一键配好收发并加入系统域名
 - [Key 与管理审计](#key-与管理审计)
 
-所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
+所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的 scopes 不提供这些权限；运维脚本常用的邮箱、用户与托管域名操作另有管理员 Key 可调的 `/v1/admin/*`，见[管理员 Key 运维接口](#管理员-key-运维接口)。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份或猜测他人 ID。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
 
 ## 用户与邮件审阅
 
@@ -45,7 +46,7 @@
 
 `mailboxPolicy` 非空时完整替代公共域名范围、总数量和每域数量配置，不与公共域名取并集，也不取公共额度的较小值。可授权非公开域名，但域名必须已存在于系统配置。额度均为 0–10000 整数，0 表示不限；空 `domains` 表示不能新增认领邮箱。系统保留前缀仍对普通用户生效；管理员始终豁免。公共配置改变不覆盖专属配置，系统移除域名后该域名不能继续新增认领。
 
-恢复公共配置提交 `{"mailboxPolicy":null,"expectedMailboxPolicyRevision":当前版本}`。保存和角色变更都会增加 `mailboxPolicyRevision`；409 时重新读取并核对当前配置，不能仅换版本强行覆盖陈旧草稿。普通用户不能修改自己的权限，API Key 也不能调用管理接口。认领与过户在写入时复核目标权限版本、域名版本和数量，避免并发突破限制。
+恢复公共配置提交 `{"mailboxPolicy":null,"expectedMailboxPolicyRevision":当前版本}`。保存和角色变更都会增加 `mailboxPolicyRevision`；409 时重新读取并核对当前配置，不能仅换版本强行覆盖陈旧草稿。普通用户不能修改自己的权限，API Key 也不能修改邮箱权限（管理员 Key 可用 `GET /v1/admin/users` 读取）。认领与过户在写入时复核目标权限版本、域名版本和数量，避免并发突破限制。
 
 权限收紧、删除域名授权或恢复公共配置不会释放已有邮箱、删除邮件或撤销已有邮箱的收发能力；所有名下邮箱继续计入总额度，超额时不能新增。只读共享邮箱不计入认领额度。专属权限只作用于邮箱认领与新增过户，不替代每日外发、翻译、注册、2FA 等系统规则。用户应从自己的 `/api/domains` 或 `/v1/domains` 查询可认领域名，公开 `/api/config` 不包含个人权限。
 
@@ -83,7 +84,7 @@ hpc '/messages' --get --data-urlencode 'scope=unclaimed' --data-urlencode 'direc
 
 ## 批量邮箱操作
 
-运维批量处理邮箱用下面的接口，**只接受管理员 JWT**（API Key 返回 401），不要直写数据库。每次最多 100 项，items 里的地址不能重复（按小写比较），否则整批 400。
+运维批量处理邮箱用下面的接口，不要直写数据库。这里的 `/api` 路径**只接受管理员 JWT**（API Key 返回 401）；管理员 Key 用 `/v1/admin/mailboxes/batch/*` 的同名接口，见[管理员 Key 运维接口](#管理员-key-运维接口)。每次最多 100 项，items 里的地址不能重复（按小写比较），否则整批 400。
 
 | 方法与 `/api` 路径 | body | 作用 |
 |---|---|---|
@@ -105,6 +106,108 @@ jq -n --argjson owner "$HPC_OWNER_ID" \
 ```
 
 每项写一行管理审计，action 与单个操作相同：`mailbox.claim`、`mailbox.release`、`mailbox.transfer`、`mailbox.share`、`mailbox.unshare`；target 为地址，detail 末尾带 `批量请求 <请求 id>`（即响应头 `X-Request-ID`），可据此找出同一批的全部记录。
+
+## 管理员 Key 运维接口
+
+运维脚本（批量建邮箱、共享、过户、释放，查归属、托管域名与 Claude 状态）用管理员 Key 调 `/v1/admin/*`，不要直连 D1 写 SQL：这些接口与 `/api/admin/*` 一样逐项校验、在事务里提交并写管理审计。
+
+**管理员 Key** 是管理员账户创建、勾选 `admin` scope（网页「管理员能力」）的 API Key，IP 白名单与有效期可选。`GET /v1/me` 的 `key.effectiveRole` 为 `admin`、且没有设置 `allowedMailboxIds` 与 `allowedDomains`（不限范围）才能调用；普通用户的 Key、没带 `admin` 的管理员 Key、限定了邮箱或域名的管理员 Key 一律 403 `forbidden`，`fix` 写明怎么处理。除 `admin` 外，每个接口还要下表 scope 列里的读写 scope：写入要 `mailbox.write`，查邮箱、用户与托管域名要 `mailbox.read`，Claude 查询要 `mail.read`，缺少时 403，message 写明缺哪个。只带 `mailbox.read`、`mail.read` 与 `admin` 的 Key 是只读的管理员 Key。限流同其他 `/v1` 请求。写操作每项一行管理审计，操作人是 Key 所属管理员的用户名，detail 末尾为 `批量请求 <请求 id>（API Key #id）`。shell 示例复用[入口指南](../skill.md)，设 `API="$BASE/v1"`、`AUTH` 为管理员 Key。
+
+### 写入
+
+| 方法与路径 | scope | body | 作用 |
+|---|---|---|---|
+| `POST /v1/admin/mailboxes/batch/claim` | `admin` + `mailbox.write` | `{userId,items:[{localPart,domain,strategy?}],shareUserIds?}` | 为该用户认领，规则同[批量邮箱操作](#批量邮箱操作)，返回 `{claimed,taken,notAttempted,stoppedBy,shares}`。`shareUserIds` 非空时把本次 `claimed` 的邮箱共享给这些用户，`shares` 为逐项结果；不给或为 `[]` 时 `shares:null` |
+| `POST /v1/admin/mailboxes/batch/release` | `admin` + `mailbox.write` | `{items:[{address,expectedOwnerId?}],deleteHistory?}` | 释放并撤销共享；`deleteHistory:true` 同时永久删除这些地址的全部历史邮件 |
+| `POST /v1/admin/mailboxes/batch/transfer` | `admin` + `mailbox.write` | `{userId,items:[{address,expectedOwnerId}]}` | 过户给同一用户，保留历史、撤销旧共享 |
+| `POST /v1/admin/mailboxes/batch/share` | `admin` + `mailbox.write` | `{userIds,items:[{address,expectedOwnerId?}]}` | 把这批用户追加进每个邮箱的共享名单，不加入所有者 |
+| `POST /v1/admin/mailboxes/batch/unshare` | `admin` + `mailbox.write` | 同 share | 从每个邮箱的名单移除这批用户 |
+| `PUT /v1/admin/mailboxes/shares` | `admin` + `mailbox.write` | `{userIds,items:[{address,expectedOwnerId?}]}` | 把每个邮箱的共享名单**精确替换**为 `userIds`，`[]` 清空；每项同时带 `addedShares` 与 `revokedShares` |
+
+每次 1–100 项，地址不能重复；`userIds`、`shareUserIds` 最多 100 个。除认领外返回 `{results,done,unchanged,failed}`，results 与 items 同序，每项 `status` 为 `done`、`unchanged`（已是目标状态；超时重试时上次已完成的项也报它）或 `failed`（`error:{code,message}`：`not_found` 邮箱不存在，`conflict` 所有者与 `expectedOwnerId` 不符；替换名单时 `userIds` 含该邮箱所有者为 `validation_failed`）。事务语义和整批 400/404/409 同[批量邮箱操作](#批量邮箱操作)，409 时重新读取再执行。
+
+认领带 `shareUserIds` 时：先校验这些用户，有不存在、已禁用或系统保留的用户时整批 400，什么都不认领；共享只作用于本次 `claimed`（落进 `taken` 的已被别人认领，不共享），名单含 `userId` 本人时不加入所有者。认领提交后共享这一步整体失败（如并发修改导致 409）时认领保留，每个新认领的地址在 `shares.results` 记为 `failed` 并带错误码，对这些地址重试 `batch/share` 即可。
+
+### 查询
+
+列表参数逗号分隔（也可重复参数），每项先规整（转小写、去空白）再去重，去重后 1–200 项，超出或格式错误返回 400 `validation_failed`。`data` 直接是数组，查询不写审计。
+
+| 方法与路径 | scope | 参数 | 返回 `data` |
+|---|---|---|---|
+| `GET /v1/admin/mailboxes` | `admin` + `mailbox.read` | `addresses` 或 `domain`，二选一 | 已认领邮箱 `[{id,address,domain,ownerId,ownerUsername,grantees:[{userId,username}],createdAt}]`，按 address 排序；未认领或不存在的地址不出现；`domain` 返回该域全部已认领邮箱，不分页 |
+| `GET /v1/admin/users` | `admin` + `mailbox.read` | `usernames` | `[{id,username,role,status,mailboxPolicy,mailboxPolicyRevision,createdAt}]`，按 username 排序；不存在的用户名不出现；`mailboxPolicy:null` 表示使用公共配置 |
+| `GET /v1/admin/hosted-domains` | `admin` + `mailbox.read` | `domains`、`owner`（用户名），都可选 | `[{id,domain,ownerId,ownerUsername,status,zoneStatus,routingStatus,sendingStatus,catchAllReady,ready,createdAt}]`，按 id 排序；都不给返回全站，同时给取交集，`owner` 不存在返回 `[]`；`ready:true` 表示收发都已就绪 |
+| `GET /v1/admin/claude/domains` | `admin` + `mail.read` | `domains` | 每个后缀一项、与请求同序：`{domain,addresses,paid,suspended,suspendedAddresses:[{address,suspendedAt}]}`，即有 Claude 账号事实或收据的地址数、付费数、封号数与封号地址，`paid` 与地址视图同一口径；没有记录的后缀计数为 0 |
+| `GET /v1/admin/claude/addresses` | `admin` + `mail.read` | `addresses` | 每个地址一项、与请求同序：`{address,domain,known,firstSeenAt,paid,suspended,suspendedAt,anthropicMails,lastAnthropicMailAt,loginLinkMails,receipts,tier}`；没有 Anthropic 来信的地址 `known:false` |
+
+Claude 状态的口径：
+
+- `paid`、`suspended` 与收据只认 Anthropic 官方发件域（`email.claude.com`、`mail.anthropic.com`、`research.anthropic.com`、`anthropic-safeguards.intercom-mail.com`）、DKIM 对齐且收件地址在 To 头里的来信。主题以 `Your account has been suspended` 开头记封号，以 `Your receipt from Anthropic` 开头或含 `subscription is confirmed` 记付费；有收据的地址也算付费，后缀汇总的 `paid` 与地址视图同一口径（事实表标了付费或有收据）。2026-11-17T16:00Z 之前收到、没有认证结果的历史收据按发件域与主题计入。两个标志只会由否变是。
+- `receipts` 按收到时间升序，每张 `{messageId,receivedAt,subject,amountCents,currency,tier,cardLast4}`：金额以分计，`cardLast4` 是扣款卡尾号，解析不到的字段为 null；原邮件永久删除后 `messageId` 为 null，收据保留。顶层 `tier` 取最近一张能识别金额的收据：$100 为 `5x`，$200 为 `20x`，其他金额为 null。
+- `anthropicMails`、`lastAnthropicMailAt` 统计发件域为 `anthropic.com`、`claude.com` 及其子域的来信（含回收站，不含已永久删除的），`anthropicMails > 0` 即收到过 Anthropic 来信（注册、登录链接等）；`loginLinkMails` 是其中登录链接邮件（主题以 `Secure link to log in to Claude` 或 `Your secure link to Claude` 开头）的数量。
+- 账号事实（`claude_address_facts`）与收据（`claude_receipts`）是只给管理员看的运维事实：邮件永久删除前先归纳留存，永久删除邮件、释放并清空历史、保留期清理都不会清掉它们。这是有意的设计，删信后后缀统计、档位与卡尾号仍可查。
+- 历史邮件由定时任务每 5 分钟分批回填，回填完成前历史收据与标志会陆续出现，不能据空结果断定没有收据。
+
+### 运维配方
+
+```bash
+# API="$BASE/v1"，AUTH 为管理员 Key；ADDRS 为逗号分隔的完整地址
+hpc '/me' | jq -e '.data.key.effectiveRole == "admin"' >/dev/null || { echo '不是管理员 Key'; exit 1; }
+uid() { hpc '/admin/users' --get --data-urlencode "usernames=$1" | jq -er '.data[0].id'; }   # 用户名 → id，不存在时失败
+```
+
+① 在托管域名上新建邮箱，归域名主人并共享给开号人：
+
+```bash
+HD=$(hpc '/admin/hosted-domains' --get --data-urlencode "domains=$DOMAIN" | jq -ec '.data[0] | select(.ready)') || exit 1   # 收发未就绪不认领
+OPENER_ID=$(uid "$OPENER") || exit 1
+jq -n --argjson hd "$HD" --argjson opener "$OPENER_ID" --arg d "$DOMAIN" \
+  '{userId:$hd.ownerId, shareUserIds:[$opener], items:[{localPart:"a1",domain:$d},{localPart:"a2",domain:$d}]}' |
+  hpc '/admin/mailboxes/batch/claim' -X POST -H 'Content-Type: application/json' --data-binary @- |
+  jq '.data | {claimed:[.claimed[].address], taken:[.taken[] | "\(.localPart)@\(.domain)"], stoppedBy, shares:(.shares | {done,failed})}'
+```
+
+② 转交开号人：把这批邮箱的共享名单换成新开号人（旧成员一并移除）：
+
+```bash
+NEW_ID=$(uid "$NEW_OPENER") || exit 1
+hpc '/admin/mailboxes' --get --data-urlencode "addresses=$ADDRS" |   # 结果里缺的地址是未认领的，先报告
+  jq --argjson u "$NEW_ID" '{userIds:[$u], items:[.data[] | {address,expectedOwnerId:.ownerId}]}' |
+  hpc '/admin/mailboxes/shares' -X PUT -H 'Content-Type: application/json' --data-binary @- | jq '.data | {done,unchanged,failed}'
+```
+
+③ 过户给买家（旧共享全部撤销，还要共享时过户后再调 `batch/share`）：
+
+```bash
+BUYER_ID=$(uid "$BUYER") || exit 1
+hpc '/admin/mailboxes' --get --data-urlencode "addresses=$ADDRS" |
+  jq --argjson u "$BUYER_ID" '{userId:$u, items:[.data[] | {address,expectedOwnerId:.ownerId}]}' |
+  hpc '/admin/mailboxes/batch/transfer' -X POST -H 'Content-Type: application/json' --data-binary @- | jq '.data | {done,unchanged,failed}'
+```
+
+④ 释放收到过 Anthropic 来信的邮箱。默认保留历史给下一个认领者，用户明确要求清除时才加 `deleteHistory:true`；Claude 状态不随删信丢失：
+
+```bash
+USED=$(hpc '/admin/claude/addresses' --get --data-urlencode "addresses=$ADDRS" |
+  jq -r '[.data[] | select(.anthropicMails > 0) | .address] | join(",")')
+[ -n "$USED" ] && hpc '/admin/mailboxes' --get --data-urlencode "addresses=$USED" |
+  jq '{items:[.data[] | {address,expectedOwnerId:.ownerId}]}' |
+  hpc '/admin/mailboxes/batch/release' -X POST -H 'Content-Type: application/json' --data-binary @- | jq '.data | {done,failed}'
+```
+
+⑤ 按后缀查封号：
+
+```bash
+hpc '/admin/claude/domains' --get --data-urlencode 'domains=a.example,b.example' |
+  jq -r '.data[] | "\(.domain) 付费 \(.paid) 封号 \(.suspended) \([.suspendedAddresses[].address] | join(" "))"'
+```
+
+⑥ 按地址查档位与卡尾号（`tier` 为 null 时看 `receipts`：没有收据或金额不是 $100/$200 时如实报告，不推断档位）：
+
+```bash
+hpc '/admin/claude/addresses' --get --data-urlencode "addresses=$ADDRS" |
+  jq '.data[] | {address, tier, paid, suspended, receipts:[.receipts[] | {receivedAt,amountCents,tier,cardLast4}]}'
+```
 
 ## 邀请码
 

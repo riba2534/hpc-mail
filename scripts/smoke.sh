@@ -212,6 +212,12 @@ v1code=$(echo "$v1" | tail -1)
 [ "$v1code" = "401" ] || fail "/v1/status 无鉴权返回 $v1code"
 echo "$v1" | head -1 | jq -e '.requestId' >/dev/null || fail "/v1 错误体缺 requestId"
 
+step "/v1/admin 无 key 返回 401 且带 requestId"
+v1admin=$(curl -sS -w '\n%{http_code}' "$BASE_URL/v1/admin/users?usernames=$SMOKE_USERNAME")
+v1admincode=$(echo "$v1admin" | tail -1)
+[ "$v1admincode" = "401" ] || fail "/v1/admin/users 无鉴权返回 $v1admincode"
+echo "$v1admin" | head -1 | jq -e '.error.code == "unauthorized" and (.requestId | type == "string")' >/dev/null || fail "/v1/admin 错误体异常"
+
 # ---------- 冒烟账号（普通用户） ----------
 
 user_checks() {

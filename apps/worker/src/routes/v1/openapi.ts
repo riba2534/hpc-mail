@@ -6,6 +6,7 @@ import {
 } from '../openapi-common.js';
 import { accountKeyPaths } from '../openapi-account.js';
 import { webhookPaths } from '../openapi-webhooks.js';
+import { adminPaths } from './admin/openapi.js';
 import { SCHEMA_EXAMPLES } from '../openapi-examples.js';
 
 /** Public API-key contract. Session/admin operations are described separately. */
@@ -96,6 +97,7 @@ export function buildOpenApiSpec(origin: string) {
     ...hostedDomainBatchPaths('domain.write'),
     ...accountKeyPaths(),
     ...webhookPaths('v1'),
+    ...adminPaths(),
   };
   const described = describePaths(paths, { security: [{ apiKey: [] }], errors: ['UnauthorizedApiKey', 'RateLimitedApiKey'] });
   return {

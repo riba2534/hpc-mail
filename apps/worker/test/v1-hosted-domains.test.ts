@@ -211,7 +211,7 @@ async function fixture() {
     const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: await testPasswordHash(), authVersionMigrated: true }).returning().get())!;
     const sid = await createSession(env, user.id);
     const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
-    // admin scope 按存量管理员 Key 的形态补上（新建要求 IP 白名单，测试请求不带来源 IP）
+    // admin scope 按存量管理员 Key 的形态直接补上
     const granted = scopes.filter((scope) => scope !== 'admin');
     const created = await data<CreatedApiKey>(await api('POST', '/api-keys', jwt, { name: `${suffix}-agent`, scopes: granted, rateLimit: 600, password: TEST_PASSWORD }), 201);
     expect(created.scopes).toEqual(granted);
@@ -390,14 +390,20 @@ describe('/v1 接入自有域名', () => {
       ['PUT', `/hosted-domains/${site.id}/members`, { userIds: [], expectedOwnerId: owner.id }],
       ['DELETE', `/hosted-domains/${site.id}/members/${other.id}`, undefined],
       ['POST', `/hosted-domains/${site.id}/transfer`, { userId: other.id, expectedOwnerId: owner.id, includeMailboxes: true }],
-      ['GET', '/admin/hosted-domains', undefined],
-      ['POST', `/admin/hosted-domains/${site.id}/suspend`, undefined],
     ] as const;
     for (const key of [owner.key, admin.key]) {
       for (const [method, path, body] of jwtOnly) {
         expect((await errorOf(await v1(method, path, key, body), 404)).code, `${method} ${path}`).toBe('not_found');
       }
     }
+    // /v1/admin 只对管理员 Key 开放；那里没有暂停，GET /v1/admin/hosted-domains 是只读查询（不是 JWT 的管理列表）
+    expect((await errorOf(await v1('POST', `/admin/hosted-domains/${site.id}/suspend`, owner.key), 403)).code).toBe('forbidden');
+    expect((await errorOf(await v1('POST', `/admin/hosted-domains/${site.id}/suspend`, admin.key), 404)).code).toBe('not_found');
+    // 查询另要 mailbox.read：只带域名 scope 的管理员 Key 403，补上后返回该域名
+    expect((await errorOf(await v1('GET', `/admin/hosted-domains?domains=${site.domain}`, admin.key), 403)).message).toBe('需要 API scope: mailbox.read');
+    const reader = await f.actor('admin-reader', ['mailbox.read', 'admin'], 'admin');
+    expect((await data<{ id: number }[]>(await v1('GET', `/admin/hosted-domains?domains=${site.domain}`, reader.key))).map((item) => item.id))
+      .toEqual([site.id]);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, site.id)).get())
       .toMatchObject({ status: 'active', userId: owner.id, memberLimit: 0 });
     expect(await db.select().from(hostedDomainMembers).where(eq(hostedDomainMembers.domainId, site.id)).all()).toHaveLength(1);

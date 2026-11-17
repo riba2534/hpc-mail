@@ -57,7 +57,7 @@ export const bool: Schema = { type: 'boolean' };
 /** 查询参数里的开关：1/true 与 0/false */
 export const boolFlag: Schema = { type: 'string', enum: ['1', 'true', '0', 'false'] };
 export const roleEnum: Schema = { type: 'string', enum: [...ROLES] };
-const userStatusEnum: Schema = { type: 'string', enum: [...USER_STATUSES] };
+export const userStatusEnum: Schema = { type: 'string', enum: [...USER_STATUSES] };
 const errorCode: Schema = { type: 'string', enum: ERROR_CODES };
 export const date: Schema = { type: 'string', format: 'date-time' };
 export const domainName: Schema = { type: 'string', minLength: 1, maxLength: 253,
@@ -270,7 +270,7 @@ const sendIdentityReason = { type: 'string', enum: ['hosted_sending_not_ready', 
 const user = object({ id: positiveId, username: str, role: roleEnum, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
 const { twoFactorEnabled: _twoFactorEnabled, ...adminUserProperties } = user.properties as Record<string, Schema>;
 const keyScopes: Schema = { ...array({ type: 'string', enum: API_SCOPES }),
-  description: 'admin is a capability flag: only administrators can grant it, it requires allowedIps and an expiry at most 90 days ahead, and only with it does an administrator key act as administrator (cross-user scopes, all=1, any mailboxId as sender, outbound-quota exemption). Without it an administrator key acts as an ordinary user.' };
+  description: 'admin is a capability flag: only administrators can grant it; allowedIps and expiresAt stay optional as for other scopes. Only with it does an administrator key act as administrator (cross-user scopes, all=1, any mailboxId as sender, outbound-quota exemption, the /v1/admin operations). Without it an administrator key acts as an ordinary user.' };
 const keyRestriction = {
   allowedMailboxIds: { ...array(positiveId), description: 'Mailbox (claim) ids this key may use. Together with allowedDomains: both empty means unrestricted; otherwise an address is usable when its domain is in allowedDomains or its current claim id is in allowedMailboxIds. Releasing and reclaiming an address gives it a new id that an old key no longer covers.' },
   allowedDomains: { ...array(str), description: 'Domains whose addresses this key may use, including addresses claimed later. A key restricted only by mailbox ids cannot claim new addresses.' },
@@ -1005,6 +1005,13 @@ export function usedSchemas(paths: Paths): Record<string, Schema> {
   };
   visit(paths);
   return Object.fromEntries([...names].sort().map(name => [name, schemas[name]! ]));
+}
+/** /v1/admin 运维接口的鉴权说明：管理员账户的 Key，带 admin scope 且不限范围，另要该接口的读写 scope */
+export const adminKeyRule = 'Requires an unrestricted administrator key: an administrator account’s key with the admin scope and empty allowedMailboxIds and allowedDomains (GET /v1/me shows key.effectiveRole admin), plus the other scope in x-required-scopes; other keys get 403 forbidden.';
+/** /v1/admin 的接口：x-required-scopes 同时列出 admin 与该接口的读写 scope，两个都要 */
+export function adminKeyOperation(operationId: OperationId, summary: string, data: Schema, scope: string, options: OperationOptions = {}): Operation {
+  return { ...operation(operationId, summary, data, { ...options, scope, errors: [...(options.errors ?? []), 'ForbiddenScopeAdmin'] }),
+    'x-required-scopes': ['admin', scope] };
 }
 export const identitiesDescription = 'Which addresses the caller can send from. identities lists caller-owned mailboxes (kind=owned) with canSend and reason, then mailboxes shared with the caller (kind=shared). For ordinary users shared entries are always canSend=false with reason=shared_readonly; for administrators they follow the same domain rules as owned ones. Use a canSend=true entry as from (mailboxId or address). domains lists domains where any local part may be used: for administrators system domains, hosted domains whose sending is ready, and removed (legacy) domains that still have claimed mailboxes; for ordinary users the hosted domains they own whose sending is ready (kind=hosted, the address is claimed for the owner when sending). Administrators may also send from any other claimed mailbox by mailboxId; those are not listed.';
 /** 批量认领、批量可用性与随机后缀方案：会话与 API Key 两套接口同形，API Key 另需 scope */

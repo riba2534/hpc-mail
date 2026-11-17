@@ -6,6 +6,7 @@ import { lazyWithReload } from './chunk-reload';
 import { PageLoader } from './page-loader';
 import { RouteErrorPage } from './route-error-page';
 import {
+  loadApiDocsPage,
   loadApiKeysPage,
   loadAppShell,
   loadComposePage,
@@ -48,6 +49,7 @@ const MailboxesPage = page(loadMailboxesPage, (m) => m.MailboxesPage);
 const HostedDomainsPage = page(loadHostedDomainsPage, (m) => m.HostedDomainsPage);
 const HostedDomainDetailPage = page(loadHostedDomainDetailPage, (m) => m.HostedDomainDetailPage);
 const ApiKeysPage = page(loadApiKeysPage, (m) => m.ApiKeysPage);
+const ApiDocsPage = page(loadApiDocsPage, (m) => m.ApiDocsPage);
 const ProfilePage = page(loadProfilePage, (m) => m.ProfilePage);
 const UsersPage = page(preloadable(() => import('@/features/admin/users/users-page')), (m) => m.UsersPage);
 const AdminUserMailPage = page(
@@ -114,6 +116,7 @@ export const routes: RouteObject[] = [
           { path: 'domains', element: <HostedDomainsPage />, handle: title('我的域名') },
           { path: 'domains/:id', element: <HostedDomainDetailPage />, handle: title('域名详情') },
           { path: 'api-keys', element: <ApiKeysPage />, handle: title('API Keys') },
+          { path: 'api-docs/:doc?', element: <ApiDocsPage />, handle: title('API 文档') },
           { path: 'profile', element: <ProfilePage />, handle: title('个人设置') },
           {
             path: 'admin',

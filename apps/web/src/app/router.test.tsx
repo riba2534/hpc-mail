@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -20,9 +20,14 @@ vi.mock('./route-modules', async (importOriginal) => {
     if (pages.inboxFails) throw new Error('列表渲染异常');
     return <p>收件列表</p>;
   }
+  const { useParams } = await import('react-router-dom');
+  function ApiDocsPage() {
+    return <p>文档：{useParams().doc ?? '入口'}</p>;
+  }
   return {
     ...actual,
     loadInboxPage: actual.preloadable(async () => ({ InboxPage })),
+    loadApiDocsPage: actual.preloadable(async () => ({ ApiDocsPage })),
     loadSentPage: actual.preloadable(() =>
       Promise.reject(new TypeError('Failed to fetch dynamically imported module: http://x/assets/sent-page.js')),
     ),
@@ -87,6 +92,20 @@ describe('外壳内页面的错误边界', () => {
     fireEvent.click(screen.getByRole('link', { name: '返回收件箱' }));
     expect(await screen.findByText('收件列表')).toBeInTheDocument();
     expect(router.state.location.pathname).toBe('/inbox');
+    client.clear();
+  });
+});
+
+describe('API 文档路由', () => {
+  it('/api-docs 与 /api-docs/:doc 在登录后的外壳里渲染，标签页标题为「API 文档」', async () => {
+    const { client, router } = renderApp('/api-docs');
+    expect(await screen.findByText('文档：入口')).toBeInTheDocument();
+    expect(screen.getByRole('main')).toHaveTextContent('文档：入口');
+    expect(screen.getByRole('navigation', { name: '主导航', hidden: true })).toBeInTheDocument();
+    await waitFor(() => expect(document.title).toMatch(/^API 文档/));
+
+    await router.navigate('/api-docs/mail');
+    expect(await screen.findByText('文档：mail')).toBeInTheDocument();
     client.clear();
   });
 });

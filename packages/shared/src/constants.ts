@@ -24,14 +24,12 @@ export const API_SCOPES = [
   /** 修改飞书、PushDeer、通用 Webhook；邮箱转发目标只能用网页会话（JWT）修改 */
   'notify.write',
   /**
-   * 管理员能力开关：只有管理员可以授予，且必须同时设置 IP 白名单与不超过 MAX_ADMIN_KEY_TTL_DAYS 天的有效期。
+   * 管理员能力开关：只有管理员可以授予；IP 白名单与有效期与其他 scope 一样可选。
    * 不带它的管理员 Key 按普通用户处理（不能跨用户查看、不能用任意 mailboxId 发信、受外发配额约束）。
    */
   'admin',
 ] as const;
 export type ApiScope = (typeof API_SCOPES)[number];
-/** 带 admin scope 的 Key 最长有效期（天） */
-export const MAX_ADMIN_KEY_TTL_DAYS = 90;
 /** Key 限定范围：allowedMailboxIds / allowedDomains 的数量上限（两者都为空表示不限） */
 export const MAX_KEY_ALLOWED_MAILBOXES = 100;
 export const MAX_KEY_ALLOWED_DOMAINS = 20;

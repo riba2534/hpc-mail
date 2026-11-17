@@ -243,14 +243,14 @@ describe('MessagePage content', () => {
     client.clear();
   });
 
-  it('shows the verification link host and warns when it differs from the sender domain', async () => {
+  it('shows a verification link on another domain without any mismatch warning', async () => {
     mocks.overrides[1] = { fromAddress: 'security@bank.example', verificationLink: 'https://bank-example.verify.io/confirm' };
     const client = show();
     const open = await screen.findByRole('link', { name: '打开验证链接' });
     expect(open).toHaveAttribute('href', 'https://bank-example.verify.io/confirm');
     expect(open).toHaveAttribute('rel', 'noopener noreferrer');
     expect(screen.getByText('bank-example.verify.io')).toBeInTheDocument();
-    expect(screen.getByText('链接域名与发件人不一致，请确认后再打开')).toBeInTheDocument();
+    expect(screen.queryByText(/不一致/)).toBeNull();
     client.clear();
   });
 });

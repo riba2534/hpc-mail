@@ -1,9 +1,10 @@
-import { Check, KeyRound, Link2, Paperclip, Star, TriangleAlert } from 'lucide-react';
+import { Check, KeyRound, Link2, Paperclip, Star } from 'lucide-react';
 import { memo, type MouseEvent } from 'react';
 import { Link } from 'react-router-dom';
 import type { MessageSummary, OutboundStatus } from '@hpc-mail/shared';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
 import { useCopy } from '@/components/ui/copy-button';
+import { senderAuthFailed } from '@/features/message/sender-auth';
 import { inspectVerificationLink } from '@/features/message/verification-link';
 import { cn } from '@/lib/cn';
 import { formatRelativeTime } from '@/lib/format';
@@ -106,8 +107,8 @@ export const MessageRow = memo(function MessageRow({
   const unconfirmed = outbound && (message.status === 'unknown' || partlyUnconfirmed);
   const failed = outbound && !unconfirmed && message.status !== 'pending'
     && Boolean(message.errorDetail || message.status === 'failed' || message.status === 'bounced');
-  // 验证链接：与发件域一致才允许在列表里直接打开；不一致只做警示，点击进入详情页核对
-  const verification = outbound ? null : inspectVerificationLink(message.verificationLink, message.fromAddress);
+  // 验证链接：发件人未通过认证（SPF/DKIM/DMARC 失败）时不在列表里一键打开，点进详情页看到警示后再决定
+  const verification = outbound || senderAuthFailed(message.auth) ? null : inspectVerificationLink(message.verificationLink);
   const daysLeft = trash ? trashDaysLeft(message.deletedAt, now) : null;
   const showCheckbox = Boolean(onToggleSelect) && checkbox !== 'hidden';
 
@@ -152,7 +153,7 @@ export const MessageRow = memo(function MessageRow({
                 to={href}
                 state={linkState}
                 data-row-link
-                aria-label={`${unread ? '未读，' : ''}${primary}，${subject}${verification?.mismatch ? '，验证链接域名与发件人不一致' : ''}`}
+                aria-label={`${unread ? '未读，' : ''}${primary}，${subject}`}
                 className={cn(
                   'scroll-mt-32 scroll-mb-6 truncate text-sm text-ink outline-none after:absolute after:inset-0',
                   'focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-focus',
@@ -190,7 +191,7 @@ export const MessageRow = memo(function MessageRow({
             </span>
             {message.hasAttachments && <Paperclip className="size-3.5 shrink-0 text-ink-tertiary" aria-label="有附件" />}
             {message.verificationCode && <OtpChip code={message.verificationCode} />}
-            {verification && !verification.mismatch && (
+            {verification && (
               <a
                 href={verification.href}
                 target="_blank"
@@ -203,13 +204,6 @@ export const MessageRow = memo(function MessageRow({
                 <Link2 className="size-3" aria-hidden />
                 <span className="hidden sm:inline">验证链接</span>
               </a>
-            )}
-            {/* 不叠在行链接之上：点击落到行链接，进入详情页查看警告后再决定是否打开 */}
-            {verification?.mismatch && (
-              <Badge tone="caution" className="shrink-0" title={`验证链接指向 ${verification.hostname}，与发件人域名不一致`}>
-                <TriangleAlert className="size-3" aria-hidden />
-                <span className="hidden sm:inline">链接域名不一致</span>
-              </Badge>
             )}
             {outbound && status && (
               <Badge tone={failed ? 'critical' : partlyUnconfirmed ? 'caution' : status.tone} className="shrink-0">

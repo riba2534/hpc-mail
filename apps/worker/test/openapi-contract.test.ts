@@ -874,7 +874,18 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     // 批量添加与批量检测（PR5f）由 hosted-domain-batch.test.ts 核对
     expect(v1Hosted).toEqual({ ...Object.fromEntries(Object.entries(keyOperations).map(([path, scopes]) => [path, Object.keys(scopes).sort()])),
       '/hosted-domains/batch': ['post'], '/hosted-domains/batch-check': ['post'] });
-    expect(Object.keys(specs.v1.paths).filter(path => path.startsWith('/admin'))).toEqual([]);
+    // /v1/admin 只有管理员 Key 的运维接口（admin 加读写 scope：查邮箱与目录 mailbox.read、写 mailbox.write、Claude mail.read），没有托管域名的管理操作
+    const adminScopes = Object.fromEntries(Object.entries(specs.v1.paths).filter(([path]) => path.startsWith('/admin'))
+      .flatMap(([path, item]) => Object.entries(item).filter(([method]) => methods.has(method))
+        .map(([method, op]) => [`${method.toUpperCase()} ${path}`, (op as Schema)['x-required-scopes']])));
+    expect(adminScopes).toEqual({
+      'GET /admin/mailboxes': ['admin', 'mailbox.read'], 'GET /admin/users': ['admin', 'mailbox.read'], 'GET /admin/hosted-domains': ['admin', 'mailbox.read'],
+      'POST /admin/mailboxes/batch/claim': ['admin', 'mailbox.write'], 'POST /admin/mailboxes/batch/release': ['admin', 'mailbox.write'],
+      'POST /admin/mailboxes/batch/transfer': ['admin', 'mailbox.write'], 'POST /admin/mailboxes/batch/share': ['admin', 'mailbox.write'],
+      'POST /admin/mailboxes/batch/unshare': ['admin', 'mailbox.write'], 'PUT /admin/mailboxes/shares': ['admin', 'mailbox.write'],
+      'GET /admin/claude/domains': ['admin', 'mail.read'], 'GET /admin/claude/addresses': ['admin', 'mail.read'],
+    });
+    expect(specs.v1.paths['/admin/mailboxes']!.get!.description).toContain('empty allowedMailboxIds and allowedDomains');
     for (const [path, method] of [['/hosted-domains/{id}', 'delete'], ['/hosted-domains/{id}', 'put'], ['/hosted-domains/{id}/members', 'put'],
       ['/hosted-domains/{id}/members/{userId}', 'delete'], ['/hosted-domains/{id}/transfer', 'post'], ['/admin/hosted-domains', 'get']] as const) {
       expect(specs.api.paths[path]?.[method], `${method} ${path}`).toBeDefined();
