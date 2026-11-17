@@ -19,7 +19,7 @@ import {
   type OnboardingAcceptance, type OnboardingPreflightSnapshot,
 } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
-import { AppError } from '../lib/errors.js';
+import { AppError, errorText } from '../lib/errors.js';
 import type { AuthUser, Env } from '../types.js';
 import { logAdminAction } from './audit.js';
 import {
@@ -42,7 +42,6 @@ type Actor = Pick<AuthUser, 'id' | 'username'>;
 /** 系统域名列表上限（与 shared domainsSettingSchema 一致）；进行中的接入任务也占名额 */
 export const MAX_SYSTEM_DOMAINS = 64;
 
-export const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** 系统域名接入只看 Worker 是否配了 Cloudflare 凭据，不受托管域名开关影响 */
 export function requireCredentials(env: Env): CloudflareCredentials {

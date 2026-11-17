@@ -1,3 +1,4 @@
+import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 
 const CF_API = 'https://api.cloudflare.com/client/v4';
@@ -180,7 +181,7 @@ export async function assertZonesVisible(creds: CloudflareCredentials, zoneId: s
  * 429 表示请求未被处理，不算结果不明。
  */
 export function isOutcomeUnknown(error: unknown): boolean {
-  return !(error instanceof CloudflareApiError) || error.status === 0 || (error.status > 0 && error.status < 400) || error.status >= 500;
+  return isTransientCloudflareError(error) && !(error instanceof CloudflareApiError && error.status === 429);
 }
 
 async function confirmMissing(creds: CloudflareCredentials, zoneId: string, name: string, error: unknown): Promise<void> {
@@ -198,6 +199,24 @@ export async function findZone(creds: CloudflareCredentials, name: string): Prom
 
 export function createZone(creds: CloudflareCredentials, name: string): Promise<CfZone> {
   return cf<CfZone>(creds, 'POST', '/zones', { name, account: { id: creds.accountId }, type: 'full' });
+}
+
+/**
+ * 建 zone 的确定性失败中与调用场景无关的几种（未注册、填了子域名、查不到注册信息、不允许添加、尝试过多），
+ * 映射为可读原因；其余错误码返回 null，由调用方按自己的场景处理
+ */
+export function zoneCreateRejection(error: CloudflareApiError): AppError | null {
+  if (error.has(1049)) return new AppError('validation_failed', '该域名尚未注册，请先在注册商完成注册');
+  if (error.has(1099, 1093, 1116)) return new AppError('validation_failed', '请填写已注册的根域名（例如 example.com，而不是 mail.example.com）');
+  if (error.has(1110)) return new AppError('validation_failed', '暂时查不到该域名的注册信息，请稍后重试');
+  if (error.has(1097)) return new AppError('validation_failed', 'Cloudflare 不允许添加该域名');
+  if (error.has(1105)) return new AppError('rate_limited', 'Cloudflare 提示该域名尝试次数过多，请 3 小时后再试');
+  return null;
+}
+
+/** zone 创建于 since 之后（留 1 分钟时钟误差），即本站这次创建的；没有 created_on 时为 false */
+export function zoneCreatedSince(zone: Pick<CfZone, 'created_on'> | null | undefined, since: Date): boolean {
+  return Boolean(zone?.created_on && new Date(zone.created_on).getTime() >= since.getTime() - 60_000);
 }
 
 /** zone 已被删除（账户里按名称也找不到该 id，且通过可见性自检）时返回 null */
@@ -225,7 +244,7 @@ export async function deleteZone(creds: CloudflareCredentials, zoneId: string, n
   const zone = await getZone(creds, zoneId, name);
   if (!zone) return;
   if (zone.name !== name) throw new Error(`拒绝删除：zone ${zoneId} 的名称为 ${zone.name}，与记录的 ${name} 不符`);
-  if (guard.notBefore && zone.created_on && new Date(zone.created_on).getTime() < guard.notBefore.getTime() - 60_000) {
+  if (guard.notBefore && zone.created_on && !zoneCreatedSince(zone, guard.notBefore)) {
     throw new Error(`拒绝删除：zone ${zoneId} 创建于 ${zone.created_on}，早于本站记录`);
   }
   try {
@@ -461,18 +480,11 @@ export async function findQueue(creds: CloudflareCredentials, name: string): Pro
   return queues.find((queue) => queue.queue_name === name) ?? null;
 }
 
-const SUBSCRIPTION_MAX_PAGES = 20;
-
-/** 投递到某个 Queue 的全部事件订阅 */
+/** 投递到某个 Queue 的事件订阅（最多 20 页） */
 export async function listQueueSubscriptions(creds: CloudflareCredentials, queueId: string): Promise<CfEventSubscription[]> {
-  const items: CfEventSubscription[] = [];
-  for (let page = 1; page <= SUBSCRIPTION_MAX_PAGES; page++) {
-    const query = new URLSearchParams({ queue_id: queueId, page: String(page), per_page: '50' });
-    const res = await cfFetch<CfEventSubscription[]>(creds, 'GET', `/accounts/${creds.accountId}/event_subscriptions/subscriptions?${query}`);
-    items.push(...(res.result ?? []));
-    if (!res.result?.length || page >= (res.result_info?.total_pages ?? 1)) break;
-  }
-  return items;
+  const page = await listPages<CfEventSubscription>(creds, `/accounts/${creds.accountId}/event_subscriptions/subscriptions`,
+    { queue_id: queueId }, 50, 20);
+  return page.items;
 }
 
 export function createEventSubscription(creds: CloudflareCredentials, body: {

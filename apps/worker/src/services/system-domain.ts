@@ -17,12 +17,12 @@ import {
 import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { systemDomainOnboarding, users, type OnboardingAcceptance, type OnboardingChangeEvent } from '../db/schema.js';
-import { AppError } from '../lib/errors.js';
+import { AppError, errorText } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
 import {
   CloudflareApiError, cloudflareCredentials, createZone, deleteZone, findZone, getZone, isOutcomeUnknown, isTransientCloudflareError,
-  requestActivationCheck, type CfZone, type CloudflareCredentials,
+  requestActivationCheck, zoneCreatedSince, zoneCreateRejection, type CfZone, type CloudflareCredentials,
 } from './cloudflare.js';
 import {
   ACTIVE_ONBOARDING_COUNT_SQL, hostedTakenSql, onboardingActiveSql, ONBOARDING_TERMINAL_SQL, SYSTEM_DOMAIN_COUNT_SQL,
@@ -34,7 +34,7 @@ import {
 import { counterStatement } from './rate-counter.js';
 import { domainsCasSql, invalidateSettingsMemory } from './setting.js';
 import {
-  acksOf, backOffCloudflare, cfBudgetGuard, cfBusyError, cfWindow, errorText, evaluateNewZone, evaluateZone, MAX_SYSTEM_DOMAINS,
+  acksOf, backOffCloudflare, cfBudgetGuard, cfBusyError, cfWindow, evaluateNewZone, evaluateZone, MAX_SYSTEM_DOMAINS,
   noteThrottle, occupancyChecks, occupancyFacts, requireCfCalls, requireCredentials, reserveCfCalls, resolveAccountZone,
   SYSTEM_DOMAIN_CF_SCOPE, throttleSeconds, zonesView, type Evaluation,
 } from './zone-catalog.js';
@@ -442,8 +442,7 @@ async function advance(run: Run): Promise<Step> {
   }
 }
 
-const adoptable = (zone: CfZone, row: OnboardingRow) =>
-  Boolean(zone.created_on && new Date(zone.created_on).getTime() >= row.createdAt.getTime() - MINUTE);
+const adoptable = (zone: CfZone, row: OnboardingRow) => zoneCreatedSince(zone, row.createdAt);
 
 /** 建 zone 的结果不明：占位 10 分钟后按名称找回。只采纳占位之后创建的 zone，来源保持 unknown（永不删除） */
 async function stepCreatingZone(run: Run): Promise<Step> {
@@ -838,11 +837,8 @@ function zoneCreateError(error: unknown): AppError {
   if (!(error instanceof CloudflareApiError)) return new AppError('internal', `Cloudflare 创建 zone 失败：${errorText(error)}`);
   if (error.status === 429) return cfBusyError();
   if (error.has(1061)) return new AppError('conflict', '该域名已在 Cloudflare 账户中，请在可接入列表中接入');
-  if (error.has(1049)) return new AppError('validation_failed', '该域名尚未注册，请先在注册商完成注册');
-  if (error.has(1099, 1093, 1116)) return new AppError('validation_failed', '请填写已注册的根域名（例如 example.com，而不是 mail.example.com）');
-  if (error.has(1110)) return new AppError('validation_failed', '暂时查不到该域名的注册信息，请稍后重试');
-  if (error.has(1097)) return new AppError('validation_failed', 'Cloudflare 不允许添加该域名');
-  if (error.has(1105)) return new AppError('rate_limited', 'Cloudflare 提示该域名尝试次数过多，请 3 小时后再试');
+  const rejection = zoneCreateRejection(error);
+  if (rejection) return rejection;
   if (error.has(1118)) return new AppError('rate_limited', '站长的 Cloudflare 账户暂时不能添加更多域名，请稍后再试');
   return new AppError('internal', `Cloudflare 创建 zone 失败：${error.message}`);
 }

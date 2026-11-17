@@ -7,7 +7,7 @@ import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizz
 import { createDb, type Db } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
 import { chunk, d1Statement } from '../lib/d1.js';
-import { AppError } from '../lib/errors.js';
+import { AppError, errorText } from '../lib/errors.js';
 import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
@@ -16,7 +16,7 @@ import {
   assertZonesVisible, CloudflareApiError, catchAllTargetsWorker, cloudflareCredentials, countZones, createSendingSubdomain, createZone, deleteSendingSubdomain,
   deleteZone, enableRouting, findZone, getCatchAll, getRouting, getSendingDnsStatus, getZone, isCloudflareNotFound,
   isTransientCloudflareError, listSendingSubdomains, putCatchAll, repairSendingDns, requestActivationCheck, verifyToken,
-  type CfZone, type CloudflareCredentials, type ZoneDeleteGuard,
+  zoneCreatedSince, zoneCreateRejection, type CfZone, type CloudflareCredentials, type ZoneDeleteGuard,
 } from './cloudflare.js';
 import { hasDnssec } from './domain-check.js';
 import { getSystemFromAddress } from './domain.js';
@@ -88,10 +88,6 @@ function requireCredentials(env: Env, settings: Pick<Settings, 'hosted_domains'>
   const creds = cloudflareCredentials(env);
   if (!settings.hosted_domains.enabled || !creds) throw new AppError('forbidden', '本站未开启域名托管');
   return creds;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /** 后台任务：有 ctx 放进 waitUntil，没有时（定时任务、单测）同步等待 */
@@ -302,11 +298,8 @@ function createZoneError(error: unknown): AppError {
   if (error instanceof AppError) return error;
   if (!(error instanceof CloudflareApiError)) return new AppError('internal', `Cloudflare 创建域名失败：${errorText(error)}`);
   if (error.has(1061)) return new AppError('conflict', '该域名已存在于 Cloudflare 账户中，不能托管');
-  if (error.has(1049)) return new AppError('validation_failed', '该域名尚未注册，请先在注册商完成注册');
-  if (error.has(1099, 1093, 1116)) return new AppError('validation_failed', '请填写已注册的根域名（例如 example.com，而不是 mail.example.com）');
-  if (error.has(1110)) return new AppError('validation_failed', '暂时查不到该域名的注册信息，请稍后重试');
-  if (error.has(1097)) return new AppError('validation_failed', 'Cloudflare 不允许添加该域名');
-  if (error.has(1105)) return new AppError('rate_limited', 'Cloudflare 提示该域名尝试次数过多，请 3 小时后再试');
+  const rejection = zoneCreateRejection(error);
+  if (rejection) return rejection;
   if (error.has(1118)) return new AppError('rate_limited', '站长的 Cloudflare 账户暂时不能添加更多域名，请稍后再试或联系管理员');
   return new AppError('internal', `Cloudflare 创建域名失败：${error.message}`);
 }
@@ -561,7 +554,7 @@ async function dropPending(env: Env, creds: CloudflareCredentials, row: HostedRo
 async function recoverReservation(env: Env, creds: CloudflareCredentials, row: HostedRow, lease: Date): Promise<boolean> {
   if (Date.now() - row.createdAt.getTime() < RESERVATION_STALE_MS) return false;
   const zone = await findZone(creds, row.domain);
-  if (zone && zone.created_on && new Date(zone.created_on).getTime() >= row.createdAt.getTime() - MINUTE) {
+  if (zone && zoneCreatedSince(zone, row.createdAt)) {
     const filled = await createDb(env).update(hostedDomains).set({
       zoneId: zone.id, nameServers: zone.name_servers ?? [], originalNameServers: zone.original_name_servers ?? [],
       originalRegistrar: zone.original_registrar ?? '', zoneStatus: zone.status, checkedAt: new Date(), updatedAt: new Date(),
@@ -596,8 +589,7 @@ async function teardown(env: Env, creds: CloudflareCredentials, row: HostedRow):
   try {
     // 中断的创建请求可能已在 Cloudflare 建好 zone：按名称找回本次创建的 zone 一并删除
     const orphan = row.zoneId ? null : await findZone(creds, row.domain);
-    const zoneId = row.zoneId ?? (orphan?.created_on && new Date(orphan.created_on).getTime() >= row.createdAt.getTime() - MINUTE
-      ? orphan.id : null);
+    const zoneId = row.zoneId ?? (orphan && zoneCreatedSince(orphan, row.createdAt) ? orphan.id : null);
     if (zoneId) {
       // 发信接入随 zone 删除，单独删除失败不阻塞
       if (row.sendingTag) await deleteSendingSubdomain(creds, zoneId, row.sendingTag).catch(() => undefined);
@@ -930,7 +922,7 @@ async function rebuildZone(
   } catch (error) {
     throw new AppError('internal', `查询 Cloudflare 失败，请稍后重试：${errorText(error)}`);
   }
-  if (zone && !(zone.created_on && new Date(zone.created_on).getTime() >= missingSince.getTime() - MINUTE)) {
+  if (zone && !zoneCreatedSince(zone, missingSince)) {
     throw new AppError('conflict', '站长账户中已有同名 zone，不能接管');
   }
   if (!zone) {

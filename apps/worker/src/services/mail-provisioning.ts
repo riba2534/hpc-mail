@@ -2,8 +2,6 @@
  * 系统域名接入的 Cloudflare 邮件配置：inspect（只读，不吞错）→ plan（纯函数，确认项与指纹）→ apply（带前置复核的写入）。
  * 与托管域名的 ensureMailConfig 完全独立：读取失败一律是 unknown 并停止相关写入，绝不推断为「不存在」；
  * 已有配置（第三方 MX、catch-all、SPF）只在管理员确认后才改；不调用 deleteZone、关闭 Routing 或删除发信子域。
- *
- * 【接口契约（PR5h 负责人定义，实现者不得改签名；需要改时先找负责人）】
  */
 import {
   SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_WRITE_STEPS, type DnssecState, type SystemDomainAck, type SystemDomainCheck, type SystemDomainCheckKey,
@@ -11,10 +9,12 @@ import {
   type SystemDomainVerdict, type SystemDomainWriteStep,
 } from '@hpc-mail/shared';
 import type { OnboardingAcceptance, OnboardingChangeEvent } from '../db/schema.js';
+import { sha256Hex } from '../lib/crypto.js';
+import { errorText } from '../lib/errors.js';
 import { dohAnswers, dohQuery, PUBLIC_LOOKUP_TIMEOUT_MS, rdapDomain, RR } from '../lib/public-dns.js';
 import { CF_SPF_INCLUDE, decodeTxtContent, isSpfContent, mergeCloudflareSpf } from '../lib/spf.js';
 import {
-  CloudflareApiError, createSendingSubdomain, deleteDnsRecord, enableRouting, getCatchAll, getDnsRecord, getRouting, getSendingDnsStatus,
+  catchAllTargetsWorker, CloudflareApiError, createSendingSubdomain, deleteDnsRecord, enableRouting, getCatchAll, getDnsRecord, getRouting, getSendingDnsStatus,
   isOutcomeUnknown, listRoutingRules, listSendingSubdomains, putCatchAllWorker, queryDnsRecords, repairSendingDns, updateDnsRecord,
   type CfCatchAll, type CfDnsRecord, type CfPage, type CfRouting, type CfRoutingRule, type CfSendingDnsStatus, type CfSendingSubdomain,
   type CfZone, type CloudflareCredentials,
@@ -85,7 +85,6 @@ const SENDING_SUBDOMAIN_LIMIT = 30;
 const read = <T>(promise: Promise<T>): Promise<CfRead<T>> =>
   promise.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
 
-const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const normHost = (value: string) => value.trim().toLowerCase().replace(/\.$/, '');
 const sameName = (a: string, b: string) => normHost(a) === normHost(b);
 
@@ -104,11 +103,6 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
-async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
 const brief = (record: CfDnsRecord): SystemDomainRecordBrief => ({
   type: record.type, name: record.name, content: record.content, priority: record.priority ?? null, ttl: record.ttl ?? null,
 });
@@ -123,11 +117,6 @@ function catchAllTarget(rule: CfCatchAll | undefined): { action: 'worker' | 'for
   const action = rule?.actions?.[0];
   const type = action?.type;
   return { action: type === 'worker' || type === 'forward' || type === 'drop' ? type : 'other', targets: action?.value ?? [] };
-}
-
-function targetsWorker(rule: CfCatchAll | undefined, workerName: string): boolean {
-  const action = rule?.actions?.[0];
-  return rule?.enabled === true && action?.type === 'worker' && action.value?.[0] === workerName;
 }
 
 function describeAction(action: { type: string; value?: string[] } | undefined): string {
@@ -372,7 +361,7 @@ export async function planMailChanges(inspection: MailInspection, policy: Provis
   else {
     const rule = inspection.catchAll.value;
     const target = catchAllTarget(rule);
-    if (targetsWorker(rule, workerName)) {
+    if (catchAllTargetsWorker(rule, workerName)) {
       catchAllState = 'ready';
       checks.push(check('catchAll', 'ok', 'none', `catch-all 已投递到本站（Worker ${workerName}）`));
     } else if (rule.source === 'wrangler') {
@@ -735,7 +724,7 @@ export async function applyMailPlan(
     exec: () => putCatchAllWorker(creds, zoneId, workerName),
     verify: async () => {
       const now = await getCatchAll(creds, zoneId);
-      if (targetsWorker(now, workerName)) return 'target';
+      if (catchAllTargetsWorker(now, workerName)) return 'target';
       const before = facts.catchAllBefore;
       return stableStringify({ enabled: now.enabled ?? null, actions: now.actions ?? [] })
         === stableStringify({ enabled: before?.enabled ?? null, actions: before?.actions ?? [] }) ? 'original' : 'other';
@@ -867,7 +856,7 @@ async function readSnapshot(
         : sendingValue.dnsStatus?.status === 'misconfigured' ? 'conflict' : 'missing';
   return {
     routing: { state: routingState, status: routing.ok ? routing.value.status ?? '' : previous.routing.status },
-    catchAll: { state: !catchAll.ok ? 'unknown' : targetsWorker(catchAll.value, workerName) ? 'ready' : 'missing' },
+    catchAll: { state: !catchAll.ok ? 'unknown' : catchAllTargetsWorker(catchAll.value, workerName) ? 'ready' : 'missing' },
     sending: {
       state: sendingState,
       status: sendingValue?.dnsStatus?.status ?? (sending.ok ? '' : previous.sending.status),
