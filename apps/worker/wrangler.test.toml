@@ -1,4 +1,4 @@
-# 测试专用配置（@cloudflare/vitest-pool-workers 消费）
+# 测试专用配置（@cloudflare/vitest-plugin 消费）
 # 与生产 wrangler.toml 一致，但去掉 miniflare 无法本地模拟的 send_email binding，
 # 以及不需要的 routes/custom_domain。集成测试不发外部邮件，不调 env.email。
 name = "hpc-cloud-mail"
