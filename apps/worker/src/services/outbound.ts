@@ -525,6 +525,15 @@ export async function sendMail(
     // 绑定失败（幂等状态已变化）时同批把发件行标 failed，不留永久 pending
     await bindIdempotentSend(env, handle, outbound.id);
   } catch (error) {
+    // 发件行已插入但尚未外发（如绑定幂等键的 batch 抛 D1 异常）：标为 failed，不留永久 pending。
+    // 尽力而为，失败只记日志，不覆盖原始错误
+    if (outbound) {
+      try {
+        await db.update(messages)
+          .set({ status: 'failed', errorDetail: (error instanceof Error ? error.message : String(error)).slice(0, 2000) })
+          .where(and(eq(messages.id, outbound.id), eq(messages.status, 'pending')));
+      } catch (markError) { console.error('未外发的发件行标记失败延迟:', markError); }
+    }
     await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
     if (!outbound && storedBody?.bodyR2Key) await queueObjectCleanup(env, [storedBody.bodyR2Key]);
     throw error;

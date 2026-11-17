@@ -90,10 +90,13 @@ export async function beginIdempotentSend(
         return { kind: 'replay', response };
       }
     } else if (existing.status === 'failed') {
-      // 条件更新只有一个请求能收回；并发的另一方落到下面的「处理中」
+      // 条件更新只有一个请求能收回；并发的另一方落到下面的「处理中」。
+      // createdAt 一并刷新：清理按 createdAt 计保留期，沿用旧值会让收回后完成的结果当天被删，
+      // 响应丢失后同 Key 重试就会重复发信
+      const now = new Date();
       const reclaimed = await db
         .update(idempotencyRecords)
-        .set({ status: 'pending', errorDetail: '', updatedAt: new Date() })
+        .set({ status: 'pending', errorDetail: '', updatedAt: now, createdAt: now })
         .where(and(recordOf(handle), eq(idempotencyRecords.status, 'failed'), isNull(idempotencyRecords.messageId)))
         .returning({ key: idempotencyRecords.key })
         .get();
