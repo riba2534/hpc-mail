@@ -5,6 +5,8 @@ import type { Env } from '../types.js';
 
 /** /v1 被拒请求的明细节流计数（每 Key 每分钟一格） */
 export const API_REJECT_SCOPE = 'api-reject';
+/** 普通用户外发日配额（count=封数，units=收件人数；subject 为 userId，按天窗口） */
+export const OUTBOUND_QUOTA_SCOPE = 'out';
 
 export interface CounterValue {
   count: number;

@@ -39,7 +39,7 @@ import { assertHostedSendable, getRoutableDomains } from './domain.js';
 import { resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
-import { bumpCounter, dayWindow } from './rate-counter.js';
+import { bumpCounter, dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { attachmentKey, getExt, sha256Hex16 } from './storage.js';
 import { assertSendBodySize, bodyBytes, storeMailBody } from './mail-body.js';
@@ -180,9 +180,6 @@ export function decodeInlineAttachments(
   });
 }
 
-/** 外发配额计数类别（rate_counters.scope） */
-const QUOTA_SCOPE_OUTBOUND = 'out';
-
 /**
  * 外发日配额：仅普通用户 + 有站外收件人时生效（admin 豁免）。
  *
@@ -200,12 +197,12 @@ async function assertOutboundQuota(
   if (quota.dailyOutbound === 0 && quota.dailyRecipients === 0) return;
   const subject = String(sender.userId);
   const window = dayWindow();
-  const cur = await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, subject, window, 1, recipientCount);
+  const cur = await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, subject, window, 1, recipientCount);
   const overMails = quota.dailyOutbound > 0 && cur.count > quota.dailyOutbound;
   const overRecipients = quota.dailyRecipients > 0 && cur.units > quota.dailyRecipients;
   if (overMails || overRecipients) {
     // 拒绝的这次不该占额度，立即回退
-    await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, subject, window, -1, -recipientCount);
+    await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, subject, window, -1, -recipientCount);
     throw new AppError(
       'rate_limited',
       overMails
@@ -224,7 +221,7 @@ async function releaseOutboundQuota(
 ): Promise<void> {
   if (sender.role === 'admin') return;
   if (quota.dailyOutbound === 0 && quota.dailyRecipients === 0) return;
-  await bumpCounter(env, QUOTA_SCOPE_OUTBOUND, String(sender.userId), dayWindow(), -1, -recipientCount);
+  await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, String(sender.userId), dayWindow(), -1, -recipientCount);
 }
 
 const FORBIDDEN_SENDER: AppErrorHints = {

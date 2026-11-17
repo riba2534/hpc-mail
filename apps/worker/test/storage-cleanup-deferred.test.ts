@@ -240,9 +240,9 @@ describe('台账清理按批判定引用', () => {
   it('引用判定的每个子查询都走对应的 r2_key 索引', async () => {
     const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${CLEANUP_JOBS_SQL}`).bind(Date.now(), 100).all<{ detail: string }>();
     const detail = plan.results.map((row) => row.detail).join(' | ');
-    for (const index of ['sqlite_autoindex_delivery_object_leases_1', 'idx_attachments_r2_key', 'idx_messages_body_r2', 'idx_messages_raw_r2', 'idx_external_links_r2']) {
+    for (const index of ['sqlite_autoindex_delivery_object_leases_1', 'idx_attachments_r2_key', 'idx_messages_body_r2', 'idx_messages_raw_r2', 'idx_external_links_r2', 'idx_draft_r2_key']) {
       expect(detail).toContain(index);
     }
-    expect(detail).not.toMatch(/SCAN (attachments|messages|external_attachment_links|delivery_object_leases)\b(?! USING)/);
+    expect(detail).not.toMatch(/SCAN (attachments|messages|external_attachment_links|delivery_object_leases|draft_attachments)\b(?! USING)/);
   });
 });

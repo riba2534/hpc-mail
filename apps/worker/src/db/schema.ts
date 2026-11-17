@@ -206,6 +206,8 @@ export const draftAttachments = sqliteTable(
   (t) => [
     index('idx_draft_user').on(t.userId),
     index('idx_draft_status').on(t.status, t.createdAt),
+    // 发信直接引用草稿对象后，对象清理要按 r2_key 判断草稿是否仍在（未发送的草稿不能被回收）
+    index('idx_draft_r2_key').on(t.r2Key),
   ],
 );
 

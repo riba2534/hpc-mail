@@ -7,11 +7,12 @@ import type { Env, ExecCtx } from '../types.js';
 /** R2 批量删除单次最多 1000 个 key */
 const R2_DELETE_BATCH = 1000;
 
-/** 对象仍被引用：附件行、正文溢出、原始 .eml 或 90 天外链。每个子查询各走自己的 r2_key 索引。 */
+/** 对象仍被引用：附件行、正文溢出、原始 .eml、90 天外链或尚未发送的草稿（发信直接引用草稿对象）。每个子查询各走自己的 r2_key 索引。 */
 const referencedSql = (key: string) => `(EXISTS (SELECT 1 FROM attachments WHERE attachments.r2_key = ${key})
   OR EXISTS (SELECT 1 FROM messages WHERE messages.body_r2_key = ${key})
   OR EXISTS (SELECT 1 FROM messages WHERE messages.raw_r2_key = ${key})
-  OR EXISTS (SELECT 1 FROM external_attachment_links WHERE external_attachment_links.r2_key = ${key}))`;
+  OR EXISTS (SELECT 1 FROM external_attachment_links WHERE external_attachment_links.r2_key = ${key})
+  OR EXISTS (SELECT 1 FROM draft_attachments WHERE draft_attachments.r2_key = ${key}))`;
 
 /** 一条查询取出台账及每个对象的租约/引用状态，替代逐对象的多次往返（导出供 EXPLAIN 回归） */
 export const CLEANUP_JOBS_SQL = `SELECT storage_cleanup_jobs.r2_key AS r2_key,

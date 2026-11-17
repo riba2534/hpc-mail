@@ -11,7 +11,7 @@ import {
 } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
 import type { Env } from '../types.js';
-import { API_REJECT_SCOPE, dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
+import { API_REJECT_SCOPE, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
@@ -19,7 +19,11 @@ import {
   HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
 } from './hosted-domain.js';
 import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
-import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
+import {
+  processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases, purgeOrphanAttachments,
+} from './storage-cleanup.js';
+import { FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE } from './forwarding.js';
+import { LOGIN_ACCOUNT_SCOPE } from './auth.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
 import { releaseDraftStatements } from './upload.js';
@@ -241,15 +245,18 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   });
   // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ abort 分片或登记清理 + 删行
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
+  // 附件行指向已不存在的邮件（附件写入前邮件被永久删除等）：登记对象清理并删行
+  await step(report, 'attachments.orphans', () => purgeOrphanAttachments(env));
   // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组
   await step(report, 'counters', async () => {
-    await purgeCounters(env, ['out', 'fwd-domain', 'fwd-target', 'ai-extract', TRANSLATE_CHARS_SCOPE],
-      dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, [
+      OUTBOUND_QUOTA_SCOPE, 'fwd-domain', 'fwd-target', FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, 'ai-extract', TRANSLATE_CHARS_SCOPE,
+    ], dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
     ], minuteWindow(1) - 120);
-    await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
+    await purgeCounters(env, ['login-fail', LOGIN_ACCOUNT_SCOPE], minuteWindow(15) - 8);
     await purgeCounters(env, 'reg', minuteWindow(60) - 3);
   });
 }

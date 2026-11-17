@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1338c040-427b-4e46-92b1-11356ec7b7a5",
+  "id": "377afd44-2f20-4ece-bd29-55aa1d44a122",
   "prevId": "199f94ac-2c46-47e0-a312-ca6bd1a2c32a",
   "tables": {
     "admin_audit_logs": {
@@ -650,6 +650,13 @@
           "columns": [
             "status",
             "created_at"
+          ],
+          "isUnique": false
+        },
+        "idx_draft_r2_key": {
+          "name": "idx_draft_r2_key",
+          "columns": [
+            "r2_key"
           ],
           "isUnique": false
         }

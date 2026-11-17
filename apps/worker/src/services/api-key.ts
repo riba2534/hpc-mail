@@ -19,7 +19,7 @@ import { bytesToHex, sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { encodeCursor, decodeCursor } from '../lib/pagination.js';
 import type { Env } from '../types.js';
-import { dayWindow } from './rate-counter.js';
+import { dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
 import { getSettings } from './setting.js';
 
 type ApiKeyRow = typeof apiKeys.$inferSelect;
@@ -140,9 +140,6 @@ async function requireKey(db: Db, id: number, userId?: number): Promise<ApiKeyRo
   if (userId !== undefined && row.userId !== userId) throw new AppError('not_found', 'API Key 不存在');
   return row;
 }
-
-/** 外发日配额计数的 rate_counters.scope，与 outbound.ts 的配额占用同一行 */
-const OUTBOUND_QUOTA_SCOPE = 'out';
 
 /**
  * GET /v1/me：Key 行、用户行与今日外发计数合成一个 batch；配额上限取设置（鉴权刚读过，命中 isolate 缓存）。
