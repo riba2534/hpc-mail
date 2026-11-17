@@ -220,10 +220,11 @@ describe('notifyPrefs schemas', () => {
 });
 
 describe('createApiKeyRequestSchema / createInviteRequestSchema', () => {
-  it('api key 默认限流且 scope 必填', () => {
-    const r = createApiKeyRequestSchema.parse({ name: 'script', scopes: ['mail.read'] });
+  it('api key 默认限流，scope 与当前密码必填', () => {
+    const r = createApiKeyRequestSchema.parse({ name: 'script', scopes: ['mail.read'], password: 'pw' });
     expect(r.rateLimit).toBe(120);
-    expect(createApiKeyRequestSchema.safeParse({ name: 'x', scopes: [] }).success).toBe(false);
+    expect(createApiKeyRequestSchema.safeParse({ name: 'x', scopes: [], password: 'pw' }).success).toBe(false);
+    expect(createApiKeyRequestSchema.safeParse({ name: 'x', scopes: ['mail.read'] }).success).toBe(false);
   });
   it('邀请码默认单次使用', () => {
     const r = createInviteRequestSchema.parse({});
