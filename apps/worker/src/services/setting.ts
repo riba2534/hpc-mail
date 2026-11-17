@@ -12,7 +12,7 @@ import { createDb } from '../db/client.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { anyHostedSql, anyOnboardingSql, ONBOARDING_TERMINAL_SQL } from './domain-occupancy.js';
 import { settings as settingsTable } from '../db/schema.js';
-import type { Env, ExecCtx } from '../types.js';
+import type { Env } from '../types.js';
 
 const SETTINGS_SQL = 'SELECT key, value FROM settings';
 
@@ -66,11 +66,8 @@ export function settingsQuery(env: Env): SettingsQuery {
   };
 }
 
-/**
- * 读设置：内存缓存 15s → 直读 D1，再失败用默认值（收件不因配置故障丢信）。
- * ctx 当前不用，保留给调用方统一传参。
- */
-export async function getSettings(env: Env, _ctx?: ExecCtx | null): Promise<Settings> {
+/** 读设置：内存缓存 15s → 直读 D1，再失败用默认值（收件不因配置故障丢信） */
+export async function getSettings(env: Env): Promise<Settings> {
   try {
     const query = settingsQuery(env);
     if ('cached' in query) return query.cached;
@@ -133,8 +130,8 @@ export function domainsCasSql(guard: string): string {
       WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ?2 RETURNING key`;
 }
 
-/** 写设置：逐 key 校验后落库并失效本 isolate 缓存（ctx 当前不用，保留给调用方统一传参） */
-export async function updateSettings(env: Env, patch: UpdateSettingsRequest, _ctx?: ExecCtx | null): Promise<void> {
+/** 写设置：逐 key 校验后落库并失效本 isolate 缓存 */
+export async function updateSettings(env: Env, patch: UpdateSettingsRequest): Promise<void> {
   const db = createDb(env);
   const writes: { key: string; value: string }[] = [];
   let fresh: Settings | undefined;
