@@ -3,8 +3,10 @@ import { AlertTriangle, ArrowLeft, ExternalLink, RefreshCw } from 'lucide-react'
 import { type ReactNode, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
+  SYSTEM_DOMAIN_ONBOARDING_TERMINAL_STATES,
   SYSTEM_DOMAIN_STEP_KEYS,
   type SystemDomainOnboarding,
+  type SystemDomainOnboardingState,
   type SystemDomainPrecheck,
 } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
@@ -20,18 +22,10 @@ import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/cn';
 import { formatDateTime, formatRelativeTime } from '@/lib/format';
 import { OnboardConfirmDialog } from './onboard-confirm-dialog';
-import { CheckDetail, DNSSEC_LABEL, OnboardingStateBadge, STEP_LABEL } from './system-domain-meta';
+import { CheckDetail, DNSSEC_LABEL, OnboardingStateBadge, STEP_LABEL, STEP_STATE_META } from './system-domain-meta';
 import { storeOnboarding, systemDomainApi, systemDomainKeys, useSystemDomainOnboarding } from './system-domains-api';
 
-const TERMINAL = new Set(['completed', 'cancelled', 'failed']);
-const STEP_STATE_LABEL: Record<string, { label: string; className: string }> = {
-  ready: { label: '已就绪', className: 'text-positive' },
-  waiting: { label: '等待中', className: 'text-ink-tertiary' },
-  missing: { label: '待写入', className: 'text-ink-tertiary' },
-  unknown: { label: '未知', className: 'text-ink-tertiary' },
-  conflict: { label: '有冲突', className: 'text-caution' },
-  error: { label: '失败', className: 'text-critical' },
-};
+const TERMINAL: ReadonlySet<SystemDomainOnboardingState> = new Set(SYSTEM_DOMAIN_ONBOARDING_TERMINAL_STATES);
 const CHANGE_LABEL: Record<string, string> = {
   'zone.create': '创建 zone', 'zone.delete': '删除 zone', 'spf.merge': '合并 SPF', 'catchAll.put': '配置 catch-all',
   'mx.delete': '删除第三方 MX', 'routing.enable': '开启收件路由', 'sending.create': '接入发信', 'sending.repair': '补写发信记录',
@@ -39,7 +33,7 @@ const CHANGE_LABEL: Record<string, string> = {
 const CHANGE_STATUS: Record<string, string> = { started: '进行中', done: '完成', unknown: '结果不明', failed: '失败' };
 
 /** 只有 404 当作不存在；403 是权限或凭据问题，要提示而不是跳走 */
-const isGone = (error: unknown) => error instanceof ApiError && (error.httpStatus === 404 || error.code === 'not_found');
+const isGone = (error: unknown) => error instanceof ApiError && error.notFound;
 const errorMessage = (error: unknown, fallback: string) => (error instanceof ApiError ? error.message : fallback);
 
 function Section({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
@@ -206,7 +200,7 @@ export function OnboardingDetailPage() {
         <ul className="flex flex-col gap-2">
           {SYSTEM_DOMAIN_STEP_KEYS.map((key) => {
             const step = task.steps[key];
-            const meta = STEP_STATE_LABEL[step.state] ?? STEP_STATE_LABEL.unknown!;
+            const meta = STEP_STATE_META[step.state];
             return (
               <li key={key} className="flex flex-wrap items-baseline gap-2 text-[13px]">
                 <span className="w-20 shrink-0 text-ink">{STEP_LABEL[key]}</span>

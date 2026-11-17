@@ -39,7 +39,8 @@ export const DNSSEC_LABEL: Record<DnssecState, string> = {
   unknown: 'DNSSEC 检测失败（不等于未开启），改 NS 前请在注册商确认已关闭',
 };
 
-const STEP_ICON: Record<SystemDomainStepState, { icon: LucideIcon; className: string; label: string }> = {
+/** 接入步骤的状态：行内进度用图标，详情页用文字 */
+export const STEP_STATE_META: Record<SystemDomainStepState, { icon: LucideIcon; className: string; label: string }> = {
   ready: { icon: CircleCheck, className: 'text-positive', label: '已就绪' },
   waiting: { icon: CircleDashed, className: 'text-ink-tertiary', label: '等待中' },
   missing: { icon: CircleDashed, className: 'text-ink-tertiary', label: '待写入' },
@@ -62,7 +63,7 @@ export function OnboardingProgress({ task }: { task: Pick<SystemDomainOnboarding
   return (
     <ol aria-label="接入进度" className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-ink-secondary">
       {items.map((item, index) => {
-        const meta = STEP_ICON[item.state];
+        const meta = STEP_STATE_META[item.state];
         const spinning = running && item.state !== 'ready' && items.slice(0, index).every((prev) => prev.state === 'ready');
         const Icon = spinning ? Loader2 : meta.icon;
         return (

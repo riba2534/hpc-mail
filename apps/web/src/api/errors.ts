@@ -35,6 +35,10 @@ export class ApiError extends Error {
   get forbidden(): boolean {
     return this.httpStatus === 403 || this.code === 'forbidden';
   }
+
+  get notFound(): boolean {
+    return this.httpStatus === 404 || this.code === 'not_found';
+  }
 }
 
 export const NETWORK_ERROR_MESSAGE = '网络连接失败，请检查网络后重试';
