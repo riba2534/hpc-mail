@@ -35,7 +35,7 @@ jq '{feishu:(.data.feishu + {contentLevel:"code_only"})}' <<< "$CURRENT_PREFS" |
 掩码 `"******"` 表示保留已存密钥，`""` 表示清除，不是“空值不更新”。省略整个通道才保留全部配置；secret 默认为空，因此提交不含 secret 的完整通道可能清掉旧密钥。读取后修改一项时保留掩码值，只有用户要求清除时才明确传空。secret、pushkey 最多 128 字符，不在报告中回显真实值。
 
 - **飞书**：HTTPS 飞书/Lark 自定义机器人 URL（服务器检查平台 host 与 hook 路径），可带机器人签名 secret。`code_only` 推送元信息与提取到的验证码，不含正文；没有提取码的邮件仍可通知。summary 正文最多 200 字符，full 最多约 4000 字符，并非原始 `.eml` 传输。测试会发送外部卡片，测试成功需平台 HTTP 与业务 code 均成功。
-- **PushDeer**：官方 `https://api2.pushdeer.com` 或自建实例端点及有效 PushKey；启用时需非空 PushKey。端点空串回落官方，当前服务接受 HTTP 或 HTTPS 的公网 origin、拒绝常见内网 host；建议 HTTPS。服务只取 URL 的 origin，路径/query/URL 用户密码不作为 PushDeer 认证配置；实际请求为该 origin 的 `/message/push`，认证用 pushkey。
+- **PushDeer**：官方 `https://api2.pushdeer.com` 或自建实例端点及有效 PushKey；启用时需非空 PushKey。端点空串回落官方，当前服务接受 HTTP 或 HTTPS 的公网 origin、拒绝常见内网 host；建议 HTTPS。服务只取 URL 的 origin，路径/query/URL 用户密码不作为 PushDeer 认证配置；实际请求为该 origin 的 `/message/push`，认证用 pushkey。用掩码沿用已存 PushKey 时，端点的 origin 与路径必须与已保存的一致（末尾斜杠视为相同，空串视为官方端点），否则返回 400 `validation_failed`，需要重新填写 PushKey。
 - **通用 Webhook**：HTTPS 公网接收端，不能内网或 URL 用户密码。固定 HPC Mail 事件格式，Bark/ntfy 等需自建适配，不能宣称其原生接口直接兼容。
 - **邮箱转发**：最多 5 个目标，启用时至少一个。Cloudflare 已验证 destination 可以原样 forward；未验证目标会用收件域 `no-reply@domain` 中转重发，邮件呈现/附件可能不同；不是保证保留全部原始 MIME。配置中目标仍应是用户授权的地址。外发大附件可能变下载链接，详见附件参考。
 
@@ -65,6 +65,6 @@ status 为 `pending|processing|succeeded|failed|skipped|unknown`。pending/proce
 
 飞书/PushDeer 每条最多 3 次自动尝试，失败退避；Webhook 默认 1 次且不自动重试，避免不支持幂等的接收端重复执行。队列/通知失败不回滚已成功收件。新 IP 登录告警按个人飞书/PushDeer 配置发送，是系统事件，并非所有渠道同样适用。
 
-手动 retry 必须是当前用户 job、通道当前 enabled、status 为 failed 或 unknown、messageId 非 null，且 channel 不是 forward。unknown 先核对接收端是否已收到，用户确认需重试时才提交，可能重复通知；已成功/处理中 retry 会拒绝。测试行应调用对应测试接口，forward 应核对收件情况后按用户要求手工转发原邮件，不能 job retry 自动重发。返回 ok 后重新查 health 确认真实投递结果。终结通知记录约 30 天后清理。
+手动 retry 必须是当前用户 job、通道当前 enabled、status 为 failed 或 unknown、messageId 非 null，且 channel 不是 forward。unknown 先核对接收端是否已收到，用户确认需重试时才提交，可能重复通知；已成功/处理中 retry 会拒绝。测试行应调用对应测试接口，forward 应核对收件情况后按用户要求手工转发原邮件，不能 job retry 自动重发。返回 ok 后重新查 health 确认真实投递结果；源邮件已被永久删除时不再推送，任务转为 skipped。邮件永久删除时其通知任务的内容一并清空，已成功或跳过的任务也不保留推送内容。终结通知记录约 30 天后清理。
 
 `health.data.forward` 为 `domainLimit,targetLimit,windowEndsAt,targets:[{address,attempts,remaining}],domains:[{domain,attempts,remaining}]`。当前单收件域 500 次/日、单转发目标 200 次/日，按 UTC 日结算；这是实例共用的尝试计数，其他用户同一目标/域也会占用，不是仅本用户额度，失败尝试也可能消耗。以实时 remaining 与窗口时间为准，不靠改用户/Key/目标规避限额。超限或失败不意味着原邮件没有保存在邮箱，应读取原邮件并报告转发情况。

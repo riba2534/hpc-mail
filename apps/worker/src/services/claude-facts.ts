@@ -7,15 +7,24 @@ import type { Env } from '../types.js';
  * 归纳幂等且单调：标志只会由否变是、时间取最早，cron 窗口重叠或永久删除前补归纳都可以重复执行。
  * 依据是 MIME From 与主题，没有校验 DKIM，界面上写作「根据历史来信判定」。
  *
- * migrations/0019_claude_address_facts.sql 的一次性回填复制了同一条语句（作用范围 1 = 1），改口径时一并更新。
+ * migrations/0019_claude_address_facts.sql 的一次性回填是当时口径的快照（已执行，不再修改）。
  */
 
-const FROM = 'lower(from_address)';
-const OFFICIAL = `(${FROM} LIKE '%@email.claude.com' OR ${FROM} LIKE '%@mail.anthropic.com'
-    OR ${FROM} LIKE '%@research.anthropic.com' OR ${FROM} LIKE '%anthropic-safeguards%')`;
+/**
+ * 官方发件域精确白名单，按线上来信统计确定（2026-11）：封号、收据、欢迎信全部来自前两个域名，
+ * 另两个是研究与 Safeguards（Intercom）来信。只比对整个发件域，不做子串匹配，
+ * 否则 anthropic-safeguards@evil.example 一类伪造来信就能给地址打上封号标记、让整个域名退出 Claude 策略。
+ */
+const CLAUDE_OFFICIAL_SENDER_DOMAINS = [
+  'email.claude.com', 'mail.anthropic.com', 'research.anthropic.com', 'anthropic-safeguards.intercom-mail.com',
+] as const;
+
+/** 第一个 @ 之后的部分；含多个 @ 的畸形地址取出的不是合法域名，不会命中白名单 */
+const SENDER_DOMAIN = `lower(substr(from_address, instr(from_address, '@') + 1))`;
+const OFFICIAL = `${SENDER_DOMAIN} IN (${CLAUDE_OFFICIAL_SENDER_DOMAINS.map((domain) => `'${domain}'`).join(', ')})`;
 const SUSPENDED = `subject LIKE 'Your account has been suspended%'`;
 const PAID = `(subject LIKE 'Your receipt from Anthropic%' OR subject LIKE '%subscription is confirmed%')`;
-const ACCOUNT = `(${SUSPENDED} OR ${PAID} OR subject LIKE 'Welcome to Claude%' OR ${FROM} LIKE '%@email.claude.com')`;
+const ACCOUNT = `(${SUSPENDED} OR ${PAID} OR subject LIKE 'Welcome to Claude%' OR ${SENDER_DOMAIN} = 'email.claude.com')`;
 
 /**
  * scope 是限定 messages 范围的 SQL 条件（含 ? 占位），由调用方绑定参数。

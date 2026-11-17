@@ -19,7 +19,7 @@ export default defineConfig(async () => {
       }),
     ],
     test: {
-      setupFiles: ['./test/apply-migrations.ts'],
+      setupFiles: ['./test/guard-credentials.ts', './test/apply-migrations.ts'],
     },
   };
 });

@@ -11,6 +11,7 @@ import {
   transferHostedDomainRequestSchema, HOSTED_DNS_CAA_TAGS, HOSTED_DNS_TTL_AUTO, hostedDnsRecordInputSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
 } from '@hpc-mail/shared';
+import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 
 export type Schema = Record<string, unknown>;
 export type Operation = Record<string, unknown>;
@@ -35,6 +36,8 @@ export function fromZod(schema: { toJSONSchema(params: { io: 'input' | 'output';
   const { $schema: _dialect, ...result } = schema.toJSONSchema({ io, unrepresentable: 'any' }) as Schema;
   return result;
 }
+/** 客户端 X-Request-ID 的取用规则，与 requestId 中间件同一正则 */
+export const clientRequestIdRule = `a client-supplied X-Request-ID is used only when it matches ${REQUEST_ID_PATTERN.source}`;
 export const claimStrategy: Schema = { type: 'string', enum: ['uniform', 'claude'],
   description: 'Optional. Omitted or uniform uses ordinary claim rules. claude rejects any domain with a historical Claude suspension, including for administrators and hosted domains; writes recheck atomically and return 403 forbidden: 该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领. Historical observations do not guarantee future safety.' };
 const claimRequest = fromZod(claimMailboxRequestSchema);
@@ -45,7 +48,7 @@ sendProperties.from = { ...sendProperties.from, oneOf: [
   { required: ['mailboxId'], not: { anyOf: [{ required: ['localPart'], properties: { localPart: str } }, { required: ['domain'], properties: { domain: str } }] } },
   { required: ['localPart', 'domain'], not: { required: ['mailboxId'], properties: { mailboxId: positiveId } } },
 ] };
-send.description = `At least one recipient across to/cc/bcc; combined maximum ${MAX_RECIPIENTS}. At least one nonempty text/html body; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes. At most ${MAX_ATTACHMENTS} total attachments, including tokens and source-message attachments. Base64 allows whitespace. A mailboxId must belong to the caller; ordinary users must own localPart+domain, and administrator explicit identities use configured/routable domains. Existing owned mailboxes remain usable when their domain is removed from the new-claim list. Shared mailboxes never grant send permission. replyToMessageId adds thread headers; use the original replyTo addresses from message detail as the new recipients. forwardAttachmentsFrom copies all original attachments and preserves inline CID images.`;
+send.description = `At least one recipient across to/cc/bcc; combined maximum ${MAX_RECIPIENTS}. At least one nonempty text/html body; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes. At most ${MAX_ATTACHMENTS} total attachments, including tokens and source-message attachments. Base64 allows whitespace. Sender identity: ordinary users must own the mailbox, whether given as mailboxId or localPart+domain. Administrators may use any claimed mailbox by mailboxId, or an explicit localPart+domain on a configured system domain, a removed domain that still has claimed mailboxes, or a hosted domain. Any address on a hosted domain needs that domain’s sending to be ready (400 otherwise); system domains do not. Existing owned mailboxes remain usable when their domain is removed from the new-claim list. Shared mailboxes never grant send permission. replyToMessageId only adds In-Reply-To/References: recipients, subject and body are not filled in, so use the original replyTo addresses (else fromAddress) from message detail. forwardAttachmentsFrom copies all original attachments and preserves inline CID images. Both source ids must be visible to the sender: mail at an address the sender claimed, or non-deleted inbound mail shared with the sender; administrators may also reference mail at unclaimed addresses. A missing or invisible source, or a forwarded attachment whose stored content is gone, returns 404 source_unavailable; drop replyToMessageId/forwardAttachmentsFrom to send it as a new message. A missing sender mailboxId stays 404 not_found. API keys need mail.read in addition to mail.send when either field is present.`;
 send.anyOf = [{ required: ['text'], properties: { text: { minLength: 1 } } }, { required: ['html'], properties: { html: { minLength: 1 } } }];
 send['x-max-body-utf8-bytes'] = MAX_BODY_BYTES;
 send['x-max-total-recipients'] = MAX_RECIPIENTS;
@@ -62,14 +65,14 @@ const domainEntry = ((domains.properties as Record<string, Schema>).list!.items)
   description: 'Whether random suffix generation in the claim dialog (uniform and Claude zero-suspension) may pick this domain. Omitted means true; false keeps it available for manual selection only.' };
 const settingsUpdate = fromZod(updateSettingsRequestSchema);
 (settingsUpdate.properties as Record<string, Schema>).domains = object({ list: { ...array({ anyOf: [domainName, domainEntry] }), maxItems: 64, 'x-unique-normalized-domain': true }, revision: int }, ['revision']);
-settingsUpdate.description = 'Partial settings update. A domains replacement requires expectedDomainsRevision from the latest GET; stale revisions return 409. Adding a domain does not configure DNS or Cloudflare Email Routing. Removing a domain only removes new-claim availability, and preserves existing mailbox routing. At least one setting key is required.';
+settingsUpdate.description = 'Partial settings update. A domains replacement requires expectedDomainsRevision from the latest GET; stale revisions return 409. A domain hosted by a user (/hosted-domains) cannot be added as a system domain and also returns 409. Adding a domain does not configure DNS or Cloudflare Email Routing. Removing a domain only removes new-claim availability, and preserves existing mailbox routing. At least one setting key is required.';
 settingsUpdate.dependentRequired = { domains: ['expectedDomainsRevision'] };
 const settingsResponse = object(Object.fromEntries(Object.entries(SETTING_SCHEMAS).map(([key, schema]) => [key, fromZod(schema, 'output')])));
 for (const schema of [settingsResponse, settingsUpdate]) {
   const properties = schema.properties as Record<string, Schema>;
   properties.ai_model!.description = 'The single OpenAI-compatible Chat Completions model used by every AI feature: message translation and the inbound verification-code fallback. Configured means baseUrl, apiKey and model are all nonempty; baseUrl must be https and excludes /chat/completions. When translation is enabled, segments a user chooses to translate are sent to it; when code_extract.aiEnabled is on, the subject and first 6000 body characters of inbound mail that the regex could not resolve and that mentions a code-related keyword are sent to it. Unconfigured: translation is unavailable and code extraction uses regex only.';
   const aiFields = properties.ai_model!.properties as Record<string, Schema>;
-  aiFields.apiKey = { ...aiFields.apiKey, description: 'Write-only provider key. Responses return ****** when a key is stored (empty string when none). Submitting ****** keeps the stored key; an empty string clears it.' };
+  aiFields.apiKey = { ...aiFields.apiKey, description: 'Write-only provider key. Responses return ****** when a key is stored (empty string when none). Submitting ****** keeps the stored key; an empty string clears it. Keeping the stored key requires the same baseUrl origin and path (a trailing slash is ignored): ****** with a baseUrl whose scheme, host, port or path changed returns 400 validation_failed, so enter the apiKey again; clearing baseUrl may keep the stored key. The stored key is never sent to a new host.' };
   properties.claim_random!.description = 'Rules for the Claude zero-suspension random suffix strategy. Any historical suspension excludes a domain. paidSuspendedLimit and suspendedPercent are deprecated compatibility fields and never change eligibility, including when zero. pendingDays counts recently claimed mailboxes without Claude mail as load (0 disables). dailyLimit caps additions in the last 24 hours (Claude accounts first seen plus new claims without Claude mail), including this plan (0 disables); full zero-suspension domains never spill over to suspended domains. domains.list[].random controls participation.';
   const claimFields = properties.claim_random!.properties as Record<string, Schema>;
   for (const name of ['paidSuspendedLimit', 'suspendedPercent']) {
@@ -78,7 +81,7 @@ for (const schema of [settingsResponse, settingsUpdate]) {
   properties.translation!.description = 'AI translation switch and quota. Enabling requires a configured ai_model (checked against the merged result when both are submitted). dailyCharsPerUser limits characters sent per user per UTC day, administrators included; 0 is unlimited.';
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
-notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webhook.secret and pushdeer.pushkey are returned as ******; plaintext secrets are never returned. In updates ****** preserves the secret and an explicit empty string clears it. Enabled configurations must have valid complete endpoints/keys/forward addresses. These are mail-owner notifications; shared mailbox readers do not receive owner notifications.';
+notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webhook.secret and pushdeer.pushkey are returned as ******; plaintext secrets are never returned. In updates ****** preserves the secret (for PushDeer only while the endpoint keeps the same origin and path, ignoring a trailing slash, with an empty endpoint meaning the official one; otherwise 400 validation_failed asks for the pushkey again) and an explicit empty string clears it. Enabled configurations must have valid complete endpoints/keys/forward addresses. These are mail-owner notifications; shared mailbox readers do not receive owner notifications.';
 const messageSummary = object({
   id: positiveId, direction: { type: 'string', enum: ['inbound', 'outbound'] }, address: str, domain: str,
   fromAddress: str, fromName: str, subject: str, preview: str, verificationCode: str,
@@ -89,7 +92,8 @@ const messageSummary = object({
   deletedAt: { ...date, description: 'Only in trash=1 lists: when the message entered the trash. Trash is purged seven days later.' },
 }, ['recipientOutcomes', 'recipientsTo', 'verificationLink', 'deletedAt']);
 const { deletedAt: _deletedAt, ...summaryProperties } = messageSummary.properties as Record<string, Schema>;
-const attachment = object({ id: positiveId, filename: str, mimeType: str, size: int, contentId: str, disposition: str, url: str });
+const attachment = object({ id: positiveId, filename: str, mimeType: str, size: int, contentId: str, disposition: str,
+  url: { ...str, description: 'Signed download URL, possibly relative to the site origin. Session-API detail URLs are aligned to the hour and valid for 1–2 hours; /v1 detail URLs expire after 5 minutes. Read the message again for a fresh URL, or download with credentials instead.' } });
 const mailbox = object({ id: positiveId, address: str, domain: str, userId: positiveId, ownerUsername: str, displayName: str, messageCount: int, createdAt: date }, ['ownerUsername']);
 const user = object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] }, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
 const { twoFactorEnabled: _twoFactorEnabled, ...adminUserProperties } = user.properties as Record<string, Schema>;
@@ -101,7 +105,9 @@ const delivery = object({ id: positiveId, messageId: nullable(positiveId), targe
   nextAttemptAt: date, lastAttemptAt: nullable(date),
 });
 export const schemas: Record<string, Schema> = {
-  Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES }, message: str }), requestId: str }),
+  Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
+    description: 'Stable machine-readable code. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message.' }, message: str }),
+    requestId: { ...str, description: `Same value as the X-Request-ID response header, which every response carries; ${clientRequestIdRule}, anything else is replaced by a server-generated UUID.` } }),
   MessageSummary: messageSummary,
   MessageDetail: object({ ...summaryProperties, replyTo: array(str), recipients: object({ to: array(str), cc: array(str), bcc: array(str) }),
     bodyText: str, bodyHtml: str, attachments: array(ref('Attachment')), hasRaw: bool }, ['recipientOutcomes', 'recipientsTo', 'replyTo', 'verificationLink']),
@@ -139,12 +145,17 @@ export const schemas: Record<string, Schema> = {
       description: 'Present only when available=false. taken: already claimed; reserved: system-reserved prefix; quota: caller reached the per-user claim limit; domain_limit: caller reached this domain’s per-user limit; domain_unavailable: domain not configured or not allowed by the caller’s public/dedicated policy. claude_suspended: strategy=claude and any historical suspension on this domain, including for administrators and hosted domains. Same rules and order as claiming.' } }, ['reason']),
   SessionUser: user,
   LoginResponse: object({ token: { ...str, description: 'Bearer JWT session token; store securely and never include it in published logs.' }, user: ref('SessionUser') }),
+  ChangePasswordResponse: object({ token: { ...str, description: 'Replacement JWT session token; previous sessions of this user are invalid.' }, user: ref('SessionUser'),
+    revokedApiKeys: { ...int, description: 'API keys revoked by this change; 0 when revokeApiKeys was false or none were active.' } }),
   AdminUser: object({ ...adminUserProperties, status: { type: 'string', enum: ['active', 'disabled'] },
     mailboxCount: int, mailboxes: array(str), mailboxPolicy: nullable(fromZod(userMailboxPolicySchema)), mailboxPolicyRevision: int,
     apiKeyCount: int, lastLoginAt: nullable(date) }),
   ApiKeySummary: apiKey,
   CreatedApiKey: object({ ...(apiKey.properties as Record<string, Schema>), key: { ...str, description: 'Full hpcm_ key, returned only once at creation. Save securely.' } }, ['ownerUsername']),
-  ApiRequestLog: object({ id: positiveId, requestId: str, method: str, path: str, statusCode: int, ip: str, durationMs: int, createdAt: date }),
+  ApiRequestLog: { ...object({ id: positiveId, requestId: str, method: str,
+    path: { ...str, maxLength: 256, description: 'Normalized route: numeric id segments become :id; at most 256 characters.' },
+    statusCode: int, ip: str, durationMs: int, createdAt: date }),
+    description: 'One row per accepted request. Rejected requests (disabled or expired key, IP not allowed, disabled user, rate limited) are recorded at most once per key per minute; revoked keys are treated as unknown and never logged.' },
   AdminAuditLog: object({ id: positiveId, actorName: str, action: str, target: str, detail: str, ip: str, createdAt: date }),
   Invite: object({ id: positiveId, code: str, maxUses: positiveId, usedCount: int, expiresAt: nullable(date), note: str, createdAt: date,
     status: { type: 'string', enum: ['usable', 'exhausted', 'expired', 'revoked'] }, usedBy: array(str) }),
@@ -229,7 +240,7 @@ export const schemas: Record<string, Schema> = {
   }),
   AiModelTestRequest: (() => {
     const schema = fromZod(aiModelTestRequestSchema);
-    schema.description = 'All fields optional; the body may be omitted. Omitted or empty fields and apiKey ****** use the saved ai_model.';
+    schema.description = 'All fields optional; the body may be omitted. Omitted or empty fields and apiKey ****** use the saved ai_model. An omitted, empty or ****** apiKey with a baseUrl whose origin or path differs from the saved one (a trailing slash is ignored) returns 400 validation_failed: the saved key is only sent to its own endpoint, so enter the apiKey to test a new one.';
     return schema;
   })(),
   AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),
@@ -243,7 +254,12 @@ export const schemas: Record<string, Schema> = {
     return schema;
   })(),
   InitMultipartUploadRequest: fromZod(initMultipartUploadSchema), CompleteMultipartUploadRequest: fromZod(completeMultipartUploadSchema),
-  LoginRequest: fromZod(loginRequestSchema), RegisterRequest: fromZod(registerRequestSchema), ChangePasswordRequest: fromZod(changePasswordRequestSchema),
+  LoginRequest: fromZod(loginRequestSchema), RegisterRequest: fromZod(registerRequestSchema), ChangePasswordRequest: (() => {
+    const schema = fromZod(changePasswordRequestSchema);
+    (schema.properties as Record<string, Schema>).revokeApiKeys = { ...(schema.properties as Record<string, Schema>).revokeApiKeys,
+      description: 'Default true: revoke every unrevoked API key of this user in the same change. Keep the default when the account may be compromised.' };
+    return schema;
+  })(),
   UploadAvatarRequest: fromZod(uploadAvatarRequestSchema), EnableTwoFactorRequest: fromZod(enableTwoFactorRequestSchema), DisableTwoFactorRequest: fromZod(disableTwoFactorRequestSchema),
   CreateUserRequest: fromZod(createUserRequestSchema), UpdateUserRequest: {
     ...fromZod(updateUserRequestSchema), dependentRequired: { mailboxPolicy: ['expectedMailboxPolicyRevision'] },
@@ -265,7 +281,7 @@ export const listQuery = [query('direction', { type: 'string', enum: ['inbound',
   query('q', { type: 'string', maxLength: 256 }, 'Literal substring search in subject/from/body; Unicode is supported.'),
   ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'), ...pageQuery];
 export const idempotencyHeader = { name: 'Idempotency-Key', in: 'header', required: false,
-  description: 'Use one stable unique visible-ASCII key per logical send. Retry identical content with the same key after network/server failures. 409 pending/unknown means inspect the outbox and do not send with a fresh key. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key. Completed keys are retained at least two days.',
+  description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed (201 with the original summary) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key. Completed keys are retained at least two days.',
   schema: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$' } };
 export const success = object({ success: { const: true, type: 'boolean' } });
 export const changed = object({ changed: int });
@@ -276,7 +292,7 @@ export function operation(summary: string, data: Schema, options: {
   const responseSchema = options.binary ? { type: 'string', format: 'binary' } : object({ data });
   const errors = Object.fromEntries([400, 401, 403, 404, 409, 413, 429, 500].map(code => [code, {
     description: ({ 400: 'Invalid request', 401: 'Missing/invalid credentials; login may return totp_required', 403: 'Permission denied or totp_setup_required',
-      404: 'Resource not found or not visible', 409: 'Conflict, stale revision or send result not confirmed', 413: 'Payload exceeds limits', 429: 'Rate limit exceeded', 500: 'Server or notification-delivery error' } as Record<number, string>)[code],
+      404: 'Resource not found or not visible', 409: 'Conflict or stale revision; for sends idempotency_mismatch or send_in_progress', 413: 'Payload exceeds limits', 429: 'Rate limit or quota exceeded', 500: 'Server or notification-delivery error' } as Record<number, string>)[code],
     content: { 'application/json': { schema: ref('Error') } },
   }]));
   return { summary, description: options.description || summary, tags: [options.role ? 'Administration' : 'Mail'],
@@ -302,7 +318,7 @@ export function describePaths(paths: Paths, namespace = ''): Paths {
   }])) as Paths;
 }
 export function specInfo(title: string, description: string) {
-  return { title, description, version: '1.4.0', license: { name: 'MIT', identifier: 'MIT' },
+  return { title, description, version: '1.5.0', license: { name: 'MIT', identifier: 'MIT' },
     contact: { name: 'HPC Mail', url: 'https://github.com/riba2534/hpc-mail' } };
 }
 export function specificationOperation(): Operation {

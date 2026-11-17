@@ -6,7 +6,7 @@
 
 ## 操作说明
 
-- [Agent 技能说明](/skill.md)：认证选择、能力地图和按任务使用的参考文档。
+- [Agent 技能说明](/skill.md)：30 秒上手、常用配方（等验证码、发信、回复转发、附件、临时地址、增量同步）、权限模型、能力地图和参考文档入口。
 - [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox scopes 操作邮箱。
 - [会话 OpenAPI](/api/openapi.json)：用户名密码及可选 2FA 登录后，使用 JWT；包含账户、通知和管理员 API。
 

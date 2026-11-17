@@ -13,9 +13,10 @@ import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
 import { settings as settingsTable, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
+import { sameSecretTarget } from '../lib/http.js';
 import type { Env } from '../types.js';
 import { validateFeishuWebhookUrl } from './feishu.js';
-import { validatePushDeerEndpoint } from './pushdeer.js';
+import { DEFAULT_PUSHDEER_ENDPOINT, validatePushDeerEndpoint } from './pushdeer.js';
 import { validateNotifyWebhookUrl } from './webhook-notify.js';
 
 function clone(prefs: UserNotifyPrefs): UserNotifyPrefs {
@@ -193,6 +194,12 @@ export async function updateUserNotifyPrefs(
   }
   if (patch.forward) next.forward = { ...patch.forward, addresses: [...patch.forward.addresses] };
   if (patch.pushdeer) {
+    // 掩码沿用的 PushKey 只能继续发往原来的接入点（空地址即默认接入点）
+    const endpointOf = (endpoint: string) => endpoint.trim() || DEFAULT_PUSHDEER_ENDPOINT;
+    if (patch.pushdeer.pushkey === SECRET_MASK && current.pushdeer.pushkey
+      && !sameSecretTarget(endpointOf(patch.pushdeer.endpoint), endpointOf(current.pushdeer.endpoint))) {
+      throw new AppError('validation_failed', 'PushDeer 接入点已更换，请重新填写 PushKey');
+    }
     next.pushdeer = {
       ...patch.pushdeer,
       pushkey: patch.pushdeer.pushkey === SECRET_MASK ? current.pushdeer.pushkey : patch.pushdeer.pushkey,

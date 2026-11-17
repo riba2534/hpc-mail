@@ -13,7 +13,7 @@ import {
   extractCodeByRegex,
   resolveVerificationCode,
 } from '../src/services/code-extract.js';
-import { htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
+import { convertHtmlToText, HTML_TO_TEXT_MAX_CHARS, htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -26,6 +26,7 @@ import { chunk, D1_ID_BATCH, D1_MAX_BOUND_PARAMS, D1_PAIR_BATCH } from '../src/l
 import { asciiFallbackFilename, buildSecureHeaders } from '../src/lib/attachment-security.js';
 import { generateCode, generateTotpSecret, verifyTotp } from '../src/lib/totp.js';
 import { AppError } from '../src/lib/errors.js';
+import { signAttachment, verifyAttachmentSig } from '../src/lib/crypto.js';
 import {
   DEFAULT_PUSHDEER_ENDPOINT,
   sendPushDeerNotification,
@@ -132,7 +133,39 @@ describe('code-extract 正则', () => {
       'Persona Identities, Inc. 981 Mission Street, San Francisco, CA 94103',
     ].join('\n');
     expect(extractCodeByRegex('Anthropic one-time link', body)).toBe('');
-    expect(resolveVerificationCode('Anthropic one-time link', body, 'VGHH62D')).toBe('');
+    // 收件时存的是空值；读取时按摘要重提同样不认 URL 里的 token
+    expect(resolveVerificationCode('Anthropic one-time link', makePreview(body, ''), '')).toBe('');
+  });
+
+  /**
+   * 主题像登录、开头是「Click the button below」、真码在第 160 字之后：摘要单看像 link-only，
+   * 一度在读取时把收件时按全文存下的码清空，列表、wait、线程和详情都看不到。
+   */
+  it('已存验证码读取时原样返回，不按摘要的 link-only 文案清空', () => {
+    const subject = 'Confirm your sign-in';
+    const body = 'Click the button below to finish signing in to your account. If the button does not work on this device, '
+      + 'you can also complete the sign-in from the app on your phone or computer.\nOr enter this code: 482913';
+    const preview = makePreview(body, '');
+    expect(body.indexOf('482913')).toBeGreaterThan(PREVIEW_LIMIT);
+    expect(extractCodeByRegex(subject, body)).toBe('482913');
+    expect(resolveVerificationCode(subject, preview, '482913', { bodyTruncated: true })).toBe('482913');
+  });
+  /**
+   * 只让点链接的邮件里顺带提到 code（「不要把链接或 code 转给别人」），旁边的请求编号会被当成码；
+   * 读取时不再按摘要清空，收件时就得按全文判定。
+   */
+  it('link-only 邮件里顺带提到的 code 不把旁边的编号当成验证码', () => {
+    const tail = 'This link expires in 15 minutes. Never share this link or code with anyone.\nRequest ID: 48291734';
+    expect(extractCodeByRegex('Your secure link to Example is here', `Click the link below to securely sign in to Example.\nhttps://app.example.com/magic-link?token=AbCdEfGhIjKlMnOpQrStUvWx\n${tail}`)).toBe('');
+    expect(extractCodeByRegex('Account notice', tail)).toBe('48291734');
+  });
+  it.each([
+    ['code 后紧跟冒号', 'Click the button below to finish signing in, or enter this code: 482913'],
+    ['your … code 另起一行', 'Tap the button below to continue.\nYour login code\n482913'],
+    ['码在说法之前', '482913 is your verification code. You can also click the link below.'],
+    ['中文验证码', '点击下方按钮完成登录，或输入验证码 482913'],
+  ])('link-only 文案与明确给码并存时（%s）仍提码', (_name, body) => {
+    expect(extractCodeByRegex('Sign in to Example', body)).toBe('482913');
   });
   it('URL 内的 code 关键词不能激活附近邮编或年份', () => {
     const body = 'Click the link below: https://example.test/verify?code=A1B2C3\nAddress 94103, year 2026.';
@@ -232,9 +265,65 @@ describe('code-extract 正则', () => {
       expect(resolveVerificationCode(subject, preview, '472913', { bodyTruncated: true })).toBe('472913');
     });
 
+    /**
+     * 列表/wait 手里只有 160 字摘要：开头的日期、订单号离主题里的关键词更近，真码在摘要之外，
+     * 一度用摘要里的年份/订单号盖掉收件时按完整正文存下的码。
+     */
+    it.each([
+      ['年份', 'Signed in on November 17, 2026 from a new device.'],
+      ['订单号', 'Order #20261117 is waiting for you to sign in on a new device.'],
+    ])('摘要里的%s不覆盖第 160 字之后的已存验证码', (_name, lead) => {
+      const subject = 'Your verification code';
+      const body = `${lead}\nWe need to confirm it is really you before the checkout can continue, so please enter the code below within ten minutes.\nYour verification code is 482913.`;
+      const preview = makePreview(body, '');
+      expect(body.indexOf('482913')).toBeGreaterThan(PREVIEW_LIMIT);
+      expect(extractCodeByRegex(subject, body)).toBe('482913');
+      // 摘要单独看确实会提出日期或订单里的数字
+      expect(extractCodeByRegex(subject, preview, { bodyTruncated: true })).not.toBe('');
+      expect(resolveVerificationCode(subject, preview, '482913', { bodyTruncated: true })).toBe('482913');
+    });
+
     it('正文超过提码扫描上限时贴着结尾的候选同样不可信', () => {
       expect(extractCodeByRegex('', `你的验证码：${'。'.repeat(CODE_SCAN_BODY_CHARS)}913472`)).toBe('');
     });
+  });
+});
+
+describe('附件签名 URL', () => {
+  const HOUR = 3600;
+  const at = (seconds: number) => vi.spyOn(Date, 'now').mockReturnValue(seconds * 1000);
+
+  it('站内详情的签名按小时对齐：同一小时内 URL 相同，有效期至少 1 小时', async () => {
+    const base = Math.floor(Date.now() / 1000 / HOUR) * HOUR;
+    try {
+      at(base);
+      const first = await signAttachment(SECRET, 42);
+      at(base + HOUR - 1);
+      const last = await signAttachment(SECRET, 42);
+      expect(last).toEqual(first);
+      expect(first.exp).toBe(base + 2 * HOUR);
+      expect(first.exp - (base + HOUR - 1)).toBeGreaterThanOrEqual(HOUR);
+      at(base + HOUR);
+      expect((await signAttachment(SECRET, 42)).exp).toBe(base + 3 * HOUR);
+
+      // 打开详情 6 分钟后（旧版 5 分钟即过期）仍可下载；过了 exp 才失效
+      at(base + HOUR - 1 + 6 * 60);
+      expect(await verifyAttachmentSig(SECRET, 42, first.exp, first.sig)).toBe(true);
+      at(first.exp);
+      expect(await verifyAttachmentSig(SECRET, 42, first.exp, first.sig)).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('显式 TTL（外发 90 天链接）仍从当前时刻起算', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    try {
+      at(now);
+      expect((await signAttachment(SECRET, 42, 90 * 86400)).exp).toBe(now + 90 * 86400);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
 
@@ -267,6 +356,87 @@ describe('htmlToText', () => {
     expect(htmlToText('<head><style>.x{color:red}</style></head><body><p>hi</p></body>')).toBe('hi');
     expect(htmlToText('<p>a &lt;b&gt; &quot;c&quot; &amp; d</p>')).toBe('a <b> "c" & d');
     expect(htmlToText('<p>line1<br>line2</p>')).toBe('line1\nline2');
+  });
+
+  it('剥离整段时大小写不敏感、取第一个闭标签；没有闭标签的开标签按普通标签处理', () => {
+    expect(htmlToText('<STYLE x>a</Style >b')).toBe('b');
+    expect(htmlToText('<style>a<style>b</style>c</style>d')).toBe('c d');
+    expect(htmlToText('x<style>never closed<p>hi</p>')).toBe('x never closed hi');
+    expect(htmlToText('<script>a</script>b<script>c')).toBe('b c');
+    // <header>、<scripts> 不是要整段丢弃的元素
+    expect(htmlToText('<header>Brand</header><p>hi</p></head>')).toBe('Brand hi');
+    expect(htmlToText('<scripts>a</script>b')).toBe('a b');
+    expect(htmlToText('<a <a <br>')).toBe('<a <a');
+  });
+
+  it('只处理开头 512KB，超长输入的结尾不参与转换', () => {
+    const text = htmlToText(`<p>${'a '.repeat(HTML_TO_TEXT_MAX_CHARS)}TAIL</p>`);
+    expect(text.length).toBeLessThanOrEqual(HTML_TO_TEXT_MAX_CHARS);
+    expect(text).not.toContain('TAIL');
+  });
+
+  it('开头的超大内嵌图片不占截断额度：后面的验证码仍能转换出来', () => {
+    const image = 'A'.repeat(600 * 1024);
+    for (const html of [
+      `<p>hi</p><img src="data:image/png;base64,${image}"><p>Your code is 913472</p>`,
+      `<img src='data:image/png;base64,${image}' alt=x><p>Your code is 913472</p>`,
+      `<img src=data:image/png;base64,${image}><p>Your code is 913472</p>`,
+      `<div style="background:url(data:image/png;base64,${image})">Your code is 913472</div>`,
+    ]) {
+      const converted = convertHtmlToText(html);
+      expect(converted.text).toContain('Your code is 913472');
+      expect(converted.text).not.toContain('AAAA');
+      expect(converted.truncated).toBe(false);
+    }
+  });
+
+  it('数百万字符的 data: URI 与属性值不抛错（不在全量输入上用正则量词），重叠的 data: 起点保持线性', () => {
+    // 正则 `[^"]{4096,}` 在约 600 万字符的单个属性值上会回溯栈溢出抛 RangeError，只有 HTML 的来信收件失败
+    const huge = (size: number) => 'A'.repeat(size);
+    const started = Date.now();
+    for (const html of [
+      `<img src="data:image/png;base64,${huge(6e6)}"><p>Your code is 913472</p>`,
+      `<img src=data:image/png;base64,${huge(10 * 1024 * 1024)}><p>Your code is 913472</p>`,
+      `<style>.a{background:url(data:image/png;base64,${huge(10 * 1024 * 1024)})}</style><p>Your code is 913472</p>`,
+      `<div style="${huge(6e6)}">Your code is 913472</div>`,
+    ]) {
+      expect(convertHtmlToText(html)).toEqual({ text: 'Your code is 913472', truncated: false });
+    }
+    // 每 1KB 一个 data: 起点（载荷都不够长、不去掉）与连续的 data:data:…，共 10MB
+    expect(convertHtmlToText(`${`data:${'A'.repeat(1019)} `.repeat(10 * 1024)}<p>x</p>`).truncated).toBe(true);
+    expect(convertHtmlToText('data:'.repeat(2 * 1024 * 1024)).text).toBe('data:');
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  it('正文里的 =" 不当属性值：清理超长属性值只在标签内生效', () => {
+    const prose = `a = "${'word '.repeat(2000)}`;
+    const text = htmlToText(`<p>${prose}</p><p>code 913472 "end</p>`);
+    expect(text).toContain(prose.trim());
+    expect(text).toContain('code 913472 "end');
+    // 引号没闭合、吞进了后面的正文：不当属性值
+    const swallowed = htmlToText(`<a href="https://example.com/x>Click</a><p>${'word '.repeat(2000)}code 913472</p><a href="y">z</a>`);
+    expect(swallowed).toContain('code 913472');
+  });
+
+  it('截断落在标签中间时丢掉残缺的标签；截断与实体留下的孤立代理字符去掉', () => {
+    const cut = convertHtmlToText(`<p>start</p><div ${'a="x" '.repeat(100_000)}>tail</div>`);
+    expect(cut).toEqual({ text: 'start', truncated: true });
+
+    // 截断点正好在表情的代理对中间
+    const emoji = htmlToText(`<p>${'a'.repeat(HTML_TO_TEXT_MAX_CHARS - 4)}${'😀'.repeat(8)}</p>`);
+    expect(emoji).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    expect(htmlToText('<p>a&#xD800;b &#xDE00;c 😀</p>')).toBe('ab c 😀');
+  });
+
+  it('病态 HTML 耗时线性：没有 > 的长串、没闭合的 <style>、大量 <header> 不再平方退化', () => {
+    // 修复前每种在 256KB 上耗时 1～12 秒（收件解析在 SMTP Ack 前同步执行，会耗尽 CPU）
+    const size = 256 * 1024;
+    const started = Date.now();
+    for (const unit of ['<a ', '<b ', '<style>', '<style ', '<header>x', '</style  ', '="a', "='", 'data:', '= ']) {
+      htmlToText(unit.repeat(Math.ceil(size / unit.length)));
+      htmlToText(`${unit.repeat(Math.ceil(size / unit.length))}<br>`);
+    }
+    expect(Date.now() - started).toBeLessThan(1500);
   });
 });
 

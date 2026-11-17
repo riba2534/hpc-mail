@@ -64,8 +64,10 @@ export type RegisterRequest = z.infer<typeof registerRequestSchema>;
 export const changePasswordRequestSchema = z.object({
   oldPassword: z.string().min(1).max(PASSWORD_MAX_LENGTH),
   newPassword: passwordSchema,
+  /** 改密时一并吊销本人全部 API Key（默认吊销：账号可能已泄露，旧 Key 不应继续有效） */
+  revokeApiKeys: z.boolean().default(true),
 });
-export type ChangePasswordRequest = z.infer<typeof changePasswordRequestSchema>;
+export type ChangePasswordRequest = z.input<typeof changePasswordRequestSchema>;
 
 export interface SessionUser {
   id: number;
@@ -94,6 +96,11 @@ export type UploadAvatarRequest = z.infer<typeof uploadAvatarRequestSchema>;
 export interface LoginResponse {
   token: string;
   user: SessionUser;
+}
+
+/** 改密响应：新会话外加本次吊销的 API Key 数（revokeApiKeys=false 时为 0） */
+export interface ChangePasswordResponse extends LoginResponse {
+  revokedApiKeys: number;
 }
 
 // ---- 管理端用户管理 ----

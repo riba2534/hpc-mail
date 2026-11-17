@@ -6,7 +6,7 @@
 
 本文件的 shell 示例复用 [入口指南](../skill.md) 中的 `BASE`、`UA`、`hpc()`；设定 `API` 和 `AUTH` 为所需鉴权。JSON 成功响应为 `{ "data": ... }`。分页为 `{ "data": { "items": [...], "nextCursor": "..." | null } }`；邮箱、Key、用户、邀请码等列表直接是 `data` 数组。默认页大小 30、最大 100；不要自己解析/生成不透明 `cursor`，始终把服务器返回值 URL 编码后带到下一页并保留原过滤条件。邮件列表按 ID 倒序。
 
-失败响应为 `{ "error": { "code": "...", "message": "..." }, "requestId": "..." }`。`X-Request-ID` 可用于追踪。下载附件、原始 `.eml` 与头像返回二进制，不包 `{data}`；OpenAPI JSON 也不包信封。
+失败响应为 `{ "error": { "code": "...", "message": "..." }, "requestId": "..." }`。每个响应都带 `X-Request-ID` 头，与错误体的 `requestId` 相同，报告问题时附上。请求可自带 `X-Request-ID` 便于关联日志，但只接受 1–64 位字母、数字和 `. _ : -`（`^[A-Za-z0-9._:-]{1,64}$`），不符合时服务端改用自己生成的 UUID，以响应头为准。下载附件、原始 `.eml` 与头像返回二进制，不包 `{data}`；OpenAPI JSON 也不包信封。
 
 写 JSON 带 `Content-Type: application/json`。查询参数用 HTTP 库或 `curl --get --data-urlencode` 编码；正文用 JSON 序列化器，勿拼接用户文本。所有示例使用稳定 `User-Agent: HPC-Mail-Agent/1.0`。若返回 HTML/Cloudflare Challenge，先核对状态与 Content-Type 并报告边缘拦截；它不是业务 JSON，也不能据此反复重试凭证。
 
@@ -41,7 +41,7 @@ hpc '/auth/me'
 | `POST /auth/register` | `{username,password,inviteCode?}`；按注册模式接受，成功 201 同登录结构，不自动认领邮箱 |
 | `GET /auth/me` | 当前 `SessionUser` |
 | `POST /auth/logout` | 撤销当前会话；`{success:true}` |
-| `PUT /auth/password` | `{oldPassword,newPassword}`；返回新 `{token,user}`，立即替换旧 JWT，其他旧会话失效 |
+| `PUT /auth/password` | `{oldPassword,newPassword,revokeApiKeys?}`；返回 `{token,user,revokedApiKeys}`，新 token 立即替换旧 JWT，其他旧会话失效。`revokeApiKeys` 默认 true：同时吊销本人全部未吊销的 API Key，`revokedApiKeys` 为吊销数量；传 false 保留 Key（数量为 0）。账户可能已泄露时保持默认 |
 | `POST /auth/avatar` | `{contentType,image}`；`image` 为无 `data:` 前缀的 base64，PNG/JPEG/WebP，解码最多 2 MiB；返回更新后的用户 |
 | `DELETE /auth/avatar` | 返回用户，`avatarUrl:null` |
 | `GET /avatar/:userId` | 公开二进制头像；优先用用户返回的带版本 URL |
@@ -53,7 +53,7 @@ hpc '/auth/me'
 
 ## Key-only 与长期自动化
 
-已有 `hpcm_` Key 可直接访问 `/v1`，无需 bootstrap 登录。Key 的所属用户当前角色、状态、邮箱归属/共享仍决定访问权；scopes 不是管理员权限。系统关闭开放 API、Key 被禁用/吊销/过期、来源 IP 不匹配均会拒绝；Key 不能创建 Key、改密码、配置个人通知或管理用户/域名/共享。
+已有 `hpcm_` Key 可直接访问 `/v1`，无需 bootstrap 登录。Key 的所属用户当前角色、状态、邮箱归属/共享仍决定访问权；scopes 不是管理员权限。系统关闭开放 API、Key 被禁用/吊销/过期、来源 IP 不匹配均会拒绝；已吊销的 Key 与不存在的 Key 一样返回 401 `unauthorized`。用户改密码（默认）或管理员重置该用户密码时，其全部 Key 被吊销，需要重新创建。Key 不能创建 Key、改密码、配置个人通知或管理用户/域名/共享。
 
 | Scope | 能力 |
 |---|---|
@@ -63,7 +63,7 @@ hpc '/auth/me'
 | `mailbox.read` | 自有/共享邮箱列表、地址可用性 |
 | `mailbox.write` | 认领、邮箱显示名、释放及可选清除历史 |
 
-`GET /v1/status` 返回 `{status:"operational",userId,role,scopes}`；`GET /v1/domains` 返回 `{domains:[...]}`；均只需任一有效 Key，无独立 scope。普通用户看到公开域，管理员看到配置中的全部域；存量旧邮箱域需另从邮箱列表发现。
+`GET /v1/status` 返回 `{status:"operational",userId,role,scopes}`；`GET /v1/domains` 返回 `{domains:[...]}`，是当前可认领的域名；均只需任一有效 Key，无独立 scope。域名范围：普通用户默认是公开的系统域名，管理员为其设置了专属邮箱权限时改为专属名单中的系统域名（可含非公开域名）；管理员看到配置中的全部系统域名。系统域名之后附上已生效的托管域名：普通用户为自己拥有或作为成员的，管理员为全部。已从列表移除、但仍有存量邮箱的旧域名不在其中，需从邮箱列表发现。
 
 要创建 Key，先用 JWT 登录且完成必要 2FA，再经 `/api/api-keys` 操作。只按任务授予最小 scopes，用户仅要查验证码时通常选 `mail.read`；若还要认领可加 `mailbox.read/mailbox.write`，无需自动加 `mail.send`。新建和长期保留 Key 应符合用户对自动化的授权。
 
@@ -85,7 +85,7 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 | `DELETE /api-keys/:id` | 吊销，不能通过重新启用恢复；`{success:true}` |
 | `GET /api-keys/:id/logs?cursor=…&limit=30` | 自己 Key 的调用审计分页 |
 
-`name` 1–64 字符；`scopes` 非空且只接受上表五个；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；保留约 90 天。
+`name` 1–64 字符；`scopes` 非空且只接受上表五个；每用户最多 10 个未吊销 Key（禁用也占名额）。`rateLimit` 每分钟 1–600，创建默认 120。`allowedIps` 最多 32 个 IPv4/IPv6 或 CIDR；`[]` 不限制 IP。创建 `expiresAt` 为未来 ISO 8601 时间，不传即不过期；更新明确 `null` 改为不过期，未传保持。Key 调用审计含 `id,requestId,method,path,statusCode,ip,durationMs,createdAt`，无请求正文和凭证明文；`path` 是归一化后的路由（数字 ID 段写成 `:id`，最长 256 字符）。被拒绝的请求（Key 禁用或过期、IP 不在白名单、用户停用、超出限流）同一 Key 每分钟最多记一条，其余只计数；已吊销的 Key 不再记录。保留约 90 天。
 
 ## 错误与限流
 
@@ -97,10 +97,13 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 | 403 `forbidden`、`user_disabled`、`registration_closed` | 权限/策略/状态阻止；不换身份绕过 |
 | 403 `totp_setup_required` | 见 API 绑定流程 |
 | 404 `not_found` | 资源不存在或不在可见范围；核对 ID/作用域 |
+| 404 `source_unavailable` | 回复或转发引用的原邮件不存在、不可见，或原附件已丢失；去掉 `replyToMessageId`/`forwardAttachmentsFrom` 后可作为新邮件发送 |
 | 409 `address_taken` | 地址被占用；可用性检查只是提示，最终以认领结果为准 |
-| 409 `conflict` | 域名并发冲突重新读配置；发件冲突先读回原结果，绝不自动换发送 Key |
+| 409 `conflict` | 并发冲突或版本过期：重新读取当前状态再决定 |
+| 409 `send_in_progress` | 同一 Idempotency-Key 的发送仍在处理或结果待确认：查已发送邮件核对，稍后用同一 Key 重试，绝不换 Key 重发 |
+| 409 `idempotency_mismatch` | 该 Idempotency-Key 已用于不同的发信内容：先核对原发送，新内容换新 Key |
 | 413 `payload_too_large` | 核对正文/附件限制，或小上传改分片 |
-| 429 `rate_limited` | 按 reset/消息退避并受总截止时间限制；外发日配额、上传草稿限额也会用此码 |
+| 429 `rate_limited` | 按 reset/消息退避并受总截止时间限制。`/v1` 的 message 区分范围：「API 调用频率超限」是这把 Key 超限，「API 调用频率超限（账户级）」是同一用户所有 Key 合计超限，「API 总调用频率超限」是全站繁忙；换 Key 不能绕过账户级限制。外发日配额、上传草稿限额、托管域名添加与立即检测的频率限制也会用此码 |
 | 500 `internal`、网络超时、非 JSON | 读操作可有限退避重试；发送按相同幂等请求查结果，其他变更先读回状态 |
 
-`/v1` 响应可能带 `X-RateLimit-Limit/Remaining/Reset`，Reset 为下一分钟 Unix 秒数。除每 Key 限额，还有用户合计 1200 次/分钟、实例 10000 次/分钟；长轮询内部查库按用户额外限 120 次/分钟，不能靠多个 Key 放大。JWT 业务请求也限流（用户 600、实例 5000 次/分钟）。注册每 IP 10 次/小时，含失败尝试。所有轮询/重试设总体期限，无法确定结果就报告待确认及 requestId。
+`/v1` 响应可能带 `X-RateLimit-Limit/Remaining/Reset`，Reset 为下一分钟 Unix 秒数。除每 Key 限额，还有用户合计 1200 次/分钟、实例 10000 次/分钟，已超出 Key 或用户限额的请求不计入实例限额；长轮询内部查库按用户额外限 120 次/分钟，不能靠多个 Key 放大。JWT 业务请求也限流（用户 600、实例 5000 次/分钟，超出用户限额的请求同样不计入实例限额）。注册每 IP 10 次/小时，含失败尝试。所有轮询/重试设总体期限，无法确定结果就报告待确认及 requestId。

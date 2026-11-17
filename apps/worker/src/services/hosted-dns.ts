@@ -10,8 +10,7 @@ import {
   CloudflareApiError, cloudflareCredentials, createDnsRecord, deleteDnsRecord, getDnsRecord, listDnsRecords, updateDnsRecord,
   type CfDnsRecord, type CloudflareCredentials,
 } from './cloudflare.js';
-import { loadAccess, requireManage } from './hosted-domain.js';
-import { counterResult, counterStatement, minuteWindow } from './rate-counter.js';
+import { meterHostedCall, requireManage } from './hosted-domain.js';
 
 /**
  * 托管域名的 DNS 解析：直接读写站长 Cloudflare 账户里该域名的 zone，不在 D1 落记录。
@@ -22,13 +21,6 @@ type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 
 /** 每位用户每分钟的解析请求计数（四个接口共用，管理员也计） */
 export const HOSTED_DNS_RATE_SCOPE = 'hosted_dns';
-/**
- * 全站每分钟由解析功能发出的 Cloudflare 调用数。所有托管域名共用站长的 Token（全局 1200 次/5 分钟），
- * 这里只限制本功能占用的份额（150 次/分钟，即 5 分钟 750 次），给定时开通、立即检测和控制台留出余量；
- * 只有能走到 Cloudflare 的请求才计入，按各接口实际的调用次数加权。
- */
-export const HOSTED_DNS_SITE_RATE_SCOPE = 'hosted_dns_site';
-export const MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE = 150;
 /** 每种操作的 Cloudflare 调用次数：列表 1；新增先列表再 POST；修改、删除先 GET 再写入 */
 const CF_CALLS = { list: 1, create: 2, update: 2, delete: 2 } as const;
 type DnsOperation = keyof typeof CF_CALLS;
@@ -43,39 +35,24 @@ interface DnsZone {
   domain: string;
 }
 
-/**
- * 个人计数按请求数，全站计数按 Cloudflare 调用次数，合成一个 batch。全站计数由守卫条件把关，
- * 只计能走到 Cloudflare 的请求：个人未超限，域名存在、zone 已建好、不在删除中，调用者是所有者或管理员，
- * 暂停的域名只有管理员能写；无关用户、成员与其他被拒绝的请求占不了全站额度。
- */
-async function countRequest(env: Env, viewer: Viewer, id: number, op: DnsOperation): Promise<{ user: number; site: number }> {
-  const window = minuteWindow(1);
-  const subject = String(viewer.id);
-  const admin = viewer.role === 'admin' ? 1 : 0;
-  const [user, site] = await env.db.batch([
-    counterStatement(env, HOSTED_DNS_RATE_SCOPE, subject, window),
-    counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, CF_CALLS[op], 0, {
-      sql: `(SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?) <= ?
-        AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND zone_id IS NOT NULL AND status <> 'deleting'
-          AND (user_id = ? OR ? = 1) AND (? = 0 OR ? = 1 OR status <> 'suspended'))`,
-      params: [HOSTED_DNS_RATE_SCOPE, subject, window, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE,
-        id, viewer.id, admin, op === 'list' ? 0 : 1, admin],
-    }),
-  ]);
-  return { user: counterResult(user)?.count ?? 1, site: counterResult(site)?.count ?? 0 };
-}
-
 /** 凭据、限流、权限与域名状态；限流计数和读取域名并行，无权访问的请求同样计入个人限额 */
 async function openZone(env: Env, viewer: Viewer, id: number, op: DnsOperation): Promise<DnsZone> {
   const creds = cloudflareCredentials(env);
   if (!creds) throw new AppError('forbidden', '本站未开启域名托管');
   const write = op !== 'list';
-  const [counter, loaded] = await Promise.allSettled([countRequest(env, viewer, id, op), loadAccess(env, viewer, id)]);
-  if (counter.status === 'rejected') throw counter.reason;
-  if (counter.value.user > MAX_HOSTED_DNS_REQUESTS_PER_MINUTE) throw new AppError('rate_limited', '解析操作过于频繁，请稍后再试');
-  if (counter.value.site > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) throw new AppError('rate_limited', '当前解析操作较多，请稍后再试');
-  if (loaded.status === 'rejected') throw loaded.reason;
-  const { row, access } = loaded.value;
+  const admin = viewer.role === 'admin' ? 1 : 0;
+  // 全站只计能走到 Cloudflare 的请求：域名存在、zone 已建好、不在删除中，调用者是所有者或管理员，
+  // 暂停的域名只有管理员能写；无关用户、成员与其他被拒绝的请求占不了全站额度
+  const { row, access } = await meterHostedCall(env, viewer, id, {
+    scope: HOSTED_DNS_RATE_SCOPE, limit: MAX_HOSTED_DNS_REQUESTS_PER_MINUTE, calls: CF_CALLS[op],
+    eligible: {
+      sql: `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND zone_id IS NOT NULL AND status <> 'deleting'
+        AND (user_id = ? OR ? = 1) AND (? = 0 OR ? = 1 OR status <> 'suspended'))`,
+      params: [id, viewer.id, admin, write ? 1 : 0, admin],
+    },
+    userBusy: '解析操作过于频繁，请稍后再试',
+    siteBusy: '当前解析操作较多，请稍后再试',
+  });
   requireManage(access);
   if (row.status === 'deleting') throw new AppError('conflict', '域名正在删除');
   if (write && row.status === 'suspended' && viewer.role !== 'admin') throw new AppError('forbidden', '域名已被管理员暂停，解析只读');

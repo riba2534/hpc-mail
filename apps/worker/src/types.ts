@@ -44,6 +44,8 @@ export interface AppVariables {
   requestId: string;
   user?: AuthUser;
   sessionId?: string;
+  /** 会话令牌声明的用户鉴权版本（uepoch），requireAuth 校验通过后与 users.auth_version 相等 */
+  authEpoch?: number;
   apiKey?: ApiKeyContext;
   apiClientIp?: string;
   apiStartedAt?: number;

@@ -6,7 +6,7 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, hostedDomainMembers, hostedDomains, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
-import { HOSTED_DNS_SITE_RATE_SCOPE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../src/services/hosted-dns.js';
+import { HOSTED_DNS_SITE_RATE_SCOPE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../src/services/hosted-domain.js';
 import { bumpCounter, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';

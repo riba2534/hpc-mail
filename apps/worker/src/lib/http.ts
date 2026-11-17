@@ -32,6 +32,28 @@ export function clientIp(c: Context<AppContext>): string {
   return (value.split(',')[0] ?? '').trim() || 'unknown';
 }
 
+function secretTarget(url: string): string {
+  try {
+    const parsed = new URL(url.trim());
+    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return url.trim();
+  }
+}
+
+/**
+ * 提交掩码表示沿用已存密钥，而密钥只能继续发往原来的接口：比较协议、主机、端口与路径（忽略末尾斜杠），
+ * 同源换路径也算换了接口（多租户网关常用路径区分账户）。无法解析的地址按原字符串比较。
+ */
+export function sameSecretTarget(a: string, b: string): boolean {
+  return secretTarget(a) === secretTarget(b);
+}
+
+/** 路由标签：数字 id 段归一为 :id，日志与审计里的路径不随 id 变成高基数 */
+export function routeLabel(pathname: string): string {
+  return pathname.replace(/\/\d+(?=\/|$)/g, '/:id');
+}
+
 /** 解析路径参数中的正整数 id，非法抛 not_found */
 export function parseId(value: string | undefined): number {
   const id = Number(value);

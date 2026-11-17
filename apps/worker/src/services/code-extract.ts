@@ -12,6 +12,20 @@ const LINK_ONLY_REGEX =
 const EXPLICIT_CODE_REGEX =
   /(one[-\s]?time\s+(?:password|passcode)|passcode|pass\s?code|security\s?code|otp|access\s?code|login\s?code|authentication\s?code|\bcode\b|\bpin\b|验证码|校验码|动态码|动态密码|确认码|验证代码|口令)/i;
 
+/**
+ * 明确「给出」验证码的说法。link-only 邮件里顺带提到的 code / PIN（「不要把链接或 code 转给别人」）
+ * 不算：EXPLICIT_CODE_REGEX 与提码关键词同一组词，正则提得出候选时它必然命中，拦不住这类误提。
+ * 算数的是：带限定词的码名（verification code、one-time password、验证码）、code/PIN 后紧跟
+ * is 或冒号、enter/use 这类动词带出的 code，以及 your … code。
+ */
+const PRESENTED_CODE_REGEX = new RegExp([
+  '\\b(?:one[-\\s]?time\\s+(?:password|passcode|code)|passcode|pass\\s?code|otp|(?:verification|security|access|login|log[\\s-]?in|sign[\\s-]?in|authentication|confirmation|2fa|mfa)\\s+code)\\b',
+  '\\b(?:code|pin)\\s*(?:is\\b|was\\b|[:：=])',
+  '\\b(?:enter|use|type|input|paste|copy)\\s+(?:(?:this|the|your|following|below)\\s+){0,2}(?:[\\w-]+\\s+)?(?:code|pin)\\b',
+  '\\byour\\s+(?:[\\w-]+\\s+){0,2}(?:code|pin)\\b',
+  '验证码|校验码|动态码|动态密码|确认码|验证代码|口令',
+].join('|'), 'i');
+
 const URL_REGEX = /\b(?:https?:\/\/|www\.)[^\s<>"']+/gi;
 
 const NEIGHBORHOOD = 120;
@@ -174,6 +188,8 @@ function truncatedTail(body: string, options: CodeExtractOptions): boolean {
 
 /**
  * 纯正则提码：关键词 ±120 字符内的候选，多候选取距关键词最近者。
+ * 只让点链接/按钮的邮件（LINK_ONLY_REGEX）须另有明确给码的说法，否则不提：收件时按主题 + 全文
+ * 判定一次，存库与通知都用这个结果，读取时不再按摘要重判。
  * 只看主题 + 正文前 16KB；URL 区间用单调游标、关键词距离用二分，整体线性。
  * 导出为纯函数便于单测。
  */
@@ -203,15 +219,20 @@ export function extractCodeByRegex(
       best = { value: cand.value, distance };
     }
   }
-  return best ? best.value : '';
+  if (!best) return '';
+  if (LINK_ONLY_REGEX.test(corpus) && !PRESENTED_CODE_REGEX.test(withoutUrls(corpus))) return '';
+  return best.value;
 }
 
 /**
- * 读取历史数据时重新校验已存验证码：新规则能提取时以新结果为准；明确的 link-only
- * 邮件则清掉旧版误识别值。其他邮件保留 AI/旧规则结果，避免破坏无法被正则覆盖的真验证码。
+ * 读取时的验证码：已存值原样返回——它是收件时按主题 + 完整正文（或 AI 兜底）得出的，link-only
+ * 判定也在那时按全文做过（见 extractCodeByRegex；AI 兜底前有 wantsAiCode 过滤）。
+ * 读取时手里只有主题和 160 字摘要：摘要里的年份、订单号离关键词更近，「Click the button
+ * below」一类开头也会让摘要像 link-only，按摘要重提或清空都会弄丢第 160 字之后的真码。
+ * 只有已存值为空的历史行才用摘要重提。
  *
- * body 是摘要这类截断文本时要带上 `bodyTruncated`，否则被切短的码会盖掉收件时
- * 按完整正文存下的正确值（6 位码在摘要边界上只剩 5 位）。
+ * body 是摘要这类截断文本时要带上 `bodyTruncated`，否则被切短的码会被当成完整码
+ * （6 位码在摘要边界上只剩 5 位）。
  */
 export function resolveVerificationCode(
   subject: string,
@@ -219,12 +240,8 @@ export function resolveVerificationCode(
   storedCode: string,
   options: CodeExtractOptions = {},
 ): string {
-  const corpus = corpusOf(subject, body);
-  if (LINK_ONLY_REGEX.test(corpus) && !EXPLICIT_CODE_REGEX.test(withoutUrls(corpus))) return '';
-  const extracted = extractCodeByRegex(subject, body, options);
-  if (extracted) return extracted;
-  if (!storedCode) return '';
-  return storedCode;
+  if (storedCode) return storedCode;
+  return extractCodeByRegex(subject, body, options);
 }
 
 interface AiCodeInput {

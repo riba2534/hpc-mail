@@ -9,7 +9,7 @@ import {
   type Page,
   type UpdateApiKeyRequest,
 } from '@hpc-mail/shared';
-import { and, desc, eq, lt } from 'drizzle-orm';
+import { and, desc, eq, lt, ne, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { apiKeys, apiRequestLogs, users } from '../db/schema.js';
 import { bytesToHex, sha256Hex } from '../lib/crypto.js';
@@ -57,21 +57,27 @@ function normalizeExpiry(value: string | undefined): Date | null {
   return date;
 }
 
+/**
+ * 创建 Key。authEpoch 传入会话令牌的用户鉴权版本（uepoch）时，插入条件同时要求用户的
+ * auth_version 仍等于它：改密会递增版本并吊销全部 Key，与之并发的旧令牌请求不能在吊销后再插入新 Key。
+ */
 export async function createApiKey(
   env: Env,
   userId: number,
   req: CreateApiKeyRequest,
+  authEpoch?: number,
 ): Promise<CreatedApiKey> {
   const db = createDb(env);
   const { key, keyPrefix, keySuffix } = generateKey();
   const keyHash = await hashApiKey(key);
   const expiresAt = normalizeExpiry(req.expiresAt);
+  const epochGuard = authEpoch === undefined ? '' : 'AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_version = ?)';
   const inserted = await env.db
     .prepare(
       `INSERT INTO api_keys
         (name, key_prefix, key_suffix, key_hash, user_id, scopes, allowed_ips, rate_limit, status, expires_at)
        SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?
-       WHERE (SELECT COUNT(*) FROM api_keys WHERE user_id = ? AND status <> 'revoked') < ?
+       WHERE (SELECT COUNT(*) FROM api_keys WHERE user_id = ? AND status <> 'revoked') < ? ${epochGuard}
        RETURNING id`,
     )
     .bind(
@@ -86,9 +92,15 @@ export async function createApiKey(
       expiresAt?.getTime() ?? null,
       userId,
       MAX_API_KEYS_PER_USER,
+      ...(authEpoch === undefined ? [] : [userId, authEpoch]),
     )
     .first<{ id: number }>();
   if (!inserted) {
+    // 未插入只在失败路径多读一次，区分「会话已失效」与「数量已满」
+    if (authEpoch !== undefined) {
+      const user = await db.select({ authVersion: users.authVersion }).from(users).where(eq(users.id, userId)).get();
+      if (user?.authVersion !== authEpoch) throw new AppError('unauthorized', '会话已失效');
+    }
     throw new AppError('forbidden', `每个用户最多保留 ${MAX_API_KEYS_PER_USER} 个 API Key`);
   }
   const row = await db.select().from(apiKeys).where(eq(apiKeys.id, inserted.id)).get();
@@ -148,14 +160,30 @@ export async function updateApiKey(
   if (req.expiresAt !== undefined) {
     patch.expiresAt = req.expiresAt === null ? null : normalizeExpiry(req.expiresAt);
   }
-  const [row] = await db.update(apiKeys).set(patch).where(eq(apiKeys.id, id)).returning();
-  return serialize(row!);
+  // 吊销不可逆：条件里复核状态，与并发吊销竞争时不能把已吊销的 Key 改回 active
+  const [row] = await db.update(apiKeys).set(patch).where(and(eq(apiKeys.id, id), ne(apiKeys.status, 'revoked'))).returning();
+  if (!row) throw new AppError('not_found', 'API Key 不存在');
+  return serialize(row);
 }
 
 export async function revokeApiKey(env: Env, id: number, userId?: number): Promise<void> {
   const db = createDb(env);
   await requireKey(db, id, userId);
   await db.update(apiKeys).set({ status: 'revoked' }).where(eq(apiKeys.id, id));
+}
+
+/**
+ * 吊销用户全部未吊销的 Key，供改密/重置密码与密码更新放进同一个 batch：
+ * 守卫要求用户密码已是本次写入的新哈希（带随机盐，唯一），密码更新未生效时不吊销。
+ * 返回被吊销 Key 的 id 列表。
+ */
+export function revokeAllApiKeysQuery(db: Db, userId: number, newPasswordHash: string) {
+  return db
+    .update(apiKeys)
+    .set({ status: 'revoked' })
+    .where(and(eq(apiKeys.userId, userId), ne(apiKeys.status, 'revoked'),
+      sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${userId} AND ${users.passwordHash} = ${newPasswordHash})`))
+    .returning({ id: apiKeys.id });
 }
 
 export async function listApiKeyLogs(

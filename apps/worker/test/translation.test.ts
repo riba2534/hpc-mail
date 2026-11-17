@@ -489,6 +489,37 @@ describe('AI 模型与翻译设置', () => {
     expect(audits.find((row) => row.detail.includes('deepseek-flash→deepseek-pro'))?.detail).not.toContain('apiKey');
   });
 
+  it('接口地址的源或路径变了，掩码不能沿用已存 Key：保存与测试都 400，已存 Key 不会发往新地址', async () => {
+    const admin = await account('tr-origin', 'admin');
+    await configure();
+    const fetchMock = echoProvider();
+    const put = (body: unknown) => request('/api/admin/settings', json(admin.jwt, body, 'PUT'));
+    const test = (body: unknown) => request('/api/admin/settings/ai-model-test', json(admin.jwt, body));
+
+    // 同源换路径同样要求重填：多租户网关常用路径区分账户
+    for (const baseUrl of ['https://evil.example', 'https://api.deepseek.com.evil.example/v1', 'https://api.deepseek.com:8443',
+      'https://api.deepseek.com/accounts/attacker', 'https://api.deepseek.com/beta']) {
+      expect(await failure(await put({ ai_model: { ...aiModel, baseUrl, apiKey: SECRET_MASK } }), 400)).toMatchObject({ code: 'validation_failed' });
+      expect(await failure(await test({ baseUrl, apiKey: SECRET_MASK }), 400)).toMatchObject({ code: 'validation_failed' });
+      // 不带 apiKey 同样沿用已存 Key，按掩码处理
+      await failure(await test({ baseUrl }), 400);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect((await getSettings(env)).ai_model).toEqual(aiModel);
+
+    // 只差末尾斜杠、主机大小写的视为同一接口，仍可沿用；换地址时重新填写 Key 正常保存
+    await data(await test({ baseUrl: 'https://API.deepseek.com/', apiKey: SECRET_MASK }));
+    expect(String(fetchMock.mock.calls[0]![0]).toLowerCase()).toContain('https://api.deepseek.com/');
+    expect(new Headers(fetchMock.mock.calls[0]![1]!.headers).get('Authorization')).toBe(`Bearer ${API_KEY}`);
+    await data(await put({ ai_model: { ...aiModel, baseUrl: 'https://api.deepseek.com/', apiKey: SECRET_MASK } }));
+    expect((await getSettings(env)).ai_model).toMatchObject({ baseUrl: 'https://api.deepseek.com/', apiKey: API_KEY });
+    await data(await put({ ai_model: { ...aiModel, baseUrl: 'https://api.deepseek.com/beta', apiKey: 'sk-beta' } }));
+    await data(await put({ ai_model: { ...aiModel, baseUrl: 'https://api.deepseek.com/beta/', apiKey: SECRET_MASK } }));
+    expect((await getSettings(env)).ai_model).toMatchObject({ baseUrl: 'https://api.deepseek.com/beta/', apiKey: 'sk-beta' });
+    await data(await put({ ai_model: { ...aiModel, baseUrl: 'https://other.example', apiKey: 'sk-new-provider' } }));
+    expect((await getSettings(env)).ai_model).toMatchObject({ baseUrl: 'https://other.example', apiKey: 'sk-new-provider' });
+  });
+
   it('旧版 KV 设置缓存（缺少 ai_model/translation）不再被读取，以 D1 为准', async () => {
     const { translation: _translation, ai_model: _aiModel, ...legacy } = DEFAULT_SETTINGS;
     invalidateSettingsMemory();

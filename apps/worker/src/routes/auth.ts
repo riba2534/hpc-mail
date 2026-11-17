@@ -11,6 +11,7 @@ import { Hono } from 'hono';
 import { requireAuth } from '../middleware/auth.js';
 import { clientIp, execCtx, ok, parseBody } from '../lib/http.js';
 import { AppError } from '../lib/errors.js';
+import { logAdminAction } from '../services/audit.js';
 import { changePassword, login, logout, register } from '../services/auth.js';
 import { avatarUrl, deleteAvatar, uploadAvatar } from '../services/avatar.js';
 import { disableTwoFactor, enableTwoFactor, setupTwoFactor } from '../services/twofa.js';
@@ -60,8 +61,12 @@ app.delete('/avatar', requireAuth, async (c) => {
 });
 
 app.put('/password', requireAuth, async (c) => {
+  const user = c.get('user')!;
   const req = await parseBody(c, changePasswordRequestSchema);
-  const result = await changePassword(c.env, c.get('user')!, req, execCtx(c));
+  const result = await changePassword(c.env, user, req, execCtx(c));
+  if (result.revokedApiKeys) {
+    await logAdminAction(c.env, user, 'apikey.revoke_all', user.username, `修改密码时吊销 ${result.revokedApiKeys} 个 API Key`, clientIp(c));
+  }
   return ok(c, result);
 });
 

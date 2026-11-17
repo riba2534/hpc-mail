@@ -33,12 +33,13 @@ import {
 import { EmptyState } from '@/components/ui/empty-state';
 import { IconButton } from '@/components/ui/icon-button';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import { buildForward, buildReply, buildReplyAll, buildResend } from '@/features/compose/compose-init';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import { Badge } from '@/components/ui/badge';
 import type { MailListLinkState } from '@/features/inbox/mail-list';
-import { mailHref, parseMailView } from '@/features/inbox/mail-view';
+import { mailHref, mailViewParams, parseMailView } from '@/features/inbox/mail-view';
 import { type MessageListData, syncReadState } from '@/features/inbox/message-cache';
 import { messageDetailQueryOptions } from '@/features/inbox/message-queries';
 import { useDeleteMessages } from '@/features/inbox/use-delete-messages';
@@ -47,10 +48,10 @@ import { useStarMutation } from '@/features/inbox/use-star';
 import { cn } from '@/lib/cn';
 import { attachmentIcon } from './attachment-icon';
 import { countRemoteImages } from './count-remote-images';
+import { downloadWithAuth, openOrDownloadWithAuth } from './download';
 import { EmailHtml } from '@/lib/email-html';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
-import { getAuthToken } from '@/lib/auth-token';
 import { extractOtp } from '@/lib/otp';
 import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
@@ -130,7 +131,15 @@ export function MessagePage() {
   const mutationScope = scope === 'unclaimed' ? ('unclaimed' as const) : undefined;
   const [imagesAllowedFor, setImagesAllowedFor] = useState<number | null>(null);
   const [htmlRoot, setHtmlRoot] = useState<HTMLElement | null>(null);
+  const [downloadingId, setDownloadingId] = useState<number | null>(null);
   const markedRef = useRef<number | null>(null);
+  // 离开页面时中止进行中的下载：不再在别的页面弹出下载或打开标签页
+  const unmountRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    unmountRef.current = controller;
+    return () => controller.abort();
+  }, []);
 
   const { data: ownedMailboxes } = useMailboxesQuery(false);
   const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
@@ -220,26 +229,35 @@ export function MessagePage() {
     goBack();
   };
 
-  // 下载原始 .eml：带鉴权头 fetch → blob → 触发下载
+  // .eml 与附件都带 JWT 和详情的可见性范围下载，管理员审计视图才能取到
+  const viewQuery = mailViewParams(view ?? {}).toString();
+  const withView = (path: string) => (viewQuery ? `${path}?${viewQuery}` : path);
+
   const downloadEml = async () => {
+    const signal = unmountRef.current?.signal;
     try {
-      const qs = searchParams.toString();
-      const res = await fetch(`/api/messages/${messageId}/raw${qs ? `?${qs}` : ''}`, {
-        headers: { Authorization: `Bearer ${getAuthToken() ?? ''}` },
-      });
-      if (!res.ok) {
-        toast({ title: '下载失败', variant: 'error' });
-        return;
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `message-${messageId}.eml`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-    } catch {
-      toast({ title: '下载失败', variant: 'error' });
+      await downloadWithAuth(withView(`/api/messages/${messageId}/raw`), `message-${messageId}.eml`, signal);
+    } catch (error) {
+      if (!signal?.aborted) toast({ title: '下载失败', description: (error as Error).message, variant: 'error' });
+    }
+  };
+
+  // 附件不用签名 URL（只留给正文内嵌图）：白名单图片在新标签页打开，其余按原文件名下载
+  const openAttachment = async (attachment: MessageDetail['attachments'][number]) => {
+    if (downloadingId !== null) return;
+    setDownloadingId(attachment.id);
+    const signal = unmountRef.current?.signal;
+    try {
+      await openOrDownloadWithAuth(
+        withView(`/api/attachments/${attachment.id}`),
+        attachment.filename || `attachment-${attachment.id}`,
+        attachment.mimeType,
+        signal,
+      );
+    } catch (error) {
+      if (!signal?.aborted) toast({ title: '附件下载失败', description: (error as Error).message, variant: 'error' });
+    } finally {
+      setDownloadingId(null);
     }
   };
 
@@ -544,17 +562,21 @@ export function MessagePage() {
                   const Icon = attachmentIcon(attachment.mimeType, attachment.filename);
                   return (
                     <li key={attachment.id}>
-                      <a
-                        href={attachment.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="flex items-center gap-3 rounded-md border border-line px-3 py-2 text-sm transition-colors hover:bg-surface-hover"
+                      <button
+                        type="button"
+                        title={attachment.filename}
+                        aria-busy={downloadingId === attachment.id}
+                        disabled={downloadingId !== null}
+                        onClick={() => void openAttachment(attachment)}
+                        className="flex w-full items-center gap-3 rounded-md border border-line px-3 py-2 text-left text-sm transition-colors hover:bg-surface-hover disabled:cursor-wait"
                       >
                         <Icon className="size-5 shrink-0 text-ink-tertiary" aria-hidden />
                         <span className="min-w-0 flex-1 truncate text-ink">{attachment.filename}</span>
                         <span className="shrink-0 text-xs text-ink-tertiary">{formatBytes(attachment.size)}</span>
-                        <Download className="size-4 shrink-0 text-ink-tertiary" />
-                      </a>
+                        {downloadingId === attachment.id
+                          ? <Spinner className="size-4 shrink-0 text-ink-tertiary" />
+                          : <Download className="size-4 shrink-0 text-ink-tertiary" />}
+                      </button>
                     </li>
                   );
                 })}

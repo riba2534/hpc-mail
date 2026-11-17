@@ -5,6 +5,15 @@ import { createApp } from '../src/app.js';
 import { buildSessionOpenApiSpec } from '../src/routes/api-openapi.js';
 import { buildOpenApiSpec } from '../src/routes/v1/openapi.js';
 import type { Schema } from '../src/routes/openapi-common.js';
+import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../src/services/hosted-domain.js';
+import skillDoc from '../../web/public/skill.md?raw';
+import llmsDoc from '../../web/public/llms.txt?raw';
+import administrationDoc from '../../web/public/references/administration.md?raw';
+import attachmentsDoc from '../../web/public/references/attachments.md?raw';
+import authDoc from '../../web/public/references/auth-and-http.md?raw';
+import mailDoc from '../../web/public/references/mail.md?raw';
+import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
+import notificationsDoc from '../../web/public/references/notifications.md?raw';
 
 const app = createApp();
 const origin = 'https://mail.example';
@@ -222,5 +231,176 @@ describe('OpenAPI routes and public contracts', () => {
     const serialized = JSON.stringify(specs);
     expect(serialized).not.toContain(env.jwt_secret);
     expect(serialized).not.toContain('PDU_SYNTHETIC_TEST');
+  });
+});
+
+describe('Phase-0 hardening is reflected in both OpenAPI documents', () => {
+  const dataOf = (operation: Schema, status = '200') => {
+    const responses = operation.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>;
+    return responses[status]!.content['application/json']!.schema.properties.data;
+  };
+
+  it('publishes the split idempotency error codes and the X-Request-ID format', () => {
+    for (const spec of Object.values(specs)) {
+      const error = spec.components.schemas.Error!.properties as Record<string, Schema>;
+      const code = (error.error!.properties as Record<string, Schema>).code!;
+      expect(code.enum).toEqual(expect.arrayContaining(['idempotency_mismatch', 'send_in_progress']));
+      expect(code.description).toContain('send_in_progress');
+      expect(error.requestId!.description).toContain('^[A-Za-z0-9._:-]{1,64}$');
+      expect(spec.info.description).toContain('X-Request-ID');
+    }
+    const header = (specs.v1.paths['/messages']!.post!.parameters as Array<{ name: string; description: string }>)
+      .find(param => param.name === 'Idempotency-Key')!;
+    expect(header.description).toContain('idempotency_mismatch');
+    expect(header.description).toContain('send_in_progress');
+  });
+
+  it('requires mail.read for reply/forward sources and corrects the sender identity rules', () => {
+    const send = specs.v1.paths['/messages']!.post!;
+    expect(send['x-required-scopes']).toEqual(['mail.send']);
+    expect(send['x-conditional-scopes']).toEqual([{ scope: 'mail.read', when: expect.stringContaining('forwardAttachmentsFrom') }]);
+    const description = specs.v1.components.schemas.SendMailRequest!.description as string;
+    expect(description).toContain('404 source_unavailable');
+    expect(description).toContain('A missing sender mailboxId stays 404 not_found');
+    for (const spec of Object.values(specs)) {
+      const error = spec.components.schemas.Error!.properties as Record<string, Schema>;
+      const code = (error.error!.properties as Record<string, Schema>).code!;
+      expect(code.enum).toContain('source_unavailable');
+      expect(code.description).toContain('source_unavailable (404)');
+    }
+    expect(specs.v1.paths['/messages/{id}']!.get!.description).toContain('expire after 5 minutes');
+    expect(specs.api.paths['/messages/{id}']!.get!.description).toContain('valid for 1–2 hours');
+    expect(specs.v1.info.description).toContain('（账户级）');
+    expect(description).toContain('Administrators may use any claimed mailbox');
+    expect(description).toContain('hosted domain');
+    expect(description).not.toContain('A mailboxId must belong to the caller');
+  });
+
+  it('documents the unread-count scope as mine only', () => {
+    const params = specs.v1.paths['/messages/unread-count']!.get!.parameters as Array<{ name: string; required: boolean; schema: Schema }>;
+    expect(params).toEqual([expect.objectContaining({ name: 'scope', required: false, schema: { type: 'string', enum: ['mine'] } })]);
+  });
+
+  it('documents API key revocation on password change and administrator reset', () => {
+    const request = specs.api.components.schemas.ChangePasswordRequest!;
+    expect((request.properties as Record<string, Schema>).revokeApiKeys).toMatchObject({ type: 'boolean', default: true });
+    expect(request.required).not.toContain('revokeApiKeys');
+    expect(dataOf(specs.api.paths['/auth/password']!.put!)).toEqual({ $ref: '#/components/schemas/ChangePasswordResponse' });
+    expect(specs.api.components.schemas.ChangePasswordResponse!.required).toEqual(['token', 'user', 'revokedApiKeys']);
+    expect(specs.api.paths['/admin/users/{id}']!.put!.description).toContain('revokes every API key');
+  });
+
+  it('documents hosted-domain creation/check limits and scoped JWT attachment downloads', () => {
+    const create = specs.api.paths['/hosted-domains']!.post!.description as string;
+    const check = specs.api.paths['/hosted-domains/{id}/check']!.post!.description as string;
+    expect(create).toContain(`More than ${MAX_HOSTED_CREATES_PER_MINUTE} attempts per user per minute`);
+    expect(check).toContain(`More than ${MAX_HOSTED_CHECKS_PER_MINUTE} requests per user per minute`);
+    for (const text of [create, check, specs.api.paths['/hosted-domains/{id}/dns-records']!.get!.description as string]) {
+      expect(text).toContain('429 rate_limited');
+      expect(text).toContain(`${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE}`);
+    }
+    for (const description of [specs.api.paths['/admin/settings/ai-model-test']!.post!.description,
+      ((specs.api.components.schemas.UpdateSettingsRequest!.properties as Record<string, Schema>).ai_model!.properties as Record<string, Schema>).apiKey!.description]) {
+      expect(description).toContain('400 validation_failed');
+    }
+    const params = (specs.api.paths['/attachments/{id}']!.get!.parameters as Array<{ name: string }>).map(param => param.name);
+    expect(params).toEqual(['exp', 'sig', 'scope', 'userId']);
+  });
+});
+
+/**
+ * Agent 文档里写到的端点必须真实存在：skill.md 的 hpc 调用按 /v1 核对，
+ * 「`METHOD /path`」与带 /v1、/api 前缀的路径按对应规格核对，相对链接与锚点必须能解析。
+ */
+describe('Agent docs reference only real endpoints and anchors', () => {
+  const docs: Record<string, string> = {
+    'skill.md': skillDoc, 'llms.txt': llmsDoc,
+    'references/administration.md': administrationDoc, 'references/attachments.md': attachmentsDoc,
+    'references/auth-and-http.md': authDoc, 'references/mail.md': mailDoc,
+    'references/mailboxes-and-domains.md': mailboxesDoc, 'references/notifications.md': notificationsDoc,
+  };
+  /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */
+  const documentedAsMissing = ['POST /messages/{id}'];
+  type Namespace = keyof typeof specs;
+  const isParam = (segment: string) => /^[:$<{]/.test(segment);
+
+  function resolve(method: string | null, rawPath: string, namespaces: Namespace[]): string[] {
+    let path = rawPath.replace(/\\\|/g, '|').split('?')[0]!.replace(/\/$/, '');
+    let candidates = namespaces;
+    for (const namespace of ['v1', 'api'] as const) {
+      if (path.startsWith(`/${namespace}/`)) { path = path.slice(namespace.length + 1); candidates = [namespace]; }
+    }
+    // 末段写成 a|b|c 时逐个展开
+    const segments = path.split('/');
+    const last = segments.pop()!;
+    return last.split('|').flatMap((variant) => {
+      const wanted = [...segments, variant];
+      const found = candidates.some(namespace => Object.entries(specs[namespace].paths).some(([specPath, item]) => {
+        const actual = specPath.split('/');
+        return actual.length === wanted.length
+          && actual.every((segment, index) => segment.startsWith('{') ? isParam(wanted[index]!) : segment === wanted[index])
+          && (method === null || method.toLowerCase() in item);
+      }));
+      return found ? [] : [`${method ?? 'ANY'} ${wanted.join('/')} (${candidates.join('|')})`];
+    });
+  }
+
+  const slug = (heading: string) => heading.trim().toLowerCase().replace(/[^\p{L}\p{N}\s_-]/gu, '').replace(/\s/g, '-');
+
+  it('every documented endpoint exists in the OpenAPI document of its API', () => {
+    const missing: string[] = [];
+    for (const [name, content] of Object.entries(docs)) {
+      const namespaces: Namespace[] = name === 'skill.md' ? ['v1', 'api'] : ['api', 'v1'];
+      for (const match of content.matchAll(/`(GET|POST|PUT|DELETE|PATCH) (\/[^`\s]*)`/g)) {
+        if (/[…*]/.test(match[2]!)) continue;
+        const label = `${match[1]} ${match[2]!.split('?')[0]!.replace(/:[A-Za-z]+/g, '{}')}`;
+        if (documentedAsMissing.some(entry => entry.replace(/\{[^}]+\}/g, '{}') === label)) continue;
+        missing.push(...resolve(match[1]!, match[2]!, namespaces).map(item => `${name}: ${item}`));
+      }
+      for (const match of content.matchAll(/`(\/(?:v1|api)\/[^`\s]*)`/g)) {
+        if (/[…*<]/.test(match[1]!)) continue;
+        missing.push(...resolve(null, match[1]!, namespaces).map(item => `${name}: ${item}`));
+      }
+      // shell 示例里的 hpc 调用：入口指南全部走 /v1；参考文件里 API 可能是 /v1 或 /api
+      for (const match of content.matchAll(/\bhpc\s+(['"])(\/[^'"]*)\1((?:[^\n]*\\\n)*[^\n]*)/g)) {
+        const method = /-X\s+(POST|PUT|DELETE|PATCH)\b/.exec(match[3]!)?.[1] ?? 'GET';
+        missing.push(...resolve(method, match[2]!, name === 'skill.md' ? ['v1'] : ['api', 'v1']).map(item => `${name}: hpc ${item}`));
+      }
+    }
+    expect(missing).toEqual([]);
+    for (const entry of documentedAsMissing) {
+      const [method, path] = entry.split(' ') as [string, string];
+      for (const spec of Object.values(specs)) expect(spec.paths[path]?.[method.toLowerCase()]).toBeUndefined();
+    }
+  });
+
+  it('skill.md keeps the phase-0 entry structure within the size budget', () => {
+    const frontmatter = /^---\nname: hpc-mail\ndescription: (.+)\n---\n/.exec(skillDoc);
+    expect(frontmatter).not.toBeNull();
+    expect([...frontmatter![1]!].length).toBeLessThanOrEqual(1024);
+    expect(frontmatter![1]).not.toMatch(/管理员|admin/i);
+    expect(skillDoc.split('\n').length).toBeLessThanOrEqual(170);
+    for (const recipe of ['①', '②', '③', '④', '⑤', '⑥']) expect(skillDoc).toMatch(new RegExp(`^### ${recipe} `, 'm'));
+    for (const field of ['scannedThroughId', 'recipientOutcomes', 'Idempotency-Key', 'send_in_progress', 'idempotency_mismatch', 'afterId', 'nextCursor']) {
+      expect(skillDoc).toContain(field);
+    }
+  });
+
+  it('relative links resolve to shipped documents and existing headings', () => {
+    const headings = Object.fromEntries(Object.entries(docs).map(([name, content]) =>
+      [name, new Set([...content.matchAll(/^#{1,6} (.+)$/gm)].map(match => slug(match[1]!)))]));
+    const broken: string[] = [];
+    for (const [name, content] of Object.entries(docs)) {
+      for (const match of content.matchAll(/\]\(([^)\s]+)\)/g)) {
+        const target = match[1]!;
+        if (/^[a-z]+:/i.test(target) || target.startsWith('/')) continue;
+        const [file, anchor] = target.split('#') as [string, string | undefined];
+        const base = name.includes('/') ? name.slice(0, name.lastIndexOf('/') + 1) : '';
+        const resolved = file === '' ? name : (base + file).replace(/[^/]+\/\.\.\//g, '');
+        if (!(resolved in docs)) { broken.push(`${name}: ${target}`); continue; }
+        if (anchor && !headings[resolved]!.has(decodeURIComponent(anchor))) broken.push(`${name}: ${target}`);
+      }
+    }
+    expect(broken).toEqual([]);
   });
 });

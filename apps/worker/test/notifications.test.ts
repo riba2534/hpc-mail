@@ -5,7 +5,9 @@ import { SECRET_MASK } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { mailboxes, messages, notificationJobs, users } from '../src/db/schema.js';
+import { signToken } from '../src/lib/jwt.js';
 import { hashPassword } from '../src/lib/password.js';
+import { createSession } from '../src/services/session.js';
 import { notificationRequest, NotificationDeliveryError } from '../src/services/notification-http.js';
 import { getUserNotifyPrefs, maskUserNotifyPrefs, updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { sendPushDeerNotification } from '../src/services/pushdeer.js';
@@ -25,6 +27,11 @@ const mail = (id: number, ownerIds: number[]) => ({ ownerIds, message: {
 async function seed(username: string): Promise<number> {
   const [user] = await createDb(env).insert(users).values({ username, passwordHash: 'x', role: 'user', status: 'active' }).returning({ id: users.id });
   return user!.id;
+}
+async function seedMessage(address: string): Promise<number> {
+  const [row] = await createDb(env).insert(messages).values({ direction: 'inbound', address, domain: 'hpc.email',
+    fromAddress: info.fromAddress, subject: info.subject, preview: 'test body', status: 'received' }).returning({ id: messages.id });
+  return row!.id;
 }
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -94,10 +101,38 @@ describe('保存与密钥语义', () => {
     await updateUserNotifyPrefs(env, id, { pushdeer: pd });
     const masked = maskUserNotifyPrefs(await getUserNotifyPrefs(env, id));
     expect(masked.pushdeer.pushkey).toBe(SECRET_MASK);
-    await updateUserNotifyPrefs(env, id, { pushdeer: { ...pd, endpoint: 'https://push.example.com', pushkey: SECRET_MASK } });
+    // 接入点不变（空地址与默认接入点、末尾斜杠视为同一个）时掩码沿用
+    await updateUserNotifyPrefs(env, id, { pushdeer: { ...pd, endpoint: 'https://api2.pushdeer.com/', pushkey: SECRET_MASK } });
     expect((await getUserNotifyPrefs(env, id)).pushdeer.pushkey).toBe(pd.pushkey);
     await updateUserNotifyPrefs(env, id, { pushdeer: { enabled: false, endpoint: '', pushkey: '' } });
     expect((await getUserNotifyPrefs(env, id)).pushdeer.pushkey).toBe('');
+  });
+
+  it('PushDeer 换了接入点（源或路径）时掩码不能沿用已存 PushKey，需重新填写', async () => {
+    const id = await seed('notify-pushdeer-target');
+    await updateUserNotifyPrefs(env, id, { pushdeer: { ...pd, endpoint: 'https://push.example.com/tenant-a' } });
+    for (const endpoint of ['https://evil.example', '', 'https://push.example.com', 'https://push.example.com/tenant-b']) {
+      await expect(updateUserNotifyPrefs(env, id, { pushdeer: { ...pd, endpoint, pushkey: SECRET_MASK } }))
+        .rejects.toMatchObject({ code: 'validation_failed' });
+      // 关闭状态同样不能借掩码改地址
+      await expect(updateUserNotifyPrefs(env, id, { pushdeer: { enabled: false, endpoint, pushkey: SECRET_MASK } }))
+        .rejects.toMatchObject({ code: 'validation_failed' });
+    }
+    expect((await getUserNotifyPrefs(env, id)).pushdeer).toEqual({ ...pd, endpoint: 'https://push.example.com/tenant-a' });
+
+    const token = await signToken(env.jwt_secret, { sub: id, sid: await createSession(env, id), epoch: 0, uepoch: 0 });
+    const ctx = createExecutionContext();
+    const response = await createApp().request('/api/me/notify-prefs', { method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pushdeer: { ...pd, endpoint: 'https://evil.example', pushkey: SECRET_MASK } }) }, env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('validation_failed');
+
+    // 重新填写 PushKey 后可以换接入点；同一接入点只差末尾斜杠仍可沿用
+    await updateUserNotifyPrefs(env, id, { pushdeer: { ...pd, endpoint: 'https://push.example.com/tenant-b', pushkey: 'PDU_NEW' } });
+    await updateUserNotifyPrefs(env, id, { pushdeer: { ...pd, endpoint: 'https://push.example.com/tenant-b/', pushkey: SECRET_MASK } });
+    expect((await getUserNotifyPrefs(env, id)).pushdeer.pushkey).toBe('PDU_NEW');
   });
 });
 
@@ -269,7 +304,9 @@ describe('持久通知队列', () => {
     const id = await seed('notify-manual-retry');
     const other = await seed('notify-other');
     await updateUserNotifyPrefs(env, id, { webhook });
-    const ids = await enqueueMailNotifications(env, null, mail(106, [id]));
+    // 重试会复核源邮件仍在，任务须指向真实存在的邮件
+    const source = await seedMessage('notify-manual-retry@hpc.email');
+    const ids = await enqueueMailNotifications(env, null, mail(source, [id]));
     vi.stubGlobal('fetch', vi.fn(async () => new Response('failed', { status: 503 })));
     await processNotificationJobs(env, { jobIds: ids });
     await expect(retryNotificationJob(env, other, ids[0]!)).rejects.toThrow('不存在');

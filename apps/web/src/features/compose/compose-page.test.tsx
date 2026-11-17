@@ -332,3 +332,104 @@ describe('send errors, shortcuts and field validation', () => {
     client.clear();
   });
 });
+
+describe('idempotency error codes', () => {
+  const initial = { fromAddress: 'first@one.example', to: ['to@example.com'], subject: 'pending?', body: 'body' };
+  const savedKey = () => JSON.parse(localStorage.getItem(sendAttemptKeyForUser(1)) ?? 'null')?.key as string | undefined;
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('send_in_progress keeps the key, never retries on its own and points to Sent', async () => {
+    mocks.send.mockRejectedValue(new ApiError('该发信请求正在处理或结果待确认，请勿重复提交', { code: 'send_in_progress', httpStatus: 409 }));
+    const client = show(initial);
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('发送结果待确认');
+    expect(screen.getByRole('link', { name: '已发送' })).toHaveAttribute('href', '/sent');
+    expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
+    const key = mocks.send.mock.calls[0]![1];
+    expect(savedKey()).toBe(key);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mocks.send).toHaveBeenCalledOnce();
+    // 用户手动再次点击：同一内容沿用原 key，只会查询原结果
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![1]).toBe(key);
+    client.clear();
+  });
+
+  it('idempotency_mismatch drops the key so the next send uses a fresh one', async () => {
+    mocks.send
+      .mockRejectedValueOnce(new ApiError('相同 Idempotency-Key 不能用于不同的发信内容', { code: 'idempotency_mismatch', httpStatus: 409 }))
+      .mockResolvedValueOnce({ id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show(initial);
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('已为这封邮件更换新凭据');
+    expect(screen.getByRole('link', { name: '已发送' })).toHaveAttribute('href', '/sent');
+    expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
+    expect(savedKey()).toBeUndefined();
+    const oldKey = mocks.send.mock.calls[0]![1];
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![0]).toEqual(mocks.send.mock.calls[0]![0]);
+    expect(mocks.send.mock.calls[1]![1]).toBeTruthy();
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
+    await screen.findByText('sent page');
+    client.clear();
+  });
+});
+
+describe('source mail no longer available', () => {
+  const sent = { id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] };
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('a reply whose original is gone can be sent as a new mail after the user confirms, with a new key', async () => {
+    mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
+    const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
+    expect(mocks.send.mock.calls[0]![0]).toMatchObject({ replyToMessageId: 5 });
+    fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // 只去掉关联，不自动重发
+    expect(mocks.send).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    const { replyToMessageId: _dropped, ...rest } = mocks.send.mock.calls[0]![0];
+    expect(mocks.send.mock.calls[1]![0]).toEqual(rest);
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(mocks.send.mock.calls[0]![1]);
+    await screen.findByText('sent page');
+    client.clear();
+  });
+
+  it('a forward whose source attachments are gone can drop them and resend on the next click', async () => {
+    mocks.send.mockRejectedValueOnce(new ApiError('转发的原邮件附件不可用', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
+    const client = show({ fromAddress: 'first@one.example', to: ['friend@example.com'], subject: 'Fwd: hi', body: 'fyi', mode: 'forward', forwardAttachmentsFrom: 8, sourceMessageId: 8 });
+    expect(screen.getByText(/将保留原邮件附件/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('原邮件的附件已不可用，无法一起转发');
+    fireEvent.click(screen.getByRole('button', { name: '去掉原邮件附件' }));
+    expect(screen.queryByText(/将保留原邮件附件/)).toBeNull();
+    expect(mocks.send).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![0]).not.toHaveProperty('forwardAttachmentsFrom');
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(mocks.send.mock.calls[0]![1]);
+    client.clear();
+  });
+
+  it.each(['发件邮箱不存在', '邮件不存在'])('a plain not_found (%s) stays a plain error: only source_unavailable offers to drop the source', async (text) => {
+    mocks.send.mockRejectedValueOnce(new ApiError(text, { code: 'not_found', httpStatus: 404 }));
+    const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(text);
+    expect(screen.queryByRole('button', { name: '作为新邮件发送' })).toBeNull();
+    client.clear();
+  });
+});

@@ -24,6 +24,7 @@ const ACTION_META: Record<string, { label: string; tone: BadgeTone }> = {
   'invite.create': { label: '生成邀请码', tone: 'neutral' },
   'invite.revoke': { label: '作废邀请码', tone: 'neutral' },
   'apikey.revoke': { label: '吊销密钥', tone: 'critical' },
+  'apikey.revoke_all': { label: '改密吊销全部密钥', tone: 'critical' },
   'mailbox.transfer': { label: '过户邮箱', tone: 'caution' },
   'mailbox.share': { label: '共享邮箱', tone: 'neutral' },
   'mailbox.unshare': { label: '取消共享', tone: 'neutral' },

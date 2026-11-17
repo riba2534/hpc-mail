@@ -12,7 +12,7 @@
 | `PUT /admin/users/:id` | 至少一个 `status:active\|disabled`、`role:user\|admin`、`password`（重置密码）、`mailboxPolicy`（邮箱权限）；修改邮箱权限需带 `expectedMailboxPolicyRevision`；返回更新后的用户 |
 | `DELETE /admin/users/:id` | `{success:true}`，不可恢复；账户与其邮箱/共享/Key/星标关联撤销，邮件历史仍按地址保留 |
 
-用户含 `id,username,role,status,mailboxCount,mailboxes,mailboxPolicy,mailboxPolicyRevision,apiKeyCount,createdAt,lastLoginAt,avatarUrl`。建户/重置密码约束见鉴权参考。不能禁用或删除自己；不能移除最后一个启用中的管理员。禁用/重置密码撤销旧会话，禁用期间 Key 也被拒绝；重置密码本身不吊销 Key。角色变化保留已有共享，存量邮箱仍存在，新认领/发件按当前角色校验。
+用户含 `id,username,role,status,mailboxCount,mailboxes,mailboxPolicy,mailboxPolicyRevision,apiKeyCount,createdAt,lastLoginAt,avatarUrl`。建户/重置密码约束见鉴权参考。不能禁用或删除自己；不能移除最后一个启用中的管理员。禁用/重置密码撤销旧会话，禁用期间 Key 也被拒绝；重置密码还会吊销该用户全部 API Key 并记管理审计，用户需重新创建 Key。角色变化保留已有共享，存量邮箱仍存在，新认领/发件按当前角色校验。
 
 ## 用户专属邮箱权限
 
@@ -95,7 +95,7 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | `claim_random` | `{paidSuspendedLimit,pendingDays,suspendedPercent,dailyLimit}`；Claude 0 封号随机后缀规则。任意历史封号记录都排除，不受账号数或付费状态影响；paidSuspendedLimit（0–1000，默认 2）和 suspendedPercent（0–100，默认 50）已弃用，仅兼容解析与存储，设为 0 也不能放行封号域名；pendingDays（0–90，默认 7，0 不计）天内认领、还没收到 Claude 来信的邮箱计入后缀负载；近 24 小时新增达到 dailyLimit（0–1000，默认 3，0 不限）的后缀当天不再分配。更新时提交完整对象，缺省字段按默认值处理 |
 | `quota` | `{dailyOutbound,dailyRecipients}`；普通用户每日外发邮件数 0–100000、唯一收件地址数 0–1000000，跨 Key/JWT 共用；0 不限，admin 豁免 |
 | `retention` | `{unclaimedDays,allMessagesDays}`；0–3650 天，0 关闭该项定时清理 |
-| `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除 |
+| `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除；沿用已存 Key 时 baseUrl 的 origin 与路径必须与已保存的一致（协议、主机、端口或路径变化都算换了接口，末尾斜杠视为相同），否则仍提交 `******` 返回 400 `validation_failed`，需要重新填写 apiKey，防止已存的 Key 被发往新地址；清空 baseUrl 可沿用已存 Key |
 | `translation` | `{enabled,dailyCharsPerUser}`；AI 翻译开关与额度。enabled=true 要求 `ai_model` 已配置，同一请求同时提交两者时按合并后的结果校验（翻译开着时不能单独清空模型）；dailyCharsPerUser 0–10000000，每用户每 UTC 日发送给模型的字符数，0 不限，admin 不豁免 |
 | `hosted_domains` | `{enabled,maxPerUser,maxPendingPerUser,maxPendingTotal,pendingDays,autoClaimLimit}`；用户托管域名开关与额度（Worker 还需配置 Cloudflare 凭据，`/api/config` 的 `hostedDomainsEnabled` 反映两者）。maxPerUser 0–1000（0 不限）为普通用户最多拥有的域名数；maxPendingPerUser 1–100 与 maxPendingTotal 1–1000 限制同时等待 NS 生效的数量，保护站长 Cloudflare 账户的添加额度；pendingDays 1–28 天未改 NS 自动删除；autoClaimLimit 0–100000（默认 0 不限）为每个托管域名自动认领的地址上限，设为正数时域内地址达到后未认领新地址的来信拒收，手动认领始终不受限。管理员不受个人上限，受全站等待数限制。全站托管域名、暂停/恢复与凭据健康检查见 `/api/admin/hosted-domains…`，详情、成员、过户、删除复用 `/api/hosted-domains/:id…`（管理员有全部权限），见[邮箱参考](mailboxes-and-domains.md#用户托管域名) |
 
@@ -105,7 +105,7 @@ retention.unclaimedDays 对当时未认领地址的旧 inbound 生效；allMessa
 
 AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Workers AI。配置 `ai_model`（例如 DeepSeek：`baseUrl=https://api.deepseek.com`、`model=deepseek-flash`）后，邮件内容会在两种情况下发送到该第三方服务：① 翻译启用后，用户在网页邮件详情点「翻译」时，主题与正文中的文字片段；只有能在该邮件中找到的片段才会发送，验证码、纯数字、URL、邮箱等无字母片段不发送，译文缓存在本站并随邮件永久删除一并删除；② `code_extract.aiEnabled` 开启时，正则没提到码、且主题或正文（不含 URL）出现验证码相关词（验证码、code、OTP、passcode、PIN、verification、one-time 等）的入站邮件，其主题和正文前 6000 字符，每域每日最多 500 封，10 秒超时；只让点链接的邮件不发送，模型返回的码必须在原文中出现才采用。是否把邮件内容交给第三方处理属于隐私决定，按用户授权和所在组织的数据政策决定是否配置，不要替用户开启。`GET /api/config` 的 `translationEnabled` 只公开是否可用，不公开服务地址或 Key。翻译另有每用户每分钟 30 次模型调用上限；超额返回 429，翻译服务失败返回 500 并退还字符额度。翻译接口 `POST /api/messages/:id/translate` 仅 JWT，见邮件参考。
 
-`POST /admin/settings/ai-model-test` 用固定英文示例按翻译格式真实调用一次 AI 模型，返回 `{ok:true,latencyMs,sample}`；body 可省略，`{baseUrl,apiKey,model}` 中未提交或为空的字段、以及 apiKey 为 `******` 时用已保存的 `ai_model`，不要求任何功能已启用，便于保存前验证。三项解析后仍缺失返回 400；服务失败返回 500，message 说明 HTTP 状态码、超时或返回格式无效，不回显 Key。测试会产生一次真实外部调用，不计用户额度。
+`POST /admin/settings/ai-model-test` 用固定英文示例按翻译格式真实调用一次 AI 模型，返回 `{ok:true,latencyMs,sample}`；body 可省略，`{baseUrl,apiKey,model}` 中未提交或为空的字段、以及 apiKey 为 `******` 时用已保存的 `ai_model`，不要求任何功能已启用，便于保存前验证。沿用已存 apiKey（未填、空串或 `******`）时 baseUrl 的 origin 与路径必须与已保存的一致（末尾斜杠视为相同），否则返回 400 `validation_failed`，要测试新地址需同时填写 apiKey。三项解析后仍缺失返回 400；服务失败返回 500，message 说明 HTTP 状态码、超时或返回格式无效，不回显 Key。测试会产生一次真实外部调用，不计用户额度。
 
 通知/转发已为个人偏好，不在上述系统设置中；通过 `/api/me/notify-prefs` 修改当前管理员的个人通道，不能 PUT 旧全局 `feishu/notify_webhook/gmail_forward` 字段。
 

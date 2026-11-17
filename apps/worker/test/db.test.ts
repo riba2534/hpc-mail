@@ -283,7 +283,7 @@ describe('message 可见性 user vs admin', () => {
 });
 
 describe('验证码响应时重校验', () => {
-  it('历史 link-only 误识别值不会继续出现在列表和详情', async () => {
+  it('link-only 邮件的 URL token 不会出现在列表和详情（收件不存，读取按摘要重提也不认）', async () => {
     const adminId = await seedUser('otp-link-admin', 'admin');
     const body = [
       'Continue verifying your identity',
@@ -293,7 +293,7 @@ describe('验证码响应时重校验', () => {
     ].join('\n');
     const id = await seedInbound('otp-link-only@hpc.email', 'Anthropic one-time link', body);
     const db = createDb(env);
-    await db.update(messages).set({ verificationCode: 'VGHH62D' }).where(eq(messages.id, id));
+    await db.update(messages).set({ preview: body.replace(/\s+/g, ' ').slice(0, 160) }).where(eq(messages.id, id));
 
     const page = await listMessages(
       env,
@@ -633,6 +633,8 @@ describe('共享邮箱', () => {
     const box = await claimMailbox(env, adminId, 'admin', { localPart, domain: 'inbox.test' });
     const inboundId = await seedInbound(address, 'shared code', 'code 654321');
     const db = createDb(env);
+    // seedInbound 不跑提码：补上收件时会存下的验证码，详情与列表都按已存值返回
+    await db.update(messages).set({ verificationCode: '654321' }).where(eq(messages.id, inboundId));
     const [outbound] = await db
       .insert(messages)
       .values({

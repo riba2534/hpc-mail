@@ -1,17 +1,7 @@
-const SAFE_INLINE_IMAGE_TYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-  'image/avif',
-]);
+import { SAFE_INLINE_IMAGE_TYPES as SHARED_SAFE_INLINE_IMAGE_TYPES, normalizeMimeType } from '@hpc-mail/shared';
+const SAFE_INLINE_IMAGE_TYPES = new Set(SHARED_SAFE_INLINE_IMAGE_TYPES);
 
-export function normalizeMimeType(value: string | undefined | null): string {
-  return String(value || '')
-    .split(';')[0]
-    ?.trim()
-    .toLowerCase() ?? '';
-}
+export { normalizeMimeType };
 
 export function sanitizeFilename(value: string | undefined | null = 'download'): string {
   const filename = String(value || 'download')
