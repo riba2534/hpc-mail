@@ -179,6 +179,19 @@ describe('草稿的增删改查与权限', () => {
     const rehtml = await data<Draft>(await call(`/v1/drafts/${htmlOnly.id}`, req(me.key, 'PATCH', { html: '<p>x</p>' })));
     expect([rehtml.text, rehtml.html]).toEqual(['plain', '<p>x</p>']);
   });
+
+  it("CR1'：只改一段正文时，与沿用的另一段合计超过 1 MiB 返回 400，什么也不写（普通草稿与创建同一口径）", async () => {
+    const me = await account('draft-body-cap');
+    const created = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { text: 'a'.repeat(1_000_000) })), 201);
+    const before = await row(created.id);
+    const tooBig = await failure(await call(`/v1/drafts/${created.id}`, req(me.key, 'PATCH', { html: `<p>${'b'.repeat(100_000)}</p>` })), 400);
+    expect(tooBig).toMatchObject({ code: 'validation_failed', message: '正文 UTF-8 字节合计超过上限' });
+    expect(await row(created.id)).toMatchObject({ status: 'draft', version: 1, bodyR2Key: before!.bodyR2Key });
+    expect((await data<Draft>(await call(`/v1/drafts/${created.id}`, req(me.key, 'GET')))).html).toBe('');
+    // 两段一起换、合计在上限内照常保存
+    const replaced = await data<Draft>(await call(`/v1/drafts/${created.id}`, req(me.key, 'PATCH', { text: '', html: `<p>${'b'.repeat(100_000)}</p>` })));
+    expect([replaced.text.length, replaced.html.length]).toEqual([0, 100_007]);
+  });
 });
 
 describe('草稿附件', () => {

@@ -1,5 +1,6 @@
 import {
   MAX_ATTACHMENT_TOTAL_BYTES,
+  MAX_BODY_BYTES,
   MAX_DRAFTS_PER_USER,
   SENT_DRAFT_RETENTION_DAYS,
   draftSendInput,
@@ -30,7 +31,7 @@ import { decodeCursor, toPage } from '../lib/pagination.js';
 import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { normalizeIdempotencyKey, type IdempotencyActor } from './idempotency.js';
-import { readMailBody, storeMailBody } from './mail-body.js';
+import { bodyBytes, readMailBody, storeMailBody } from './mail-body.js';
 import { loadMessageSummary } from './message.js';
 import { attachmentDisposition, decodeInlineAttachments, type BytesAttachment, type Sender } from './outbound.js';
 import { deliverSend, inItemOrder, planOf, settledResult, type SendEnvironment } from './send-flow.js';
@@ -316,6 +317,13 @@ async function prepare(
   const content = mergeContent(base.content, input);
   const text = input.text ?? base.text;
   const html = input.html ?? base.html;
+  // 请求体里各段已按上限校验；只改一段时与沿用的另一段合起来也不能超（与创建、发信同一口径），在任何副作用之前拒绝
+  if ((input.text !== undefined || input.html !== undefined) && bodyBytes(text, html) > MAX_BODY_BYTES) {
+    throw new AppError('validation_failed', '正文 UTF-8 字节合计超过上限', {
+      fix: `text 与 html 合计最多 ${MAX_BODY_BYTES / 1024 / 1024} MiB（UTF-8 字节）；只改一段时另一段沿用原文，一起计入，可以同时给出两段`,
+      docs: '/references/drafts.md#保存草稿',
+    });
+  }
   const replacesAttachments = input.attachments !== undefined || input.attachmentTokens !== undefined;
   const kept = replacesAttachments ? input.attachmentTokens ?? [] : content.attachmentTokens;
   if (sendable) assertSendable({ ...content, attachmentTokens: kept }, text, html, replacesAttachments ? input.attachments : []);
