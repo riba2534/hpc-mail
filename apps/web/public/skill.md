@@ -152,12 +152,14 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 |---|---|---|---|
 | Key 自查（scopes、速率、今日外发用量）、可认领域名 | `GET /me`、`GET /status`、`GET /domains` | 任一有效 Key | [auth](references/auth-and-http.md#key-only-与长期自动化) |
 | 可用的发件身份 | `GET /identities` | `mail.send` 或 `mailbox.read` | [mailboxes](references/mailboxes-and-domains.md#发件身份) |
-| 列表、搜索、增量同步 | `GET /messages` | `mail.read` | [mail](references/mail.md) |
+| 列表、搜索、增量同步，按时间/发件人/收件人/验证码/附件筛选 | `GET /messages` | `mail.read` | [mail](references/mail.md#读取与搜索) |
 | 等新邮件、验证码、验证链接 | `GET /messages/wait` | `mail.read` | [mail](references/mail.md#等待本次验证码) |
 | 详情、线程、原始 .eml、未读数、联系人 | `GET /messages/:id`、`GET /messages/:id/thread`、`GET /messages/:id/raw`、`GET /messages/unread-count`、`GET /messages/contacts` | `mail.read` | [mail](references/mail.md) |
 | 已读、全部已读、星标、删除、恢复、永久删除 | `POST /messages/read\|read-all\|star\|delete\|restore\|purge` | `mail.write` | [mail](references/mail.md#维护状态与回收站) |
-| 发信、补发（可带回复/转发字段） | `POST /messages` | `mail.send`（带回复、转发字段另需 `mail.read`） | [mail](references/mail.md#发送) |
+| 发信、补发（可带回复/转发字段；附件可写 `{url}` 由服务端拉取） | `POST /messages` | `mail.send`（带回复、转发字段另需 `mail.read`） | [mail](references/mail.md#发送)、[URL 附件](references/attachments.md#url-附件) |
 | 回复、转发（服务器填收件人、主题与引用） | `POST /messages/:id/reply`、`POST /messages/:id/forward` | `mail.send` + `mail.read` | [mail](references/mail.md#回复和转发) |
+| 一次发最多 20 封独立的信 | `POST /messages/batch` | `mail.send` | [mail](references/mail.md#批量发送) |
+| 草稿（等用户在网页确认后再发）、定时发送、取消定时 | `GET\|POST /drafts`、`GET\|PATCH\|DELETE /drafts/:id`、`POST /drafts/:id/send` | 读 `mail.read` 或 `mail.send`；写与发送 `mail.send` | [drafts](references/drafts.md) |
 | 下载附件 | `GET /messages/:id/attachments/:attId` | `mail.read` | [attachments](references/attachments.md) |
 | 上传附件、分片、取消 | `POST /uploads`、`POST /uploads/multipart`、`DELETE /uploads/:token` | `mail.send` | [attachments](references/attachments.md) |
 | 我的邮箱、共享给我的、可用性、随机后缀 | `GET /mailboxes`、`GET /mailboxes/shared`、`GET /mailboxes/availability`、`POST /mailboxes/availability/batch`、`GET /mailboxes/random-plan` | `mailbox.read` | [mailboxes](references/mailboxes-and-domains.md) |
@@ -179,4 +181,4 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 5. 每次逻辑发信用一个 Idempotency-Key，与请求体一起保存；重试时复用同一凭证、路径、Key 和内容，不自动换 Key 重发。完成的记录约两天后清理，幂等不是永久保障。
 6. 发信返回 201 后仍检查 `status`、`errorDetail`、`recipientOutcomes`。部分失败只补发 `failed` 且不带 `code` 的地址（`bounced` 与带 `code:"recipient_suppressed"` 的在对方地址恢复前补发会被抑制名单拦下）：保留 To/Cc/Bcc 分组，附件用 `forwardAttachmentsFrom=<原发件 id>`，换新 Key；`unknown` 的收件人可能已经收到，先确认再决定是否补发；没有逐个结果时先核对，不全体重发。
 7. 删除、永久删除、清除历史释放、全部已读和对外发信都要有用户授权，不附带在查信任务里。变更后读回状态，以服务器返回的计数报告结果。
-8. 遇到 429 按 `X-RateLimit-Reset` 或错误信息退避，外发日配额看 `/me` 的 `outbound`；所有轮询和重试都设总期限。网页的草稿、默认发件身份只存在浏览器本地，Agent 自己保存发送上下文。
+8. 遇到 429 按 `X-RateLimit-Reset` 或错误信息退避，外发日配额看 `/me` 的 `outbound`；所有轮询和重试都设总期限。需要用户确认的信建成草稿等用户在网页发送，不要替用户点发送；默认发件身份只存在浏览器本地，Agent 自己保存发送上下文。

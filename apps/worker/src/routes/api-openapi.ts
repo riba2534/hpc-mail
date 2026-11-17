@@ -1,6 +1,6 @@
 import { HOSTED_DOMAIN_STATUSES, MAX_ADMIN_MAILBOX_BATCH } from '@hpc-mail/shared';
 import {
-  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, conditionalDetail, describePaths, domainName, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
+  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, conditionalDetail, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
   mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref,
   scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedExamples, usedSchemas, type Paths,
 } from './openapi-common.js';
@@ -116,6 +116,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       security: [{ sessionToken: [] }, { attachmentSignature: [], attachmentExpiry: [] }],
       description: 'JWT mode enforces the same visibility as message detail, including scope/userId: administrators reviewing another user pass scope=user&userId=, or scope=unclaimed for unclaimed addresses. Ordinary users get 403 for unclaimed/user and an invalid scope returns 400. Signed mode requires both exp and sig, ignores scope, and may serve retained external links after sent-mail deletion. Session-API message detail URLs are aligned to the hour and valid for 1–2 hours, so repeated reads within an hour return the same URL; /v1 detail URLs expire after 5 minutes. Returns binary bytes with safe MIME/download headers.' }) },
     ...uploadPaths(),
+    ...draftPaths(),
     '/me/notify-prefs': {
       get: operation('getNotifyPrefs', 'Read masked personal notification and forwarding preferences', ref('NotifyPrefs')),
       put: operation('updateNotifyPrefs', 'Update personal notification and forwarding preferences', ref('NotifyPrefs'), { errors: ['PushKeyReentryRequired', 'ReauthRequired', 'ReauthFailed', 'ForwardConfirmLimit'], request: 'UpdateNotifyPrefsRequest',

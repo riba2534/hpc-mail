@@ -8,6 +8,8 @@ import { encodeCursor } from '../src/lib/pagination.js';
 import { syncDueHostedDomains } from '../src/services/hosted-domain.js';
 import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
 import { purgeStatements } from '../src/services/message-lifecycle.js';
+import { DUE_DRAFTS_CLAIM_SQL, STALE_DRAFTS_SQL } from '../src/services/drafts.js';
+import { CLEANUP_JOBS_SQL } from '../src/services/storage-cleanup.js';
 import { anyOnboardingSql, hostedTakenSql, onboardingActiveSql } from '../src/services/domain-occupancy.js';
 import { syncDueOnboarding } from '../src/services/system-domain.js';
 import { occupancyFacts } from '../src/services/zone-catalog.js';
@@ -712,6 +714,79 @@ describe('列表改走地址索引、domain 下推与分流：结果与改前逐
       expect(await getRecentContacts(env, viewer), who).toEqual([...expected].slice(0, 100));
     }
   }, 20_000); // 逐视图逐页回放，CI 慢机上整文件曾到 5 秒以上
+});
+
+describe('执行计划回归：列表筛选（since/until/from/to/hasCode/hasAttachments）', () => {
+  const since = new Date(Date.now() + 12 * 3_600_000).toISOString();
+  const filters: [string, Partial<ListMessagesQuery>][] = [
+    ['since', { since: Date.parse(since) }], ['until', { until: Date.now() }], ['from', { from: '@example.net' }],
+    ['to', { to: 'x@example.net' }], ['hasCode', { hasCode: true }], ['hasAttachments', { hasAttachments: true }],
+    ['组合', { since: Date.parse(since), from: 'f@example.net', hasCode: true, hasAttachments: true }],
+  ];
+
+  it('自己的默认视图加筛选后仍按地址取数，不倒扫全站；since 在索引里成为 id 区间，下界经 created_at 索引取', async () => {
+    for (const who of [sparse, admin]) {
+      for (const [label, filter] of filters) {
+        for (const [view, base, expected] of [['全部', {}, BY_ADDRESS], ['收件', { direction: 'inbound' as const }, VISIBLE_FULL_PREFIX]] as const) {
+          const plans = onMessages(await capturePlans((e) => listMessages(e, who, q({ ...base, ...filter }))));
+          const page = plans[0]!;
+          const name = `${who === sparse ? 'sparse' : 'admin'} ${view} ${label}`;
+          expect(page.plan, name).toMatch(expected);
+          expectNoFullScan(page.plan, name);
+          if (filter.since !== undefined) {
+            expect(page.plan, name).toMatch(view === '全部' ? /idx_messages_address_deleted_id \(address=\? AND deleted_at=\? AND id>\?\)/ : /rowid>\?/);
+            expect(page.plan, name).toContain('SEARCH b USING COVERING INDEX idx_messages_created_id (created_at>?)');
+          }
+          if (filter.hasAttachments) expect(page.plan, name).toMatch(/SEARCH filter_att (EXISTS )?USING (COVERING )?INDEX idx_attachments_message \(message_id=\?\)/);
+        }
+      }
+    }
+  });
+
+  it('主人邮件很多、窗口内很少：since 收窄后只读几十行（去掉 id 下界要逐封回表判断时间，读满 2000 封）', async () => {
+    const db = createDb(env);
+    const [user] = await db.insert(users).values({ username: 'since-heavy', passwordHash: 'x', role: 'admin', authVersionMigrated: true })
+      .returning({ id: users.id });
+    await db.insert(mailboxes).values({ address: 'heavy@since.test', domain: 'since.test', userId: user!.id });
+    // 先有 2000 封旧信，之后才来了 3 封窗口内的新信（线上 id 与时间同序）
+    await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+      INSERT INTO messages (direction, address, domain, from_address, subject, preview, status)
+      SELECT 'inbound', 'heavy@since.test', 'since.test', 'bulk@example.net', 's', 'p', 'received' FROM n`).run();
+    const recent = new Date(Date.now() + 24 * 3_600_000);
+    for (let i = 0; i < 3; i++) {
+      await db.insert(messages).values({ direction: 'inbound', address: 'heavy@since.test', domain: 'since.test',
+        fromAddress: 'new@example.net', subject: 's', preview: 'p', status: 'received', createdAt: recent });
+    }
+    const who: Viewer = { userId: user!.id, role: 'admin' };
+    for (const query of [{ since: Date.parse(since) }, { since: Date.parse(since), direction: 'inbound' as const },
+      { since: Date.parse(since), from: 'new@example.net' }]) {
+      let page: Awaited<ReturnType<typeof listMessages>> | undefined;
+      const [statement] = onMessages(await capturePlans(async (e) => { page = await listMessages(e, who, q(query)); }));
+      expect(page!.items, JSON.stringify(query)).toHaveLength(3);
+      expect(statement!.rowsRead, JSON.stringify(query)).toBeLessThan(100);
+    }
+  });
+});
+
+describe('执行计划回归：草稿派发与对象清理', () => {
+  const plan = async (query: string, params: unknown[]) =>
+    (await env.db.prepare(`EXPLAIN QUERY PLAN ${query}`).bind(...params).all<{ detail: string }>()).results.map((row) => row.detail).join(' | ');
+
+  it('每分钟的到期认领与租约到期查询只走草稿表的部分索引，不扫全表', async () => {
+    const claim = await plan(DUE_DRAFTS_CLAIM_SQL, [1, 1, 1, 20]);
+    expect(claim).toContain('idx_drafts_due (send_at<?)');
+    expect(claim).not.toMatch(/SCAN drafts\b(?! USING)/);
+    const stale = await plan(STALE_DRAFTS_SQL, [1, 20]);
+    expect(stale).toContain('idx_drafts_sending (claimed_at<?)');
+    // 草稿列表按 (user_id, id) 倒序翻页
+    const list = await plan('SELECT id FROM drafts WHERE user_id = ? AND id < ? ORDER BY id DESC LIMIT 31', [1, 100]);
+    expect(list).toContain('idx_drafts_user (user_id=? AND id<?)');
+  });
+
+  it('对象清理判断草稿正文引用时走 idx_drafts_body_r2', async () => {
+    const cleanup = await plan(CLEANUP_JOBS_SQL, [Date.now(), 100]);
+    expect(cleanup).toMatch(/SEARCH drafts USING COVERING INDEX idx_drafts_body_r2 \(body_r2_key=\?\)/);
+  });
 });
 
 describe('执行计划回归：系统域名接入', () => {

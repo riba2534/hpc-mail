@@ -16,6 +16,7 @@ import apiKeys from './routes/api-keys.js';
 import attachments from './routes/attachments.js';
 import auth from './routes/auth.js';
 import uploads from './routes/uploads.js';
+import { apiDrafts } from './routes/drafts.js';
 import avatar from './routes/avatar.js';
 import config from './routes/config.js';
 import domains from './routes/domains.js';
@@ -59,6 +60,7 @@ export function createApp() {
   api.route('/forward-confirmations', forwardConfirmations);
   api.route('/attachments', attachments);
   api.route('/uploads', uploads);
+  api.route('/drafts', apiDrafts);
   api.route('/api-keys', apiKeys);
   api.route('/admin/users', adminUsers);
   api.route('/admin/mailbox-shares', adminMailboxShares);

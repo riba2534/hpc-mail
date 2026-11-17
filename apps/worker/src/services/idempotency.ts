@@ -8,7 +8,8 @@ import { COUNTS_AS_ATTACHMENT } from '../lib/attachment-rule.js';
 import { summarize } from './message.js';
 import type { Env } from '../types.js';
 
-export type IdempotencyActor = { type: 'user' | 'api_key'; id: number };
+/** draft：服务端草稿发送占用的幂等记录（id 为草稿 id，key 为第几次发送），与调用方自己的 Idempotency-Key 互不干扰 */
+export type IdempotencyActor = { type: 'user' | 'api_key' | 'draft'; id: number };
 
 export interface IdempotencyHandle {
   actor: IdempotencyActor;

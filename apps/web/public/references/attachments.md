@@ -3,7 +3,7 @@
 ## 目录
 
 - [下载](#下载)：带凭证下载、签名 URL、`inline` 标记
-- [发送附件的三种来源](#发送附件的三种来源)：base64、上传 token、转发原附件
+- [发送附件的三种来源](#发送附件的三种来源)：base64、上传 token、转发原附件，另可写 [URL 附件](#url-附件)由服务端拉取
 - [内联图片](#内联图片)：`contentId`、`disposition` 与 `cid:` 引用
 - [大小与数量限制](#大小与数量限制)：10 MiB base64、50 MiB 合计、16 MiB 请求体
 - [上传协议](#上传协议)：单片与分片上传、取消
@@ -32,7 +32,26 @@ hpc "/messages/$MESSAGE_ID/attachments/$ATTACHMENT_ID" --output "$HPC_DOWNLOAD_F
 2. 独立上传后在发送请求放 `attachmentTokens`，无需把文件重新 base64；上传完成后才能发送，token 不存在、不属于自己或尚未完成返回 400。每项写 token 字符串，或写成 `{token,contentId?,disposition?}` 把它作为内联图片。JSON 的 MIME 字段名上传为 `mimeType`，base64 附件为 `contentType`，不要混用。
 3. 转发或已确认部分失败的补发，用 `forwardAttachmentsFrom=原邮件 ID` 复制原附件，保留 inline/CID；此时不重复引用原附件 Tokens/重复 base64 加入。来源须对发件人可见（自己认领地址上的邮件、共享给自己的未删除来信，管理员另含未认领地址），否则或原附件已丢失时返回 404 `source_unavailable`；Key 还需要 `mail.read`。
 
-三种来源可以混用。附件 Token 过期/上传失败时不能默默略掉附件发送。
+三种来源可以混用，`attachments` 里还可以写 [URL 附件](#url-附件)。附件 Token 过期/上传失败时不能默默略掉附件发送。
+
+## URL 附件
+
+文件已经在公网上（对象存储的预签名链接、GitHub raw、CDN）时，`attachments` 的一项可以只写地址，由服务端拉取，不必先下载再 base64 或上传：
+
+```json
+{"attachments": [
+  {"url": "https://files.example.com/report.pdf"},
+  {"url": "https://cdn.example.com/logo.png", "filename": "logo.png", "contentType": "image/png", "contentId": "logo"},
+  {"filename": "note.txt", "contentType": "text/plain", "content": "aGk="}
+]}
+```
+
+- 字段：`url`（必填）、`filename`、`contentType`、`contentId`、`disposition`；同一项不能同时有 `url` 与 `content`。`filename` 缺省时取响应的 `Content-Disposition`，再缺省取地址路径最后一段；`contentType` 缺省取响应的 `Content-Type`，都没有时为 `application/octet-stream`。
+- 只允许 `https://`、默认端口 443，地址里不能带账号密码。IP 字面量或域名解析出的任一 A/AAAA 地址落在内网、回环、链路本地（含云元数据 `169.254.169.254`）、CGNAT、组播、保留或文档网段时拒绝；`localhost`、`*.local`、`*.internal`、`*.home.arpa` 等内网主机名和本站自身的地址也拒绝：400 `attachment_url_forbidden`。
+- 最多跟随 3 次重定向，每一跳重新检查上面的规则；单个附件的拉取（含 DNS 与重定向）限时 15 秒。DNS 解析失败、超时、非 2xx、重定向过多、内容为空或长度与 `Content-Length` 不符：422 `attachment_url_fetch_failed`。两种错误都带 `details.url`，错误信息不包含对方返回的正文。
+- 大小与其他附件同一套上限：单个不超过 50 MiB，与其他附件合计不超过 50 MiB；对方没有给出 `Content-Length` 时最多读 10 MiB。超过返回 413 `payload_too_large`。URL 附件不计入 base64 的 10 MiB，但计入附件个数（最多 10 个）。
+- 拉到的内容按上传附件保存，发送前计入每人待发送附件的配额（20 个、100 MiB），发送后回收；发送失败时立即释放，同一个 `Idempotency-Key` 重试会重新拉取，幂等重放不会再拉取。
+- 地址要能匿名访问：需要登录或 Cookie 的地址拉不到；预签名链接要在发送时仍有效（定时发送的草稿在保存时就拉取，见[草稿与定时发送](drafts.md)）。
 
 ## 内联图片
 

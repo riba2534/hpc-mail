@@ -1,5 +1,5 @@
 import { DRAFT_ATTACHMENT_TTL_HOURS } from '@hpc-mail/shared';
-import { and, eq, exists, inArray, isNotNull, lt, notInArray, or, type SQL } from 'drizzle-orm';
+import { and, eq, exists, inArray, isNotNull, isNull, lt, notInArray, or, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import {
   apiRateLimits,
@@ -10,7 +10,7 @@ import {
   sessions,
 } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
-import type { Env } from '../types.js';
+import type { Env, ExecCtx } from '../types.js';
 import { API_REJECT_SCOPE, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { REAUTH_FAIL_SCOPE } from './reauth.js';
@@ -33,6 +33,7 @@ import { releaseDraftStatements } from './upload.js';
 import { markStaleOutbound } from './outbound-recovery.js';
 import { repairPendingInbound } from './inbound-repair.js';
 import { offloadMailBodies } from './body-offload.js';
+import { dispatchDueDrafts, purgeSentDrafts } from './drafts.js';
 import { cleanupDeliveryRefs } from './delivery-events.js';
 import { syncDeliveryEventSubscriptions } from './event-subscriptions.js';
 import { cleanupExpiredSuppressions } from './suppression.js';
@@ -126,7 +127,8 @@ export async function runDraftAttachmentCleanup(env: Env): Promise<number> {
       status: draftAttachments.status,
     })
     .from(draftAttachments)
-    .where(lt(draftAttachments.createdAt, cutoff))
+    // 服务端草稿引用中的附件随草稿保留（定时发送最长 30 天），草稿删除或发送时才释放
+    .where(and(lt(draftAttachments.createdAt, cutoff), isNull(draftAttachments.draftId)))
     .limit(RETENTION_BATCH)
     .all();
   if (stale.length === 0) return 0;
@@ -172,6 +174,20 @@ async function step(report: StepReport[], name: string, task: () => Promise<numb
     console.error(`定时任务步骤 ${name} 失败:`, error);
     report.push({ step: name, ms: Date.now() - started, failed: true });
   }
+}
+
+/** 草稿定时发送的 cron：每分钟只派发到期的草稿与恢复中断的发送，不跑其他步骤，也不写 cron 心跳（心跳由 5 分钟任务负责） */
+export const DRAFT_DISPATCH_CRON = '* * * * *';
+
+/** 定时发送的精度由它决定：到点后 1 分钟内发出（cron 本身可能再晚几十秒） */
+export async function runDraftDispatch(env: Env, ctx: ExecCtx): Promise<void> {
+  const report: StepReport[] = [];
+  await step(report, 'drafts.dispatch', async () => {
+    const result = await dispatchDueDrafts(env, ctx);
+    return result.sent + result.failed + result.recovered;
+  });
+  // 空闲的分钟不打日志
+  if (report.some((item) => item.failed || item.count)) console.log(JSON.stringify({ event: 'scheduled', cron: DRAFT_DISPATCH_CRON, steps: report }));
 }
 
 /**
@@ -271,6 +287,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   });
   // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ abort 分片或登记清理 + 删行
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
+  // 已发送的服务端草稿保留 7 天后删除（附件已在发送时回收，正文对象登记清理）
+  await step(report, 'drafts.sent', () => purgeSentDrafts(env));
   // 附件行指向已不存在的邮件（附件写入前邮件被永久删除等）：登记对象清理并删行
   await step(report, 'attachments.orphans', () => purgeOrphanAttachments(env));
   // 托管域名墓碑过了保留期：前所有者的优先权到期，NS 委派预检只看仍在的托管记录与墓碑

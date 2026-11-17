@@ -1,6 +1,6 @@
-import { API_SCOPES, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
+import { API_SCOPES, MAX_BATCH_SEND_ITEMS, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, composeOperation, conditionalDetail, describePaths, domainName, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription,
+  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, composeOperation, conditionalDetail, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, idempotencyHeader, identitiesDescription,
   int, listQuery, mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, operation, optionalPageQuery, positiveId, query, ref,
   scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths, usedExamples, usedSchemas, type Paths,
 } from '../openapi-common.js';
@@ -46,6 +46,11 @@ export function buildOpenApiSpec(origin: string) {
         description: 'Descending cursor pagination. Use nextCursor exactly as returned; null ends the page stream. Shared inboxes only add non-trash inbound visibility. afterId supports incremental polling, but process all relevant results before advancing. unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt.' }),
       post: sendMailOperation('mail.send'),
     },
+    '/messages/batch': { post: { ...operation('sendMessageBatch', 'Send up to 20 independent messages in one request', ref('BatchSendResult'), { request: 'BatchSendRequest', scope: 'mail.send',
+      errors: ['SendPayloadTooLarge'],
+      parameters: [{ ...idempotencyHeader, description: 'Optional. Derives <key>:<index> as the Idempotency-Key of every item without its own idempotencyKey, so retrying the identical batch replays each item. The derived key must stay within 128 characters, otherwise that item fails with 400.' }],
+      description: `Each item is processed like its own POST /messages: validation, the mail.read requirement for replyToMessageId/forwardAttachmentsFrom, the API key's mailbox/domain restriction, idempotency, URL attachments, the daily outbound quota and delivery all apply per item, with up to 4 items in flight. An item failure, including 429 rate_limited when the quota runs out part-way, only affects that item: the response is HTTP 200 with one result per item (ok, httpStatus, message or error) sorted by index, plus succeeded/failed counts, even when every item failed. Only an invalid envelope (items missing, empty or over ${MAX_BATCH_SEND_ITEMS}) returns 400, a key without mail.send 403, and a body over 16 MiB or base64 attachments over 10 MiB across all items 413, before anything is sent.` }),
+      'x-conditional-scopes': [{ scope: 'mail.read', when: 'an item has replyToMessageId or forwardAttachmentsFrom (that item fails with 403 without it)' }] } },
     '/messages/{id}/reply': { post: composeOperation('reply') },
     '/messages/{id}/forward': { post: composeOperation('forward') },
     '/messages/wait': { get: operation('waitForMessage', 'Wait for the earliest new incoming message matching optional filters', object({
@@ -87,6 +92,7 @@ export function buildOpenApiSpec(origin: string) {
     '/messages/{id}/attachments/{attId}': { get: operation('downloadMessageAttachment', 'Download a visible message attachment', str, { scope: 'mail.read', parameters: scopeQuery, binary: 'application/octet-stream',
       description: 'Binary bytes with a safe Content-Type/Content-Disposition, without a data envelope. Attachment must belong to message id and the message must be visible.' }) },
     ...uploadPaths('mail.send'),
+    ...draftPaths(true),
     ...hostedDomainBatchPaths('domain.write'),
     ...accountKeyPaths(),
     ...webhookPaths('v1'),

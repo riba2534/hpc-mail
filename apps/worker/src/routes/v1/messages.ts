@@ -1,11 +1,18 @@
 import {
+  MAX_INLINE_ATTACHMENT_TOTAL_BYTES,
+  batchSendRequestSchema,
   deleteMessagesRequestSchema,
+  inlineAttachmentBytes,
+  internalSendMailSchema,
   listMessagesQuerySchema,
   markReadRequestSchema,
   MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
   starMessagesRequestSchema,
   markAllReadRequestSchema,
   waitMessagesQuerySchema,
+  type BatchSendItemResult,
+  type BatchSendResult,
+  type InternalSendMailRequest,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
@@ -13,10 +20,11 @@ import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer 
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
 import { conditionalDetailResponse } from '../../lib/etag.js';
-import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
+import { execCtx, ok, parseBody, parseId, parseQuery, parseValue } from '../../lib/http.js';
 import {
   apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, assertKeyCanUseSender, keyRestriction, requireScope,
 } from '../../middleware/api-key-auth.js';
+import { errorObject } from '../../middleware/error.js';
 import {
   countUnread,
   deleteMessages,
@@ -35,8 +43,7 @@ import {
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import type { InternalSendMailRequest } from '@hpc-mail/shared';
-import { handleCompose, handleSend } from '../send-handler.js';
+import { assertRequestSize, handleCompose, handleSend, sendEnvironment, sendOne } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -58,11 +65,76 @@ app.get('/', async (c) => {
 app.post('/', (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
-  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, async (req) => {
-    // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
-    if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
-    await assertSendWithinRestriction(c, key, req);
+  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, (req) => authorizeSend(c, key, req));
+});
+
+/** 单发与批量的每一项共用：引用来源邮件另需 mail.read，限定范围的 Key 只能用范围内的发件地址与来源 */
+async function authorizeSend(
+  c: Context<AppContext>,
+  key: { userId: number; role: Viewer['role'] },
+  req: InternalSendMailRequest,
+): Promise<void> {
+  // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
+  if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
+  await assertSendWithinRestriction(c, key, req);
+}
+
+/** 批量发送并发上限：项与项之间互不等待，又不至于同时持有太多附件或占满出站连接 */
+const BATCH_SEND_CONCURRENCY = 4;
+
+/**
+ * 批量发送：每项是一份独立的发信请求，与单发同一流程（校验、mail.read、幂等、URL 附件、配额、发送、回收）。
+ * 外层不合法、请求体或 base64 附件合计超限才整体失败；单项失败（含配额用尽的 429）只体现在该项结果里。
+ * 幂等键：项的 idempotencyKey 优先，否则由请求头 Idempotency-Key 派生 `<头>:<index>`，整批重试时逐项重放。
+ */
+app.post('/batch', async (c) => {
+  requireScope(c, 'mail.send');
+  assertRequestSize(c);
+  const key = c.get('apiKey')!;
+  const { items } = await parseBody(c, batchSendRequestSchema);
+  const headerKey = c.req.header('Idempotency-Key')?.trim() || undefined;
+  const parsed = items.map((raw, index) => {
+    try {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new AppError('validation_failed', '每一项都需要是发信请求对象');
+      const { idempotencyKey, ...request } = raw as Record<string, unknown>;
+      if (idempotencyKey !== undefined && typeof idempotencyKey !== 'string') {
+        throw new AppError('validation_failed', 'idempotencyKey 需为字符串');
+      }
+      const itemKey = idempotencyKey?.trim() || (headerKey ? `${headerKey}:${index}` : undefined);
+      return { index, itemKey, req: parseValue(internalSendMailSchema, request) };
+    } catch (error) {
+      return { index, error };
+    }
   });
+  // base64 附件在内存里要解码、组装 MIME，整批合计与单发同一上限，超了整体拒绝
+  const inlineBytes = parsed.reduce((sum, item) => sum + ('req' in item && item.req ? inlineAttachmentBytes(item.req.attachments) : 0), 0);
+  if (inlineBytes > MAX_INLINE_ATTACHMENT_TOTAL_BYTES) {
+    throw new AppError('payload_too_large', `批量请求里的 base64 附件合计超过 ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024}MB 上限`);
+  }
+  const se = sendEnvironment(c);
+  const sender = { userId: key.userId, role: key.role };
+  const results: BatchSendItemResult[] = [];
+  let next = 0;
+  const worker = async () => {
+    for (let i = next++; i < parsed.length; i = next++) {
+      const item = parsed[i]!;
+      const itemKey = 'itemKey' in item ? item.itemKey : undefined;
+      try {
+        if ('error' in item) throw item.error;
+        await authorizeSend(c, key, item.req);
+        const message = await sendOne(se, { type: 'api_key', id: key.id }, sender, item.req, itemKey);
+        results.push({ index: item.index, ok: true, httpStatus: 201, ...(itemKey ? { idempotencyKey: itemKey } : {}), message });
+      } catch (error) {
+        const { status, error: body } = errorObject(error, c);
+        results.push({ index: item.index, ok: false, httpStatus: status, ...(itemKey ? { idempotencyKey: itemKey } : {}), error: body });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(BATCH_SEND_CONCURRENCY, parsed.length) }, worker));
+  results.sort((a, b) => a.index - b.index);
+  const succeeded = results.filter((result) => result.ok).length;
+  const body: BatchSendResult = { items: results, succeeded, failed: results.length - succeeded };
+  return ok(c, body);
 });
 
 /**

@@ -16,6 +16,8 @@ import {
   EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE,
   MAIL_AUTH_RESULTS, PROMPT_INJECTION_REASONS, ERROR_STATUS,
   MAX_HOSTED_DOMAIN_BATCH, batchCreateHostedDomainsRequestSchema, batchCheckHostedDomainsRequestSchema,
+  MAX_ATTACHMENT_FILE_BYTES, URL_ATTACHMENT_MAX_REDIRECTS, URL_ATTACHMENT_TIMEOUT_MS,
+  MAX_BATCH_SEND_ITEMS, DRAFT_STATUSES, MAX_DRAFTS_PER_USER, SENT_DRAFT_RETENTION_DAYS, draftInputSchema,
   DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, SUPPRESSION_REASONS,
   LIST_PAGE_DEFAULT_LIMIT, LIST_PAGE_MAX_LIMIT,
   DNSSEC_STATES, SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_CHANGE_KINDS, SYSTEM_DOMAIN_CHECK_KEYS, SYSTEM_DOMAIN_ONBOARDING_MODES,
@@ -122,7 +124,20 @@ sendProperties.headers = {
 };
 const contentIdDescription = 'Content-ID without angle brackets (brackets are stripped); reference it in html as <img src="cid:<contentId>">. Unique within the request, case-insensitively.';
 const dispositionDescription = 'inline needs contentId and is embedded in the HTML body (multipart/related); omitted means inline when contentId is given, else attachment.';
-const attachmentFields = (sendProperties.attachments!.items as Schema).properties as Record<string, Schema>;
+// attachments[] 每项是 base64 内联或 {url}（anyOf 的两支），URL 那支的说明由 URL 附件一节补充
+const [base64Attachment, urlAttachment] = (sendProperties.attachments!.items as Schema).anyOf as Schema[];
+const attachmentFields = base64Attachment!.properties as Record<string, Schema>;
+const urlAttachmentFields = urlAttachment!.properties as Record<string, Schema>;
+urlAttachmentFields.contentId = { ...urlAttachmentFields.contentId, description: contentIdDescription };
+urlAttachmentFields.disposition = { ...urlAttachmentFields.disposition, description: dispositionDescription };
+urlAttachmentFields.url = { ...urlAttachmentFields.url, examples: ['https://files.example.com/report.pdf'],
+  description: `Public https URL fetched by the server. Only the default port 443, no credentials. Private, loopback, link-local (including cloud metadata 169.254.169.254), CGNAT, multicast, reserved and documentation addresses are refused, as literal IPs or as DNS answers (A and AAAA), and so are internal hostnames (localhost, *.local, *.internal…) and this site itself: 400 attachment_url_forbidden. Up to ${URL_ATTACHMENT_MAX_REDIRECTS} redirects are followed, each hop checked again; the whole fetch must finish within ${URL_ATTACHMENT_TIMEOUT_MS / 1000} seconds. DNS failure, timeout, non-2xx, too many redirects, empty content or a length mismatch return 422 attachment_url_fetch_failed. Each file is at most ${MAX_ATTACHMENT_FILE_BYTES / MIB} MiB and counts toward the ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB total; a response without Content-Length is limited to ${SINGLE_UPLOAD_THRESHOLD_BYTES / MIB} MiB (413 payload_too_large). Errors carry details.url. Fetched content is stored like an upload (counts toward the per-user pending-upload quota until sent).` };
+urlAttachmentFields.filename = { ...urlAttachmentFields.filename, description: 'Optional; defaults to the Content-Disposition filename, else the last URL path segment, else attachment.' };
+urlAttachmentFields.contentType = { ...urlAttachmentFields.contentType, description: 'Optional; defaults to the response Content-Type (parameters removed), else application/octet-stream.' };
+delete urlAttachmentFields.content;
+delete attachmentFields.url;
+sendProperties.attachments = { ...sendProperties.attachments,
+  description: `Base64 items ({filename, contentType, content}) and URL items ({url}) in any order, at most ${MAX_ATTACHMENTS} together with attachmentTokens. An item cannot have both url and content.` };
 attachmentFields.content = {
   type: 'string', minLength: 1, pattern: '^[A-Za-z0-9+/\\s]+(?:=\\s*){0,2}$',
   description: `Base64 without a data: prefix; whitespace and line breaks are removed before decoding. Base64 attachments together decode to at most ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / MIB} MiB (413 payload_too_large); upload larger files to /uploads and use attachmentTokens.`,
@@ -346,9 +361,42 @@ function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
     succeeded: int, failed: int,
   });
 }
-export const schemas: Record<string, Schema> = {
-  Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
-    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; details.source says which (reply or forward), so remove only that reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. recipient_suppressed (422): every recipient is on this site’s suppression list for the sender’s domain after an earlier bounce or spam complaint; nothing was sent, no outbound message was recorded, no quota was used and the Idempotency-Key is released; details.suppressed lists each address with its reason and expiry.' },
+/** 服务端草稿：请求体与发信相同、字段都可暂缺；响应按 shared 的 DraftSummary / Draft */
+const draftInput = fromZod(draftInputSchema);
+{
+  const fields = draftInput.properties as Record<string, Schema>;
+  const sendFields = sendProperties;
+  for (const name of ['to', 'cc', 'bcc', 'replyTo', 'headers', 'attachmentTokens', 'attachments']) {
+    if (sendFields[name]) fields[name] = { ...sendFields[name], default: undefined };
+  }
+  fields.from = { anyOf: [sendFields.from!, { type: 'null' }], description: 'Same forms as SendMailRequest.from; null clears it.' };
+  fields.sendAt = { anyOf: [{ type: 'string', maxLength: 40 }, { type: 'null' }], examples: ['2026-11-18T09:00:00+08:00'],
+    description: 'ISO 8601 with a time zone (or a date, meaning UTC midnight), at least 1 minute and at most 30 days ahead by server time. Setting it schedules the draft (status scheduled) and requires a complete send request; null cancels the schedule (status draft).' };
+  fields.expectedVersion = { ...fields.expectedVersion, description: 'PATCH only: the version you read. A different current version returns 409 draft_state_conflict.' };
+  draftInput.description = `Every field is optional. POST: omitted fields start empty. PATCH: omitted fields keep their value, null clears from/replyToMessageId/forwardAttachmentsFrom/sendAt. attachments (base64 or {url}) are stored as uploads when saved and the draft keeps only tokens; when attachments or attachmentTokens is present the attachment set is replaced by the newly stored ones followed by attachmentTokens, so list existing tokens in attachmentTokens to keep them. Draft attachments count toward the per-user pending-upload quota and do not expire while referenced. At most ${MAX_DRAFTS_PER_USER} unsent drafts per user (409 draft_limit_reached).`;
+}
+const draftStatus: Schema = { type: 'string', enum: DRAFT_STATUSES,
+  description: 'draft: editable; scheduled: will be sent by the per-minute cron at sendAt; sending: in progress, cannot be changed or deleted; sent: a send ran, see messageId for its result (partial failure or unknown included); failed: nobody received it, edit and send again.' };
+const draftSummaryProperties = {
+  id: positiveId, status: draftStatus, version: { ...positiveId, description: 'Increments on every change; send it back as expectedVersion to guard edits.' },
+  from: nullable({ type: 'object', description: 'Stored sender in the parsed form: {mailboxId} or {localPart, domain, displayName?}.' }),
+  to: array(ref('MailAddress')), cc: array(ref('MailAddress')), bcc: array(ref('MailAddress')),
+  subject: str, preview: str, attachmentCount: int,
+  sendAt: nullable(date), messageId: { ...nullable(positiveId), description: 'Outbound message created by the send (GET /messages/{id}); null before sending.' },
+  errorDetail: { ...str, description: 'Why the last send failed or a scheduled send was cancelled; empty when none.' },
+  createdVia: { type: 'string', enum: ['web', 'api'], description: 'api: created with an API key (an agent draft awaiting review).' },
+  apiKeyName: { ...nullable(str), description: 'Name of the creating API key; null for web drafts or deleted keys.' },
+  createdAt: date, updatedAt: date, sentAt: nullable(date),
+};
+const draftSummary = object(draftSummaryProperties);
+const draft = object({ ...draftSummaryProperties, replyTo: array(ref('MailAddress')), text: str, html: str,
+  headers: { type: 'object', additionalProperties: str }, replyToMessageId: nullable(positiveId), forwardAttachmentsFrom: nullable(positiveId),
+  attachments: array(object({ token: str, filename: str, mimeType: str, size: int, contentId: str,
+    disposition: { type: 'string', enum: ['attachment', 'inline'] } })) });
+
+/** 错误信封里的 error 对象：统一错误信封与批量发送的逐项结果共用 */
+const errorObjectSchema: Schema = object({ code: { type: 'string', enum: ERROR_CODES,
+    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; details.source says which (reply or forward), so remove only that reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. recipient_suppressed (422): every recipient is on this site’s suppression list for the sender’s domain after an earlier bounce or spam complaint; nothing was sent, no outbound message was recorded, no quota was used and the Idempotency-Key is released; details.suppressed lists each address with its reason and expiry. attachment_url_forbidden (400): a URL attachment points to a disallowed address (not https, credentials, non-443 port, private/loopback/link-local/metadata/reserved IP or a hostname resolving to one, or this site); details.url names it. attachment_url_fetch_failed (422): fetching a URL attachment failed (DNS, timeout, non-2xx, too many redirects, empty or length mismatch); details.url names it. draft_state_conflict (409): the draft status does not allow the operation (sending cannot be changed or deleted, sent cannot be changed) or expectedVersion is stale; details.draftStatus and details.draftVersion give the current state. draft_limit_reached (409): too many unsent drafts; send or delete some first.' },
     message: { ...str, description: 'Human-readable Chinese explanation; wording may change.' },
     fix: { ...str, description: 'Optional: one actionable correction, e.g. which scope to add or which endpoint to call first.' },
     docs: { type: 'string', format: 'uri', description: 'Optional: absolute URL of the matching section in /references/errors.md on this site.' },
@@ -358,10 +406,15 @@ export const schemas: Record<string, Schema> = {
       recipientOutcomes: { ...array(recipientOutcome), description: 'delivery_failed: per-recipient results, all failed.' },
       source: { type: 'string', enum: ['reply', 'forward'],
         description: 'source_unavailable only: which reference is unavailable. reply: replyToMessageId; forward: forwardAttachmentsFrom or one of its attachments. When a request has both, drop only this one. Older servers omit it.' },
+      url: { ...str, description: 'attachment_url_forbidden, attachment_url_fetch_failed and URL-attachment payload_too_large: the offending address, possibly a redirect target.' },
+      draftStatus: { type: 'string', enum: ['draft', 'scheduled', 'sending', 'sent', 'failed'], description: 'draft_state_conflict: the draft’s current status.' },
+      draftVersion: { ...positiveId, description: 'draft_state_conflict: the draft’s current version.' },
       suppressed: { ...array(ref('SuppressedRecipient')), description: 'recipient_suppressed: every recipient with its suppression entry.' },
       precheck: { type: 'object', description: 'Session API system-domain onboarding 409 only: the latest precheck (SystemDomainPrecheck in /api/openapi.json) with confirmation items, blockers and fingerprint; confirm with its fingerprint and accept, then retry.' },
-    }, ['headers', 'messageId', 'recipientOutcomes', 'source', 'suppressed', 'precheck']), description: 'Optional structured data, present only on the codes above.' },
-  }, ['fix', 'docs', 'details']),
+    }, ['headers', 'messageId', 'recipientOutcomes', 'source', 'url', 'draftStatus', 'draftVersion', 'suppressed', 'precheck']), description: 'Optional structured data, present only on the codes above.' },
+  }, ['fix', 'docs', 'details']);
+export const schemas: Record<string, Schema> = {
+  Error: object({ error: errorObjectSchema,
     requestId: { ...str, description: `Same value as the X-Request-ID response header, which every response carries; ${clientRequestIdRule}, anything else is replaced by a server-generated UUID.` } }),
   MessageSummary: messageSummary,
   MessageDetail: object({ ...summaryProperties, replyTo: array(str), recipients: object({ to: array(str), cc: array(str), bcc: array(str) }),
@@ -571,6 +624,21 @@ export const schemas: Record<string, Schema> = {
   })(),
   AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),
   SendMailRequest: send, MailAddress: mailAddress, ReplyMessageRequest: replyRequest, ForwardMessageRequest: forwardRequest,
+  BatchSendRequest: object({ items: { type: 'array', minItems: 1, maxItems: MAX_BATCH_SEND_ITEMS,
+    items: { allOf: [ref('SendMailRequest'), { type: 'object', properties: { idempotencyKey: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$',
+      description: 'Optional per-item Idempotency-Key with the same rules as the header. Without it, an Idempotency-Key request header derives <header>:<index> (0-based) for each item.' } } }] },
+    description: `1–${MAX_BATCH_SEND_ITEMS} independent send requests, each exactly a POST /messages body plus an optional idempotencyKey.` } }),
+  BatchSendResult: object({
+    items: { ...array(object({
+      index: { ...int, description: 'Position in the request items array.' },
+      ok: { ...bool, description: 'true when the item would have returned 201 alone (partial recipient failure included; inspect message.status and recipientOutcomes).' },
+      httpStatus: { type: 'integer', description: 'The status this item would have returned as a single POST /messages: 201, or 400/403/404/409/413/422/429/500.' },
+      idempotencyKey: { ...str, description: 'The key used for this item; omitted when none.' },
+      message: ref('MessageSummary'),
+      error: { ...errorObjectSchema, description: 'Same object as a single-send error envelope’s error (code, message, fix, docs, details).' },
+    }, ['idempotencyKey', 'message', 'error'])), description: 'One result per request item, sorted by index.' },
+    succeeded: int, failed: int,
+  }),
   ClaimMailboxRequest: claimRequest, BatchMailboxRequest: fromZod(batchMailboxRequestSchema), UpdateMailboxRequest: fromZod(updateMailboxRequestSchema),
   TransferMailboxRequest: fromZod(transferMailboxRequestSchema),
   MarkReadRequest: fromZod(markReadRequestSchema),
@@ -617,16 +685,31 @@ export const schemas: Record<string, Schema> = {
   SingleUploadResult: object({ token: str, filename: str, size: int, mimeType: str }),
   MultipartInitResult: object({ token: str, uploadId: str, partBytes: positiveId, partCount: positiveId }),
   MultipartPartResult: object({ partNumber: positiveId, etag: str }), MultipartCompleteResult: object({ token: str, size: int }),
+  DraftInput: draftInput, DraftSummary: draftSummary, Draft: draft, DraftPage: page(ref('DraftSummary')),
+  SendDraftRequest: object({ expectedVersion: { ...positiveId, description: 'Version the reviewer saw; a different current version returns 409 draft_state_conflict.' } }, ['expectedVersion']),
 };
 export const query = (name: string, schema: Schema, description?: string, required = false): Schema => ({ name, in: 'query', required, schema, ...(description ? { description } : {}) });
 export const scopeQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed', 'user'] }, 'Default mine. unclaimed/user are administrator-only; user requires userId. Shared inboxes add read-only inbound visibility.'),
   query('userId', positiveId, 'Required for administrator scope=user; mutations cannot modify another owner’s mail.')];
 export const mutationQuery = [query('scope', { type: 'string', enum: ['mine', 'unclaimed'] }, 'Default mine; unclaimed requires administrator. Query or JSON body scope are accepted; conflicting values return 400.')];
 export const pageQuery = [query('cursor', { type: 'string', maxLength: 128 }, 'Opaque server nextCursor. Omit on first page; null means no next page. A cursor that is present but cannot be decoded returns 400 validation_failed instead of silently restarting from the first page.'), query('limit', { type: 'integer', minimum: 1, maximum: 100, default: 30 })];
+const isoTimeQuery: Schema = { type: 'string', maxLength: 40, examples: ['2026-11-17', '2026-11-17T08:00:00Z', '2026-11-17T16:00:00+08:00'],
+  description: 'ISO 8601: a date (UTC midnight) or a date-time with Z or ±HH:MM. A date-time without a time zone or a bare number returns 400 validation_failed.' };
+const addressFilterQuery: Schema = { type: 'string', maxLength: 254, examples: ['alice@example.net', '@example.net'] };
+/** 列表筛选：多个条件同时满足，0/false 与不传相同 */
+const listFilterQuery = [
+  query('since', isoTimeQuery, 'Only mail with createdAt at or after this time (inclusive).'),
+  query('until', isoTimeQuery, 'Only mail with createdAt before this time (exclusive). With since, since must be earlier.'),
+  query('from', addressFilterQuery, 'Sender filter, case-insensitive: a full address matches fromAddress exactly; @domain matches that exact domain (subdomains excluded).'),
+  query('to', addressFilterQuery, 'Recipient filter with the same address/@domain rule: outbound mail matches To/Cc/Bcc; inbound mail matches the receiving address or the original To/Cc.'),
+  query('hasCode', { type: 'string', enum: ['1', 'true', '0', 'false'] }, '1/true: only mail with a verification code recognized when it was received (the stored code). 0/false applies no filter.'),
+  query('hasAttachments', { type: 'string', enum: ['1', 'true', '0', 'false'] }, '1/true: only mail with attachments, same rule as hasAttachments in summaries (inline body images do not count). 0/false applies no filter.'),
+];
 export const listQuery = [query('direction', { type: 'string', enum: ['inbound', 'outbound'] }), query('domain', str), query('address', str),
   ...['unread', 'starred', 'trash'].map(name => query(name, { type: 'string', enum: ['1', 'true', '0', 'false'] })),
   query('q', { type: 'string', maxLength: 256 }, 'Case-insensitive literal substring of subject, sender address/name, recipients and the first 4 KB of the body text (HTML-only mail: its text content); Unicode is supported. Text further into the body is not searched.'),
-  ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'), ...pageQuery];
+  ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'),
+  ...listFilterQuery, ...pageQuery];
 export const idempotencyHeader = { name: 'Idempotency-Key', in: 'header', required: false,
   description: 'Use one stable unique visible-ASCII key per logical send, persisted with the request. After a network error, timeout or 5xx, retry the identical request with the same key: a finished send is replayed exactly as first returned (201 with the original summary, including status unknown, or the same 422 delivery_failed when every recipient definitely failed) and a send that failed before creating its outbound record continues. 409 send_in_progress: still processing or result unconfirmed; inspect the outbox and retry later with the same key, never with a fresh one. 409 idempotency_mismatch: the key was used for different content; check the original send and use a new key for new content. Business errors raised before sending (400, 403, 404, 413, 429) release the key, so the corrected request may reuse it; so does 422 recipient_suppressed, which creates no outbound record and uses no quota. After 422 delivery_failed, correct the recipients and use a new key. A partial-success response should retry only recipientOutcomes marked failed, with a new logical key; confirm unknown recipients before resending to them. Outbound mail still pending an hour after creation is marked unknown, after which the same key replays 201 with status unknown; in the rare case the final result cannot be stored, the same key keeps returning 409 send_in_progress until then. Completed keys are retained at least two days.',
   schema: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[!-~]+$' } };
@@ -755,11 +838,11 @@ export function operation(operationId: OperationId, summary: string, data: Schem
 }
 /** 发信各错误状态的说明；/v1 的回复与转发接口在此基础上改写 400/403/404 */
 const SEND_ERROR_DESCRIPTIONS: Record<number, string> = {
-  400: 'validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, or a hosted-domain sender whose sending is not ready.',
+  400: 'validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, a hosted-domain sender whose sending is not ready, or attachment_url_forbidden for a disallowed URL attachment (details.url).',
   403: 'forbidden: the API key lacks a scope (fix names it), or the sender identity is not allowed (fix points to GET /identities); shared mailboxes never send.',
   404: 'source_unavailable: replyToMessageId or forwardAttachmentsFrom is missing or invisible, or a forwarded attachment is lost; details.source is reply or forward. not_found: the sender mailboxId does not exist.',
   413: `payload_too_large: request body over ${MAX_SEND_REQUEST_BYTES / 1024 / 1024} MiB (rejected before parsing), base64 attachments over ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB combined, or all attachments over ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB. Upload large files and use attachmentTokens.`,
-  422: 'delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key. recipient_suppressed: every recipient is on this site’s suppression list for the sender’s domain (an earlier bounce or spam complaint), so nothing was sent, no outbound message was recorded and no quota was used; details.suppressed lists address, reason, sendingDomain, since and expiresAt (null: until an administrator removes it), and the Idempotency-Key is released for reuse. When only some recipients are suppressed the others are sent (201) and each suppressed recipient has status failed with code recipient_suppressed; if every other recipient fails too, the response is 422 delivery_failed whose recipientOutcomes include the suppressed ones.',
+  422: 'delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key. recipient_suppressed: every recipient is on this site’s suppression list for the sender’s domain (an earlier bounce or spam complaint), so nothing was sent, no outbound message was recorded and no quota was used; details.suppressed lists address, reason, sendingDomain, since and expiresAt (null: until an administrator removes it), and the Idempotency-Key is released for reuse. When only some recipients are suppressed the others are sent (201) and each suppressed recipient has status failed with code recipient_suppressed; if every other recipient fails too, the response is 422 delivery_failed whose recipientOutcomes include the suppressed ones. attachment_url_fetch_failed: a URL attachment could not be fetched (details.url); nothing was sent and the same key may be retried.',
   429: 'rate_limited: request rate, or the daily outbound mail/recipient quota (GET /v1/me shows usage).',
   500: 'internal: the server failed before every recipient was attempted. Retry the identical request with the same Idempotency-Key to fetch the result: it may be 201, or 422 delivery_failed whose recipientOutcomes show recipients that were never attempted.',
 };
@@ -770,9 +853,9 @@ export function sendMailOperation(scope?: string): Operation {
   return { ...operation('sendMessage', 'Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope, status: 201, parameters: [idempotencyHeader],
     example: sentMessageExample,
     errors: ['HeaderNotAllowed', 'ForbiddenSender', 'SourceUnavailableReply', 'SourceUnavailableForward', 'IdempotencyMismatch', 'SendInProgress',
-      'SendPayloadTooLarge', 'DeliveryFailed', 'RecipientSuppressed', 'OutboundQuota'],
+      'SendPayloadTooLarge', 'DeliveryFailed', 'RecipientSuppressed', 'OutboundQuota', 'AttachmentUrlForbidden', 'AttachmentUrlFetchFailed'],
     errorDescriptions: SEND_ERROR_DESCRIPTIONS,
-    description: `HTTP 201 means at least one recipient succeeded (status sent or delivered), or none succeeded but at least one result is uncertain (status unknown: provider timeout or network error, possibly delivered; also an interrupted send replayed after an hour). Only a definite provider rejection (destination not verified, sending domain not ready, invalid address, limit exceeded and the like) counts as failed; anything else is unknown. Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; confirm unknown recipients before resending; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient definitely failed (or the server failed before delivery started) the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery; on deployments with delivery receipts enabled, Cloudflare receipts later update recipientOutcomes (delivered, bounced, failed, complained) and status, so read the message again to confirm delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. ${scope ? 'To let the server fill in recipients, subject and quote, use POST /messages/{id}/reply or /forward instead. Here' : 'There is no separate reply or forward endpoint (POST /messages/{id} does not exist):'} set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable with error.details.source (reply or forward), and removing that reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` }),
+    description: `HTTP 201 means at least one recipient succeeded (status sent or delivered), or none succeeded but at least one result is uncertain (status unknown: provider timeout or network error, possibly delivered; also an interrupted send replayed after an hour). Only a definite provider rejection (destination not verified, sending domain not ready, invalid address, limit exceeded and the like) counts as failed; anything else is unknown. Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; confirm unknown recipients before resending; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient definitely failed (or the server failed before delivery started) the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery; on deployments with delivery receipts enabled, Cloudflare receipts later update recipientOutcomes (delivered, bounced, failed, complained) and status, so read the message again to confirm delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported, and {url} attachments are fetched by the server (https only, SSRF-checked, size, timeout and redirect limits). Large external attachments become signed links valid for 90 days independently of sent-mail deletion. ${scope ? 'To let the server fill in recipients, subject and quote, use POST /messages/{id}/reply or /forward instead. Here' : 'There is no separate reply or forward endpoint (POST /messages/{id} does not exist):'} set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable with error.details.source (reply or forward), and removing that reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` }),
     ...(scope ? { 'x-conditional-scopes': [{ scope: 'mail.read', when: 'replyToMessageId or forwardAttachmentsFrom is present' }] } : {}) };
 }
 /** GET /messages/{id} 的条件读取：弱 ETag 与 Cache-Control，If-None-Match 命中时 304 无正文；bucket 写附件签名的时间桶 */
@@ -814,7 +897,7 @@ const NOT_FOUND_BY_RESOURCE: Record<string, ErrorExampleName> = {
   'mailbox-shares': 'NotFoundMailbox', grantees: 'NotFoundGrantee', 'hosted-domains': 'NotFoundHostedDomain', 'dns-records': 'NotFoundDnsRecord',
   'api-keys': 'NotFoundApiKey', users: 'NotFoundUser', invites: 'NotFoundInvite', uploads: 'NotFoundUpload', multipart: 'NotFoundUpload',
   avatar: 'NotFoundAvatar', jobs: 'NotFoundNotificationJob', suppressions: 'NotFoundSuppression', onboardings: 'NotFoundOnboarding',
-  webhooks: 'NotFoundWebhook', deliveries: 'NotFoundWebhook',
+  webhooks: 'NotFoundWebhook', deliveries: 'NotFoundWebhook', drafts: 'NotFoundDraft',
 };
 function notFoundExamples(path: string): string[] {
   const segments = path.split('/');
@@ -964,6 +1047,39 @@ export function hostedDomainBatchPaths(scope?: string): Paths {
       description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domains, same rules as POST /hosted-domains for each. ${budget} Each attempted item counts toward the ${MAX_HOSTED_CREATES_PER_MINUTE} additions per user per minute and costs 2 site-wide calls when reserved (plus 5 for background preconfiguration). A rate_limited, forbidden (per-user hosted or pending limit) or user_disabled failure stops the batch: the remaining items fail with the same code without being attempted. Other failures, such as 409 for a domain already used, affect only that item. Ordinary users may keep only hosted_domains.maxPendingPerUser domains pending at once. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
     '/hosted-domains/batch-check': { post: operation('checkHostedDomains', 'Check several hosted domains now', ref('HostedDomainBatchCheckResult'), { request: 'BatchCheckHostedDomainsRequest', scope,
       description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domain ids, same rules as POST /hosted-domains/{id}/check for each (owner or administrator; members get forbidden and other users not_found for that item only). ${budget} Each attempted item counts toward the ${MAX_HOSTED_CHECKS_PER_MINUTE} checks per user per minute; a check that reaches Cloudflare costs 4 site-wide calls. rate_limited or user_disabled stops the batch. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
+  };
+}
+/** 服务端草稿与定时发送：/api 与 /v1 同形，API Key 读需 mail.read 或 mail.send，写与发送需 mail.send */
+export function draftPaths(keyScopes = false): Paths {
+  const read = keyScopes ? { 'x-required-scopes-any-of': ['mail.read', 'mail.send'] } : {};
+  const write = keyScopes ? 'mail.send' : undefined;
+  const sourceRule = keyScopes ? { 'x-conditional-scopes': [{ scope: 'mail.read', when: 'the draft content has replyToMessageId or forwardAttachmentsFrom' }] } : {};
+  return {
+    '/drafts': {
+      get: { ...operation('listDrafts', 'List your drafts', ref('DraftPage'), { parameters: [
+        query('status', draftStatus), ...pageQuery],
+        description: `Your own drafts only (administrators too), newest first, including API-created ones (createdVia=api) awaiting review in the web UI. Sent drafts stay listed for ${SENT_DRAFT_RETENTION_DAYS} days.${keyScopes ? ' Requires mail.read or mail.send.' : ''}` }), ...read },
+      post: { ...operation('createDraft', 'Create a draft, optionally scheduled', ref('Draft'), { request: 'DraftInput', scope: write, status: 201,
+        errors: ['DraftIncomplete', 'DraftLimitReached', 'IdempotencyMismatch', 'AttachmentUrlForbidden', 'AttachmentUrlFetchFailed', 'DraftQuota',
+          ...(keyScopes ? ['KeyRestricted' as const] : [])],
+        parameters: [{ ...idempotencyHeader, description: 'Optional, same rules as for sends. The same key and body return 200 with the existing draft (in its current state); a different body returns 409 idempotency_mismatch.' }],
+        description: 'Saves a draft (status draft) or, with sendAt, schedules it (status scheduled; the content must then be a complete send request, else 400). base64 and {url} attachments are stored right away, so a scheduled send uses what was fetched at save time. A user reviews and sends agent drafts in the web UI, or anyone with mail.send calls POST /drafts/{id}/send.' }), ...sourceRule },
+    },
+    '/drafts/{id}': {
+      get: { ...operation('getDraft', 'Read a draft with its full content', ref('Draft')), ...read },
+      patch: { ...operation('updateDraft', 'Change, schedule or unschedule a draft', ref('Draft'), { request: 'DraftInput', scope: write,
+        errors: ['DraftStateConflict', 'DraftIncomplete', 'AttachmentUrlForbidden', 'AttachmentUrlFetchFailed', 'DraftQuota',
+          ...(keyScopes ? ['KeyRestricted' as const] : [])],
+        description: 'Allowed while status is draft, scheduled or failed; sending or sent return 409 draft_state_conflict. Omitted fields keep their value. sendAt schedules, sendAt:null cancels the schedule. A scheduled draft must stay a complete send request. expectedVersion guards against overwriting someone else’s edit.' }), ...sourceRule },
+      delete: operation('deleteDraft', 'Delete a draft and release its attachments', success, { scope: write, errors: ['DraftStateConflict'],
+        description: 'Not while sending (409 draft_state_conflict). Deleting a sent draft only removes the draft; the outbound message stays.' }),
+    },
+    '/drafts/{id}/send': { post: { ...operation('sendDraft', 'Send a draft now', ref('MessageSummary'), { scope: write, status: 201,
+      request: 'SendDraftRequest', requestRequired: false, example: sentMessageExample,
+      errors: ['DraftStateConflict', 'DraftIncomplete', 'DraftSendInProgress', 'ForbiddenSender', 'DeliveryFailed', 'RecipientSuppressed', 'OutboundQuota',
+        ...(keyScopes ? ['KeyRestricted' as const] : [])],
+      errorDescriptions: { ...SEND_ERROR_DESCRIPTIONS, 409: 'draft_state_conflict: expectedVersion is stale or the draft cannot be sent from its status; send_in_progress: the draft is being sent.' },
+      description: 'Optional body {expectedVersion}: the version the reviewer saw; if the draft changed since (for example an agent edited the recipients), 409 draft_state_conflict and nothing is sent. Same result as POST /messages: 201 with the outbound summary (partial failure included), 422 delivery_failed when every recipient was rejected (the draft becomes failed and keeps its attachments), other 4xx before anything is sent (the draft keeps its previous status and records errorDetail). Works from draft, scheduled or failed and ignores sendAt. Exactly once per draft: a sent draft replays the original summary with 201; a draft being sent returns 409 send_in_progress. The daily outbound quota applies as for any send.' }), ...sourceRule } },
   };
 }
 export function uploadPaths(scope?: string): Paths {

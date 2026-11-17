@@ -12,6 +12,7 @@ import v1HostedDomains from './hosted-domains.js';
 import v1MailboxShares from './mailbox-shares.js';
 import v1Mailboxes from './mailboxes.js';
 import v1Messages from './messages.js';
+import { v1Drafts } from '../drafts.js';
 import v1NotifyPrefs from './notify-prefs.js';
 import v1Webhooks from './webhooks.js';
 import { buildOpenApiSpec } from './openapi.js';
@@ -24,7 +25,7 @@ app.use(
   cors({
     origin: '*',
     allowHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'If-None-Match'],
-    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     exposeHeaders: ['Link', 'X-Request-ID', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'ETag'],
   }),
 );
@@ -76,6 +77,7 @@ app.route('/hosted-domains', v1HostedDomains);
 app.route('/mailboxes/shares', v1MailboxShares);
 app.route('/mailboxes', v1Mailboxes);
 app.route('/messages', v1Messages);
+app.route('/drafts', v1Drafts);
 app.route('/notify-prefs', v1NotifyPrefs);
 app.route('/webhooks', v1Webhooks);
 app.route('/uploads', createUploadRoutes(apiKeyAuth, async (c, next) => {

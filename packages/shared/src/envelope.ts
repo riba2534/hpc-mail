@@ -14,6 +14,11 @@ export interface ApiErrorDetails {
   /** delivery_failed：已记录的发件行 id（可在已发送里查看）与逐收件人结果 */
   messageId?: number;
   recipientOutcomes?: RecipientOutcome[];
+  /** attachment_url_forbidden / attachment_url_fetch_failed：出错的附件地址（重定向后的地址也可能出现在这里） */
+  url?: string;
+  /** draft_state_conflict：草稿当前状态与版本 */
+  draftStatus?: string;
+  draftVersion?: number;
   /** source_unavailable：不可用的是哪一个引用（reply = replyToMessageId，forward = forwardAttachmentsFrom 或其附件） */
   source?: 'reply' | 'forward';
   /** recipient_suppressed：命中抑制名单的收件人（全部收件人都在名单里，没有创建发件记录） */
@@ -77,6 +82,14 @@ export const ERROR_CODES = [
   'header_not_allowed',
   /** 全部收件人被明确拒收，没有任何一份投递成功：422，details 带发件行 id 与逐收件人结果；同 Key 重放返回同样的错误 */
   'delivery_failed',
+  /** 草稿当前状态不允许该操作（发送中不能修改或删除；已发送不能修改），或 expectedVersion 与当前版本不一致：409 */
+  'draft_state_conflict',
+  /** 未发送的草稿数已达上限：409，先发送或删除旧草稿 */
+  'draft_limit_reached',
+  /** URL 附件地址不允许：非 https、带账号密码、非 443 端口、内网/回环/链路本地/云元数据地址或本站自身：400 */
+  'attachment_url_forbidden',
+  /** URL 附件拉取失败：DNS 解析失败、超时、非 2xx、重定向过多或内容为空：422，details.url 为出错的地址 */
+  'attachment_url_fetch_failed',
   /** 全部收件人都在本站抑制名单里（此前退信或投诉）：422，没有发信也不占配额，details.suppressed 列出原因与解除时间 */
   'recipient_suppressed',
   /** 回复/转发没给 from，而原信的收件地址不是调用者可用的发件身份（如共享给你的邮箱）：400，在 from 指定自己的地址 */
@@ -110,6 +123,10 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   source_unavailable: 404,
   header_not_allowed: 400,
   delivery_failed: 422,
+  draft_state_conflict: 409,
+  draft_limit_reached: 409,
+  attachment_url_forbidden: 400,
+  attachment_url_fetch_failed: 422,
   recipient_suppressed: 422,
   from_required: 400,
   reauth_required: 403,

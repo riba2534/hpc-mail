@@ -1,7 +1,5 @@
 import {
   MAX_ATTACHMENT_FILE_BYTES,
-  MAX_DRAFT_ATTACHMENTS_PER_USER,
-  MAX_DRAFT_ATTACHMENT_BYTES_PER_USER,
   SINGLE_UPLOAD_THRESHOLD_BYTES,
   MULTIPART_PART_BYTES,
   attachmentFilenameSchema,
@@ -18,7 +16,7 @@ import { AppError } from '../lib/errors.js';
 import { execCtx, ok, parseBody, parseId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import { scheduleStorageCleanup } from '../services/storage-cleanup.js';
-import { draftKey, newDraftToken, releaseDraftStatements } from '../services/upload.js';
+import { draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment } from '../services/upload.js';
 import type { AppContext } from '../types.js';
 
 function uploadOwner(c: Context<AppContext>): { id: number } {
@@ -32,42 +30,6 @@ export function createUploadRoutes(authentication: MiddlewareHandler<AppContext>
   const app = new Hono<AppContext>();
   app.use('*', authentication);
   if (authorize) app.use('*', authorize);
-
-  async function reserveDraft(
-    c: Context<AppContext>,
-    input: { userId: number; token: string; filename: string; mimeType: string; size: number; r2Key: string },
-  ): Promise<number> {
-    const inserted = await c.env.db
-      .prepare(
-        `INSERT INTO draft_attachments
-          (user_id, token, filename, mime_type, size, r2_key, status)
-         SELECT ?, ?, ?, ?, ?, ?, 'uploading'
-         WHERE (SELECT COUNT(*) FROM draft_attachments WHERE user_id = ?) < ?
-           AND COALESCE((SELECT SUM(size) FROM draft_attachments WHERE user_id = ?), 0) + ? <= ?
-         RETURNING id`,
-      )
-      .bind(
-        input.userId,
-        input.token,
-        input.filename,
-        input.mimeType,
-        input.size,
-        input.r2Key,
-        input.userId,
-        MAX_DRAFT_ATTACHMENTS_PER_USER,
-        input.userId,
-        input.size,
-        MAX_DRAFT_ATTACHMENT_BYTES_PER_USER,
-      )
-      .first<{ id: number }>();
-    if (!inserted) {
-      throw new AppError(
-        'rate_limited',
-        `待发送附件最多 ${MAX_DRAFT_ATTACHMENTS_PER_USER} 个、合计 ${Math.floor(MAX_DRAFT_ATTACHMENT_BYTES_PER_USER / 1024 / 1024)}MB`,
-      );
-    }
-    return inserted.id;
-  }
 
   /** 单片流式直传：filename/mimeType 走 query，二进制内容走 body → R2 put 流式 */
   app.post('/', async (c) => {
@@ -96,7 +58,7 @@ export function createUploadRoutes(authentication: MiddlewareHandler<AppContext>
     const db = createDb(c.env);
     // 先落 D1 占位行再写 R2：反过来的话，put 成功而 insert 失败就留下一个没有任何行指向的
     // R2 对象，而清理任务是遍历 draft_attachments 表的，永远扫不到它 → 永久计费
-    const draftId = await reserveDraft(c, {
+    const draftId = await reserveDraftAttachment(c.env, {
       userId: user.id,
       token,
       filename: filenameParsed.data,
@@ -130,7 +92,7 @@ export function createUploadRoutes(authentication: MiddlewareHandler<AppContext>
     const db = createDb(c.env);
     // 同单片直传：先占位行再建 multipart upload，避免 create 成功、insert 失败时
     // uploadId 丢失——R2 binding 没有 list-multipart-uploads，丢了就再也 abort 不掉
-    const draftId = await reserveDraft(c, {
+    const draftId = await reserveDraftAttachment(c.env, {
       userId: user.id,
       token,
       filename: req.filename,
@@ -256,6 +218,13 @@ export function createUploadRoutes(authentication: MiddlewareHandler<AppContext>
     const db = createDb(c.env);
     const row = await db.select().from(draftAttachments).where(eq(draftAttachments.token, token)).get();
     if (!row || row.userId !== user.id) throw new AppError('not_found', '上传会话不存在');
+    // 服务端草稿引用中的附件归草稿管理：直接删掉会让草稿（可能已安排定时发送）到点缺附件
+    if (row.draftId !== null) {
+      throw new AppError('draft_state_conflict', `该附件属于草稿 #${row.draftId}，不能直接删除`, {
+        fix: `通过 PATCH /drafts/${row.draftId} 修改 attachmentTokens 把它移出草稿，或删除整份草稿`,
+        docs: '/references/drafts.md#附件',
+      });
+    }
     if (row.uploadId && row.status === 'uploading') {
       await c.env.r2.resumeMultipartUpload(row.r2Key, row.uploadId).abort();
       await db.delete(draftAttachments).where(eq(draftAttachments.id, row.id));

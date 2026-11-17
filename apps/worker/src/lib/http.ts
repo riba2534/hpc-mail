@@ -99,6 +99,13 @@ export async function parseBody<T>(c: Context<AppContext>, schema: SafeParser<T>
   return result.data;
 }
 
+/** safeParse 任意值（批量请求的单项等），失败按与 parseBody 相同的规则抛错 */
+export function parseValue<T>(schema: SafeParser<T>, raw: unknown): T {
+  const result = schema.safeParse(raw);
+  if (!result.success) throw issueError(result.error.issues[0]);
+  return result.data;
+}
+
 /** safeParse query，失败抛 validation_failed */
 export function parseQuery<T>(c: Context<AppContext>, schema: SafeParser<T>): T {
   const result = schema.safeParse(c.req.query());

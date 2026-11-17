@@ -306,6 +306,21 @@ export const ERROR_EXAMPLES = {
   WebhookEndpointLimit: { code: 'forbidden', message: '每个用户最多 10 个 Webhook 端点' },
   WebhookUrlInvalid: { code: 'validation_failed', message: 'Webhook 地址不能指向本站' },
   WebhookNotRetryable: { code: 'conflict', message: '只有投递失败的记录可以重试' },
+  AttachmentUrlForbidden: { code: 'attachment_url_forbidden', message: '附件地址不允许：内网、回环、链路本地或保留地址',
+    fix: '只能引用公网可访问的 https 地址；内网或本站的文件先下载，再用 POST /v1/uploads（网页会话用 /api/uploads）上传后写进 attachmentTokens',
+    docs: '/references/errors.md#attachment_url_forbidden', details: { url: 'https://169.254.169.254/latest/meta-data/' } },
+  AttachmentUrlFetchFailed: { code: 'attachment_url_fetch_failed', message: '附件拉取失败：HTTP 404',
+    fix: '确认地址能公开访问（预签名链接未过期、不需要登录），或先下载再用 POST /v1/uploads（网页会话用 /api/uploads）上传后写进 attachmentTokens',
+    docs: '/references/errors.md#attachment_url_fetch_failed', details: { url: 'https://files.example.com/report.pdf' } },
+  NotFoundDraft: { code: 'not_found', message: '草稿不存在' },
+  DraftStateConflict: { code: 'draft_state_conflict', message: '草稿正在发送，不能修改',
+    fix: '先 GET /drafts/:id 读取草稿当前的 status 与 version：发送中的等它结束；已发送的结果看 messageId；版本变了就基于最新内容重新修改',
+    docs: '/references/errors.md#draft_state_conflict', details: { draftStatus: 'sending', draftVersion: 4 } },
+  DraftLimitReached: { code: 'draft_limit_reached', message: '未发送的草稿最多 100 份',
+    fix: '未发送的草稿已达上限：先发送或删除不需要的草稿（GET /drafts 列出），再创建', docs: '/references/errors.md#draft_limit_reached' },
+  DraftIncomplete: { code: 'validation_failed', message: '草稿还不能发送：至少需要一个收件人',
+    fix: '补全 from、收件人、主题与正文后再安排定时发送；只想保存时不要带 sendAt', docs: '/references/drafts.md#安排定时发送' },
+  DraftSendInProgress: { code: 'send_in_progress', message: '草稿正在发送，请稍后用 GET /drafts/:id 查看结果，不要重复发送' },
 } satisfies Record<string, ErrorExample>;
 export type ErrorExampleName = keyof typeof ERROR_EXAMPLES;
 

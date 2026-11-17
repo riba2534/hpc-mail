@@ -21,6 +21,7 @@ import attachmentsDoc from '../../web/public/references/attachments.md?raw';
 import authDoc from '../../web/public/references/auth-and-http.md?raw';
 import errorsDoc from '../../web/public/references/errors.md?raw';
 import mailDoc from '../../web/public/references/mail.md?raw';
+import draftsDoc from '../../web/public/references/drafts.md?raw';
 import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
 import mcpDoc from '../../web/public/references/mcp.md?raw';
 import notificationsDoc from '../../web/public/references/notifications.md?raw';
@@ -210,7 +211,9 @@ describe('OpenAPI routes and public contracts', () => {
     expect(send.required).toEqual(expect.arrayContaining(['from', 'to', 'subject']));
     expect(fields.from!.oneOf).toHaveLength(4);
     expect(fields.from).not.toHaveProperty('anyOf');
-    expect(fields.attachments!.items).toMatchObject({ type: 'object', required: ['filename', 'contentType', 'content'] });
+    const [base64Item, urlItem] = (fields.attachments!.items as Schema).anyOf as Schema[];
+    expect(base64Item).toMatchObject({ type: 'object', required: ['filename', 'contentType', 'content'] });
+    expect(urlItem).toMatchObject({ type: 'object', required: ['url'] });
     expect(fields.attachmentTokens).toMatchObject({ type: 'array', maxItems: 10 });
     expect(send['x-max-body-utf8-bytes']).toBe(1048576);
     const update = specs.api.components.schemas.UpdateSettingsRequest!;
@@ -438,7 +441,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(spec.components.schemas.MailAddress!.oneOf).toHaveLength(2);
       expect(fields.headers).toMatchObject({ type: 'object', 'x-allowed-headers': ALLOWED_CUSTOM_HEADERS });
       for (const text of ['header_not_allowed', 'details.headers', 'replyToMessageId']) expect(fields.headers!.description).toContain(text);
-      const attachment = props(fields.attachments!.items as Schema);
+      const attachment = props(((fields.attachments!.items as Schema).anyOf as Schema[])[0]!);
       expect(attachment.contentId!.description).toContain('cid:');
       expect(attachment.disposition).toMatchObject({ enum: ['attachment', 'inline'] });
       const [token, tokenObject] = (fields.attachmentTokens!.items as Schema).oneOf as Schema[];
@@ -457,7 +460,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
       for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
       expect(envelope.required).toEqual(['code', 'message']);
-      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'source', 'suppressed', 'precheck']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'source', 'url', 'draftStatus', 'draftVersion', 'suppressed', 'precheck']);
       expect(props(error.details!).source).toMatchObject({ enum: ['reply', 'forward'] });
       expect(props(error.details!).suppressed).toMatchObject({ type: 'array', items: { $ref: '#/components/schemas/SuppressedRecipient' } });
       expect(error.docs).toMatchObject({ format: 'uri' });
@@ -470,7 +473,8 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
     expect(withoutExamples(v1.responses)).toEqual(withoutExamples(api.responses));
     for (const operation of [v1, api]) {
       expect(exampleNames(operation.responses, '404')).toEqual(expect.arrayContaining(['SourceUnavailableReply', 'SourceUnavailableForward']));
-      expect(exampleNames(operation.responses, '422')).toEqual(['DeliveryFailed', 'RecipientSuppressed']);
+      expect(exampleNames(operation.responses, '422')).toEqual(['DeliveryFailed', 'RecipientSuppressed', 'AttachmentUrlFetchFailed']);
+      expect(exampleNames(operation.responses, '400')).toEqual(expect.arrayContaining(['AttachmentUrlForbidden']));
     }
     for (const operation of [v1, api]) {
       const responses = operation.responses as Record<string, { description: string }>;
@@ -659,6 +663,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     'references/administration.md': administrationDoc, 'references/attachments.md': attachmentsDoc,
     'references/auth-and-http.md': authDoc, 'references/errors.md': errorsDoc, 'references/mail.md': mailDoc,
     'references/mailboxes-and-domains.md': mailboxesDoc, 'references/mcp.md': mcpDoc, 'references/notifications.md': notificationsDoc,
+    'references/drafts.md': draftsDoc,
     'references/webhooks.md': webhooksDoc,
   };
   /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */

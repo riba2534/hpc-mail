@@ -2,12 +2,12 @@
 
 ## 目录
 
-- [读取与搜索](#读取与搜索)：列表参数、摘要与详情字段、翻译、管理员 scope
+- [读取与搜索](#读取与搜索)：列表参数与筛选（时间、发件人、收件人、验证码、附件）、摘要与详情字段、翻译、管理员 scope
 - [发件认证与正文预处理](#发件认证与正文预处理)：`auth`（SPF/DKIM/DMARC）、`extractedText`、`risk` 与安全守则
 - [增量同步](#增量同步)：`afterId` 拉新邮件，避免重复读取详情；复查详情用 `If-None-Match`（304）
 - [等待本次验证码](#等待本次验证码)：`/v1/messages/wait` 的过滤、多地址、`include=body` 与游标、Python 示例
 - [维护状态与回收站](#维护状态与回收站)：已读、全部已读、星标、删除、恢复、永久删除
-- [发送](#发送)：请求字段，[发件身份](#发件身份)、[收件人与显示名](#收件人与显示名)、[自定义邮件头](#自定义邮件头)、[结果与状态](#结果与状态)、[幂等与重试](#幂等与重试)、[回复和转发](#回复和转发)（`/v1` 回复与转发接口、回复站外邮件）、[部分失败补发](#部分失败补发)
+- [发送](#发送)：请求字段，[发件身份](#发件身份)、[收件人与显示名](#收件人与显示名)、[自定义邮件头](#自定义邮件头)、[结果与状态](#结果与状态)、[幂等与重试](#幂等与重试)、[回复和转发](#回复和转发)（`/v1` 回复与转发接口、回复站外邮件）、[部分失败补发](#部分失败补发)、[批量发送](#批量发送)
 
 shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`API`、`AUTH`。邮件读/维护路径在 `/api` 与 `/v1` 相同；JWT 无 Key scope，Key 需下面的 scope。唯有发送是 `/api/messages/send` 对应 `/v1/messages`，长轮询仅 `/v1`。
 
@@ -27,10 +27,28 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`AP
 
 列表支持 `direction=inbound|outbound`、`address`（完整地址）、`domain`、`q`（最长 256 字符，不区分大小写的子串，匹配主题、发件地址、发件名、收件人和正文开头 4KB 的纯文本；只有 HTML 的邮件匹配其文字内容，正文更靠后的内容搜不到）、`unread=1`（只匹配你认领的地址，共享邮件不出现在未读筛选里）、`starred=1`、`trash=1`、`afterId`（非负安全整数，0 是合法空基线）、`cursor`、`limit`（1–100）。布尔查询接受 `1/true/0/false`；`unread=0` 与 `starred=0` 表示不筛选，不是“只看已读/未星标”。`trash=1` 只看软删除，未传看非回收站。
 
+筛选参数（`/api` 与 `/v1` 相同，可与上面的参数任意组合，多个条件同时满足）：
+
+| 参数 | 格式 | 匹配 |
+|---|---|---|
+| `since` | ISO 8601：`2026-11-17`（UTC 零点）、`2026-11-17T08:00:00Z` 或 `2026-11-17T16:00:00+08:00` | `createdAt` ≥ since（含边界） |
+| `until` | 同上 | `createdAt` < until（不含边界）；同时给出时 since 必须早于 until |
+| `from` | 完整地址，或 `@域名` | `fromAddress` 精确匹配（不区分大小写）；`@域名` 只匹配该域，不含子域（`@example.com` 不匹配 `a@mail.example.com`） |
+| `to` | 完整地址，或 `@域名` | 外发看 To/Cc/Bcc；收件看收件地址（`address`）与原信 To/Cc |
+| `hasCode` | `1/true` | 只看收件时识别出验证码的邮件（存储的码）；读取时临时识别出的码不参与筛选 |
+| `hasAttachments` | `1/true` | 只看带附件的邮件，口径同摘要的 `hasAttachments`（正文内联图不算） |
+
+没有时区的日期时间（`2026-11-17T08:00:00`）和纯数字时间戳返回 400 `validation_failed`，避免本地时区与秒/毫秒的歧义。`hasCode=0`、`hasAttachments=0` 与不传相同。读取量随匹配的稀疏程度增加：`from`、`to` 这类条件命中很少时，建议同时给 `since` 把范围收窄到需要的时间段。
+
 ```bash
 hpc '/messages' --get --data-urlencode 'direction=inbound' \
   --data-urlencode "address=$HPC_MAIL_ADDRESS" --data-urlencode 'limit=30'
 hpc '/messages' --get --data-urlencode 'q=验证码' --data-urlencode 'unread=1'
+# 最近 24 小时 GitHub 发来的、带附件的邮件
+hpc '/messages' --get --data-urlencode "since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
+  --data-urlencode 'from=@github.com' --data-urlencode 'hasAttachments=1'
+# 发给 bob 的外发邮件
+hpc '/messages' --get --data-urlencode 'direction=outbound' --data-urlencode 'to=bob@example.net'
 ```
 
 `/api` 列表首页（不带 `cursor`、`afterId`）另带 `head`，是该页内容的不透明指纹，只用于和 `/api/messages/sync` 比较是否相等；`/v1` 列表没有该字段。后续页带 `cursor=<data.nextCursor>`，保留过滤条件。`cursor` 只用服务器返回的值：伪造或截断后无法解码时返回 400 `validation_failed`，不会静默从首页重来（API Key 调用日志、管理员审计日志的分页同样如此）。
@@ -216,10 +234,10 @@ if not matched:
 | `headers` | 可选对象 `{名称:取值}`，只允许 `X-*` 与白名单头，见[自定义邮件头](#自定义邮件头) |
 | `replyToMessageId` | 可选站内邮件 ID，服务器据此写 In-Reply-To/References；不自动填收件人/主题/正文。不能与 `headers` 的 `In-Reply-To`/`References` 同时给（400） |
 | `forwardAttachmentsFrom` | 可选站内来源 ID，复制其全部附件（含内嵌图）；不自动填正文、主题或目标 |
-| `attachments` | 可选 base64 附件数组 `{filename,contentType,content,contentId?,disposition?}`，合计解码后最多 10 MiB；带 `contentId` 即内联图片，见[附件参考](attachments.md#内联图片) |
+| `attachments` | 可选附件数组：base64 项 `{filename,contentType,content,contentId?,disposition?}`（合计解码后最多 10 MiB），或 URL 项 `{url,filename?,contentType?,contentId?,disposition?}` 由服务端拉取（见 [URL 附件](attachments.md#url-附件)）；带 `contentId` 即内联图片，见[附件参考](attachments.md#内联图片) |
 | `attachmentTokens` | 可选已完成上传的 token 数组：字符串，或 `{token,contentId?,disposition?}` |
 
-附件三路（base64、token、`forwardAttachmentsFrom`）合计最多 10 个、50 MiB。整个请求体超过 16 MiB 时在解析前返回 413 `payload_too_large`。例子是请求结构，地址、正文必须替换为用户确认的值并用 JSON 序列化器生成：
+附件各路（base64、URL、token、`forwardAttachmentsFrom`）合计最多 10 个、50 MiB。整个请求体超过 16 MiB 时在解析前返回 413 `payload_too_large`。例子是请求结构，地址、正文必须替换为用户确认的值并用 JSON 序列化器生成：
 
 ```json
 {"from":"Alice <alice@example.org>","to":["Bob <bob@example.net>",{"address":"li@example.net","name":"李雷"}],
@@ -429,3 +447,21 @@ jq -n --slurpfile original message.json --arg from "$HPC_FROM" \
 
 - `status=unknown` 或某个收件人为 `unknown`：投递中断，结果未确认，对方可能已经收到。先向用户或收件人确认，确认没收到的再按上面的方法补发，不要把 `unknown` 当成 `failed` 直接重发。
 - 仍是 `pending`、没有逐收件人结果时先等待并核实，不全体重发。
+
+### 批量发送
+
+`POST /v1/messages/batch`（只有 Key 接口，需 `mail.send`）一次提交最多 20 封互相独立的信，例如给不同收件人发不同内容的通知。每一项就是一份 `POST /v1/messages` 的请求体，另可带 `idempotencyKey`：
+
+```bash
+jq -n --arg from "$FROM" '{items:[
+  {from:$from, to:["bob@example.net"], subject:"周报 Bob", text:"…"},
+  {from:$from, to:["carol@example.net"], subject:"周报 Carol", text:"…", idempotencyKey:"weekly-2026-46-carol"}]}' > "$WORK/batch.json"
+hpc '/messages/batch' -X POST -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY" \
+  --data-binary @"$WORK/batch.json" | jq '.data | {succeeded, failed, items:[.items[] | {index, ok, httpStatus, id:.message.id, code:.error.code}]}'
+```
+
+- 逐项处理，与单发完全相同：各自校验、带 `replyToMessageId`/`forwardAttachmentsFrom` 的项另需 `mail.read`、限定范围的 Key 只能用范围内的发件地址、各自幂等、URL 附件、各自占用每日外发配额。最多 4 项同时进行。
+- 响应总是 HTTP 200 加 `{items, succeeded, failed}`，`items` 按 `index`（请求里的下标，从 0 起）排序。每项 `ok`、`httpStatus`（单发时会得到的状态）、`idempotencyKey`（本项实际用的键，没有时省略），成功时 `message` 与单发 201 的 `data` 相同（部分收件人失败也算 `ok`，仍要看 `status` 与 `recipientOutcomes`），失败时 `error` 与单发的错误对象相同。全部失败也是 200，看 `failed`。
+- 配额中途用完时，之后的项得到 429 `rate_limited`，前面已发出的不受影响；只重试失败的项。站点所在 Cloudflare 账户的每日发信上限用尽时，外部收件人被明确拒收，相应的项是 422 `delivery_failed`（`recipientOutcomes` 写明原因）。
+- 幂等：项里的 `idempotencyKey` 优先；没有时，请求头 `Idempotency-Key: K` 为第 i 项派生 `K:i`。网络错误或 5xx 后用同一个头、同一请求体整批重试，已完成的项原样重放，没开始的项继续发送；派生后的键超过 128 字符的项返回 400。改了某一项的内容就会得到该项的 409 `idempotency_mismatch`。
+- 整体失败只有几种：`items` 缺失、为空或超过 20 项（400），Key 没有 `mail.send`（403），请求体超过 16 MiB 或各项 base64 附件合计超过 10 MiB（413）。这些情况一封都没发。
