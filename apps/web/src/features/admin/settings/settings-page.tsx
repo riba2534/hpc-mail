@@ -209,6 +209,41 @@ function AiModelSection({
   );
 }
 
+/** 投递回执：自动订阅开关，以及各发信域名的订阅状态（只读，失败的列出原因） */
+function DeliveryEventsSection({ enabled, onChange }: { enabled: boolean; onChange: (value: boolean) => void }) {
+  const { data, isError } = useQuery({ queryKey: queryKeys.admin.deliveryEvents, queryFn: () => adminApi.deliveryEvents() });
+  const failed = data?.subscriptions.filter((item) => item.status === 'error') ?? [];
+  return (
+    <Section
+      title="投递回执"
+      description="送达、退信与投诉经 Cloudflare 事件订阅写回已发送邮件的收件人结果；退信与投诉的地址进入抑制名单，之后从同一发信域名发给它们会直接失败。"
+    >
+      <ToggleRow
+        label="自动订阅投递事件"
+        description="开启且 Worker 配置了 Cloudflare 凭据时，自动为系统域名与已开通发信的托管域名建立订阅。关闭只停止新建订阅，已有订阅的回执照常写回。"
+        checked={enabled}
+        onChange={onChange}
+      />
+      {isError ? (
+        <p className="text-sm text-ink-tertiary">订阅状态读取失败。</p>
+      ) : data && (
+        <div aria-label="投递事件订阅状态" className="text-sm text-ink-secondary">
+          <p>
+            {data.credentials
+              ? `已订阅 ${data.subscriptions.length - failed.length} 个发信域名${failed.length ? `，${failed.length} 个失败（定时任务稍后重试）` : ''}。`
+              : 'Worker 未配置 Cloudflare 凭据（cf_api_token / cf_account_id），不会自动建立订阅。'}
+          </p>
+          {failed.length > 0 && (
+            <ul className="mt-1 list-disc pl-4">
+              {failed.map((item) => <li key={item.domain} className="break-words">{item.domain}：{item.lastError || '建立失败'}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+    </Section>
+  );
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
   const { data, isLoading, isError, error, refetch } = useQuery({
@@ -533,6 +568,14 @@ export function SettingsPage() {
               suffix="个"
             />
           </Section>
+        )}
+
+        {/* 旧版本服务端没有 delivery_events 设置时不显示 */}
+        {draft.delivery_events && (
+          <DeliveryEventsSection
+            enabled={draft.delivery_events.enabled}
+            onChange={(value) => patch((s) => void (s.delivery_events.enabled = value))}
+          />
         )}
       </div>
 

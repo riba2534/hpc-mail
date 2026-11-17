@@ -404,6 +404,39 @@ describe('idempotency error codes', () => {
   });
 });
 
+describe('recipient_suppressed', () => {
+  const savedKey = () => JSON.parse(localStorage.getItem(sendAttemptKeyForUser(1)) ?? 'null')?.key as string | undefined;
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('lists each suppressed recipient with its reason and release time, and sends again with a fresh key', async () => {
+    mocks.send
+      .mockRejectedValueOnce(new ApiError('全部收件人都在抑制名单中，没有发送', {
+        code: 'recipient_suppressed', httpStatus: 422,
+        details: { suppressed: [
+          { address: 'gone@example.com', reason: 'hard_bounce', sendingDomain: 'one.example', since: '2026-11-01T00:00:00Z', expiresAt: null },
+          { address: 'full@example.com', reason: 'soft_bounce', sendingDomain: 'one.example', since: '2026-11-01T00:00:00Z', expiresAt: '2026-11-02T00:00:00Z' },
+        ] },
+      }))
+      .mockResolvedValueOnce({ id: 24, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show({ fromAddress: 'first@one.example', to: ['gone@example.com'], subject: 'hello', body: 'body' });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('没有发送：收件人都在抑制名单中');
+    expect(alert).toHaveTextContent('gone@example.com：此前退信（地址或域名不可用），需管理员解除');
+    expect(alert).toHaveTextContent(`full@example.com：此前临时退信且重试耗尽，${new Date('2026-11-02T00:00:00Z').toLocaleString()} 自动解除`);
+    expect(alert).toHaveTextContent('从 one.example 发给这些地址会直接失败');
+    expect(savedKey()).toBeUndefined();
+    const oldKey = mocks.send.mock.calls[0]![1];
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
+    client.clear();
+  });
+});
+
 describe('resend of unconfirmed recipients', () => {
   beforeEach(() => {
     localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };

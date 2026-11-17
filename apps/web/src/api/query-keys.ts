@@ -62,6 +62,7 @@ export const queryKeys = {
     hostedDomains: ['admin', 'hosted-domains'] as const,
     hostedDomainList: (filters: { status?: string; q?: string }) => ['admin', 'hosted-domains', filters] as const,
     hostedDomainsHealth: ['admin', 'hosted-domains-health'] as const,
+    deliveryEvents: ['admin', 'delivery-events'] as const,
   },
 } as const;
 

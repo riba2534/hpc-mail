@@ -100,6 +100,13 @@ interface AttachmentUpload {
 type FieldKey = 'identity' | 'to' | 'subject' | 'body' | 'attachments';
 type FieldErrors = Partial<Record<FieldKey, string>>;
 
+/** recipient_suppressed 的抑制原因 */
+const SUPPRESSION_REASON_TEXT: Record<string, string> = {
+  hard_bounce: '此前退信（地址或域名不可用）',
+  soft_bounce: '此前临时退信且重试耗尽',
+  complaint: '收件人曾把来信标记为垃圾邮件',
+};
+
 /** 提交失败时按表单顺序聚焦第一个出错字段 */
 const FIELD_ORDER: FieldKey[] = ['identity', 'to', 'subject', 'body', 'attachments'];
 const FIELD_IDS: Record<FieldKey, string[]> = {
@@ -280,8 +287,8 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   // kind 为 reply / forward：回复或转发引用的原邮件已不可用
   const [sendError, setSendError] = useState<{
     message: string;
-    kind: 'uncertain' | 'in_progress' | 'key_mismatch' | 'delivery_failed' | 'error' | SendSource;
-    /** delivery_failed：已记录的失败发件与逐收件人原因 */
+    kind: 'uncertain' | 'in_progress' | 'key_mismatch' | 'delivery_failed' | 'recipient_suppressed' | 'error' | SendSource;
+    /** delivery_failed：已记录的失败发件与逐收件人原因；recipient_suppressed：抑制名单里的收件人 */
     details?: ApiErrorDetails;
   } | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -445,7 +452,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       sendIdempotencyKeyRef.current = null;
       sendPayloadHashRef.current = null;
       writeLastIdentity(user.id, currentIdentity());
-      const failures = result.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
+      const failures = result.recipientOutcomes?.filter((outcome) => outcome.status === 'failed' || outcome.status === 'bounced') ?? [];
       const issue = failures.length > 0 || Boolean(result.errorDetail) || result.status === 'failed';
       toast({ title: issue ? failures.length ? `${failures.length} 个收件人发送失败，请查看并重试失败目标` : '邮件发送有异常，请查看详情' : result.status === 'delivered' ? '站内邮件已送达' : '邮件已提交发送', variant: issue ? 'error' : 'success' });
       clearDraft(draftKey);
@@ -456,7 +463,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       });
       // 新收件人会进入往来联系人
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });
-      navigate(result.errorDetail || result.status === 'failed' || result.recipientOutcomes?.some((outcome) => outcome.status === 'failed') ? `/mail/${result.id}` : '/sent');
+      navigate(result.errorDetail || result.status === 'failed' || failures.length ? `/mail/${result.id}` : '/sent');
     },
     onError: (err, payload) => {
       // 网络/超时可能发生在服务端已经发送之后、服务端也可能仍在处理：保留同一个 key，再次发送只会查询/重放原结果。
@@ -473,6 +480,10 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         // 服务端已记下一封全部失败的外发，已发送列表要显示它
         syncSentMessage(queryClient, { sourceIds: [], selfDelivered: false });
         setSendError({ message, kind: 'delivery_failed', details: err.details });
+        return;
+      }
+      if (err instanceof ApiError && err.code === 'recipient_suppressed') {
+        setSendError({ message, kind: 'recipient_suppressed', details: err.details });
         return;
       }
       const sessionChanged = err instanceof ApiError && err.code === 'session_changed';
@@ -991,6 +1002,23 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
                   <Link to={`/mail/${sendError.details.messageId}`} className="ml-0.5 font-medium text-accent hover:underline">查看失败记录</Link>
                 )}
               </p>
+            </div>
+          ) : sendError.kind === 'recipient_suppressed' ? (
+            <div role="alert" className="rounded-md border border-critical/40 bg-critical-soft p-3 text-sm text-ink-secondary">
+              <p className="font-medium text-critical">没有发送：收件人都在抑制名单中</p>
+              {(sendError.details?.suppressed?.length ?? 0) > 0 ? (
+                <ul className="mt-1 list-disc pl-4">
+                  {sendError.details!.suppressed!.map((item) => (
+                    <li key={item.address} className="break-words">
+                      {item.address}：{SUPPRESSION_REASON_TEXT[item.reason] ?? item.reason}，
+                      {item.expiresAt ? `${new Date(item.expiresAt).toLocaleString()} 自动解除` : '需管理员解除'}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-1 break-words">{sendError.message}</p>
+              )}
+              <p className="mt-1">从 {sendError.details?.suppressed?.[0]?.sendingDomain ?? '该域名'} 发给这些地址会直接失败，请换用其他收件人。</p>
             </div>
           ) : sendError.kind === 'key_mismatch' ? (
             <p role="alert" className="text-sm text-critical">
