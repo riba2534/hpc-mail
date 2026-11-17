@@ -43,6 +43,16 @@ function safeChar(code: number): string {
 export const HTML_TO_TEXT_MAX_CHARS = 512 * 1024;
 
 /**
+ * 截断前先清掉不产生文字的大块内容，免得开头一张内嵌图片就占满上限、把后面的正文（验证码）挤出去：
+ * 超长的带引号属性值（data: 图片、巨型 style 等）清空，未加引号或在 CSS url() 里的超长 data: URI 去掉载荷。
+ * 两条正则都只在 `="`、`data:` 处起扫，扫到第一个终止字符为止，整体线性。
+ */
+const LONG_ATTRIBUTE_VALUE = /=\s*(?:"[^"]{4096,}"|'[^']{4096,}')/g;
+const LONG_DATA_URI = /\bdata:[^\s"'<>)]{1024,}/gi;
+/** 截断或实体解码留下的孤立代理字符 */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
  * 只处理最后一个 `>` 之前的部分：之后不可能有完整标签，`<[^>]+>` 这类正则在没有 `>` 的长串上
  * 会对每个 `<` 都扫到结尾，退化成平方耗时（64KB 的 `<a <a …` 约 0.7 秒，256KB 约 12 秒）。
  * 前一步替换可能删掉末尾的 `>`，所以每一步都重新切分。
@@ -87,9 +97,23 @@ const MARKUP_STEPS: Array<(markup: string) => string> = [
   (markup) => markup.replace(/<[^>]+>/g, ' '),
 ];
 
+/** HTML 转换出的纯文本；truncated 表示去掉大块内容后仍超过上限，只转换了开头 */
+export interface HtmlText {
+  text: string;
+  truncated: boolean;
+}
+
 /** 无依赖的 HTML → 纯文本（收件解析与摘要用，禁止引入 linkedom 等重依赖） */
-export function htmlToText(html: string | undefined | null): string {
-  return MARKUP_STEPS.reduce((source, step) => withinMarkup(source, step), String(html || '').slice(0, HTML_TO_TEXT_MAX_CHARS))
+export function convertHtmlToText(html: string | undefined | null): HtmlText {
+  const compact = String(html || '').replace(LONG_ATTRIBUTE_VALUE, '=""').replace(LONG_DATA_URI, 'data:');
+  let source = compact.slice(0, HTML_TO_TEXT_MAX_CHARS);
+  const truncated = compact.length > source.length;
+  if (truncated) {
+    // 截断点落在标签中间时丢掉这段残缺的标签，不把属性当正文
+    const open = source.lastIndexOf('<');
+    if (open > source.lastIndexOf('>')) source = source.slice(0, open);
+  }
+  const text = MARKUP_STEPS.reduce((markup, step) => withinMarkup(markup, step), source)
     .replace(/&nbsp;/gi, ' ')
     .replace(ZERO_WIDTH_ENTITY, '')
     // 数字实体先于 &amp; 解码，避免把 `&amp;#8203;` 这种字面量当成零宽空格
@@ -102,9 +126,15 @@ export function htmlToText(html: string | undefined | null): string {
     .replace(/&apos;/gi, "'")
     .replace(ZERO_WIDTH, '')
     .replace(WIDE_SPACE, ' ')
+    .replace(LONE_SURROGATE, '')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+  return { text, truncated };
+}
+
+export function htmlToText(html: string | undefined | null): string {
+  return convertHtmlToText(html).text;
 }
 
 function previewOf(source: string, limit: number): string {
