@@ -30,7 +30,7 @@ hpc "/messages/$MESSAGE_ID/attachments/$ATTACHMENT_ID" --output "$HPC_DOWNLOAD_F
 
 1. 小附件可直接放发送请求的 `attachments:[{filename,contentType,content,contentId?,disposition?}]`；content 为无 `data:` 前缀的 base64，可含折行空白。`filename` 1–255 字符，不能有 `/`、`\` 或 `..`；`contentType` 3–128 字符。全部 base64 附件解码后合计不超过 10 MiB，更大的走第 2 种。
 2. 独立上传后在发送请求放 `attachmentTokens`，无需把文件重新 base64；上传完成后才能发送，token 不存在、不属于自己或尚未完成返回 400。每项写 token 字符串，或写成 `{token,contentId?,disposition?}` 把它作为内联图片。JSON 的 MIME 字段名上传为 `mimeType`，base64 附件为 `contentType`，不要混用。
-3. 转发或已确认部分失败的补发，用 `forwardAttachmentsFrom=原邮件 ID` 复制原附件，保留 inline/CID；此时不重复引用原附件 Tokens/重复 base64 加入。来源须对发件人可见（自己认领地址上的邮件、共享给自己的未删除来信，管理员另含未认领地址），否则或原附件已丢失时返回 404 `source_unavailable`；Key 还需要 `mail.read`。
+3. 转发或已确认部分失败的补发，用 `forwardAttachmentsFrom=原邮件 ID` 复制原附件，保留 inline/CID；此时不重复引用原附件 Tokens/重复 base64 加入。来源可见性、404 `source_unavailable` 与 Key 另需的 `mail.read` 见[回复和转发](mail.md#回复和转发)。
 
 三种来源可以混用，`attachments` 里还可以写 [URL 附件](#url-附件)。附件 Token 过期/上传失败时不能默默略掉附件发送。
 
@@ -72,15 +72,15 @@ hpc "/messages/$MESSAGE_ID/attachments/$ATTACHMENT_ID" --output "$HPC_DOWNLOAD_F
 
 | 限制 | 上限 | 超出时 |
 |---|---|---|
-| 附件个数（base64、token、转发原附件三路合计） | 10 个 | 400 `validation_failed` |
-| 全部附件合计（含 token 与转发原附件） | 50 MiB（`50*1024*1024` 字节），单个文件同样 | 413 `payload_too_large` |
+| 附件个数（base64、URL、token、转发原附件合计） | 10 个 | 400 `validation_failed` |
+| 全部附件合计（含 URL、token 与转发原附件） | 50 MiB（`50*1024*1024` 字节），单个文件同样 | 413 `payload_too_large` |
 | 请求体内 base64 附件解码后合计 | 10 MiB | 413 `payload_too_large`，`fix` 指向上传接口 |
 | 整个发信请求体（Content-Length） | 16 MiB | 413 `payload_too_large`，在解析前直接拒绝 |
 | 正文 `text`+`html` | UTF-8 合计 1 MiB | 400 `validation_failed` |
 | 单次直传 `POST /uploads` | 10 MiB，更大的走分片 | 413 |
-| 每用户待发送草稿 | 20 个、声明大小合计 100 MiB（含未完成上传） | 429 `rate_limited` |
+| 每用户待发送附件（上传的、发送中拉取的 URL 附件、草稿引用的，含未完成上传） | 20 个、声明大小合计 100 MiB | 429 `rate_limited` |
 
-未消费的草稿约 24 小时后定时清理；不再需要时用 `DELETE /uploads/:token` 及时取消。
+未发送的上传附件约 24 小时后定时清理（被草稿引用的除外）；不再需要时用 `DELETE /uploads/:token` 及时取消。
 
 ## 上传协议
 
@@ -92,7 +92,7 @@ hpc "/messages/$MESSAGE_ID/attachments/$ATTACHMENT_ID" --output "$HPC_DOWNLOAD_F
 | `POST /uploads/multipart` | JSON `{filename,mimeType,size}`，size 正整数 ≤50 MiB | 201 `{token,uploadId,partBytes,partCount}` |
 | `PUT /uploads/multipart/:token/parts/:partNumber` | 对应分片二进制 body，准确 Content-Length；编号从 1 起 | `{partNumber,etag}` |
 | `POST /uploads/multipart/:token/complete` | JSON `{parts:[{partNumber,etag},...]}` | `{token,size}`，至此 Token 才可用于发送 |
-| `DELETE /uploads/:token` | 无正文，终止分片或删除已上传草稿 | `{success:true}` |
+| `DELETE /uploads/:token` | 无正文，终止分片或删除已上传的附件 | `{success:true}` |
 
 使用 init 返回的 `partBytes/partCount`，目前每片 5 MiB，最后一片可更小。每片长度必须符合声明 size 的对应区间，不是任意大小；完成时提交所有连续编号与服务器 ETag，按编号排序，不伪造。上传和 complete 失败应显示/报告失败，不把 uploading Token 当 ready。
 
