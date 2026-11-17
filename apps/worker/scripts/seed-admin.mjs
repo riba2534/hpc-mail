@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 幂等 admin 引导：库内无 admin 时插入（CI 部署后执行；本地传 --local）
+// 幂等 admin 引导：库内无 admin 时插入（CI 部署前执行；本地传 --local [--persist-to <目录>]）
 // 哈希格式与 worker src/lib/password.ts 完全一致：pbkdf2-sha256$100000$<salt>$<hash>（base64url）
 import { execFileSync } from 'node:child_process';
 import { webcrypto as crypto } from 'node:crypto';
@@ -43,11 +43,13 @@ const sql = `INSERT INTO users (username, password_hash, role, status)
 SELECT '${username}', '${hash}', 'admin', 'active'
 WHERE NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin');`;
 
-const target = process.argv.includes('--local') ? '--local' : '--remote';
+const target = process.argv.includes('--local') ? ['--local'] : ['--remote'];
+const persistAt = process.argv.indexOf('--persist-to');
+if (persistAt !== -1) target.push('--persist-to', process.argv[persistAt + 1]);
 execFileSync(
   'npx',
   // 'db' 是 wrangler.toml 里的 D1 binding 名——按 binding 解析对一键部署（资源名可能不同）与 CI 都成立
-  ['wrangler', 'd1', 'execute', 'db', target, '--command', sql],
+  ['wrangler', 'd1', 'execute', 'db', ...target, '--command', sql],
   { stdio: 'inherit', cwd: new URL('..', import.meta.url).pathname },
 );
-console.log(`admin 引导完成（已存在则跳过）：${username}`);
+console.log('admin 引导完成（已存在则跳过）');
