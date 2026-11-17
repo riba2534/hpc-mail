@@ -23,7 +23,7 @@ import {
   ownedCountsFromResult, ownedCountsStatement, ownerLabel, releaseTargets,
 } from './mailbox.js';
 import { claimSettingsStatement } from './mailbox-policy.js';
-import { assertShareTargets } from './mailbox-share.js';
+import { assertShareTargets, shareTargetsStatement } from './mailbox-share.js';
 
 interface BatchMailboxRow {
   id: number;
@@ -119,6 +119,13 @@ const IDS_SQL = `SELECT json_extract(value, '$.id') FROM json_each(?1)`;
 /** 邮箱仍归读取时的所有者（?1 = [{id, ownerId}]） */
 const OWNER_CHANGED_SQL = `SELECT 1 FROM json_each(?1) j WHERE NOT EXISTS (SELECT 1 FROM mailboxes
   WHERE id = json_extract(j.value, '$.id') AND user_id = json_extract(j.value, '$.ownerId'))`;
+/** 共享写入的闸门：所有者未变，被分享人（?2 = [userId]）仍启用 */
+const SHARE_GATE_SQL = `${OWNER_CHANGED_SQL}
+      UNION ALL SELECT 1 FROM json_each(?2) g WHERE NOT EXISTS (SELECT 1 FROM users WHERE id = g.value AND status = 'active')`;
+
+/** 接受项写进写入语句的 JSON 参数（?1 = [{id, ownerId, address}]） */
+const acceptedJson = (accepted: readonly Accepted[]) =>
+  JSON.stringify(accepted.map(({ row }) => ({ id: row.id, ownerId: row.user_id, address: row.address })));
 
 interface TargetUser {
   id: number;
@@ -151,7 +158,13 @@ function targetUserFrom(result: D1Result | undefined, inactiveMessage: string): 
  * 认领分块提交，审计在认领之后补写（每个认领到的地址一行 mailbox.claim），写失败只记日志。
  */
 export async function adminClaimMailboxes(env: Env, actor: AuditActor, req: AdminBatchClaimRequest, tag: string): Promise<BatchClaimMailboxResult> {
-  const target = targetUserFrom(await targetUserStatement(env, req.userId).all(), '只能为启用中的用户认领');
+  return claimForTarget(env, actor, await targetUserStatement(env, req.userId).all(), req, tag);
+}
+
+/** adminClaimMailboxes 的认领与审计；目标用户行由调用方读取（可与其他读取合进一个 batch） */
+async function claimForTarget(env: Env, actor: AuditActor, targetResult: D1Result | undefined, req: AdminBatchClaimRequest,
+  tag: string): Promise<BatchClaimMailboxResult> {
+  const target = targetUserFrom(targetResult, '只能为启用中的用户认领');
   const result = await claimMailboxes(env, target.id, target.role, req.items);
   if (result.claimed.length) {
     try {
@@ -174,13 +187,11 @@ export async function adminClaimMailboxes(env: Env, actor: AuditActor, req: Admi
  */
 export async function adminClaimAndShare(env: Env, actor: AuditActor, req: AdminClaimAndShareRequest, tag: string): Promise<AdminClaimAndShareResult> {
   const userIds = [...new Set(req.shareUserIds ?? [])];
-  if (userIds.length) {
-    const grantees = await env.db.prepare('SELECT username, status FROM users WHERE id IN (SELECT value FROM json_each(?))')
-      .bind(JSON.stringify(userIds)).all<{ username: string; status: UserStatus }>();
-    assertShareTargets(grantees.results, userIds.length);
-  }
-  const claim = await adminClaimMailboxes(env, actor, req, tag);
-  if (!userIds.length) return { ...claim, shares: null };
+  if (!userIds.length) return { ...await adminClaimMailboxes(env, actor, req, tag), shares: null };
+  // 被分享人与目标用户一次读出；先复核被分享人，不合规时什么都不认领
+  const [grantees, targetResult] = await env.db.batch([shareTargetsStatement(env, userIds), targetUserStatement(env, req.userId)]);
+  assertShareTargets((grantees?.results ?? []) as { username: string; status: UserStatus }[], userIds.length);
+  const claim = await claimForTarget(env, actor, targetResult, req, tag);
   if (!claim.claimed.length) return { ...claim, shares: summarize([]) };
   try {
     const shares = await adminShareMailboxes(env, actor,
@@ -285,7 +296,7 @@ export async function adminTransferMailboxes(env: Env, actor: AuditActor, req: A
 async function loadShareContext(env: Env, addresses: readonly string[], userIds: readonly number[]) {
   const [rowsResult, granteeResult, membersResult] = await env.db.batch([
     mailboxesByAddressStatement(env, addresses),
-    env.db.prepare('SELECT id, username, status FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(userIds)),
+    shareTargetsStatement(env, userIds),
     env.db.prepare(`SELECT s.mailbox_id, s.user_id FROM mailbox_shares s JOIN mailboxes m ON m.id = s.mailbox_id
       WHERE m.address IN (SELECT value FROM json_each(?))`).bind(JSON.stringify(addresses)),
   ]);
@@ -318,15 +329,13 @@ export async function adminShareMailboxes(env: Env, actor: AuditActor, req: Admi
   });
   if (!accepted.length) return summarize(results);
 
-  const items = JSON.stringify(accepted.map(({ row }) => ({ id: row.id, ownerId: row.user_id, address: row.address })));
+  const items = acceptedJson(accepted);
   const granteeJson = JSON.stringify(userIds);
   // 本项真正要新增的成员 g：不是所有者、也不在名单里。审计写在插入之前，列出的就是本次新增的人
   const isNew = `g.value <> json_extract(j.value, '$.ownerId')
     AND NOT EXISTS (SELECT 1 FROM mailbox_shares s WHERE s.mailbox_id = json_extract(j.value, '$.id') AND s.user_id = g.value)`;
   const [, , inserted] = await commit(env, [
-    batchGateStatement(env, `${OWNER_CHANGED_SQL}
-      UNION ALL SELECT 1 FROM json_each(?2) g WHERE NOT EXISTS (SELECT 1 FROM users WHERE id = g.value AND status = 'active')`,
-    items, granteeJson),
+    batchGateStatement(env, SHARE_GATE_SQL, items, granteeJson),
     env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
       SELECT ?1, ${ACTOR_NAME_SQL}, 'mailbox.share', json_extract(j.value, '$.address'),
         '追加共享 ' || (SELECT group_concat(u.username, '、') FROM json_each(?3) g JOIN users u ON u.id = g.value WHERE ${isNew}) || ?4, ?2
@@ -355,7 +364,7 @@ export async function adminUnshareMailboxes(env: Env, actor: AuditActor, req: Ad
     userIds.some((userId) => members.get(row.id)?.has(userId)) ? null : itemResult(item.address, row, 'unchanged', { revokedShares: 0 }));
   if (!accepted.length) return summarize(results);
 
-  const items = JSON.stringify(accepted.map(({ row }) => ({ id: row.id, ownerId: row.user_id, address: row.address })));
+  const items = acceptedJson(accepted);
   const granteeJson = JSON.stringify(userIds);
   // 本项名单里要移除的成员 s。审计写在删除之前，列出的就是本次实际移除的人
   const isRemoved = `s.mailbox_id = json_extract(j.value, '$.id') AND s.user_id IN (SELECT value FROM json_each(?3))`;
@@ -393,16 +402,14 @@ export async function adminReplaceShares(env: Env, actor: AuditActor, req: Admin
   });
   if (!accepted.length) return summarize(results);
 
-  const items = JSON.stringify(accepted.map(({ row }) => ({ id: row.id, ownerId: row.user_id, address: row.address })));
+  const items = acceptedJson(accepted);
   const granteeJson = JSON.stringify(userIds);
   const suffix = `；${tag}${auditSuffix(actor)}`;
   // 本项名单里要移除的成员 s、要新增的成员 g
   const isRemoved = `s.mailbox_id = json_extract(j.value, '$.id') AND s.user_id NOT IN (SELECT value FROM json_each(?3))`;
   const isNew = `NOT EXISTS (SELECT 1 FROM mailbox_shares s WHERE s.mailbox_id = json_extract(j.value, '$.id') AND s.user_id = g.value)`;
   const [, , , removed, inserted] = await commit(env, [
-    batchGateStatement(env, `${OWNER_CHANGED_SQL}
-      UNION ALL SELECT 1 FROM json_each(?2) g WHERE NOT EXISTS (SELECT 1 FROM users WHERE id = g.value AND status = 'active')`,
-    items, granteeJson),
+    batchGateStatement(env, SHARE_GATE_SQL, items, granteeJson),
     env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
       SELECT ?1, ${ACTOR_NAME_SQL}, 'mailbox.unshare', json_extract(j.value, '$.address'),
         '替换共享名单，移除 ' || (SELECT group_concat(u.username, '、') FROM mailbox_shares s JOIN users u ON u.id = s.user_id WHERE ${isRemoved}) || ?4, ?2
