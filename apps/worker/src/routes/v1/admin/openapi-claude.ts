@@ -19,8 +19,8 @@ registerSchemas({
   }),
   ClaudeDomainFacts: object({
     domain: domainName,
-    addresses: { ...int, description: 'Addresses with a Claude account fact (welcome, receipt, subscription, suspension or product mail from Anthropic).' },
-    paid: { ...int, description: 'Of those, addresses that received a receipt or subscription confirmation.' },
+    addresses: { ...int, description: 'Addresses with a Claude account fact (welcome, receipt, subscription, suspension or product mail from Anthropic) or a recorded receipt.' },
+    paid: { ...int, description: 'Of those, addresses that are paid by the same rule as ClaudeAddressFacts.paid (a receipt or subscription confirmation).' },
     suspended: { ...int, description: 'Of those, addresses that received a suspension notice.' },
     suspendedAddresses: array(object({ address, suspendedAt: nullable(date) })),
   }),
