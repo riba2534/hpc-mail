@@ -1,9 +1,12 @@
-import { claimMailboxRequestSchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
+import { batchMailboxRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../../lib/http.js';
 import { AppError } from '../../lib/errors.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
-import { checkAvailability, claimMailbox, listMailboxes, releaseMailbox, updateMailbox } from '../../services/mailbox.js';
+import { planRandomDomains } from '../../services/claim-plan.js';
+import {
+  checkAvailability, checkAvailabilityBatch, claimMailbox, claimMailboxes, listMailboxes, releaseMailbox, updateMailbox,
+} from '../../services/mailbox.js';
 import { listSharedMailboxes } from '../../services/mailbox-share.js';
 import type { AppContext } from '../../types.js';
 
@@ -30,6 +33,30 @@ app.get('/availability', async (c) => {
   const key = c.get('apiKey')!;
   const req = parseQuery(c, claimMailboxRequestSchema);
   return ok(c, await checkAvailability(c.env, { userId: key.userId, role: key.role }, req.localPart, req.domain, req.strategy));
+});
+
+/** 批量可用性提示：同 /api 同名接口，结果保持请求顺序 */
+app.post('/availability/batch', async (c) => {
+  requireScope(c, 'mailbox.read');
+  const key = c.get('apiKey')!;
+  const req = await parseBody(c, batchMailboxRequestSchema);
+  return ok(c, await checkAvailabilityBatch(c.env, { userId: key.userId, role: key.role }, req.items));
+});
+
+/** 随机后缀分配（不认领），同 /api 同名接口 */
+app.get('/random-plan', async (c) => {
+  requireScope(c, 'mailbox.read');
+  const key = c.get('apiKey')!;
+  const req = parseQuery(c, claimPlanQuerySchema);
+  return ok(c, await planRandomDomains(c.env, { userId: key.userId, role: key.role }, req.count, req.strategy));
+});
+
+/** 批量认领：按顺序逐个认领，被占用的跳过，其他错误停止并保留已认领的（见 stoppedBy） */
+app.post('/batch', async (c) => {
+  requireScope(c, 'mailbox.write');
+  const key = c.get('apiKey')!;
+  const req = await parseBody(c, batchMailboxRequestSchema);
+  return ok(c, await claimMailboxes(c.env, key.userId, key.role, req.items));
 });
 
 app.put('/:id', async (c) => {
