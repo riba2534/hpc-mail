@@ -96,11 +96,11 @@ export interface Mailbox {
 
 /**
  * 不能用作发件身份的原因：hosted_sending_not_ready 托管域名的发信尚未就绪；
- * hosted_domain_unavailable 托管域名已暂停、迁走或删除中；shared_readonly 别人共享给我的邮箱只能读不能发。
+ * hosted_domain_unavailable 托管域名已暂停、迁走或删除中；shared_readonly 别人共享给我的邮箱只能读不能发（普通用户）。
  */
 export type SendIdentityBlockReason = 'hosted_sending_not_ready' | 'hosted_domain_unavailable' | 'shared_readonly';
 
-/** 一个具体的发件地址：自己认领的（kind=owned）或共享给我的（kind=shared，恒不能发信） */
+/** 一个具体的发件地址：自己认领的（kind=owned）或共享给我的（kind=shared：普通用户恒不能发；管理员可用 mailboxId 发，按域名状态判定） */
 export interface SendIdentity {
   kind: 'owned' | 'shared';
   mailboxId: number;
