@@ -1,20 +1,24 @@
 import {
   HOSTED_DOMAIN_USABLE_STATUSES,
   type BatchClaimMailboxResult, type ClaimMailboxRequest, type ClaimPlanStrategy, type HostedDomainStatus, type Mailbox, type MailboxAvailability,
-  type MailboxTransferResult, type MailboxUnavailableReason, type Role, type TransferMailboxRequest,
+  type MailboxTransferResult, type MailboxUnavailableReason, type Page, type Role, type TransferMailboxRequest,
 } from '@hpc-mail/shared';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, lt, or, sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { hostedDomains, mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
+import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import {
-  claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
+  asActor, claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
   type ClaimSettings, type MailboxPolicyUser,
 } from './mailbox-policy.js';
+import { hostedSendBlock, USABLE_HOSTED_SQL } from './domain.js';
+import { systemDomainListedSql } from './domain-occupancy.js';
 import { getSettingsFresh, mergeSettingRows } from './setting.js';
-import { PURGE_MESSAGES_INDEX, purgeStatements } from './message-lifecycle.js';
+import { purgeStatements } from './message-lifecycle.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
+import { ACTOR_NAME_SQL, auditStatement, auditSuffix, type AuditActor } from './audit.js';
 
 type MailboxRow = typeof mailboxes.$inferSelect;
 
@@ -33,39 +37,84 @@ function serialize(row: MailboxRow, messageCount: number, ownerUsername?: string
   };
 }
 
-export async function listMailboxes(
-  env: Env,
-  opts: { userId?: number; all?: boolean },
-): Promise<Mailbox[]> {
-  const db = createDb(env);
-  if (opts.all) {
-    const rows = await db
-      .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql })
-      .from(mailboxes)
-      .leftJoin(users, eq(users.id, mailboxes.userId))
-      .orderBy(desc(mailboxes.id))
-      .all();
-    return rows.map((r) => serialize(r.mailbox, Number(r.messageCount), r.username ?? ''));
-  }
-  const rows = await db
-    .select({ mailbox: mailboxes, messageCount: messageCountSql })
-    .from(mailboxes)
-    .where(eq(mailboxes.userId, opts.userId!))
-    .orderBy(desc(mailboxes.id))
-    .all();
-  return rows.map((r) => serialize(r.mailbox, Number(r.messageCount)));
+/** 列表项的发信判定所需列：托管域名 LEFT JOIN 进同一条查询，不多一次往返 */
+const sendableColumns = { status: hostedDomains.status, sendingStatus: hostedDomains.sendingStatus };
+
+/** 地址或所有者用户名包含 q（调用方已转小写；地址入库即为小写）：instr 按字面匹配，% 和 _ 不当通配符 */
+export function mailboxSearchSql(q: string): SQL {
+  return or(sql`instr(${mailboxes.address}, ${q}) > 0`,
+    sql`${mailboxes.userId} IN (SELECT id FROM users WHERE instr(lower(username), ${q}) > 0)`)!;
 }
 
-/** 管理员按 id 读任意邮箱：与 ?all=1 列表同形（含所有者用户名与邮件数），一次查询 */
+export interface ListMailboxesOptions {
+  userId?: number;
+  all?: boolean;
+  q?: string;
+  domain?: string;
+  /** API Key 限定范围：只列 id 在 mailboxIds 或域名在 domains 中的邮箱（两个列表各以一个 JSON 参数绑定） */
+  restrict?: { mailboxIds: number[]; domains: string[] };
+}
+
+function restrictedMailboxes(restrict: ListMailboxesOptions['restrict']): SQL | undefined {
+  if (!restrict) return undefined;
+  return or(
+    sql`${mailboxes.id} IN (SELECT value FROM json_each(${JSON.stringify(restrict.mailboxIds)}))`,
+    sql`${mailboxes.domain} IN (SELECT value FROM json_each(${JSON.stringify(restrict.domains)}))`,
+  );
+}
+
+/**
+ * 本人或全站（all）邮箱，按 id 倒序。page 为 null 时返回完整数组（旧行为）；
+ * 分页时 LIMIT 作用在 mailboxes 上，没有排序步骤，messageCount 子查询只为返回的行计算。
+ */
+export async function listMailboxes(env: Env, opts: ListMailboxesOptions): Promise<Mailbox[]>;
+export async function listMailboxes(env: Env, opts: ListMailboxesOptions, page: PageRequest | null): Promise<Mailbox[] | Page<Mailbox>>;
+export async function listMailboxes(env: Env, opts: ListMailboxesOptions, page: PageRequest | null = null): Promise<Mailbox[] | Page<Mailbox>> {
+  const db = createDb(env);
+  const where = and(
+    opts.all ? undefined : eq(mailboxes.userId, opts.userId!),
+    opts.domain ? eq(mailboxes.domain, opts.domain) : undefined,
+    opts.q ? mailboxSearchSql(opts.q) : undefined,
+    restrictedMailboxes(opts.restrict),
+    page?.cursorId ? lt(mailboxes.id, page.cursorId) : undefined,
+  );
+  let items: Mailbox[];
+  if (opts.all) {
+    const rows = await db
+      .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql, ...sendableColumns })
+      .from(mailboxes)
+      .leftJoin(users, eq(users.id, mailboxes.userId))
+      .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
+      .where(where)
+      .orderBy(desc(mailboxes.id))
+      .limit(fetchLimit(page))
+      .all();
+    items = rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount), r.username ?? ''), canSend: hostedSendBlock(r) === null }));
+  } else {
+    const rows = await db
+      .select({ mailbox: mailboxes, messageCount: messageCountSql, ...sendableColumns })
+      .from(mailboxes)
+      .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
+      .where(where)
+      .orderBy(desc(mailboxes.id))
+      .limit(fetchLimit(page))
+      .all();
+    items = rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount)), canSend: hostedSendBlock(r) === null }));
+  }
+  return page ? toPage(items, page.limit, (box) => box.id) : items;
+}
+
+/** 管理员按 id 读任意邮箱：与 ?all=1 列表同形（含所有者用户名、邮件数与 canSend），一次查询 */
 export async function getMailbox(env: Env, id: number): Promise<Mailbox> {
   const row = await createDb(env)
-    .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql })
+    .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql, ...sendableColumns })
     .from(mailboxes)
     .leftJoin(users, eq(users.id, mailboxes.userId))
+    .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
     .where(eq(mailboxes.id, id))
     .get();
   if (!row) throw new AppError('not_found', '邮箱不存在');
-  return serialize(row.mailbox, Number(row.messageCount), row.username ?? '');
+  return { ...serialize(row.mailbox, Number(row.messageCount), row.username ?? ''), canSend: hostedSendBlock(row) === null };
 }
 
 interface ClaimPolicy {
@@ -131,7 +180,7 @@ function hostedAccessFromResult(result: D1Result | undefined): Map<string, Hoste
  * 绑定顺序：域名、角色、用户 id、用户 id。
  */
 const HOSTED_CLAIM_GUARD_SQL = `EXISTS (SELECT 1 FROM hosted_domains h WHERE h.domain = ?
-  AND h.status IN (${HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ')})
+  AND h.status IN (${USABLE_HOSTED_SQL})
   AND (? = 'admin' OR h.user_id = ? OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?)))`;
 
 const CLAUDE_SUSPENDED_MESSAGE = '该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领';
@@ -141,7 +190,7 @@ const CLAUDE_SUSPENDED_MESSAGE = '该域名有 Claude 封号记录，不能在 C
  * 顺序：域名存在与授权 → 保留前缀 → 全局上限 → 按域名上限 → Claude 封号（显式选择时）。
  * 管理员同样受 Claude 策略约束；纯函数，所需数据由调用方一次读齐。
  */
-function evaluateClaimPolicy(
+export function evaluateClaimPolicy(
   settings: ClaimSettings,
   user: MailboxPolicyUser,
   owned: OwnedCounts,
@@ -199,7 +248,12 @@ function evaluateClaimPolicy(
 interface ClaimContext {
   userId: number;
   settings: ClaimSettings;
+  /** 按凭据有效角色收窄后的用户（规则判定与托管域名守卫用它，见 asActor） */
   user: MailboxPolicyUser;
+  /** 读取时的账户角色：写入守卫据此确认角色没有变化 */
+  dbRole: Role;
+  /** 凭据的有效角色（API Key 没有 admin scope 时为 user） */
+  actorRole: Role;
   owned: OwnedCounts;
   /** 已被认领的地址：读取时已存在的，加上本批刚认领的 */
   taken: Set<string>;
@@ -212,7 +266,7 @@ interface ClaimContext {
 const addressOf = (req: ClaimMailboxRequest) => `${req.localPart}@${req.domain}`;
 
 /** 与 getSettingsFresh 同一个合并函数（只读回 domains / mailbox_policy 两行，其余项为默认值且不使用） */
-const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
+export const claimSettingsFrom = (result: D1Result | undefined): ClaimSettings =>
   mergeSettingRows((result?.results ?? []) as { key: string; value: string }[]);
 
 /** 规则所需的全部读取合成一个 D1 batch：认领设置（强一致直读）、用户权限、已认领数、地址占用。 */
@@ -229,10 +283,13 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
     ...(claudeDomains.length ? [env.db.prepare(`SELECT DISTINCT domain FROM claude_address_facts
       WHERE domain IN (SELECT value FROM json_each(?)) AND suspended > 0`).bind(JSON.stringify(claudeDomains))] : []),
   ]);
+  const dbUser = mailboxPolicyUserFromResult(userResult);
   return {
     userId: actor.userId,
     settings: claimSettingsFrom(settingsResult),
-    user: mailboxPolicyUserFromResult(userResult),
+    user: asActor(dbUser, actor.role),
+    dbRole: dbUser.role,
+    actorRole: actor.role,
     owned: ownedCountsFromResult(ownedResult),
     taken: new Set(((takenResult?.results ?? []) as { address: string }[]).map((row) => row.address)),
     hosted: hostedAccessFromResult(hostedResult),
@@ -240,7 +297,8 @@ async function loadClaimContext(env: Env, actor: { userId: number; role: Role },
   };
 }
 
-interface InsertedMailboxRow {
+/** 原生 SQL 读回的邮箱行（RETURNING 或 SELECT），带历史邮件数 */
+interface MailboxSqlRow {
   id: number;
   address: string;
   domain: string;
@@ -248,6 +306,20 @@ interface InsertedMailboxRow {
   display_name: string;
   created_at: number;
   message_count: number;
+}
+
+const MAILBOX_SQL_COLUMNS = `id, address, domain, user_id, display_name, created_at,
+  (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`;
+
+function fromSqlRow(row: MailboxSqlRow): Mailbox {
+  return serialize({
+    id: Number(row.id),
+    address: row.address,
+    domain: row.domain,
+    userId: Number(row.user_id),
+    displayName: row.display_name,
+    createdAt: new Date(Number(row.created_at)),
+  }, Number(row.message_count));
 }
 
 /** 规则判定 → 占用判定 → 带守卫的 INSERT（RETURNING 直接带回整行与历史邮件数）。成功后更新 context。 */
@@ -260,8 +332,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
 
   const address = addressOf(req);
   if (context.taken.has(address)) throw new AppError('address_taken', '该地址已被占用');
-  const returning = `RETURNING id, address, domain, user_id, display_name, created_at,
-    (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`;
+  const returning = `RETURNING ${MAILBOX_SQL_COLUMNS}`;
   try {
     // Domain revision and quotas are checked in the same write as INSERT. A
     // concurrent domain removal/private toggle must not create a stale claim.
@@ -278,8 +349,8 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
            ${returning}`,
         )
         .bind(address, req.domain, userId, perDomainLimit, userId, req.domain, perDomainLimit,
-          userId, policyUser.role, req.domain, policyUser.role, userId, userId, req.strategy === 'claude' ? 1 : 0, req.domain)
-        .first<InsertedMailboxRow>()
+          userId, context.dbRole, req.domain, policyUser.role, userId, userId, req.strategy === 'claude' ? 1 : 0, req.domain)
+        .first<MailboxSqlRow>()
       : await env.db
         .prepare(
           `INSERT INTO mailboxes (address, domain, user_id, display_name)
@@ -288,10 +359,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
              AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
              AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ?
              AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ? AND mailbox_policy_revision = ?)
-             AND EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
-               WHERE settings.key = 'domains'
-                 AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
-                   ELSE json_extract(configured.value, '$.domain') END)) = ?)
+             AND ${systemDomainListedSql('?')}
              AND (? = 0 OR NOT EXISTS (SELECT 1 FROM claude_address_facts WHERE domain = ? AND suspended > 0))
            ${returning}`,
         )
@@ -308,25 +376,18 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
           perDomainLimit,
           settings.domains.revision ?? 0,
           userId,
-          policyUser.role,
+          context.dbRole,
           policyUser.mailboxPolicyRevision,
           req.domain,
           req.strategy === 'claude' ? 1 : 0,
           req.domain,
         )
-        .first<InsertedMailboxRow>();
+        .first<MailboxSqlRow>();
     if (!inserted) throw await claimGuardError(env, context, req, policy.hosted);
     context.taken.add(address);
     if (!policy.hosted) context.owned.total += 1;
     context.owned.byDomain.set(req.domain, (context.owned.byDomain.get(req.domain) ?? 0) + 1);
-    return serialize({
-      id: Number(inserted.id),
-      address: inserted.address,
-      domain: inserted.domain,
-      userId: Number(inserted.user_id),
-      displayName: inserted.display_name,
-      createdAt: new Date(Number(inserted.created_at)),
-    }, Number(inserted.message_count));
+    return fromSqlRow(inserted);
   } catch (error) {
     if (error instanceof AppError) throw error;
     if (error instanceof Error && error.message.includes('UNIQUE constraint failed: mailboxes.address')) {
@@ -351,12 +412,13 @@ async function claimGuardError(env: Env, context: ClaimContext, req: ClaimMailbo
     return new AppError('conflict', '域名配置已改变，请刷新后重试');
   }
   const currentUser = mailboxPolicyUserFromResult(userResult);
-  if ((!hosted && currentUser.mailboxPolicyRevision !== context.user.mailboxPolicyRevision) || currentUser.role !== context.user.role) {
+  if ((!hosted && currentUser.mailboxPolicyRevision !== context.user.mailboxPolicyRevision) || currentUser.role !== context.dbRole) {
     return new AppError('conflict', '邮箱权限已改变，请刷新后重试');
   }
   if (hosted) {
     const access = hostedAccessFromResult(hostedResult).get(req.domain);
-    if (!access || evaluateClaimPolicy(current, currentUser, { total: 0, byDomain: new Map() }, req.localPart, req.domain, access).blocked) {
+    if (!access || evaluateClaimPolicy(current, asActor(currentUser, context.actorRole), { total: 0, byDomain: new Map() },
+      req.localPart, req.domain, access).blocked) {
       return hostedConflict();
     }
   }
@@ -437,12 +499,10 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
         OR (hosted = 0 AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4)
         OR NOT EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active' AND role = ?5
           AND (counted.hosted = 1 OR mailbox_policy_revision = ?6))
-        OR (hosted = 0 AND NOT EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
-          WHERE settings.key = 'domains' AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
-            ELSE json_extract(configured.value, '$.domain') END)) = counted.domain))
+        OR (hosted = 0 AND NOT ${systemDomainListedSql('counted.domain')})
         OR (hosted = 1 AND NOT EXISTS (SELECT 1 FROM hosted_domains h WHERE h.domain = counted.domain
-          AND h.status IN (${HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ')})
-          AND (?5 = 'admin' OR h.user_id = ?2
+          AND h.status IN (${USABLE_HOSTED_SQL})
+          AND (?7 = 'admin' OR h.user_id = ?2
             OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?2))))
       ) THEN 'guard'
       WHEN strategy = 'claude' AND domain IN (SELECT domain FROM blocked_domains) THEN 'claude_suspended'
@@ -476,19 +536,19 @@ async function claimChunk(env: Env, context: ClaimContext, items: ClaimMailboxRe
       code: policy.blocked?.error.code ?? null, message: policy.blocked?.error.message ?? null,
     };
   });
+  // ?5 账户角色（守卫确认未变），?7 凭据有效角色（托管域名权限）
   const bindings = [JSON.stringify(inputs), context.userId, context.owned.total, context.settings.domains.revision ?? 0,
-    context.user.role, context.user.mailboxPolicyRevision];
+    context.dbRole, context.user.mailboxPolicyRevision, context.user.role];
   const [plan, inserted] = await env.db.batch([
     env.db.prepare(`${BATCH_CLAIM_PLAN_SQL} SELECT position, address, is_new, blocked, policy_message, user_limit, domain_limit FROM planned ORDER BY position`).bind(...bindings),
     env.db.prepare(`${BATCH_CLAIM_PLAN_SQL}
       INSERT INTO mailboxes (address, domain, user_id, display_name)
       SELECT address, domain, ?2, '' FROM planned WHERE blocked IS NULL AND is_new ORDER BY position
-      RETURNING id, address, domain, user_id, display_name, created_at,
-        (SELECT COUNT(*) FROM messages WHERE messages.address = mailboxes.address) AS message_count`).bind(...bindings),
+      RETURNING ${MAILBOX_SQL_COLUMNS}`).bind(...bindings),
   ]);
   return {
     plan: plan!.results as unknown as PlannedClaimRow[],
-    inserted: new Map((inserted!.results as unknown as InsertedMailboxRow[]).map((row) => [row.address, row])),
+    inserted: new Map((inserted!.results as unknown as MailboxSqlRow[]).map((row) => [row.address, row])),
   };
 }
 
@@ -523,11 +583,7 @@ export async function claimMailboxes(
         } else {
           const mailbox = inserted.get(row.address);
           if (!mailbox) throw new Error('批量认领写入结果缺失');
-          result.claimed.push(serialize({
-            id: Number(mailbox.id), address: mailbox.address, domain: mailbox.domain,
-            userId: Number(mailbox.user_id), displayName: mailbox.display_name,
-            createdAt: new Date(Number(mailbox.created_at)),
-          }, Number(mailbox.message_count)));
+          result.claimed.push(fromSqlRow(mailbox));
           context.taken.add(row.address);
           if (!context.hosted.has(item.domain)) context.owned.total++;
           context.owned.byDomain.set(item.domain, (context.owned.byDomain.get(item.domain) ?? 0) + 1);
@@ -558,25 +614,41 @@ function availabilityOf(context: ClaimContext, req: ClaimMailboxRequest): Mailbo
   return context.taken.has(address) ? { address, available: false, reason: 'taken' } : { address, available: true };
 }
 
+/** 邮箱行与所有者用户名（审计写所有者用），一次查询 */
+async function mailboxWithOwner(env: Env, id: number) {
+  const row = await createDb(env).select({ mailbox: mailboxes, ownerName: users.username })
+    .from(mailboxes).leftJoin(users, eq(users.id, mailboxes.userId)).where(eq(mailboxes.id, id)).get();
+  return row && { ...row.mailbox, ownerName: row.ownerName };
+}
+
+export const ownerLabel = (row: { userId: number; ownerName: string | null }) =>
+  `${row.ownerName ?? `user#${row.userId}`} (#${row.userId})`;
+
+/** actor 为审计操作者：管理员改他人邮箱的发件名时记录前后值，自己的邮箱不记 */
 export async function updateMailbox(
   env: Env,
   userId: number,
   id: number,
   displayName: string,
   isAdmin: boolean,
+  actor?: AuditActor,
 ): Promise<Mailbox> {
   const db = createDb(env);
-  const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  const row = await mailboxWithOwner(env, id);
   if (!row || (!isAdmin && row.userId !== userId)) throw new AppError('not_found', '邮箱不存在');
   const result = await db.update(mailboxes).set({ displayName })
     .where(and(eq(mailboxes.id, id), eq(mailboxes.userId, row.userId))).run();
   if (!result.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
-  const [updated] = await db
-    .select({ mailbox: mailboxes, messageCount: messageCountSql })
-    .from(mailboxes)
-    .where(eq(mailboxes.id, id))
-    .all();
-  return serialize(updated!.mailbox, Number(updated!.messageCount));
+  // 审计与读回合进同一个 batch，不多一次往返
+  const audited = isAdmin && actor !== undefined && row.userId !== userId && row.displayName !== displayName;
+  const results = await env.db.batch([
+    ...(audited ? [auditStatement(env, actor, 'mailbox.update', row.address,
+      `发件名「${row.displayName}」→「${displayName}」；所有者 ${ownerLabel(row)}`)] : []),
+    env.db.prepare(`SELECT ${MAILBOX_SQL_COLUMNS} FROM mailboxes WHERE id = ?`).bind(id),
+  ]);
+  const updated = results[results.length - 1]?.results?.[0] as MailboxSqlRow | undefined;
+  if (!updated) throw new AppError('not_found', '邮箱已被释放，请刷新后重试');
+  return fromSqlRow(updated);
 }
 
 /** 不经过释放/重新认领：所有权、审计及旧共享撤销在同一个 D1 事务内完成。 */
@@ -589,7 +661,7 @@ export async function transferMailbox(
 ): Promise<MailboxTransferResult> {
   if (actor.role !== 'admin') throw new AppError('forbidden', '需要管理员权限');
   const db = createDb(env);
-  const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  const row = await mailboxWithOwner(env, id);
   if (!row) throw new AppError('not_found', '邮箱不存在');
   const target = await db.select().from(users).where(eq(users.id, req.userId)).get();
   if (!target) throw new AppError('not_found', '目标用户不存在');
@@ -610,8 +682,7 @@ export async function transferMailbox(
   if (policy?.blocked) throw policy.blocked.error;
   const totalLimit = policy?.perUserLimit ?? 0;
   const domainLimit = policy?.perDomainLimit ?? 0;
-  const previous = await db.select({ username: users.username }).from(users).where(eq(users.id, row.userId)).get();
-  const detail = `${previous?.username ?? `user#${row.userId}`} (#${row.userId}) → ${target.username} (#${target.id})；保留全部历史并撤销旧共享`;
+  const detail = `${ownerLabel(row)} → ${target.username} (#${target.id})；保留全部历史并撤销旧共享`;
   const results = await env.db.batch([
     env.db.prepare(`UPDATE mailboxes SET user_id = ? WHERE id = ? AND user_id = ? AND user_id <> ?
       AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ? AND mailbox_policy_revision = ?)
@@ -638,9 +709,106 @@ export async function transferMailbox(
 }
 
 /**
+ * 批量写入的前置闸门：violation 查出任一行（某项的前置条件已不成立）就插入 actor_id 为 NULL 的行，
+ * 触发 NOT NULL 约束使整个 batch 事务回滚。闸门之后的语句不必重复这些条件：同一事务里没有别的写入能插进来。
+ */
+export function batchGateStatement(env: Env, violation: string, ...params: unknown[]): D1PreparedStatement {
+  return env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, action) SELECT NULL, 'batch.gate' WHERE EXISTS (${violation})`)
+    .bind(...params);
+}
+
+export function isBatchGateError(error: unknown): boolean {
+  return String(error).includes('NOT NULL constraint failed: admin_audit_logs.actor_id');
+}
+
+/** 待释放的邮箱：读取时的所有者及其用户名（审计用） */
+export interface ReleaseTarget {
+  id: number;
+  address: string;
+  userId: number;
+  ownerName: string | null;
+}
+
+export interface ReleaseOutcome {
+  deletedMessages: number;
+  revokedShares: number;
+}
+
+/** 释放审计：操作者与 detail 末尾的附加说明（如批量标记） */
+export interface ReleaseAudit {
+  actor: AuditActor;
+  note: string;
+}
+
+/**
+ * 释放一组邮箱，全部写入同一个 D1 事务：闸门（每只邮箱仍归读取时的所有者，否则整批回滚）→
+ * [按地址圈定历史邮件并逐地址计数] → 审计（mailbox.release，删除条数在事务内计出）→ [删除邮件] → 撤销共享 → 删除邮箱。
+ * 历史邮件在事务内按地址圈定，授权之后、提交之前刚到的来信也一并删除。
+ */
+export async function releaseTargets(
+  env: Env,
+  targets: readonly ReleaseTarget[],
+  deleteHistory: boolean,
+  audit: ReleaseAudit | null,
+  ctx?: ExecCtx | null,
+): Promise<Map<number, ReleaseOutcome>> {
+  // 每项的 id/所有者/地址作为一个 JSON 参数传入：绑定参数个数不随项数增长
+  const items = JSON.stringify(targets.map((target) => ({
+    id: target.id, userId: target.userId, address: target.address, detail: `原所有者 ${ownerLabel(target)}`,
+  })));
+  const ids = `SELECT json_extract(value, '$.id') FROM json_each(?1)`;
+  const token = deleteHistory ? crypto.randomUUID() : null;
+  const statements = [batchGateStatement(env, `SELECT 1 FROM json_each(?1) j WHERE NOT EXISTS (SELECT 1 FROM mailboxes
+    WHERE id = json_extract(j.value, '$.id') AND user_id = json_extract(j.value, '$.userId'))`, items)];
+  if (token) {
+    statements.push(
+      env.db.prepare(`UPDATE messages SET purge_token = ?2 WHERE address IN (SELECT json_extract(value, '$.address') FROM json_each(?1))`)
+        .bind(items, token),
+      env.db.prepare('SELECT address, COUNT(*) AS n FROM messages WHERE purge_token = ? GROUP BY address').bind(token),
+    );
+  }
+  if (audit) {
+    statements.push(env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+      SELECT ?1, ${ACTOR_NAME_SQL}, 'mailbox.release', json_extract(j.value, '$.address'),
+        json_extract(j.value, '$.detail') || CASE WHEN ?2 IS NULL THEN '；保留历史邮件'
+          ELSE '；永久删除历史邮件 ' || (SELECT COUNT(*) FROM messages WHERE purge_token = ?2
+            AND address = json_extract(j.value, '$.address')) || ' 封' END || ?3, ?4
+      FROM json_each(?5) j`).bind(audit.actor.id, token, `${audit.note}${auditSuffix(audit.actor)}`, audit.actor.ip, items));
+  }
+  if (token) statements.push(...purgeStatements(env, token));
+  const sharesIndex = statements.length;
+  statements.push(
+    env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id IN (${ids}) RETURNING mailbox_id`).bind(items),
+    env.db.prepare(`DELETE FROM mailboxes WHERE id IN (${ids})`).bind(items),
+  );
+  let results: D1Result[];
+  try {
+    results = await env.db.batch(statements);
+  } catch (error) {
+    if (isBatchGateError(error)) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
+    throw error;
+  }
+  const deleted = new Map(((token ? results[2]?.results : undefined) as { address: string; n: number }[] | undefined ?? [])
+    .map((row) => [row.address, Number(row.n)]));
+  const revoked = countByMailbox(results[sharesIndex]?.results);
+  if (token) await scheduleStorageCleanup(env, ctx, 100);
+  return new Map(targets.map((target) => [target.id, {
+    deletedMessages: deleted.get(target.address) ?? 0, revokedShares: revoked.get(target.id) ?? 0,
+  }]));
+}
+
+/** 按 mailbox_id 计数 RETURNING mailbox_id 的结果行（撤销、新增了几条共享） */
+export function countByMailbox(rows: readonly unknown[] | undefined): Map<number, number> {
+  const counts = new Map<number, number>();
+  for (const row of (rows ?? []) as { mailbox_id: number }[]) counts.set(Number(row.mailbox_id), (counts.get(Number(row.mailbox_id)) ?? 0) + 1);
+  return counts;
+}
+
+/**
  * 释放地址。默认历史邮件不动（随地址回到未认领态，下一个认领者可见）；
  * deleteHistory=true 时同时删除该地址名下全部邮件——堵住「释放后被他人继承验证码/账单」的隐私路径。
  * 元数据与清理台账同一事务提交；传入 ctx 时 R2 删除放进 waitUntil，不阻塞响应。
+ * actor 为审计操作者：管理员释放他人邮箱时，mailbox.release 审计与释放同一事务。
  */
 export async function releaseMailbox(
   env: Env,
@@ -649,27 +817,13 @@ export async function releaseMailbox(
   isAdmin: boolean,
   deleteHistory = false,
   ctx?: ExecCtx | null,
+  actor?: AuditActor,
 ): Promise<{ deletedMessages: number }> {
-  const db = createDb(env);
-  const row = await db.select().from(mailboxes).where(eq(mailboxes.id, id)).get();
+  const row = await mailboxWithOwner(env, id);
   if (!row || (!isAdmin && row.userId !== userId)) throw new AppError('not_found', '邮箱不存在');
-  const token = crypto.randomUUID();
-  const statements: D1PreparedStatement[] = [];
-  if (deleteHistory) {
-    statements.push(env.db.prepare(`UPDATE messages SET purge_token = ? WHERE address = ?
-      AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`)
-      .bind(token, row.address, row.id, row.userId));
-    statements.push(...purgeStatements(env, token));
-  }
-  statements.push(env.db.prepare(`DELETE FROM mailbox_shares WHERE mailbox_id = ?
-    AND EXISTS (SELECT 1 FROM mailboxes WHERE id = ? AND user_id = ?)`).bind(row.id, row.id, row.userId));
-  statements.push(env.db.prepare('DELETE FROM mailboxes WHERE id = ? AND user_id = ?').bind(row.id, row.userId));
-  // One D1 transaction includes every message present at release, including concurrent inbound.
-  const result = await env.db.batch(statements);
-  if (!result[result.length - 1]?.meta.changes) throw new AppError('conflict', '邮箱归属已改变，请刷新后重试');
-  const deletedMessages = deleteHistory ? (result[1 + PURGE_MESSAGES_INDEX]?.meta.changes ?? 0) : 0;
-  if (deleteHistory) await scheduleStorageCleanup(env, ctx, 100);
-  return { deletedMessages };
+  const audit = isAdmin && actor !== undefined && row.userId !== userId ? { actor, note: '' } : null;
+  const outcome = await releaseTargets(env, [row], deleteHistory, audit, ctx);
+  return { deletedMessages: outcome.get(id)?.deletedMessages ?? 0 };
 }
 
 /** 可用性提示：与认领同一套规则（evaluateClaimPolicy），不可用时给出 reason；不预订地址 */
@@ -694,28 +848,6 @@ export async function checkAvailabilityBatch(
   return items.map((item) => availabilityOf(context, item));
 }
 
-/** 取用户认领的全部地址（用于 messages 可见性过滤） */
-export async function userAddresses(env: Env, userId: number): Promise<string[]> {
-  const db = createDb(env);
-  const rows = await db
-    .select({ address: mailboxes.address })
-    .from(mailboxes)
-    .where(eq(mailboxes.userId, userId))
-    .all();
-  return rows.map((r) => r.address);
-}
-
-/** 地址 → 认领它的用户 id（地址全局唯一，至多一个 owner）；未认领返回 null */
-export async function getMailboxOwner(env: Env, address: string): Promise<number | null> {
-  const db = createDb(env);
-  const row = await db
-    .select({ userId: mailboxes.userId })
-    .from(mailboxes)
-    .where(eq(mailboxes.address, address))
-    .get();
-  return row?.userId ?? null;
-}
-
 /** 通知归属 SQL（?1 = 收件地址）：收件链路把它并进自己的 batch，必须与 resolveNotifyOwnerIds 同源 */
 export const NOTIFY_OWNER_IDS_SQL = `SELECT user_id AS id FROM mailboxes WHERE address = ?1
     UNION ALL
@@ -731,7 +863,6 @@ export async function resolveNotifyOwnerIds(env: Env, address: string): Promise<
   return rows.results.map((row) => Number(row.id));
 }
 
-const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ');
 
 /**
  * 托管域名收件（?1 = 收件地址，?2 = 域名）：未认领的地址先认领给域名所有者，邮件随即出现在他的收件箱。
@@ -742,6 +873,15 @@ export const HOSTED_AUTO_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, 
   SELECT ?1, ?2, user_id, '' FROM hosted_domains WHERE domain = ?2 AND status IN (${USABLE_HOSTED_SQL})
     AND (SELECT lim = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE domain = ?2) < lim
       FROM (SELECT COALESCE((SELECT json_extract(value, '$.autoClaimLimit') FROM settings WHERE key = 'hosted_domains'), 0) AS lim))`;
+
+/**
+ * 托管域名所有者发信（?1 = 发件地址，?2 = 域名，?3 = 发信人）：域名可用且发信已就绪时，未认领的地址
+ * 在发出前认领给所有者，发件记录与之后的回信都在他名下可见。与所有者手动认领同一口径：不占全站每人上限，
+ * 也不受只约束收件自动认领的 autoClaimLimit；地址已有主人时不改动，由调用方按主人判定。
+ */
+export const HOSTED_SEND_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, domain, user_id, display_name)
+  SELECT ?1, ?2, user_id, '' FROM hosted_domains WHERE domain = ?2 AND user_id = ?3
+    AND status IN (${USABLE_HOSTED_SQL}) AND sending_status = 'ready'`;
 
 /** 收件域名的托管状态与该地址是否已有主人（?1 = 收件地址，?2 = 域名）；非托管域名无结果 */
 export const HOSTED_STATUS_SQL = `SELECT status, EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1) AS claimed
@@ -769,13 +909,3 @@ export async function resolveDeliveryOwners(env: Env, address: string): Promise<
   return { rejected, ownerIds: rejected ? [] : (owners?.results ?? []).map((row) => Number((row as { id: number }).id)) };
 }
 
-/** 校验地址归属（发件身份校验用） */
-export async function userOwnsAddress(env: Env, userId: number, address: string): Promise<boolean> {
-  const db = createDb(env);
-  const row = await db
-    .select({ id: mailboxes.id })
-    .from(mailboxes)
-    .where(and(eq(mailboxes.userId, userId), eq(mailboxes.address, address)))
-    .get();
-  return row !== undefined;
-}

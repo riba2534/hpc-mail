@@ -1,5 +1,5 @@
 import { DRAFT_ATTACHMENT_TTL_HOURS } from '@hpc-mail/shared';
-import { and, eq, exists, inArray, isNotNull, lt, notInArray, or, type SQL } from 'drizzle-orm';
+import { and, eq, exists, inArray, isNotNull, isNull, lt, notInArray, or, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import {
   apiRateLimits,
@@ -10,22 +10,41 @@ import {
   sessions,
 } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
-import type { Env } from '../types.js';
-import { API_REJECT_SCOPE, dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
+import type { Env, ExecCtx } from '../types.js';
+import { API_REJECT_SCOPE, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
+import { REAUTH_FAIL_SCOPE } from './reauth.js';
+import { LOGIN_FAIL_SCOPE, REGISTER_SCOPE } from './auth.js';
+import { FORWARD_CONFIRM_SCOPE } from './forward-confirm.js';
+import { cleanupWebhookDeliveries, processWebhookDeliveries } from './webhooks.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
 import {
   HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
 } from './hosted-domain.js';
 import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
+import { purgeHostedTombstones } from './hosted-tombstone.js';
 import { CANARY_RATE_SCOPE, writeCronHeartbeat } from './ops-probe.js';
-import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
+import {
+  processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases, purgeOrphanAttachments,
+} from './storage-cleanup.js';
+import { FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE } from './forwarding.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
+import { releaseDraftStatements } from './upload.js';
+import { markStaleOutbound } from './outbound-recovery.js';
+import { repairPendingInbound } from './inbound-repair.js';
+import { offloadMailBodies } from './body-offload.js';
+import { dispatchDueDrafts, purgeSentDrafts } from './drafts.js';
+import { URL_FETCH_SCOPE } from './url-fetch-budget.js';
+import { cleanupDeliveryRefs } from './delivery-events.js';
+import { syncDeliveryEventSubscriptions } from './event-subscriptions.js';
+import { cleanupExpiredSuppressions } from './suppression.js';
+import { syncDueOnboarding } from './system-domain.js';
+import { SYSTEM_DOMAIN_CF_SCOPE, SYSTEM_DOMAIN_CF_WINDOW_MINUTES } from './zone-catalog.js';
 
-const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const NINETY_DAYS_MS = 90 * DAY_MS;
 /**
  * 幂等记录保留：已完成的 2 天（按创建时间）；仍是 pending、但发件行已终态的同样保留 2 天（按最后更新时间），
  * 保留期内同 Key 重试仍被拦下，不会当成新请求重发；失败的 7 天。
@@ -41,9 +60,15 @@ const TRASH_RETENTION_DAYS = 7;
 const RETENTION_BATCH = 1000;
 const RETENTION_MAX_BATCHES = 10;
 
-/** 按 where 条件删除邮件（D1 行 + R2 对象：正文/附件/原始 .eml），返回删除条数；限批量 */
-async function purgeMessagesWhere(env: Env, cond: SQL): Promise<number> {
-  return purgeMatchingMessages(env, cond, RETENTION_BATCH);
+/** 按条件分批删除邮件（D1 行 + R2 正文/附件/原始 .eml），每批 RETENTION_BATCH 封、最多 RETENTION_MAX_BATCHES 批；返回删除封数 */
+async function purgeMessagesInBatches(env: Env, cond: SQL): Promise<number> {
+  let total = 0;
+  for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
+    const n = await purgeMatchingMessages(env, cond, RETENTION_BATCH);
+    total += n;
+    if (n < RETENTION_BATCH) break;
+  }
+  return total;
 }
 
 /** 邮件保留清理：未认领地址 + 全局上限；各自独立 try/catch 互不影响；返回删除封数 */
@@ -58,19 +83,11 @@ async function runRetention(env: Env): Promise<number> {
       const cutoff = new Date(Date.now() - unclaimedDays * DAY_MS);
       // 未被任何用户认领的地址收到的 inbound 邮件（catch-all 垃圾的主要来源）
       const claimed = db.select({ address: mailboxes.address }).from(mailboxes);
-      let total = 0;
-      for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
-        const n = await purgeMessagesWhere(
-          env,
-          and(
-            eq(messages.direction, 'inbound'),
-            lt(messages.createdAt, cutoff),
-            notInArray(messages.address, claimed),
-          )!,
-        );
-        total += n;
-        if (n < RETENTION_BATCH) break;
-      }
+      const total = await purgeMessagesInBatches(env, and(
+        eq(messages.direction, 'inbound'),
+        lt(messages.createdAt, cutoff),
+        notInArray(messages.address, claimed),
+      )!);
       deleted += total;
       if (total > 0) console.log(`保留清理：删除未认领地址邮件 ${total} 封`);
     } catch (e) {
@@ -81,12 +98,7 @@ async function runRetention(env: Env): Promise<number> {
   if (allMessagesDays > 0) {
     try {
       const cutoff = new Date(Date.now() - allMessagesDays * DAY_MS);
-      let total = 0;
-      for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
-        const n = await purgeMessagesWhere(env, lt(messages.createdAt, cutoff));
-        total += n;
-        if (n < RETENTION_BATCH) break;
-      }
+      const total = await purgeMessagesInBatches(env, lt(messages.createdAt, cutoff));
       deleted += total;
       if (total > 0) console.log(`保留清理：删除超期邮件 ${total} 封`);
     } catch (e) {
@@ -96,8 +108,11 @@ async function runRetention(env: Env): Promise<number> {
   return deleted;
 }
 
-/** 草稿附件孤儿清理：上传后未发送、超过 TTL 的 draft（含未完成 multipart）→ 回收 R2 + 删行 */
-async function runDraftAttachmentCleanup(env: Env): Promise<number> {
+/**
+ * 草稿附件孤儿清理：上传后未发送、超过 TTL 的草稿删行。未完成的分片上传直接 abort；已完成的对象
+ * 可能已被发出（含全部失败而保留）的邮件附件直接引用，改为登记清理台账，由 processStorageCleanup 按引用判断。
+ */
+export async function runDraftAttachmentCleanup(env: Env): Promise<number> {
   const db = createDb(env);
   const cutoff = new Date(Date.now() - DRAFT_ATTACHMENT_TTL_HOURS * 3600 * 1000);
   const stale = await db
@@ -108,33 +123,34 @@ async function runDraftAttachmentCleanup(env: Env): Promise<number> {
       status: draftAttachments.status,
     })
     .from(draftAttachments)
-    .where(lt(draftAttachments.createdAt, cutoff))
+    // 服务端草稿引用中的附件随草稿保留（定时发送最长 30 天），草稿删除或发送时才释放
+    .where(and(lt(draftAttachments.createdAt, cutoff), isNull(draftAttachments.draftId)))
     .limit(RETENTION_BATCH)
     .all();
   if (stale.length === 0) return 0;
-  const cleaned: number[] = [];
+  const aborted: number[] = [];
+  const released: number[] = [];
   for (const s of stale) {
     if (s.uploadId && s.status === 'uploading') {
       try {
         await env.r2.resumeMultipartUpload(s.r2Key, s.uploadId).abort();
-        cleaned.push(s.id);
+        aborted.push(s.id);
       } catch (e) {
         console.error('清理：abort multipart 失败:', e);
       }
     } else {
-      try {
-        await env.r2.delete(s.r2Key);
-        cleaned.push(s.id);
-      } catch (e) {
-        console.error('清理：删草稿 R2 失败:', e);
-      }
+      released.push(s.id);
     }
   }
-  for (const batch of chunk(cleaned)) {
+  for (const batch of chunk(aborted)) {
     await db.delete(draftAttachments).where(inArray(draftAttachments.id, batch));
   }
-  console.log(`草稿附件清理：删除 ${cleaned.length} 个过期草稿`);
-  return cleaned.length;
+  for (const batch of chunk(released)) {
+    await env.db.batch(releaseDraftStatements(env, batch));
+  }
+  const cleaned = aborted.length + released.length;
+  console.log(`草稿附件清理：删除 ${cleaned} 个过期草稿`);
+  return cleaned;
 }
 
 interface StepReport {
@@ -156,6 +172,22 @@ async function step(report: StepReport[], name: string, task: () => Promise<numb
   }
 }
 
+/** 草稿定时发送的 cron：每分钟只派发到期的草稿与恢复中断的发送，不跑其他步骤，也不写 cron 心跳（心跳由 5 分钟任务负责） */
+export const DRAFT_DISPATCH_CRON = '* * * * *';
+/** 每日维护的 cron（UTC 16:00）；其余 cron（每 5 分钟）跑常规步骤。与 wrangler.toml 的 crons 一致 */
+export const MAINTENANCE_CRON = '0 16 * * *';
+
+/** 定时发送的精度由它决定：到点后 1 分钟内发出（cron 本身可能再晚几十秒） */
+export async function runDraftDispatch(env: Env, ctx: ExecCtx): Promise<void> {
+  const report: StepReport[] = [];
+  await step(report, 'drafts.dispatch', async () => {
+    const result = await dispatchDueDrafts(env, ctx);
+    return result.sent + result.failed + result.recovered;
+  });
+  // 空闲的分钟不打日志
+  if (report.some((item) => item.failed || item.count)) console.log(JSON.stringify({ event: 'scheduled', cron: DRAFT_DISPATCH_CRON, steps: report }));
+}
+
 /**
  * 每 5 分钟（maintenance=false）：通知补录与投递、清理台账；
  * 每日（maintenance=true）：审计日志 90 天 + 过期限流窗口 + 邮件保留策略。
@@ -169,6 +201,12 @@ export async function runScheduled(env: Env, maintenance = true, cron = maintena
   else await runRegular(env, report);
   console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
   await writeCronHeartbeat(env, cron, report.filter((item) => item.failed).map((item) => item.step));
+  // 入站 pending 自愈排在全部步骤、汇总日志与心跳之后：修复大邮件时 isolate 可能因内存或 CPU 上限被直接终止，
+  // 不能连累本轮其他步骤。结果见它自己的 inbound_repair 日志；修不了而转 degraded 的行下一轮补入通知
+  if (!maintenance) {
+    try { await repairPendingInbound(env); }
+    catch (error) { console.error('定时任务步骤 inbound.repair 失败:', error); }
+  }
 }
 
 async function runRegular(env: Env, report: StepReport[]): Promise<void> {
@@ -180,19 +218,33 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
     for (const row of tokens.results) await env.db.batch(purgeStatements(env, row.token));
     return tokens.results.length;
   });
+  // 投递中断（Worker 被回收、结果回填失败）超过 1 小时仍 pending 的外发标为 unknown，幂等重放才有终态
+  await step(report, 'outbound.stale', () => markStaleOutbound(env));
   await step(report, 'claude_facts.harvest', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_WINDOW_MS));
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
+  // 历史正文分批搬到 R2（放在清理之前：本轮没被引用的对象登记后同一轮就能回收）
+  await step(report, 'bodies.offload', () => offloadMailBodies(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
+  // 系统域名接入由管理员发起、数量很少（每轮最多 3 条，墙钟 20 秒），先于托管同步，不被它占满 Cloudflare 额度
+  await step(report, 'system_domains.onboarding', () => syncDueOnboarding(env));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
+  // 投递回执订阅：只为新域名或失败超过 6 小时的域名调用 Cloudflare，其余时候只读本地记录
+  await step(report, 'delivery_events.subscriptions', () => syncDeliveryEventSubscriptions(env));
+  // 排在托管域名核对之后：本轮产生的域名事件同轮投递
+  await step(report, 'webhooks.process', async () => (await processWebhookDeliveries(env, { limit: 50 })).processed);
 }
 
 async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'claude_facts.catchup', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_CATCHUP_MS));
   await step(report, 'notification.cleanup', () => cleanupNotificationJobs(env));
+  // 每日核对 Cloudflare 上的投递回执订阅（被删除的重建），并清理过期的回执对应关系与抑制条目
+  await step(report, 'delivery_events.verify', () => syncDeliveryEventSubscriptions(env, { verify: true }));
+  await step(report, 'delivery_events.cleanup', async () => await cleanupDeliveryRefs(env) + await cleanupExpiredSuppressions(env));
+  await step(report, 'webhooks.cleanup', () => cleanupWebhookDeliveries(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
-  const staleWindow = Math.floor(Date.now() / 60000) - 120;
+  const staleWindow = minuteWindow(1) - 120;
 
   for (const table of ['api_request_logs', 'admin_audit_logs']) {
     await step(report, `${table}.cleanup`, async () => {
@@ -216,7 +268,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'idempotency.cleanup', async () => {
     const settledBefore = new Date(Date.now() - IDEMPOTENCY_SETTLED_RETENTION_MS);
     const settledMessage = db.select({ id: messages.id }).from(messages).where(and(
-      eq(messages.id, idempotencyRecords.messageId), inArray(messages.status, ['sent', 'delivered', 'failed'])));
+      eq(messages.id, idempotencyRecords.messageId), inArray(messages.status, ['sent', 'delivered', 'failed', 'unknown'])));
     return (await db.delete(idempotencyRecords).where(or(
       and(eq(idempotencyRecords.status, 'completed'), lt(idempotencyRecords.createdAt, settledBefore)),
       and(eq(idempotencyRecords.status, 'failed'),
@@ -228,25 +280,32 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   // 回收站：软删除超过 7 天硬删
   await step(report, 'trash', async () => {
     const trashCutoff = new Date(Date.now() - TRASH_RETENTION_DAYS * DAY_MS);
-    const n = await purgeMessagesWhere(
-      env,
-      and(isNotNull(messages.deletedAt), lt(messages.deletedAt, trashCutoff))!,
-    );
+    const n = await purgeMatchingMessages(env, and(isNotNull(messages.deletedAt), lt(messages.deletedAt, trashCutoff))!, RETENTION_BATCH);
     if (n > 0) console.log(`回收站清理：硬删 ${n} 封`);
     return n;
   });
-  // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ 回收 R2 + 删行
+  // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ abort 分片或登记清理 + 删行
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
-  // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组
+  // 已发送的服务端草稿保留 7 天后删除（附件已在发送时回收，正文对象登记清理）
+  await step(report, 'drafts.sent', () => purgeSentDrafts(env));
+  // 附件行指向已不存在的邮件（附件写入前邮件被永久删除等）：登记对象清理并删行
+  await step(report, 'attachments.orphans', () => purgeOrphanAttachments(env));
+  // 托管域名墓碑过了保留期：前所有者的优先权到期，NS 委派预检只看仍在的托管记录与墓碑
+  await step(report, 'hosted_domains.tombstones', () => purgeHostedTombstones(env));
+  // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组。
+  // auth-user/auth-global/api-user/api-global 已由 Rate Limiting binding 计数，只剩升级前写入的旧行待回收
   await step(report, 'counters', async () => {
-    await purgeCounters(env, ['out', 'fwd-domain', 'fwd-target', 'ai-extract', TRANSLATE_CHARS_SCOPE],
-      dayWindow(new Date(Date.now() - 3 * DAY_MS)));
+    await purgeCounters(env, [
+      OUTBOUND_QUOTA_SCOPE, 'fwd-domain', 'fwd-target', FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, 'ai-extract', TRANSLATE_CHARS_SCOPE,
+      FORWARD_CONFIRM_SCOPE,
+    ], dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
-      CANARY_RATE_SCOPE,
+      CANARY_RATE_SCOPE, URL_FETCH_SCOPE,
     ], minuteWindow(1) - 120);
-    await purgeCounters(env, 'login-fail', minuteWindow(15) - 8);
-    await purgeCounters(env, 'reg', minuteWindow(60) - 3);
+    await purgeCounters(env, SYSTEM_DOMAIN_CF_SCOPE, minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES) - 24);
+    await purgeCounters(env, [LOGIN_FAIL_SCOPE, REAUTH_FAIL_SCOPE], minuteWindow(15) - 8);
+    await purgeCounters(env, REGISTER_SCOPE, minuteWindow(60) - 3);
   });
 }

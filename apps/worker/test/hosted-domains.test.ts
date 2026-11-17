@@ -16,6 +16,10 @@ import { sendMail } from '../src/services/outbound.js';
 import { createSession } from '../src/services/session.js';
 import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 const app = createApp();
 const db = createDb(env);
@@ -50,6 +54,8 @@ function fakeCloudflare(opts: { dnssec?: string[]; existing?: string[]; createEr
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     const method = (init?.method ?? 'GET').toUpperCase();
+    // 他人添加前的公开委派预检：RDAP 默认查不到，DoH 的 NS 默认为空（委派已知且不指向本站）
+    if (url.hostname === 'rdap.org') return json({ errorCode: 404 }, 404);
     if (url.hostname === 'cloudflare-dns.com') {
       const name = url.searchParams.get('name') ?? '';
       const answer = url.searchParams.get('type') === 'DS' && opts.dnssec?.includes(name) ? [{ name, type: 43, data: '2371 13 2 ABC' }] : [];
@@ -483,7 +489,7 @@ describe('托管域名的收件与认领', () => {
     const hosted = await activeDomain(cf, owner, domain);
     const box = await data<Mailbox>(await call('POST', '/mailboxes', owner.jwt, { localPart: 'me', domain }), 201);
     await db.update(hostedDomains).set({ sendingStatus: 'unconfigured' }).where(eq(hostedDomains.id, hosted.id));
-    const send = (fromId: number, to: string, userId: number) => sendMail(runtime, { waitUntil: () => {} }, { userId, role: 'user' },
+    const send = (fromId: number, to: string, userId: number) => sendMail(runtime, background.ctx, { userId, role: 'user' },
       { from: { mailboxId: fromId }, to: [to], cc: [], bcc: [], subject: 'hi', text: 'hi' } as never, [], 'https://hpc.email');
     await expect(send(box.id, 'friend@example.org', owner.id)).rejects.toMatchObject({ message: '该域名的发信尚未生效或已停用' });
 
@@ -584,12 +590,16 @@ describe('托管域名的异常与上限', () => {
     expect((await db.select().from(hostedDomains).where(eq(hostedDomains.id, reserved.id)).get())!.zoneId).toBe(cf.zoneByName(domain)!.id);
   });
 
-  it('zone 被外部删除后：已生效的域名标记为已迁走，等待中的域名删除记录；查不到时不做破坏性判断', async () => {
-    const cf = fakeCloudflare();
+  it('zone 被外部删除后：已生效的域名间隔复核后标记为已迁走，等待中的域名删除记录；查不到时不做破坏性判断', async () => {
     const f = await fixture();
+    // 账户里另有 zone：判定不存在前的可见性自检能列出账户 zone
+    const cf = fakeCloudflare({ existing: [f.domain('elsewhere')] });
     const owner = await f.actor('owner');
     const active = await activeDomain(cf, owner, f.domain('a'));
     cf.zones.delete(cf.zoneByName(f.domain('a'))!.id);
+    await syncHostedDomain(runtime, active.id);
+    expect((await db.select().from(hostedDomains).where(eq(hostedDomains.id, active.id)).get())!.status).toBe('error');
+    await db.update(hostedDomains).set({ zoneMissingAt: new Date(Date.now() - 26 * 60_000) }).where(eq(hostedDomains.id, active.id));
     await syncHostedDomain(runtime, active.id);
     expect((await db.select().from(hostedDomains).where(eq(hostedDomains.id, active.id)).get())!.status).toBe('moved');
 
@@ -759,10 +769,10 @@ describe('添加与立即检测的 Cloudflare 调用额度', () => {
     expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - 1);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, f.domain('busy'))).get()).toBeUndefined();
 
-    // 删除：撤发信接入、删 zone，共 2 次；额度满时照常执行，只计数
+    // 删除：撤发信接入、核对 zone 身份、删 zone，共 3 次；额度满时照常执行，只计数
     await data(await call('DELETE', `/hosted-domains/${taken.id}`, owner.jwt));
-    expect(cf.calls.slice(callsBefore)).toHaveLength(2);
-    expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE + 1);
+    expect(cf.calls.slice(callsBefore)).toHaveLength(3);
+    expect(await siteCalls()).toBe(MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE + 2);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, taken.id)).get()).toBeUndefined();
   });
 
@@ -855,8 +865,8 @@ describe('托管域名的 Cloudflare 调用序列基准', () => {
         `GET ${z}/email/routing/rules/catch_all`,
         `GET ${z}/email/sending/subdomains/sub-${zoneId}/dns/status`, `POST ${z}/email/sending/subdomains/sub-${zoneId}/dns`,
       ],
-      // 删除先撤发信接入，再删 zone
-      afterDelete: [`DELETE ${z}/email/sending/subdomains/sub-${zoneId}`, `DELETE ${z}`],
+      // 删除先撤发信接入，再读出 zone 核对名称与创建时间后删除
+      afterDelete: [`DELETE ${z}/email/sending/subdomains/sub-${zoneId}`, `GET ${z}`, `DELETE ${z}`],
     });
   });
 });

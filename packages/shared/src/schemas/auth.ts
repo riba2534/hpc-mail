@@ -21,9 +21,17 @@ export const passwordSchema = z
   .min(PASSWORD_MIN_LENGTH, `密码至少 ${PASSWORD_MIN_LENGTH} 位`)
   .max(PASSWORD_MAX_LENGTH, `密码最多 ${PASSWORD_MAX_LENGTH} 位`);
 
+/** 已设置的密码（登录、改密的旧密码、敏感操作前重新验证）：只校验非空与上限，不套用新密码的长度规则 */
+export const currentPasswordSchema = z.string().min(1).max(PASSWORD_MAX_LENGTH);
+
+/** 两步验证的登记与关闭：重新输入当前密码 */
+const reauthPasswordRequestSchema = z.object({
+  password: z.string().min(1, '请输入当前密码').max(PASSWORD_MAX_LENGTH),
+});
+
 export const loginRequestSchema = z.object({
   username: usernameSchema,
-  password: z.string().min(1).max(PASSWORD_MAX_LENGTH),
+  password: currentPasswordSchema,
   /** 已启用 2FA 的账户需附带 6 位 TOTP 或恢复码 */
   totp: z.string().trim().max(32).optional(),
 });
@@ -36,12 +44,13 @@ export const enableTwoFactorRequestSchema = z.object({
 });
 export type EnableTwoFactorRequest = z.infer<typeof enableTwoFactorRequestSchema>;
 
-export const disableTwoFactorRequestSchema = z.object({
-  /** 当前密码或有效 TOTP 码任一 */
-  password: z.string().max(PASSWORD_MAX_LENGTH).optional(),
-  code: z.string().trim().max(32).optional(),
-});
+/** 关闭两步验证：必须重新输入当前密码（只凭 TOTP 码不能关闭） */
+export const disableTwoFactorRequestSchema = reauthPasswordRequestSchema;
 export type DisableTwoFactorRequest = z.infer<typeof disableTwoFactorRequestSchema>;
+
+/** 开始登记两步验证：必须重新输入当前密码 */
+export const setupTwoFactorRequestSchema = reauthPasswordRequestSchema;
+export type SetupTwoFactorRequest = z.infer<typeof setupTwoFactorRequestSchema>;
 
 /** 开始登记：返回密钥与 otpauth URI（尚未启用，需 verify） */
 export interface TwoFactorSetup {
@@ -49,9 +58,19 @@ export interface TwoFactorSetup {
   otpauthUri: string;
 }
 
-/** 启用成功：一次性返回恢复码 */
+/**
+ * 启用成功：一次性返回恢复码。开启会递增鉴权版本让其他会话失效，
+ * token 是替换当前会话的新令牌，后续请求要改用它。
+ */
 export interface TwoFactorEnabled {
   recoveryCodes: string[];
+  token: string;
+}
+
+/** 关闭成功：同样让其他会话失效，token 替换当前会话令牌 */
+export interface TwoFactorDisabled {
+  success: true;
+  token: string;
 }
 
 export const registerRequestSchema = z.object({
@@ -62,7 +81,7 @@ export const registerRequestSchema = z.object({
 export type RegisterRequest = z.infer<typeof registerRequestSchema>;
 
 export const changePasswordRequestSchema = z.object({
-  oldPassword: z.string().min(1).max(PASSWORD_MAX_LENGTH),
+  oldPassword: currentPasswordSchema,
   newPassword: passwordSchema,
   /** 改密时一并吊销本人全部 API Key（默认吊销：账号可能已泄露，旧 Key 不应继续有效） */
   revokeApiKeys: z.boolean().default(true),
@@ -115,7 +134,8 @@ export type SearchUsersQuery = z.infer<typeof searchUsersQuerySchema>;
 export interface UserSearchResult {
   id: number;
   username: string;
-  role: Role;
+  /** 只有管理员的用户搜索返回角色；共享与成员候选搜索不返回，避免普通用户枚举管理员 */
+  role?: Role;
 }
 
 export interface UserSearchResults {

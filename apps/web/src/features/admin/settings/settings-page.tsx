@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { type ReactNode, useEffect, useState } from 'react';
-import type { AiModelTestRequest, AiModelTestResult, Settings } from '@hpc-mail/shared';
+import type { AiModelTestRequest, AiModelTestResult, DeliveryEventsOverview, Settings } from '@hpc-mail/shared';
 import { api } from '@/api/client';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
@@ -124,7 +124,8 @@ function AiModelSection({
   onChange: (updater: (model: AiModelSetting) => void) => void;
 }) {
   const savedKey = saved?.apiKey === SECRET_MASK;
-  const test = useMutation({ mutationFn: testAiModel });
+  // 失败原因在按钮下方就地展示，不再弹提示
+  const test = useMutation({ mutationFn: testAiModel, meta: { errorToast: false } });
   // 表单改动后，旧的测试结果不再代表当前配置
   const tested = test.variables?.baseUrl === value.baseUrl && test.variables.apiKey === value.apiKey && test.variables.model === value.model;
   const insecureUrl = value.baseUrl !== '' && !value.baseUrl.startsWith('https://');
@@ -205,6 +206,49 @@ function AiModelSection({
           </p>
         )}
       </div>
+    </Section>
+  );
+}
+
+/** 只在系统设置页使用：请求与查询键放在本页 chunk，不进入口公共模块 */
+const DELIVERY_EVENTS_KEY = ['admin', 'delivery-events'] as const;
+
+/** 投递回执：自动订阅开关，以及各发信域名的订阅状态（只读，失败的列出原因） */
+function DeliveryEventsSection({ enabled, onChange }: { enabled: boolean; onChange: (value: boolean) => void }) {
+  const { data, isError } = useQuery({
+    queryKey: DELIVERY_EVENTS_KEY,
+    queryFn: () => api.get<DeliveryEventsOverview>('/admin/delivery-events'),
+  });
+  const failed = data?.subscriptions.filter((item) => item.status === 'error') ?? [];
+  return (
+    <Section
+      title="投递回执"
+      description="送达、退信与投诉经 Cloudflare 事件订阅写回已发送邮件的收件人结果；退信与投诉的地址进入抑制名单，之后从同一发信域名发给它们会直接失败。"
+    >
+      <ToggleRow
+        label="自动订阅投递事件"
+        description="开启且 Worker 配置了 Cloudflare 凭据时，自动为系统域名与已开通发信的托管域名建立订阅。关闭只停止新建订阅，已有订阅的回执照常写回。"
+        checked={enabled}
+        onChange={onChange}
+      />
+      {isError ? (
+        <p className="text-sm text-ink-tertiary">订阅状态读取失败。</p>
+      ) : data && (
+        <div aria-label="投递事件订阅状态" className="text-sm text-ink-secondary">
+          <p>
+            {!data.queue
+              ? '本站部署未启用投递回执（未设置 GitHub Variable DELIVERY_EVENTS_QUEUE），这个开关暂不生效。'
+              : data.credentials
+                ? `Queue ${data.queue}：已订阅 ${data.subscriptions.length - failed.length} 个发信域名${failed.length ? `，${failed.length} 个失败（定时任务稍后重试）` : ''}。`
+                : 'Worker 未配置 Cloudflare 凭据（cf_api_token / cf_account_id），不会自动建立订阅。'}
+          </p>
+          {failed.length > 0 && (
+            <ul className="mt-1 list-disc pl-4">
+              {failed.map((item) => <li key={item.domain} className="break-words">{item.domain}：{item.lastError || '建立失败'}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
     </Section>
   );
 }
@@ -386,7 +430,7 @@ export function SettingsPage() {
 
         <Section
           title="外发配额"
-          description="限制普通用户每日外发量，防被盗账号脚本化群发。管理员不受限。0 表示不限。"
+          description="限制每日外发量，防被盗账号脚本化群发。外发上限只限普通用户，管理员不受限；转发中转上限含管理员。0 表示不限。"
         >
           <NumberRow
             label="每日外发邮件上限"
@@ -402,6 +446,30 @@ export function SettingsPage() {
             onChange={(v) => patch((s) => void (s.quota.dailyRecipients = v))}
             max={1000000}
             suffix="人/天"
+          />
+          <NumberRow
+            label="转发中转全站每日上限"
+            description="自动转发的目标未经 Cloudflare 验证时，以 no-reply@收件域名 重新发送，占用账户发信额度；原生转发不计入。"
+            value={draft.quota.relayDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayDaily = v))}
+            max={100000}
+            suffix="封/天"
+          />
+          <NumberRow
+            label="转发中转每人每日上限"
+            description="已认领地址按认领人计，同一封信转给多个目标各计一次；原生转发不计入。"
+            value={draft.quota.relayPerUserDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayPerUserDaily = v))}
+            max={100000}
+            suffix="封/天"
+          />
+          <NumberRow
+            label="未认领地址转发中转每日上限"
+            description="未认领地址的来信归全体管理员，任何人都能往这类地址灌信，全体管理员共用这一个额度，不按人数叠加；原生转发不计入。"
+            value={draft.quota.relayUnclaimedDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayUnclaimedDaily = v))}
+            max={100000}
+            suffix="封/天"
           />
         </Section>
 
@@ -517,6 +585,14 @@ export function SettingsPage() {
               suffix="个"
             />
           </Section>
+        )}
+
+        {/* 旧版本服务端没有 delivery_events 设置时不显示 */}
+        {draft.delivery_events && (
+          <DeliveryEventsSection
+            enabled={draft.delivery_events.enabled}
+            onChange={(value) => patch((s) => void (s.delivery_events.enabled = value))}
+          />
         )}
       </div>
 

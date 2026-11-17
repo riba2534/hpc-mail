@@ -50,18 +50,26 @@ import { attachmentIcon } from './attachment-icon';
 import { countRemoteImages } from './count-remote-images';
 import { downloadWithAuth, openOrDownloadWithAuth } from './download';
 import { EmailHtml } from '@/lib/email-html';
+import { EmailBodyBoundary } from '@/lib/email-html/body-error-boundary';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
 import { extractOtp } from '@/lib/otp';
 import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
+import { SenderAuthBanner, senderAuthFailed } from './sender-auth-banner';
 import { TranslationBar } from './translation/translation-bar';
 import { useMessageTranslation } from './translation/use-message-translation';
+import { isFailedOutcome } from './delivery-outcomes';
 import { inspectVerificationLink } from './verification-link';
 import { useDocumentTitle } from '@/lib/use-document-title';
 import { useCurrentUser } from '@/lib/use-session';
 import { QueryErrorState } from '@/components/query-error-state';
 import { ApiError } from '@/api/errors';
+
+/** 详情页 j/k 翻阅的方向 */
+type KeyboardStep = 'next' | 'prev';
+/** 列表行带来的上下文，加上详情页内 j/k 翻阅时记下的方向（决定预取哪一封） */
+type DetailLinkState = Partial<MailListLinkState> & { keyboard?: KeyboardStep };
 
 /** 去重（不区分大小写，保留首次出现的写法） */
 function uniqueAddresses(addresses: string[], exclude: ReadonlySet<string> = new Set()): string[] {
@@ -86,11 +94,13 @@ function RecipientLine({ label, addresses }: { label: string; addresses: string[
 function VerificationLinkBanner({ message }: { message: MessageDetail }) {
   const link = inspectVerificationLink(message.verificationLink, message.fromAddress);
   if (!link) return null;
+  const unverifiedSender = senderAuthFailed(message.auth);
+  const caution = link.mismatch || unverifiedSender;
   return (
     <div
       className={cn(
         'flex flex-col gap-2 rounded-lg border px-4 py-3',
-        link.mismatch ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
+        caution ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
       )}
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -98,7 +108,7 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
           <p className="text-xs font-medium text-ink-secondary">验证链接</p>
           <p className="truncate text-sm text-ink" title={link.href}>{link.hostname}</p>
         </div>
-        <Button asChild size="sm" variant={link.mismatch ? 'secondary' : 'primary'}>
+        <Button asChild size="sm" variant={caution ? 'secondary' : 'primary'}>
           <a href={link.href} target="_blank" rel="noopener noreferrer">
             <ExternalLink className="size-4" />
             打开验证链接
@@ -109,6 +119,12 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
         <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           链接域名与发件人不一致，请确认后再打开
+        </p>
+      )}
+      {!link.mismatch && unverifiedSender && (
+        <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          发件人未通过验证，请确认后再打开
         </p>
       )}
     </div>
@@ -141,7 +157,7 @@ export function MessagePage() {
     return () => controller.abort();
   }, []);
 
-  const { data: ownedMailboxes } = useMailboxesQuery(false);
+  const { data: ownedMailboxes } = useMailboxesQuery();
   const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
     ...messageDetailQueryOptions(messageId, view),
     enabled: Number.isInteger(messageId) && messageId > 0,
@@ -188,24 +204,30 @@ export function MessagePage() {
   const position = order ? order.indexOf(messageId) : -1;
   const prevId = order && position > 0 ? order[position - 1] : undefined;
   const nextId = order && position >= 0 ? order[position + 1] : undefined;
-  const goToMessage = (target: number | undefined) => {
+  // j/k 进入的详情记下方向：连续翻阅时只预取同方向的下一封；直接打开、点链接或按钮切换都不预取
+  const goToMessage = (target: number | undefined, keyboard?: KeyboardStep) => {
     if (target === undefined) return;
-    navigate(mailHref(target, view ?? {}), { replace: true, state: location.state });
+    const state: DetailLinkState = { ...(location.state as DetailLinkState | null), keyboard };
+    navigate(mailHref(target, view ?? {}), { replace: true, state });
   };
+  const keyboardStep = (location.state as DetailLinkState | null)?.keyboard;
+  const prefetchTarget = keyboardStep === 'next' ? nextId : keyboardStep === 'prev' ? prevId : undefined;
   useEffect(() => {
-    for (const target of [nextId, prevId]) {
-      if (target !== undefined) void queryClient.prefetchQuery(messageDetailQueryOptions(target, view));
-    }
+    if (prefetchTarget !== undefined) void queryClient.prefetchQuery(messageDetailQueryOptions(prefetchTarget, view));
     // view 由查询串决定，随 messageId 一起变化
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextId, prevId, queryClient]);
+  }, [prefetchTarget, queryClient]);
 
   const markRead = useMutation({
-    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope }) => messageApi.markRead([args.id], args.isRead, args.scope),
+    // 个人视图让服务端随响应带回未读数，不再单独请求 unread-count
+    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope }) =>
+      messageApi.markRead([args.id], args.isRead, args.scope, args.scope === undefined),
     onSuccess: (result, { id, isRead }) => {
       // 只同步这一封的已读状态与未读数；列表只标记过期，回到列表时由首页探测/单页重拉对齐
-      if (result.changed > 0) syncReadState(queryClient, [id], isRead);
+      if (result.changed > 0) syncReadState(queryClient, [id], isRead, result.unread);
     },
+    // 打开未读邮件时自动标已读也走这里：失败由全局 mutationCache 提示原因，否则列表一直显示未读却不知为何
+    meta: { errorTitle: '已读状态更新失败' },
   });
 
   useEffect(() => {
@@ -281,8 +303,8 @@ export function MessagePage() {
 
   useMailShortcuts(
     {
-      j: () => goToMessage(nextId),
-      k: () => goToMessage(prevId),
+      j: () => goToMessage(nextId, 'next'),
+      k: () => goToMessage(prevId, 'prev'),
       r: () => void reply(),
       a: () => void replyAll(),
       f: () => void forward(),
@@ -336,8 +358,16 @@ export function MessagePage() {
     ? uniqueAddresses(message.recipients.bcc, new Set([...toRecipients, ...ccRecipients].map((address) => address.toLowerCase())))
     : [];
   const multipleRecipients = message.recipients.to.length + message.recipients.cc.length > 1;
-  const sendIssue = outbound && (message.errorDetail || message.status === 'failed' || message.status === 'bounced');
-  const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed') ?? [];
+  // pending：投递还在进行，结果未回填，不算问题；unknown：投递中断，部分收件人可能已收到
+  const deliveryPending = outbound && message.status === 'pending';
+  const deliveryUnknown = outbound && message.status === 'unknown';
+  const sendIssue = outbound && !deliveryPending && (deliveryUnknown || message.errorDetail || message.status === 'failed');
+  // 投递回执的退信与发送时被拒一样列为失败；投诉表示已送达但被标记为垃圾邮件
+  const failedRecipients = message.recipientOutcomes?.filter(isFailedOutcome) ?? [];
+  const unknownRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'unknown') ?? [];
+  const complainedRecipients = outbound ? message.recipientOutcomes?.filter((outcome) => outcome.status === 'complained') ?? [] : [];
+  // 正文里已经就地显示的内联图不再在附件区重复列出
+  const listedAttachments = message.attachments.filter((attachment) => !attachment.inline);
   const canMarkUnread = readStateWritable && !outbound;
   const hasMobileMenu = canActAsOwner || canMarkUnread || message.hasRaw || translation.available;
 
@@ -482,14 +512,24 @@ export function MessagePage() {
         </header>
 
         <div className="flex flex-col gap-4 px-4 py-5 sm:px-5">
+          {!outbound && <SenderAuthBanner auth={message.auth} fromAddress={message.fromAddress} />}
           {translation.translated && <TranslationBar translation={translation} />}
+          {deliveryPending && (
+            <p role="status" className="rounded-md border border-line bg-canvas px-3 py-2.5 text-sm text-ink-secondary">投递中，结果尚未回填</p>
+          )}
           {sendIssue && (
-            <div className="rounded-md border border-critical/40 bg-critical-soft px-3 py-2.5 text-sm">
-              <p className="font-medium text-critical">
-                {message.status === 'failed' ? '发送失败' : message.status === 'bounced' ? '退信' : '部分收件人失败'}
+            <div className={cn('rounded-md border px-3 py-2.5 text-sm', deliveryUnknown ? 'border-caution/40 bg-caution-soft' : 'border-critical/40 bg-critical-soft')}>
+              <p className={cn('font-medium', deliveryUnknown ? 'text-caution' : 'text-critical')}>
+                {deliveryUnknown ? '投递结果未确认：部分收件人可能已收到，补发前先确认'
+                  : message.status === 'failed' ? '发送失败' : '部分收件人失败'}
               </p>
               {message.errorDetail && (
                 <p className="mt-1 break-words text-ink-secondary">{message.errorDetail}</p>
+              )}
+              {unknownRecipients.length > 0 && (
+                <ul aria-label="结果未确认的收件人" className="mt-1 list-disc pl-4 text-ink-secondary">
+                  {unknownRecipients.map((outcome) => <li key={outcome.address}>{outcome.address}：{outcome.error || '结果未确认'}</li>)}
+                </ul>
               )}
               {failedRecipients.length > 0 && (
                 <ul className="mt-1 list-disc pl-4 text-ink-secondary">
@@ -507,6 +547,11 @@ export function MessagePage() {
               </button>
               )}
             </div>
+          )}
+          {complainedRecipients.length > 0 && (
+            <p className="rounded-md border border-caution/40 bg-caution-soft px-3 py-2.5 text-sm text-ink-secondary">
+              已送达，但这些收件人把邮件标记为垃圾邮件，之后从同一发信域名发给他们会被拦截：{complainedRecipients.map((outcome) => outcome.address).join('、')}
+            </p>
           )}
           {!outbound && (message.status === 'degraded' || message.errorDetail) && <div role="alert" className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
             <p className="font-medium text-caution">邮件内容可能不完整</p>
@@ -540,25 +585,32 @@ export function MessagePage() {
             </div>
           )}
 
-          {message.bodyHtml ? (
-            <EmailHtml
-              html={message.bodyHtml}
-              allowRemoteImages={showRemoteImages}
-              trustedImageOrigins={[globalThis.location.origin]}
-              onContentChange={setHtmlRoot}
-            />
-          ) : (
-            <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
-          )}
+          <EmailBodyBoundary
+            resetKey={message.id}
+            text={message.bodyText}
+            html={message.bodyHtml}
+            onDownloadRaw={message.hasRaw ? () => void downloadEml() : undefined}
+          >
+            {message.bodyHtml ? (
+              <EmailHtml
+                html={message.bodyHtml}
+                allowRemoteImages={showRemoteImages}
+                trustedImageOrigins={[globalThis.location.origin]}
+                onContentChange={setHtmlRoot}
+              />
+            ) : (
+              <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
+            )}
+          </EmailBodyBoundary>
 
-          {message.attachments.length > 0 && (
+          {listedAttachments.length > 0 && (
             <div className="border-t border-line pt-4">
               <p className="mb-2 flex items-center gap-1.5 text-sm font-medium text-ink-secondary">
                 <Paperclip className="size-4" />
-                {message.attachments.length} 个附件
+                {listedAttachments.length} 个附件
               </p>
               <ul className="flex flex-col gap-2">
-                {message.attachments.map((attachment) => {
+                {listedAttachments.map((attachment) => {
                   const Icon = attachmentIcon(attachment.mimeType, attachment.filename);
                   return (
                     <li key={attachment.id}>

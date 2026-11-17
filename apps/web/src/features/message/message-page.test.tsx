@@ -36,6 +36,7 @@ vi.mock('@/features/mailboxes/use-mailboxes', () => ({ useMailboxesQuery: () => 
 vi.mock('@/features/inbox/use-star', () => ({ useStarMutation: () => ({ mutate: vi.fn() }) }));
 vi.mock('@/lib/email-html', () => ({ EmailHtml: ({allowRemoteImages}: {allowRemoteImages: boolean}) => <div data-testid="email-html" data-allow={String(allowRemoteImages)} /> }));
 vi.mock('@/lib/use-session', () => ({useCurrentUser: () => ({id:1,role:'user'})}));
+import { messageApi } from '@/api/resources';
 import { MessagePage } from './message-page';
 
 function Where() {
@@ -72,7 +73,7 @@ describe('MessagePage navigation', () => {
   it('marks each message read and binds remote image permission to one mail', async () => {
     const client = show();
     await screen.findByText('mail-1');
-    await waitFor(() => expect(mocks.markRead).toHaveBeenCalledWith([1], true, undefined));
+    await waitFor(() => expect(mocks.markRead).toHaveBeenCalledWith([1], true, undefined, true));
     expect(screen.getByTestId('email-html')).toHaveAttribute('data-allow', 'false');
     fireEvent.click(screen.getByRole('button', { name: '显示图片' }));
     expect(screen.getByTestId('email-html')).toHaveAttribute('data-allow', 'true');
@@ -81,6 +82,20 @@ describe('MessagePage navigation', () => {
     expect(screen.getByTestId('email-html')).toHaveAttribute('data-allow', 'false');
     expect(screen.getByRole('button', { name: '显示图片' })).toBeInTheDocument();
     await waitFor(() => expect(mocks.markRead.mock.calls.map((args) => args[0])).toEqual([[1], [2]]));
+    client.clear();
+  });
+
+  it('tells the user when marking the opened mail read fails, keeping the server reason and request id', async () => {
+    const { ApiError } = await import('@/api/errors');
+    // 失败提示来自应用的全局 mutationCache
+    const { queryClient } = await import('@/lib/query-client');
+    mocks.markRead.mockRejectedValueOnce(new ApiError('操作过于频繁', { code: 'rate_limited', httpStatus: 429, requestId: 'req-9' }));
+    const client = show('/mail/1', queryClient);
+    await screen.findByText('mail-1');
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({
+      title: '已读状态更新失败', description: '操作过于频繁', requestId: 'req-9', variant: 'error',
+    }));
+    expect(mocks.toast).toHaveBeenCalledOnce();
     client.clear();
   });
 
@@ -98,6 +113,52 @@ describe('MessagePage navigation', () => {
     await screen.findByText('mail-1');
     fireEvent.click(screen.getByRole('button', { name: '上一封' }));
     await screen.findByText('mail-3');
+    client.clear();
+  });
+
+  it('prefetches the neighbour only after j/k, and only in that direction', async () => {
+    const detail = vi.mocked(messageApi.detail);
+    detail.mockClear();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    const list = { direction: 'inbound' as const, scope: 'mine' as const };
+    client.setQueryData(queryKeys.messages.list(list), { pages: [{ items: [{ id: 3 }, { id: 1 }, { id: 2 }, { id: 4 }], nextCursor: null }], pageParams: [''] });
+    show({ pathname: '/mail/1', state: { list } }, client);
+    await screen.findByText('mail-1');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // 直接打开：不预取上一封/下一封
+    expect(detail.mock.calls.map(([id]) => id)).toEqual([1]);
+    fireEvent.click(screen.getByRole('button', { name: '下一封' }));
+    await screen.findByText('mail-2');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // 按钮切换也不预取
+    expect(detail.mock.calls.map(([id]) => id)).toEqual([1, 2]);
+    fireEvent.keyDown(window, { key: 'k' });
+    await screen.findByText('mail-1');
+    // k 之后只预取同方向（上一封）的那一封
+    await waitFor(() => expect(detail.mock.calls.map(([id]) => id)).toEqual([1, 2, 3]));
+    fireEvent.keyDown(window, { key: 'j' });
+    await screen.findByText('mail-2');
+    await waitFor(() => expect(detail.mock.calls.map(([id]) => id)).toEqual([1, 2, 3, 4]));
+    client.clear();
+  });
+
+  it('writes the unread count returned by /read instead of refetching it', async () => {
+    mocks.markRead.mockResolvedValueOnce({ changed: 1, unread: 4 } as never);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData(queryKeys.messages.unreadCount, { unread: 5 });
+    show('/mail/1', client);
+    await screen.findByText('mail-1');
+    await waitFor(() => expect(client.getQueryData(queryKeys.messages.unreadCount)).toEqual({ unread: 4 }));
+    expect(client.getQueryState(queryKeys.messages.unreadCount)?.isInvalidated).toBe(false);
+    client.clear();
+  });
+
+  it('falls back to refetching the unread count when /read does not return it', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData(queryKeys.messages.unreadCount, { unread: 5 });
+    show('/mail/1', client);
+    await screen.findByText('mail-1');
+    await waitFor(() => expect(client.getQueryState(queryKeys.messages.unreadCount)?.isInvalidated).toBe(true));
     client.clear();
   });
 

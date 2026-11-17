@@ -1,6 +1,9 @@
 name = "hpc-cloud-mail"
 main = "src/index.ts"
-compatibility_date = "2025-06-04"
+compatibility_date = "2026-11-16"
+# 2026-08-04 起 nodejs_compat 随日期默认开启；本 Worker 不依赖 Node API（mimetext 走 browser 入口），
+# 显式关闭以保持运行时不出现 process/Buffer 等全局、process.env 不注入 secrets。
+compatibility_flags = ["no_nodejs_compat", "no_nodejs_compat_v2"]
 # account_id 不入库：wrangler 从 CLOUDFLARE_ACCOUNT_ID 环境变量读取（CI 由 GitHub Variables 提供）
 # 默认跑在 workers.dev（Deploy to Cloudflare 一键部署路径）；
 # 自有域名部署由 CI 注入 routes 并关闭 workers_dev（deploy.yml「注入 Cloudflare 资源配置」步骤）
@@ -24,7 +27,8 @@ enabled = true
 # email/scheduled handler 不受 placement 影响。
 
 [triggers]
-crons = ["*/5 * * * *", "0 16 * * *"]
+# 每分钟一次只派发到期的定时草稿（精度 1 分钟内）；每 5 分钟常规任务；每日 16:00 维护
+crons = ["* * * * *", "*/5 * * * *", "0 16 * * *"]
 
 [vars]
 # 系统域名不再写死在 vars，改由 settings.domains.list（管理端维护）；见 services/domain.ts
@@ -51,13 +55,88 @@ bucket_name = "hpc-cloud-mail-r2"
 [[send_email]]
 name = "email"
 
+# 已认证请求的分钟级限流（Workers Rate Limiting binding，services/rate-limit.ts）。
+# 计数在 Cloudflare 各节点本地近似、不写 D1；period 只能是 10 或 60。limit 必须与 shared 常量一致（测试核对）。
+# namespace_id 是账户内唯一的正整数字符串，同一账户里 namespace_id 相同的 binding 共享计数：
+# 同一账户部署多套实例时，给每套换一组不重复的 namespace_id。
+# 用户桶与全站桶：/api（JWT）与 /v1（API Key）各一组
+[[ratelimits]]
+name = "rl_auth_user"
+namespace_id = "71001"
+simple = { limit = 600, period = 60 }
+
+[[ratelimits]]
+name = "rl_auth_global"
+namespace_id = "71002"
+simple = { limit = 5000, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_user"
+namespace_id = "71003"
+simple = { limit = 1200, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_global"
+namespace_id = "71004"
+simple = { limit = 10000, period = 60 }
+
+# Key 自定义的每分钟上限按 1-2-5 档位拆分（如 120 = 100 + 20），每档一个 binding
+[[ratelimits]]
+name = "rl_api_key_500"
+namespace_id = "72500"
+simple = { limit = 500, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_200"
+namespace_id = "72200"
+simple = { limit = 200, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_100"
+namespace_id = "72100"
+simple = { limit = 100, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_50"
+namespace_id = "72050"
+simple = { limit = 50, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_20"
+namespace_id = "72020"
+simple = { limit = 20, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_10"
+namespace_id = "72010"
+simple = { limit = 10, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_5"
+namespace_id = "72005"
+simple = { limit = 5, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_2"
+namespace_id = "72002"
+simple = { limit = 2, period = 60 }
+
+[[ratelimits]]
+name = "rl_api_key_1"
+namespace_id = "72001"
+simple = { limit = 1, period = 60 }
+
+# 外发投递回执（可选，默认不启用）：设置 GitHub Variable DELIVERY_EVENTS_QUEUE（队列名）后，
+# CI 在部署前确保 Queue 存在，并向本文件注入 [vars] delivery_events_queue 与对应的 [[queues.consumers]]
+# （scripts/ensure-delivery-queue.mjs）。这里不写 consumer：wrangler deploy 遇到不存在的队列会直接失败
+
 [assets]
 binding = "assets"
 directory = "./dist"
 not_found_handling = "single-page-application"
-# Agent 文档必须经过 Worker：补 UTF-8，并阻止缺失文档回退为成功的 SPA HTML。
+# Agent 文档必须经过 Worker：补 UTF-8，并阻止缺失文档回退为成功的 SPA HTML。"/mcp" 是远程 MCP 端点。
 # "/assets/*" 让缺失的哈希资源进 Worker 返回 404；现存文件的 "!/assets/<文件>" 排除规则由部署时注入。
-run_worker_first = ["/api", "/api/*", "/v1", "/v1/*", "/skill.md", "/references/*", "/llms.txt", "/assets/*"]
+run_worker_first = ["/api", "/api/*", "/v1", "/v1/*", "/mcp", "/skill.md", "/references/*", "/llms.txt", "/assets/*"]
 
 # Secrets（wrangler secret put）：
 #   jwt_secret              JWT 签名密钥（必需）

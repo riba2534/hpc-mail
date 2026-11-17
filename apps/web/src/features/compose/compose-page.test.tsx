@@ -1,13 +1,16 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-const mocks=vi.hoisted(()=>({user:{id:1,role:'user'},boxes:[] as Array<{id:number,address:string}>,domains:['one.example'],send:vi.fn(async(_payload:import('@hpc-mail/shared').InternalSendMailRequest,_key?:string)=>({id:22,status:'sent',errorDetail:'',recipientOutcomes:[] as Array<{address:string,status:string,error?:string}>})),single:vi.fn(),remove:vi.fn(async()=>({success:true})),toast:vi.fn()}));
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+const mocks=vi.hoisted(()=>({user:{id:1,role:'user'},boxes:[] as Array<{id:number,address:string}>,domains:['one.example'],send:vi.fn(async(_payload:import('@hpc-mail/shared').InternalSendMailRequest,_key?:string)=>({id:22,status:'sent',errorDetail:'',recipientOutcomes:[] as Array<{address:string,status:string,error?:string}>})),single:vi.fn(),remove:vi.fn(async()=>({success:true})),toast:vi.fn(),identities:{identities:[],domains:[]} as import('@hpc-mail/shared').SendIdentities,apiGet:vi.fn()}));
 vi.mock('@/api/resources',()=>({messageApi:{contacts:vi.fn(async()=>({contacts:[]})),send:mocks.send},uploadsApi:{single:mocks.single,remove:mocks.remove}}));
 vi.mock('@/lib/use-config',()=>({useDomains:()=>({data:mocks.domains})}));
 vi.mock('@/lib/use-session',()=>({useCurrentUser:()=>mocks.user}));
 vi.mock('@/features/mailboxes/use-mailboxes',()=>({useMailboxesQuery:()=>({data:mocks.boxes})}));
 vi.mock('@/components/ui/toast',()=>({toast:mocks.toast}));
+// 发件身份由写信页按需读取 /identities；其余接口仍走上面的 resources mock
+vi.mock('@/api/client',async(importOriginal)=>({...await importOriginal<typeof import('@/api/client')>(),api:{get:mocks.apiGet}}));
+mocks.apiGet.mockImplementation(async(path:string)=>{if(path==='/identities') return mocks.identities;throw new Error(`unexpected GET ${path}`)});
 import { ComposePage } from './compose-page';
 import { draftKeyForUser, identityKeyForUser, lastIdentityKeyForUser, legacyDraftKeyForUser } from './compose-draft';
 import { sendAttemptKeyForUser } from './send-attempt';
@@ -52,7 +55,7 @@ describe('ComposePage complete delivery',()=>{
     fireEvent.click(await screen.findByRole('button',{name:'继续编辑'}));
     fireEvent.click(screen.getByRole('button',{name:'发送'}));
     await waitFor(()=>expect(mocks.send).toHaveBeenCalledOnce());
-    expect(mocks.send.mock.calls[0]![0]).toMatchObject({from:{mailboxId:10},bcc:['secret@example.com'],html:'<b>saved</b>',attachmentTokens:['saved-token'],replyToMessageId:77,forwardAttachmentsFrom:88});
+    expect(mocks.send.mock.calls[0]![0]).toMatchObject({from:{mailboxId:10},bcc:[{address:'secret@example.com',name:''}],html:'<b>saved</b>',attachmentTokens:[{token:'saved-token'}],replyToMessageId:77,forwardAttachmentsFrom:88});
     expect(localStorage.getItem(draftKeyForUser(1))).toBeNull();
     client.clear();
   });
@@ -109,6 +112,25 @@ describe('ComposePage complete delivery',()=>{
     const client=show({fromAddress:'first@one.example',to:['to@example.com','failed@example.com'],subject:'test',body:'body'});
     fireEvent.click(screen.getByRole('button',{name:'发送'}));
     await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:expect.stringContaining('1 个收件人发送失败')})));
+    client.clear();
+  });
+  it('201 + status unknown：提示先向收件人核对再补发，进入详情页而不是报成功',async()=>{
+    mocks.send.mockResolvedValueOnce({id:23,status:'unknown',errorDetail:'投递结果未确认，可能已送达，补发前先向收件人核对: to@example.com: timeout',
+      recipientOutcomes:[{address:'to@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人的投递结果未确认',
+      description:expect.stringContaining('请先向收件人核对')})));
+    expect(mocks.toast).not.toHaveBeenCalledWith(expect.objectContaining({variant:'success'}));
+    expect(await screen.findByText('mail page')).toBeInTheDocument();
+    client.clear();
+  });
+  it('部分送达、部分失败、部分未确认：标题同时说明失败与未确认',async()=>{
+    mocks.send.mockResolvedValueOnce({id:24,status:'sent',errorDetail:'部分收件人失败',recipientOutcomes:[{address:'to@example.com',status:'sent'},
+      {address:'bad@example.com',status:'failed',error:'rejected'},{address:'slow@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com','bad@example.com','slow@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人发送失败，1 个收件人的投递结果未确认'})));
     client.clear();
   });
 });
@@ -379,6 +401,80 @@ describe('idempotency error codes', () => {
     await screen.findByText('sent page');
     client.clear();
   });
+
+  it('delivery_failed lists each recipient reason, links to the failed record and sends again with a fresh key', async () => {
+    mocks.send
+      .mockRejectedValueOnce(new ApiError('全部收件人投递失败: to@example.com: destination not verified', {
+        code: 'delivery_failed', httpStatus: 422,
+        details: { messageId: 55, recipientOutcomes: [{ address: 'to@example.com', status: 'failed', error: 'destination not verified' }] },
+      }))
+      .mockResolvedValueOnce({ id: 23, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show(initial);
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('所有收件人都没有收到');
+    expect(alert).toHaveTextContent('to@example.com：destination not verified');
+    expect(screen.getByRole('link', { name: '查看失败记录' })).toHaveAttribute('href', '/mail/55');
+    expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
+    expect(savedKey()).toBeUndefined();
+    const oldKey = mocks.send.mock.calls[0]![1];
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![1]).toBeTruthy();
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
+    client.clear();
+  });
+});
+
+describe('recipient_suppressed', () => {
+  const savedKey = () => JSON.parse(localStorage.getItem(sendAttemptKeyForUser(1)) ?? 'null')?.key as string | undefined;
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('lists each suppressed recipient with its reason and release time, and sends again with a fresh key', async () => {
+    mocks.send
+      .mockRejectedValueOnce(new ApiError('全部收件人都在抑制名单中，没有发送', {
+        code: 'recipient_suppressed', httpStatus: 422,
+        details: { suppressed: [
+          { address: 'gone@example.com', reason: 'hard_bounce', sendingDomain: 'one.example', since: '2026-11-01T00:00:00Z', expiresAt: null },
+          { address: 'full@example.com', reason: 'soft_bounce', sendingDomain: 'one.example', since: '2026-11-01T00:00:00Z', expiresAt: '2026-11-02T00:00:00Z' },
+        ] },
+      }))
+      .mockResolvedValueOnce({ id: 24, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show({ fromAddress: 'first@one.example', to: ['gone@example.com'], subject: 'hello', body: 'body' });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('没有发送：收件人都在抑制名单中');
+    expect(alert).toHaveTextContent('gone@example.com：此前退信（地址或域名不可用），需管理员解除');
+    expect(alert).toHaveTextContent(`full@example.com：此前临时退信且重试耗尽，${new Date('2026-11-02T00:00:00Z').toLocaleString()} 自动解除`);
+    expect(alert).toHaveTextContent('从 one.example 发给这些地址会直接失败');
+    expect(savedKey()).toBeUndefined();
+    const oldKey = mocks.send.mock.calls[0]![1];
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
+    client.clear();
+  });
+});
+
+describe('resend of unconfirmed recipients', () => {
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('lists unconfirmed recipients without adding them to the retry', async () => {
+    mocks.send.mockResolvedValue({ id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show({ fromAddress: 'first@one.example', to: ['failed@example.com'], subject: 'retry', body: 'body', mode: 'resend',
+      sourceMessageId: 7, unconfirmed: ['maybe@example.com'] });
+    expect(screen.getByRole('status')).toHaveTextContent('投递结果未确认，可能已经收到，没有自动加入：maybe@example.com');
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].to).toEqual([{ address: 'failed@example.com', name: '' }]);
+    client.clear();
+  });
 });
 
 describe('source mail no longer available', () => {
@@ -391,10 +487,13 @@ describe('source mail no longer available', () => {
   it('a reply whose original is gone can be sent as a new mail after the user confirms, with a new key', async () => {
     mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
     const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
+    expect(screen.getByRole('heading', { level: 1, name: '回复邮件' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
     expect(mocks.send.mock.calls[0]![0]).toMatchObject({ replyToMessageId: 5 });
     fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
+    // 去掉回复关联后就是一封新邮件，标题随之变化
+    expect(screen.getByRole('heading', { level: 1, name: '写邮件' })).toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 50));
     // 只去掉关联，不自动重发
     expect(mocks.send).toHaveBeenCalledOnce();
@@ -405,6 +504,16 @@ describe('source mail no longer available', () => {
     expect(mocks.send.mock.calls[1]![0]).toEqual(rest);
     expect(mocks.send.mock.calls[1]![1]).not.toBe(mocks.send.mock.calls[0]![1]);
     await screen.findByText('sent page');
+    client.clear();
+  });
+
+  it('a reply-forward whose reply thread is gone (details.source = reply) offers to drop the reply link, not the attachments', async () => {
+    mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404, details: { source: 'reply' } }));
+    const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, forwardAttachmentsFrom: 8, sourceMessageId: 5 });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
+    fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
+    expect(screen.getByText(/将保留原邮件附件/)).toBeInTheDocument();
     client.clear();
   });
 
@@ -430,6 +539,125 @@ describe('source mail no longer available', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(text);
     expect(screen.queryByRole('button', { name: '作为新邮件发送' })).toBeNull();
+    client.clear();
+  });
+});
+
+describe('custom prefix on hosted domains', () => {
+  const sent = { id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] };
+  const domainsOf = (system: string[], hosted: string[]) => ({
+    identities: [],
+    domains: [
+      ...system.map((domain) => ({ domain, kind: 'system' as const, anyLocalPart: true as const })),
+      ...hosted.map((domain) => ({ domain, kind: 'hosted' as const, anyLocalPart: true as const })),
+    ],
+  });
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.send.mockResolvedValue(sent); mocks.toast.mockClear(); mocks.apiGet.mockClear();
+    mocks.user = { id: 1, role: 'user' }; mocks.domains = ['one.example'];
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+    mocks.identities = domainsOf([], ['own.example']);
+  });
+  afterEach(() => { mocks.identities = domainsOf([], []); });
+
+  it('an owner picks any prefix on the hosted domain, sends it as {localPart, domain} and refreshes mailboxes', async () => {
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    client.setQueryData(queryKeys.mailboxes.list('mine'), mocks.boxes);
+    fireEvent.click(await screen.findByRole('combobox', { name: /发件身份/ }));
+    fireEvent.click(screen.getByRole('option', { name: '用 own.example 的任意前缀发信' }));
+    fireEvent.change(screen.getByPlaceholderText('前缀'), { target: { value: 'Hello' } });
+    fireEvent.click(screen.getByRole('combobox', { name: '发件域名' }));
+    // 系统域名（one.example）不给普通用户
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['own.example']);
+    fireEvent.click(screen.getByRole('option', { name: 'own.example' }));
+    expect(screen.getByText('用 own.example 的任意前缀发信（发出时自动认领）')).toBeInTheDocument();
+    // 草稿记下自定义身份
+    fireEvent.change(screen.getByLabelText(/主题/), { target: { value: 'hi there' } });
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(draftKeyForUser(1))!)).toMatchObject({
+      mailboxId: null, localPart: 'hello', adminDomain: 'own.example', fromAddress: 'hello@own.example',
+    }));
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'hello', domain: 'own.example' });
+    await screen.findByText('sent page');
+    // 服务端发出时已认领该地址
+    expect(client.getQueryState(queryKeys.mailboxes.list('mine'))?.isInvalidated).toBe(true);
+    expect(JSON.parse(localStorage.getItem(lastIdentityKeyForUser(1))!)).toEqual({ mailboxId: null, localPart: 'hello', domain: 'own.example' });
+    expect(mocks.apiGet).toHaveBeenCalledWith('/identities');
+    client.clear();
+  });
+
+  it('a default custom identity waits for the hosted domains and is kept instead of falling back to a mailbox', async () => {
+    localStorage.setItem(identityKeyForUser(1), JSON.stringify({ mailboxId: null, localPart: 'support', domain: 'own.example' }));
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    expect(await screen.findByDisplayValue('support')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'support', domain: 'own.example' });
+    client.clear();
+  });
+
+  it('a saved custom identity on a domain the owner no longer hosts falls back to a mailbox', async () => {
+    localStorage.setItem(lastIdentityKeyForUser(1), JSON.stringify({ mailboxId: null, localPart: 'old', domain: 'gone.example' }));
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    await waitFor(() => expect(screen.getByRole('combobox', { name: /发件身份/ })).toHaveTextContent('first@one.example'));
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ mailboxId: 9 });
+    client.clear();
+  });
+
+  it('a reply addressed to an unclaimed address on the hosted domain preselects that prefix', async () => {
+    const client = show({ fromAddress: 'support@own.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
+    expect(await screen.findByDisplayValue('support')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0]).toMatchObject({ from: { localPart: 'support', domain: 'own.example' }, replyToMessageId: 5 });
+    client.clear();
+  });
+
+  it('restores a custom hosted identity from a saved draft', async () => {
+    localStorage.setItem(draftKeyForUser(1), JSON.stringify({ fromAddress: 'sales@own.example', mailboxId: null, localPart: 'sales', adminDomain: 'own.example',
+      to: ['to@example.com'], cc: [], bcc: [], subject: 'saved', body: 'body', isHtml: false }));
+    const client = show();
+    fireEvent.click(await screen.findByRole('button', { name: '继续编辑' }));
+    expect(await screen.findByDisplayValue('sales')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'sales', domain: 'own.example' });
+    client.clear();
+  });
+
+  it('a user without hosted domains sees no custom prefix and a stale custom identity falls back to a mailbox', async () => {
+    mocks.identities = domainsOf([], []);
+    localStorage.setItem(lastIdentityKeyForUser(1), JSON.stringify({ mailboxId: null, localPart: 'old', domain: 'gone.example' }));
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    await waitFor(() => expect(screen.getByRole('combobox', { name: /发件地址/ })).toHaveTextContent('first@one.example'));
+    expect(screen.queryByRole('combobox', { name: /发件身份/ })).toBeNull();
+    expect(screen.queryByText(/任意前缀/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ mailboxId: 9 });
+    client.clear();
+  });
+
+  it('administrators keep system domains and also get their own hosted domains, without the auto-claim refresh', async () => {
+    mocks.user = { id: 1, role: 'admin' }; mocks.boxes = [];
+    mocks.identities = domainsOf(['one.example'], ['own.example']);
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    client.setQueryData(queryKeys.mailboxes.list('mine'), []);
+    fireEvent.click(await screen.findByRole('combobox', { name: /发件身份/ }));
+    expect(screen.getAllByRole('option')[0]).toHaveTextContent('自定义发件地址');
+    fireEvent.keyDown(screen.getByRole('searchbox'), { key: 'Escape' });
+    fireEvent.change(screen.getByPlaceholderText('前缀'), { target: { value: 'ops' } });
+    fireEvent.click(screen.getByRole('combobox', { name: '发件域名' }));
+    await waitFor(() => expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['one.example', 'own.example']));
+    fireEvent.click(screen.getByRole('option', { name: 'one.example' }));
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'ops', domain: 'one.example' });
+    await screen.findByText('sent page');
+    expect(client.getQueryState(queryKeys.mailboxes.list('mine'))?.isInvalidated).toBe(false);
     client.clear();
   });
 });

@@ -8,7 +8,7 @@ import {
   updateHostedDomainRequestSchema,
   type UserSearchResult,
 } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { ApiError, errorMessage } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
@@ -23,7 +23,6 @@ import { hostedDomainApi } from './hosted-domains-api';
 import { patchHostedDomain, storeHostedDomain } from './use-hosted-domains';
 import { UserSearch } from './user-search';
 
-const errorText = (error: unknown, fallback: string) => (error instanceof ApiError ? error.message : fallback);
 
 /** 每位成员的认领上限：本地暂存，点保存提交 */
 function MemberLimitForm({ domain }: { domain: HostedDomain }) {
@@ -40,7 +39,7 @@ function MemberLimitForm({ domain }: { domain: HostedDomain }) {
       storeHostedDomain(queryClient, updated);
       toast({ title: '成员认领上限已保存', variant: 'success' });
     },
-    onError: (error) => toast({ title: errorText(error, '保存失败，请重试'), variant: 'error' }),
+    onError: (error) => toast({ title: errorMessage(error, '保存失败，请重试'), variant: 'error' }),
   });
 
   const handleSubmit = (event: FormEvent) => {
@@ -81,7 +80,7 @@ export function HostedDomainMembersSection({ domain }: { domain: HostedDomain })
 
   /** 所有者已变化（并发过户）时名单作废：整体刷新该域名 */
   const handleError = (error: unknown, fallback: string) => {
-    toast({ title: errorText(error, fallback), variant: 'error' });
+    toast({ title: errorMessage(error, fallback), variant: 'error' });
     if (error instanceof ApiError && error.code === 'conflict') {
       void queryClient.invalidateQueries({ queryKey: queryKeys.hostedDomains.root });
     }

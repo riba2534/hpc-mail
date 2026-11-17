@@ -1,7 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft } from 'lucide-react';
 import { Link, useParams } from 'react-router-dom';
-import type { Mailbox } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
@@ -15,6 +14,7 @@ import { useAdminMailDirection } from '@/features/admin/mail/admin-mail-page';
 import { FilterBar } from '@/features/inbox/filter-bar';
 import { MailList } from '@/features/inbox/mail-list';
 import { useInboxFilters } from '@/features/inbox/use-inbox-filters';
+import { findLoadedAdminMailbox } from './admin-mailboxes';
 
 const DIRECTION_OPTIONS = [
   { value: 'inbound', label: '收件箱' },
@@ -34,8 +34,7 @@ function BackToAddresses() {
   );
 }
 
-const isNotFound = (error: unknown) =>
-  error instanceof ApiError && (error.httpStatus === 404 || error.code === 'not_found');
+const isNotFound = (error: unknown) => error instanceof ApiError && error.notFound;
 
 /** 按 id 只读这一个邮箱；从全站地址列表进来时先用列表缓存里的这一行渲染，不必等请求返回 */
 function useAdminMailbox(mailboxId: number, enabled: boolean) {
@@ -44,8 +43,7 @@ function useAdminMailbox(mailboxId: number, enabled: boolean) {
     queryKey: queryKeys.mailboxes.adminDetail(mailboxId),
     queryFn: () => adminApi.getMailbox(mailboxId),
     enabled,
-    placeholderData: () =>
-      queryClient.getQueryData<Mailbox[]>(queryKeys.mailboxes.list('all'))?.find((item) => item.id === mailboxId),
+    placeholderData: () => findLoadedAdminMailbox(queryClient, mailboxId),
   });
 }
 

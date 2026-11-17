@@ -38,7 +38,7 @@ export function clearSendAttempt(userId: number, key: string | null): void {
  * - uncertain：请求可能已到达服务器并完成投递，只是响应没回来（网络、超时、5xx 等）。保留同一个 key，重试可安全重放结果；
  * - in_progress：服务器确认同一个 key 正在处理或结果待确认。保留 key，不自动重试，引导用户去已发送核对；
  * - key_mismatch：这个 key 已绑定其他内容，当前内容一定没有用它发出。换新 key，由用户再次发送；
- * - rejected：明确的业务错误，没有外发。换新 key，修正后再发。
+ * - rejected：明确的业务错误，没有外发；或 delivery_failed（422）：全部收件人都被拒收，没有任何人收到。换新 key，修正后再发。
  */
 type SendFailure = 'uncertain' | 'in_progress' | 'key_mismatch' | 'rejected';
 /** 发信引用的原邮件：回复线程头或转发附件的来源 */
@@ -55,7 +55,8 @@ export function classifySendError(error: unknown): SendFailure {
 }
 
 /**
- * 发信引用的原邮件已删除或对发件人不可见（服务端 404 source_unavailable）。来源按请求里带的字段区分；
+ * 发信引用的原邮件已删除或对发件人不可见（服务端 404 source_unavailable）。服务端在 details.source 里指明是
+ * 哪一个引用（请求里确实带了该字段才采信）；旧服务端没有这个字段时按请求里带的字段推断：
  * 服务端先校验转发附件再校验回复线程，两者都带时归到转发。
  */
 export function missingSendSource(
@@ -63,6 +64,9 @@ export function missingSendSource(
   payload: Pick<InternalSendMailRequest, 'replyToMessageId' | 'forwardAttachmentsFrom'>,
 ): SendSource | null {
   if (!(error instanceof ApiError) || error.code !== 'source_unavailable') return null;
+  const reported = error.details?.source;
+  if (reported === 'reply' && payload.replyToMessageId) return 'reply';
+  if (reported === 'forward' && payload.forwardAttachmentsFrom) return 'forward';
   if (payload.forwardAttachmentsFrom) return 'forward';
   if (payload.replyToMessageId) return 'reply';
   return null;

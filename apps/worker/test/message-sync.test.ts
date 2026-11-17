@@ -220,10 +220,11 @@ describe('GET /api/messages/sync 与列表首页 head', () => {
     expect(marks('isStarred')).toEqual([...picked].sort());
   });
 
-  it('sync 的 D1 往返不多于列表首页：未读数与首页同一 batch，标记再一次 batch', async () => {
+  it('列表、sync、wait 各一次 D1 往返：标记随行取回，未读数与首页同一 batch，分流的两条语句也在同一 batch', async () => {
     const user = await account('sync-trips');
+    const first = await mail(user.address);
     await mail(user.address);
-    await mail(user.address);
+    await createDb(env).insert(attachmentsTable).values({ messageId: first, r2Key: `att/${first}/a` });
     const counting = () => {
       let prepared = 0;
       let batched = 0;
@@ -240,16 +241,23 @@ describe('GET /api/messages/sync 与列表首页 head', () => {
       return { env: { ...env, db } as typeof env, trips: () => batches + prepared - batched };
     };
     const viewer = { userId: user.id, role: 'user' as const };
-    const query = { limit: 30 } as ListMessagesQuery;
-    const listed = counting();
-    await listMessages(listed.env, viewer, query);
-    const synced = counting();
-    await syncMessages(synced.env, viewer, query);
-    expect(listed.trips()).toBe(2);
-    expect(synced.trips()).toBe(2);
-    // 首页为空时不查标记
-    const empty = counting();
-    await syncMessages(empty.env, viewer, { limit: 30, address: 'nobody@sync.test' } as ListMessagesQuery);
-    expect(empty.trips()).toBe(1);
+    for (const query of [{}, { direction: 'inbound' as const }, { domain: 'sync.test' }, { q: 'hello' }, { address: 'nobody@sync.test' }]) {
+      const label = JSON.stringify(query);
+      const listed = counting();
+      const page = await listMessages(listed.env, viewer, { limit: 30, ...query } as ListMessagesQuery);
+      expect(listed.trips(), label).toBe(1);
+      if (!('address' in query)) expect(page.items.find((item) => item.id === first)?.hasAttachments, label).toBe(true);
+      const synced = counting();
+      await syncMessages(synced.env, viewer, { limit: 30, ...query } as ListMessagesQuery);
+      expect(synced.trips(), label).toBe(1);
+    }
+    // wait 命中：摘要与标记同一条语句（原先命中后再查一次标记）；include=body 再取一次整行与附件
+    const waited = counting();
+    const found = await findNextMessage(waited.env, viewer, { afterId: first - 1 });
+    expect(found.message).toMatchObject({ id: first, hasAttachments: true, isStarred: false });
+    expect(waited.trips()).toBe(1);
+    const withBody = counting();
+    await findNextMessage(withBody.env, viewer, { afterId: first - 1, include: 'body' });
+    expect(withBody.trips()).toBe(2);
   });
 });

@@ -37,15 +37,15 @@ import { listMailView, mailHref } from './mail-view';
 import { syncReadState, syncRemovedMessages, syncStarState } from './message-cache';
 import { messageDetailQueryOptions } from './message-queries';
 import { MessageRow, type RowCheckbox } from './message-row';
-import { useDeleteMessages } from './use-delete-messages';
+import { undoLatestDelete, useDeleteMessages } from './use-delete-messages';
 import { useMailShortcuts } from './use-mail-shortcuts';
 import { useMessagesQuery } from './use-messages';
 import { useStarMutation } from './use-star';
 
 /** 距已加载末尾不足这么多行就开始拉下一页（用户已开始滚动时） */
 const PREFETCH_ROWS = 20;
-/** 悬停/聚焦行这么久才预取详情，划过不算 */
-const DETAIL_PREFETCH_DELAY_MS = 100;
+/** 悬停/聚焦行这么久才预取详情：鼠标扫过列表不读正文，停下来看才算 */
+const DETAIL_PREFETCH_DELAY_MS = 250;
 
 const SHARED_READ_ONLY = '共享给你的邮件只读，不能改变已读状态';
 
@@ -154,7 +154,7 @@ export function MailList({
 }: MailListProps) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } =
+  const { data, isLoading, isPlaceholderData, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } =
     useMessagesQuery(query);
   const items = useMemo(() => data?.pages.flatMap((page) => page.items) ?? [], [data]);
   const now = useMinuteClock();
@@ -164,7 +164,7 @@ export function MailList({
   const trash = variant === 'trash';
 
   // 「共享来的」= 个人视图里地址不在自己认领列表中：只读，不改已读状态、不能删除
-  const { data: ownedMailboxes } = useMailboxesQuery(false);
+  const { data: ownedMailboxes } = useMailboxesQuery();
   const personalView = (query.scope ?? 'mine') === 'mine';
   const ownedAddresses = useMemo(
     () => (ownedMailboxes ? new Set(ownedMailboxes.map((mailbox) => mailbox.address)) : null),
@@ -193,13 +193,26 @@ export function MailList({
   );
 
   // ---- 悬停/聚焦行时预取详情（GET 无副作用；已读由详情页单独 POST）----
+  // 同一时间只保留一个悬停预取：新的开始前取消上一个仍在途、且没有页面在用的预取
   const prefetchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const prefetching = useRef<number | null>(null);
   const handleOpenIntent = useCallback(
     (id: number | null) => {
       globalThis.clearTimeout(prefetchTimer.current);
       if (id === null) return;
       prefetchTimer.current = globalThis.setTimeout(() => {
-        void queryClient.prefetchQuery(messageDetailQueryOptions(id, mailView));
+        const previous = prefetching.current;
+        if (previous !== null && previous !== id) {
+          const { queryKey } = messageDetailQueryOptions(previous, mailView);
+          const query = queryClient.getQueryCache().find({ queryKey, exact: true });
+          if (query?.state.fetchStatus === 'fetching' && query.getObserversCount() === 0) {
+            void queryClient.cancelQueries({ queryKey, exact: true });
+          }
+        }
+        prefetching.current = id;
+        void queryClient.prefetchQuery(messageDetailQueryOptions(id, mailView)).finally(() => {
+          if (prefetching.current === id) prefetching.current = null;
+        });
       }, DETAIL_PREFETCH_DELAY_MS);
     },
     [queryClient, mailView],
@@ -283,7 +296,7 @@ export function MailList({
       syncReadState(queryClient, ids, isRead);
       reconcileLists(changed, expected);
     },
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '标记失败' },
   });
 
   const markRead = (ids: number[], isRead: boolean) => {
@@ -304,7 +317,7 @@ export function MailList({
       syncStarState(queryClient, ids, starred);
       reconcileLists(changed, expected);
     },
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '星标操作失败' },
   });
 
   const batchDelete = useDeleteMessages(mutationScope, clearSelection);
@@ -325,7 +338,7 @@ export function MailList({
       syncRemovedMessages(queryClient, ids, 'trash');
       reconcileLists(changed, ids.length);
     },
-    onError: () => toast({ title: '恢复失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '恢复失败' },
   });
 
   const batchPurge = useMutation({
@@ -337,7 +350,7 @@ export function MailList({
       syncRemovedMessages(queryClient, ids, 'trash');
       reconcileLists(changed, ids.length);
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '永久删除失败' },
   });
 
   const batchPending =
@@ -387,7 +400,7 @@ export function MailList({
     if (last.index >= items.length - 1 - threshold) void fetchNextPage();
   }, [virtualItems, items.length, hasNextPage, isFetchingNextPage, fetchNextPage, scrolled]);
 
-  // ---- 键盘：j/k 移动焦点行，o/Enter 打开，x 选中，s 星标，e/# 删除，Shift+I/U 已读/未读（/ 由全局处理）----
+  // ---- 键盘：j/k 移动焦点行，o/Enter 打开，x 选中，s 星标，e/# 删除，z 撤销删除，Shift+I/U 已读/未读（/ 由全局处理）----
   const cursorRef = useRef<number | null>(null);
   const handleListFocus = (event: FocusEvent<HTMLDivElement>) => {
     const row = (event.target as HTMLElement).closest<HTMLElement>('[data-message-id]');
@@ -448,6 +461,7 @@ export function MailList({
     },
     e: () => deleteShortcut(),
     '#': () => deleteShortcut(),
+    z: () => undoLatestDelete(),
     'Shift+I': () => readShortcut(true),
     'Shift+U': () => readShortcut(false),
   });
@@ -617,10 +631,18 @@ export function MailList({
           已选中 {selection.size - selectedOwnCount} 封共享邮件：只读，不能改变已读状态或删除。
         </p>
       )}
+      {/* 虚拟列表只渲染可见行：用 setsize/posinset 告诉读屏总数与位置，还有下一页时总数未知（-1）；
+          换筛选后新结果未到时仍显示上一组结果，淡化并标记 busy */}
       <div
         ref={listRef}
+        role="list"
+        aria-label="邮件列表"
+        aria-busy={isPlaceholderData || undefined}
         onFocus={handleListFocus}
-        className="relative overflow-hidden rounded-lg border border-line bg-surface"
+        className={cn(
+          'relative overflow-hidden rounded-lg border border-line bg-surface transition-opacity',
+          isPlaceholderData && 'opacity-60',
+        )}
         style={{ height: virtualizer.getTotalSize() }}
       >
         {virtualItems.map((virtualItem) => {
@@ -629,6 +651,9 @@ export function MailList({
           return (
             <div
               key={message.id}
+              role="listitem"
+              aria-setsize={hasNextPage ? -1 : items.length}
+              aria-posinset={virtualItem.index + 1}
               data-index={virtualItem.index}
               ref={virtualizer.measureElement}
               className="absolute inset-x-0 top-0"

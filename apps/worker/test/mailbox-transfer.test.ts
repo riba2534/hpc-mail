@@ -11,6 +11,7 @@ import { releaseMailbox, transferMailbox, updateMailbox } from '../src/services/
 import { replaceMailboxShares, revokeMailboxShare } from '../src/services/mailbox-share.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 import type { Env } from '../src/types.js';
 
 const app = createApp();
@@ -25,7 +26,7 @@ async function fixture() {
     security: { require2fa: false }, api: { enabled: true },
   });
   async function actor(suffix: string, role: 'admin' | 'user' = 'user') {
-    const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: 'test', authVersionMigrated: true }).returning().get())!;
+    const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: await testPasswordHash(), authVersionMigrated: true }).returning().get())!;
     const sid = await createSession(env, user.id);
     const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
     return { ...user, jwt };
@@ -155,8 +156,8 @@ describe('管理员邮箱强制过户', () => {
     const box = await f.box(f.old.id);
     const message = await receive(box.address, `other-${box.id}`);
     await updateSettings(env, { domains: { list: [] } });
-    const oldKey = await value<CreatedApiKey>(await request('/api/api-keys', f.old.jwt, { name: 'before-transfer', scopes: ['mail.read', 'mail.send'] }), 201);
-    const newKey = await value<CreatedApiKey>(await request('/api/api-keys', f.target.jwt, { name: 'after-transfer', scopes: ['mail.read', 'mail.send'] }), 201);
+    const oldKey = await value<CreatedApiKey>(await request('/api/api-keys', f.old.jwt, { name: 'before-transfer', scopes: ['mail.read', 'mail.send'], password: TEST_PASSWORD }), 201);
+    const newKey = await value<CreatedApiKey>(await request('/api/api-keys', f.target.jwt, { name: 'after-transfer', scopes: ['mail.read', 'mail.send'], password: TEST_PASSWORD }), 201);
     await value(await request(`/api/admin/mailboxes/${box.id}/transfer`, f.admin.jwt, { userId: f.target.id, expectedOwnerId: f.old.id }));
     for (const [prefix, token] of [['/api', f.old.jwt], ['/v1', oldKey.key]]) {
       expect((await request(`${prefix}/messages/${message.id}`, token!)).status).toBe(404);
@@ -177,7 +178,7 @@ describe('管理员邮箱强制过户', () => {
     const body = { userId: f.target.id, expectedOwnerId: f.old.id };
     expect((await request(path, f.old.jwt, body)).status).toBe(403);
     expect((await request(path, '', body)).status).toBe(401);
-    const key = await value<CreatedApiKey>(await request('/api/api-keys', f.admin.jwt, { name: 'admin-key', scopes: ['mailbox.write'] }), 201);
+    const key = await value<CreatedApiKey>(await request('/api/api-keys', f.admin.jwt, { name: 'admin-key', scopes: ['mailbox.write'], password: TEST_PASSWORD }), 201);
     expect((await request(path, key.key, body)).status).toBe(401);
     for (const invalid of [{ userId: 0, expectedOwnerId: f.old.id }, { userId: f.target.id }, { ...body, expectedOwnerId: 1.5 }]) {
       expect((await request(path, f.admin.jwt, invalid)).status).toBe(400);

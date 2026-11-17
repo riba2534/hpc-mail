@@ -41,6 +41,7 @@ import {
 import { HostedDomainMembersSection } from './hosted-domain-members';
 import { HostedDnsSection } from './hosted-dns-section';
 import { hostedDomainApi } from './hosted-domains-api';
+import { ReconnectHostedDomainSection } from './reconnect-hosted-domain-section';
 import { TransferHostedDomainDialog } from './transfer-hosted-domain-dialog';
 import { forgetHostedDomain, storeHostedDomain, useHostedDomainQuery } from './use-hosted-domains';
 
@@ -53,8 +54,7 @@ const STEP_STATES: Record<HostedDomainStepState, { label: string; icon: LucideIc
   error: { label: '异常', icon: CircleAlert, className: 'text-critical' },
 };
 
-const isGone = (error: unknown) =>
-  error instanceof ApiError && (error.httpStatus === 404 || error.httpStatus === 403 || error.code === 'not_found');
+const isGone = (error: unknown) => error instanceof ApiError && (error.notFound || error.httpStatus === 403);
 
 function Section({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
   return (
@@ -214,7 +214,8 @@ function ProgressSection({ domain, canManage }: { domain: HostedDomain; canManag
         {checkable && siteDisabled && <p>本站已关闭域名托管，暂不能手动检测，系统仍会定时核对。</p>}
         {domain.status === 'pending' && domain.expiresAt && (
           <p className="text-caution">
-            请在 {formatDateTime(domain.expiresAt)} 前完成名称服务器修改，逾期仍未生效会自动删除。
+            请在 {formatDateTime(domain.expiresAt)} 前完成名称服务器修改，
+            {domain.activatedAt ? '逾期仍未生效会撤回这次重新接入（地址与历史邮件保留，可再次重新接入）。' : '逾期仍未生效会自动删除。'}
           </p>
         )}
       </div>
@@ -456,6 +457,7 @@ export function HostedDomainDetailPage() {
       <SummarySection domain={domain} />
 
       <ProgressSection domain={domain} canManage={canManage} />
+      {canManage && domain.status === 'moved' && <ReconnectHostedDomainSection domain={domain} />}
       {canManage && active && <NameServerSection domain={domain} />}
       {canManage && active && <HostedDnsSection domain={domain} />}
       {canManage && active && <HostedDomainMembersSection domain={domain} />}

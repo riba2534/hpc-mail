@@ -1,3 +1,10 @@
+const HTML_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+/** 文本放进 HTML 前转义 & < > " '（附件下载区块、中转与回复转发的引用头部共用） */
+export function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
+}
+
 /**
  * 零宽、软连字符、方向控制等不可见字符：渲染时不占位，却常被反爬插在验证码中间，
  * 换成空格会把码切成两段（`913472` → `91347 2`，提码只剩 5 位），只能直接去掉。
@@ -266,6 +273,8 @@ export interface MailText {
   readonly plain: string;
   /** plain 来自 HTML 转换且超长只转换了开头 */
   readonly plainTruncated: boolean;
+  /** HTML 段转出的文本，与 plain 共用同一次转换（纯文本段只是占位时提码改看它） */
+  readonly htmlText: string;
   /** 与 makePreview 相同的摘要 */
   preview(limit?: number): string;
 }
@@ -280,6 +289,7 @@ export function mailText(text: string, html: string): MailText {
   return {
     get plain() { return text || htmlText().text; },
     get plainTruncated() { return !text && htmlText().truncated; },
+    get htmlText() { return htmlText().text; },
     preview: (limit = PREVIEW_LIMIT) => previewOf((text && text.trim()) || htmlText().text, limit),
   };
 }

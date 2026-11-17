@@ -52,4 +52,43 @@ describe('IdentityPicker', () => {
     fireEvent.click(screen.getByRole('option', { name: 'a.test' }));
     expect(props.onDomain).toHaveBeenCalledWith('a.test');
   });
+
+  it('普通用户没有托管域名时只有已认领邮箱，没有自定义前缀', () => {
+    show({ hostedDomains: [] });
+    expect(screen.queryByRole('combobox', { name: /发件身份/ })).toBeNull();
+    expect(screen.queryByText(/任意前缀/)).toBeNull();
+    fireEvent.click(screen.getByRole('combobox', { name: /发件地址/ }));
+    expect(optionNames()).toEqual(['amy@c.test', 'bob@a.test', 'zed@b.test']);
+  });
+
+  it('托管域名所有者：任意前缀一项置顶，域名只在自己的托管域名里选，并说明发出时自动认领', () => {
+    const props = show({ domains: ['own.test'], hostedDomains: ['own.test'], domain: 'own.test' });
+    expect(screen.getByText('用 own.test 的任意前缀发信（发出时自动认领）')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('combobox', { name: /发件身份/ }));
+    expect(optionNames()).toEqual(['用 own.test 的任意前缀发信', 'amy@c.test', 'bob@a.test', 'zed@b.test']);
+    fireEvent.keyDown(screen.getByRole('searchbox'), { key: 'Escape' });
+
+    fireEvent.change(screen.getByPlaceholderText('前缀'), { target: { value: ' Sales ' } });
+    expect(props.onLocalPart).toHaveBeenCalledWith('sales');
+    fireEvent.click(screen.getByRole('combobox', { name: '发件域名' }));
+    expect(optionNames()).toEqual(['own.test']);
+  });
+
+  it('托管域名有多个且还没选域名时，提示先选域名', () => {
+    show({ domains: ['two.test', 'one.test'], hostedDomains: ['two.test', 'one.test'], domain: '' });
+    expect(screen.getByText('选择你托管的域名，前缀可任意填写（发出时自动认领）')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('combobox', { name: /发件身份/ }));
+    expect(optionNames()[0]).toBe('用托管域名的任意前缀发信');
+  });
+
+  it('管理员有托管域名时仍是「自定义发件地址」，域名选项由调用方给出', () => {
+    show({ isAdmin: true, domains: ['c.test', 'own.test'], hostedDomains: ['own.test'] });
+    expect(screen.getByText('管理员可用任意前缀 + 系统域名或自己托管的域名发件。')).toBeInTheDocument();
+    expect(screen.queryByText(/自动认领/)).toBeNull();
+    fireEvent.click(screen.getByRole('combobox', { name: /发件身份/ }));
+    expect(optionNames()[0]).toBe('自定义发件地址');
+    fireEvent.keyDown(screen.getByRole('searchbox'), { key: 'Escape' });
+    fireEvent.click(screen.getByRole('combobox', { name: '发件域名' }));
+    expect(optionNames()).toEqual(['c.test', 'own.test']);
+  });
 });

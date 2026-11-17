@@ -1,18 +1,13 @@
+import { safeStorage } from './local-storage';
+
 const TOKEN_STORAGE_KEY = 'token';
 const TOKEN_EVENT = 'hpc-mail:token-change';
 let observedToken: string | null | undefined;
 let tokenRevision = 0;
 
-function storage(): Storage | null {
-  try {
-    return globalThis.localStorage ?? null;
-  } catch {
-    return null;
-  }
-}
 
 export function getAuthToken(): string | null {
-  const value = storage()?.getItem(TOKEN_STORAGE_KEY)?.trim();
+  const value = safeStorage()?.getItem(TOKEN_STORAGE_KEY)?.trim();
   const token = value || null;
   if (observedToken !== token) {
     observedToken = token;
@@ -30,12 +25,17 @@ export function setAuthToken(token: string): void {
     clearAuthToken();
     return;
   }
-  storage()?.setItem(TOKEN_STORAGE_KEY, normalized);
+  try {
+    safeStorage()?.setItem(TOKEN_STORAGE_KEY, normalized);
+  } catch {
+    // 存储写满或被禁用：保持原状，不让登录、改密的回调抛错中断
+    return;
+  }
   globalThis.dispatchEvent?.(new CustomEvent(TOKEN_EVENT, { detail: normalized }));
 }
 
 export function clearAuthToken(): void {
-  storage()?.removeItem(TOKEN_STORAGE_KEY);
+  safeStorage()?.removeItem(TOKEN_STORAGE_KEY);
   globalThis.dispatchEvent?.(new CustomEvent(TOKEN_EVENT, { detail: null }));
 }
 

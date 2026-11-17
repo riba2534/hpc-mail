@@ -106,7 +106,7 @@ describe('一致性与资源治理', () => {
     const actual: number[] = [];
     let afterId = 0;
     for (;;) {
-      const { message: next, scannedThroughId } = await findNextMessage(env, { userId, role: 'user' }, { afterId, address });
+      const { message: next, scannedThroughId } = await findNextMessage(env, { userId, role: 'user' }, { afterId, address: [address] });
       if (!next) { expect(scannedThroughId).toBe(afterId); break; }
       expect(scannedThroughId).toBe(next.id);
       actual.push(next.id);
@@ -299,11 +299,14 @@ describe('Webhook SSRF 字面地址拦截', () => {
     'https://[::ffff:127.0.0.1]/hook',
     'https://metadata.google.internal/hook',
     'https://127.0.0.1.nip.io/hook',
+    'https://192.0.0.8/hook',
+    'https://192.0.2.1/hook',
   ])('拒绝 %s', (url) => {
     expect(validateNotifyWebhookUrl(url)).toBeNull();
   });
 
   it('允许普通公网 HTTPS 地址', () => {
     expect(validateNotifyWebhookUrl('https://hooks.example.com/mail')).not.toBeNull();
+    expect(validateNotifyWebhookUrl('https://192.0.78.9/mail')).not.toBeNull();
   });
 });

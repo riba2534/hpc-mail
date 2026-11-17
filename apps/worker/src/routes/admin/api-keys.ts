@@ -1,6 +1,6 @@
-import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { clientIp, ok, parseId } from '../../lib/http.js';
+import { pageLimit } from '../../lib/pagination.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { getApiKey, listApiKeyLogs, listApiKeys, revokeApiKey } from '../../services/api-key.js';
 import { logAdminAction } from '../../services/audit.js';
@@ -21,11 +21,7 @@ app.get('/:id', async (c) => {
 app.get('/:id/logs', async (c) => {
   const id = parseId(c.req.param('id'));
   const cursor = c.req.query('cursor');
-  const limitRaw = Number(c.req.query('limit'));
-  const limit = Number.isInteger(limitRaw)
-    ? Math.min(MAX_PAGE_SIZE, Math.max(1, limitRaw))
-    : DEFAULT_PAGE_SIZE;
-  return ok(c, await listApiKeyLogs(c.env, id, cursor, limit));
+  return ok(c, await listApiKeyLogs(c.env, id, cursor, pageLimit(c.req.query('limit'))));
 });
 
 /** admin 吊销任意 key */

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { PASSWORD_MAX_LENGTH } from '../constants.js';
 import {
   feishuSettingSchema,
   gmailForwardSettingSchema,
@@ -34,18 +35,44 @@ export const DEFAULT_USER_NOTIFY_PREFS: UserNotifyPrefs = {
   pushdeer: { enabled: false, endpoint: '', pushkey: '' },
 };
 
-/** 更新请求：各项各自可选，至少一项 */
+/**
+ * 更新请求：各项各自可选，至少一项。forward 只能网页会话修改：新增的目标先发确认信、确认后才生效，
+ * 新增目标或把转发从关改为开时要带当前密码 password。
+ */
 export const updateNotifyPrefsRequestSchema = z
   .object({
     feishu: feishuSettingSchema.optional(),
     webhook: notifyWebhookSettingSchema.optional(),
     forward: gmailForwardSettingSchema.optional(),
     pushdeer: pushdeerSettingSchema.optional(),
+    password: z.string().max(PASSWORD_MAX_LENGTH).optional(),
   })
-  .refine((v) => Object.values(v).some((x) => x !== undefined), {
+  .refine((v) => [v.feishu, v.webhook, v.forward, v.pushdeer].some((x) => x !== undefined), {
     message: '至少提供一个待更新项',
   });
 export type UpdateNotifyPrefsRequest = z.infer<typeof updateNotifyPrefsRequestSchema>;
+
+/** 等待目标邮箱确认的转发地址：确认后才写进 forward.addresses 并开始转发 */
+export interface ForwardPendingTarget {
+  address: string;
+  expiresAt: string;
+}
+
+/** GET/PUT 通知偏好的响应：掩码后的偏好，加上等待确认的转发目标 */
+export type NotifyPrefsView = UserNotifyPrefs & { forwardPending: ForwardPendingTarget[] };
+
+/** 转发确认（公开接口，凭确认信里的一次性 token） */
+export const confirmForwardRequestSchema = z.object({
+  token: z.string().trim().min(16).max(128),
+});
+export type ConfirmForwardRequest = z.infer<typeof confirmForwardRequestSchema>;
+export interface ConfirmForwardResult {
+  address: string;
+}
+/** 确认链接有效期（小时） */
+export const FORWARD_CONFIRM_TTL_HOURS = 72;
+/** 每个用户每天最多发出的转发确认信 */
+export const MAX_FORWARD_CONFIRM_MAILS_PER_DAY = 20;
 
 export interface NotificationDeliveryView {
   id: number; messageId: number | null; target: string; status: 'pending' | 'processing' | 'succeeded' | 'failed' | 'skipped' | 'unknown';

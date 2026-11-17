@@ -112,6 +112,9 @@ jobs:
       - name: 部署脚本自测（冒烟、金丝雀、心跳）
         run: node scripts/check-deploy-scripts.mjs
 
+      # Spectral 只在 PR CI（ci.yml）里跑：它由 npx 现装，传递依赖没有锁定，不能进入这个持有生产密钥、
+      # 随后部署工作区产物的 job。同样的 OpenAPI 规则已由上面 worker 测试里的 openapi-quality 把关。
+
       - name: 依赖安全审计
         run: pnpm audit --prod --audit-level high
 
@@ -121,6 +124,7 @@ jobs:
           CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
           BUILD_SHA: ${{ github.sha }}
           PLACEMENT_REGION: ${{ vars.PLACEMENT_REGION }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
         run: |
           set -euo pipefail
           sed -i \
@@ -142,6 +146,8 @@ jobs:
           else
             echo '::notice::未设置 PLACEMENT_REGION，跳过 placement 注入'
           fi
+          # 可选的外发投递回执：设置了 Variable DELIVERY_EVENTS_QUEUE 才注入 Worker 变量与 Queue consumer，未设置时只在 Summary 记一行
+          node scripts/ensure-delivery-queue.mjs --inject wrangler.toml
           # 现存哈希资源由边缘直出、不绕到 placement 区域；缺失文件仍经 Worker 返回 404（build:assets 已在前面执行）
           node scripts/inject-asset-routes.mjs
           rules=$(grep -E '^run_worker_first' wrangler.toml | grep -o '"[^"]*"' | wc -l)
@@ -150,13 +156,24 @@ jobs:
           [ "$rules" -le 100 ] || { echo '::error::run_worker_first 超过 Cloudflare 100 条上限'; exit 1; }
           grep -E '^run_worker_first' wrangler.toml | grep -q '"/assets/\*"' || { echo '::error::run_worker_first 缺少 /assets/* 兜底规则'; exit 1; }
 
+      # 启用了投递回执时，在迁移与发布之前只读预检一次（按名称列 Queue）：Token 没有 Queues 权限就在这里失败，
+      # Job Summary 写明缺 Account → Queues:Edit。日志只有队列名与错误码，不含账户 id
+      - name: 投递回执权限预检
+        if: vars.DELIVERY_EVENTS_QUEUE != ''
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
+        run: node scripts/ensure-delivery-queue.mjs --check
+
       - name: 部署预演（dry-run）
         working-directory: apps/worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: npx wrangler deploy --dry-run
 
-      # 回滚基线：迁移前的 D1 书签（只用于人工恢复数据）与当前承载流量的 Worker 版本（失败时自动回滚到它）
+      # 回滚基线：迁移前的 D1 书签（只用于人工恢复数据）、当前承载流量的 Worker 版本（失败时自动回滚到它）
+      # 与当前的 cron 触发器（wrangler rollback 不恢复触发器，回滚时由 scripts/worker-schedules.sh 恢复）
       - name: 记录回滚基线
         id: baseline
         working-directory: apps/worker
@@ -192,8 +209,10 @@ jobs:
             echo "- D1 Time Travel 书签（本次迁移之前）：\`$bookmark\`"
             echo "- 部署前线上 Worker 版本：\`${version_id:-无（首次部署）}\`"
             echo "- 部署前线上 build：\`${build:-未知}\`"
-            echo
           } >> "$GITHUB_STEP_SUMMARY"
+          # 读不到触发器时终止部署（与读不到线上版本同理）；日志与 Summary 只有 cron 表达式，不含账户 id
+          bash "$GITHUB_WORKSPACE/scripts/worker-schedules.sh" save "$RUNNER_TEMP/worker-schedules.json"
+          echo >> "$GITHUB_STEP_SUMMARY"
 
       # 迁移先于代码上线，且失败回滚时不回滚迁移：迁移只能做加法（apps/worker/scripts/check-migrations.mjs 已在测试中把关）
       - name: 应用数据库迁移
@@ -238,6 +257,16 @@ jobs:
           echo "::add-mask::$smoke_password"
           echo "::add-mask::$canary_token"
           { echo "SMOKE_PASSWORD=$smoke_password"; echo "CANARY_TOKEN=$canary_token"; } >> "$GITHUB_ENV"
+
+      # 注入的 consumer 引用的 Queue 必须先存在，否则 wrangler deploy 直接失败。创建失败时在发布前中止（线上仍是旧版本，
+      # 不触发回滚），Job Summary 写明原因。日志只有队列名与错误码，不含账户 id
+      - name: 确保投递回执 Queue 存在
+        if: vars.DELIVERY_EVENTS_QUEUE != ''
+        working-directory: apps/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DELIVERY_EVENTS_QUEUE: ${{ vars.DELIVERY_EVENTS_QUEUE }}
+        run: node scripts/ensure-delivery-queue.mjs
 
       # secrets 随代码进同一个版本：部署后逐个 secret put 会各自生成新版本，回滚目标随之失真
       - name: 部署 Worker（代码与 secrets 同一版本）
@@ -353,6 +382,12 @@ jobs:
             echo "::error::自动回滚失败，线上仍是本次发布的版本"
             exit 1
           fi
+          # rollback 只换回代码版本：本次发布改过的 cron 触发器会留在线上、被旧代码当成常规任务执行，恢复为基线值。
+          # 恢复失败只告警（Summary 写明手动恢复的值），不改变回滚结论
+          summary '### cron 触发器'
+          bash "$GITHUB_WORKSPACE/scripts/worker-schedules.sh" restore "$RUNNER_TEMP/worker-schedules.json" \
+            || echo '::warning::恢复 cron 触发器的脚本异常退出，请按 Summary「回滚基线」里的值手动恢复'
+          summary ''
           # 用 X-HPC-Build 确认线上已回到部署前的 build
           restored=unverified
           if [ -n "$PREVIOUS_BUILD" ]; then

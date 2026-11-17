@@ -1,16 +1,31 @@
-import { constantTimeEqual } from './password.js';
-
 const encoder = new TextEncoder();
+
+/** 常量时间比较两个字节序列 */
+export function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
+  let mismatch = left.length ^ right.length;
+  const length = Math.max(left.length, right.length);
+  for (let i = 0; i < length; i++) {
+    mismatch |= (left[i] ?? 0) ^ (right[i] ?? 0);
+  }
+  return mismatch === 0;
+}
+
+/** base64url（无填充）：JWT 与密码哈希共用 */
+export function bytesToBase64url(input: ArrayBuffer | Uint8Array): string {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+export function base64urlToBytes(value: string): Uint8Array {
+  let normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  while (normalized.length % 4) normalized += '=';
+  return Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0));
+}
 
 export function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-export function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.length % 2 ? `0${hex}` : hex;
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  return out;
 }
 
 export async function sha256Hex(input: string | Uint8Array): Promise<string> {
@@ -53,8 +68,28 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
   return constantTimeEqual(encoder.encode(a), encoder.encode(b));
 }
 
+/** jwt_secret 派生出的各用途子密钥：会话令牌、附件签名链接、转发中转防环头 */
+export type SubkeyPurpose = 'jwt' | 'attachment' | 'relay';
+
+const subkeys = new Map<string, Promise<string>>();
+
+/**
+ * 子密钥 = HMAC-SHA256(jwt_secret, "hpc-mail/subkey/v1/<用途>") 的十六进制，按 (密钥, 用途) 在 isolate 内缓存。
+ * 一把密钥不再直接签多种东西，各用途互不相通；之后要单独轮换某个用途时只需换它的派生来源。
+ * 金丝雀令牌按自己的约定直接用 jwt_secret 计算，不经过这里。
+ */
+export function deriveSubkey(secret: string, purpose: SubkeyPurpose): Promise<string> {
+  const id = `${purpose}\n${secret}`;
+  let key = subkeys.get(id);
+  if (!key) {
+    key = hmacSha256Hex(secret, `hpc-mail/subkey/v1/${purpose}`);
+    subkeys.set(id, key);
+  }
+  return key;
+}
+
 /** 站内详情签名的时间桶：exp 对齐到整点 */
-const ATTACHMENT_BUCKET_SECONDS = 60 * 60;
+export const ATTACHMENT_BUCKET_SECONDS = 60 * 60;
 /**
  * /v1 详情的签名有效期：调用方另有带 Key 鉴权的附件端点，签名 URL 只是临时直链，
  * 保持 5 分钟，Key 吊销后很快失效。
@@ -62,7 +97,7 @@ const ATTACHMENT_BUCKET_SECONDS = 60 * 60;
 export const V1_ATTACHMENT_TTL_SECONDS = 5 * 60;
 
 /**
- * 附件签名 URL：HMAC(jwt_secret, `att:{id}.{exp}`)。
+ * 附件签名 URL：HMAC(附件子密钥, `att:{id}.{exp}`)。
  * 不传 ttlSeconds 时供站内详情（附件与 CID 内联图）：exp 取当前小时之后的第二个整点，有效期 1–2 小时，
  * 同一小时内重复请求得到相同的 URL，内嵌图的正文 HTML 不随每次刷新变化。外发转链接传长 TTL。
  */
@@ -75,7 +110,7 @@ export async function signAttachment(
   const exp = ttlSeconds === undefined
     ? (Math.floor(now / ATTACHMENT_BUCKET_SECONDS) + 2) * ATTACHMENT_BUCKET_SECONDS
     : now + ttlSeconds;
-  const sig = await hmacSha256Hex(secret, `att:${attId}.${exp}`);
+  const sig = await hmacSha256Hex(await deriveSubkey(secret, 'attachment'), `att:${attId}.${exp}`);
   return { exp, sig };
 }
 
@@ -86,6 +121,9 @@ export async function verifyAttachmentSig(
   sig: string,
 ): Promise<boolean> {
   if (!Number.isInteger(exp) || exp * 1000 <= Date.now()) return false;
-  const expected = await hmacSha256Hex(secret, `att:${attId}.${exp}`);
-  return timingSafeEqualStr(expected, sig);
+  const expected = await hmacSha256Hex(await deriveSubkey(secret, 'attachment'), `att:${attId}.${exp}`);
+  if (timingSafeEqualStr(expected, sig)) return true;
+  // 过渡期：改用子密钥之前直接用 jwt_secret 签出的链接（外发大附件有效期 90 天）继续有效，
+  // 发出的最后一批旧链接过期（本版本上线 90 天）后删除这一分支
+  return timingSafeEqualStr(await hmacSha256Hex(secret, `att:${attId}.${exp}`), sig);
 }

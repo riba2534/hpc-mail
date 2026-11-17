@@ -1,4 +1,4 @@
-import type { ErrorCode } from '@hpc-mail/shared';
+import type { ApiErrorDetails, ErrorCode } from '@hpc-mail/shared';
 
 /** 非契约错误码：本地网络/超时/响应格式问题 */
 export type ClientErrorCode = 'network' | 'timeout' | 'malformed' | 'session_changed';
@@ -9,12 +9,15 @@ export interface ApiErrorInit {
   httpStatus?: number | null;
   requestId?: string;
   cause?: unknown;
+  /** 错误信封的结构化补充（如 delivery_failed 的发件行与逐收件人结果） */
+  details?: ApiErrorDetails;
 }
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode;
   readonly httpStatus: number | null;
   readonly requestId?: string;
+  readonly details?: ApiErrorDetails;
 
   constructor(message: string, init: ApiErrorInit) {
     super(message, { cause: init.cause });
@@ -22,6 +25,7 @@ export class ApiError extends Error {
     this.code = init.code;
     this.httpStatus = init.httpStatus ?? null;
     this.requestId = init.requestId;
+    this.details = init.details;
   }
 
   get unauthorized(): boolean {
@@ -31,6 +35,15 @@ export class ApiError extends Error {
   get forbidden(): boolean {
     return this.httpStatus === 403 || this.code === 'forbidden';
   }
+
+  get notFound(): boolean {
+    return this.httpStatus === 404 || this.code === 'not_found';
+  }
+}
+
+/** 服务端给出的原因；不是 ApiError（如渲染或解析异常）时用调用方的兜底文案 */
+export function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof ApiError ? error.message : fallback;
 }
 
 export const NETWORK_ERROR_MESSAGE = '网络连接失败，请检查网络后重试';

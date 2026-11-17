@@ -2,7 +2,7 @@ import { clearAuthToken, getAuthToken } from '@/lib/auth-token';
 import { ApiError, toApiError } from './errors';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const API_BASE = '/api';
+export const API_BASE = '/api';
 
 export type QueryValue = string | number | boolean | null | undefined;
 export type QueryParams = Record<string, QueryValue | readonly QueryValue[]>;
@@ -65,12 +65,12 @@ async function readJson(response: Response): Promise<unknown> {
 
 async function toErrorFromResponse(response: Response): Promise<ApiError> {
   const payload = (await readJson(response)) as
-    | { error?: { code?: string; message?: string }; requestId?: string }
+    | { error?: { code?: string; message?: string; details?: ApiError['details'] }; requestId?: string }
     | undefined;
   const code = (payload?.error?.code ?? 'internal') as ApiError['code'];
   const message = payload?.error?.message || `请求失败（${response.status}）`;
   const requestId = payload?.requestId ?? response.headers.get('x-request-id') ?? undefined;
-  return new ApiError(message, { code, httpStatus: response.status, requestId });
+  return new ApiError(message, { code, httpStatus: response.status, requestId, details: payload?.error?.details });
 }
 
 export async function apiRequest<TResponse, TBody = unknown>(

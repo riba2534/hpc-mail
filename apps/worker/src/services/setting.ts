@@ -10,12 +10,10 @@ import { AppError } from '../lib/errors.js';
 import { sameSecretTarget } from '../lib/http.js';
 import { createDb } from '../db/client.js';
 import { isAiModelConfigured } from './ai-provider.js';
-import { anyHostedSql } from './domain-occupancy.js';
+import { anyHostedSql, anyOnboardingSql, ONBOARDING_TERMINAL_SQL } from './domain-occupancy.js';
 import { settings as settingsTable } from '../db/schema.js';
-import type { Env, ExecCtx } from '../types.js';
+import type { Env } from '../types.js';
 
-/** 旧版本的 KV 设置缓存键：当前只在更新设置时尽力删除，回滚到旧版本时不会读到陈旧值 */
-const LEGACY_KV_CACHE_KEY = 'setting-cache';
 const SETTINGS_SQL = 'SELECT key, value FROM settings';
 
 /** 设置行与默认值合并（逐 key safeParse，非法回落默认） */
@@ -68,11 +66,8 @@ export function settingsQuery(env: Env): SettingsQuery {
   };
 }
 
-/**
- * 读设置：内存缓存 15s → 直读 D1，再失败用默认值（收件不因配置故障丢信）。
- * ctx 当前不用，保留给调用方统一传参。
- */
-export async function getSettings(env: Env, _ctx?: ExecCtx | null): Promise<Settings> {
+/** 读设置：内存缓存 15s → 直读 D1，再失败用默认值（收件不因配置故障丢信） */
+export async function getSettings(env: Env): Promise<Settings> {
   try {
     const query = settingsQuery(env);
     if ('cached' in query) return query.cached;
@@ -86,22 +81,6 @@ export async function getSettings(env: Env, _ctx?: ExecCtx | null): Promise<Sett
 export function invalidateSettingsMemory(): void {
   memory = null;
   generation++;
-}
-
-/**
- * 失效设置缓存：本 isolate 内存立即失效；旧版 KV 缓存尽力删除，不阻塞调用方，失败也不报错。
- * 有 ctx 时交给 waitUntil，没有时 fire-and-forget。
- */
-export async function invalidateSettingsCache(env: Env, ctx?: ExecCtx | null): Promise<void> {
-  invalidateSettingsMemory();
-  const guarded = (async () => {
-    try {
-      await env.kv.delete(LEGACY_KV_CACHE_KEY);
-    } catch {
-      // 删不掉的旧缓存会在 60s TTL 后自然过期
-    }
-  })();
-  if (ctx) ctx.waitUntil(guarded);
 }
 
 /** AI 翻译已启用且 ai_model 配置完整（/api/config 的 translationEnabled 与翻译接口共用此口径） */
@@ -121,18 +100,38 @@ export function resolveMaskedAiKey(saved: Settings['ai_model'], baseUrl: string,
   return saved.apiKey;
 }
 
-/** domains 的 CAS 没有写入：区分「被用户托管」和「revision 已变化」，给出可操作的原因 */
+/** domains 的 CAS 没有写入：区分「被用户托管」「正在自动接入」和「revision 已变化」，给出可操作的原因（只在失败时多读一次） */
 async function domainsWriteConflict(env: Env, listed: string): Promise<AppError> {
-  const hosted = await env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))')
-    .bind(listed).all<{ domain: string }>();
-  if (hosted.results.length) {
-    return new AppError('conflict', `${hosted.results.map((row) => row.domain).join('、')} 已被用户托管，不能加为系统域名`);
+  const [hosted, onboarding] = await env.db.batch([
+    env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))').bind(listed),
+    env.db.prepare(`SELECT domain, id FROM system_domain_onboarding
+      WHERE domain IN (SELECT value FROM json_each(?)) AND state NOT IN ${ONBOARDING_TERMINAL_SQL}`).bind(listed),
+  ]);
+  const hostedRows = (hosted?.results ?? []) as { domain: string }[];
+  if (hostedRows.length) {
+    return new AppError('conflict', `${hostedRows.map((row) => row.domain).join('、')} 已被用户托管，不能加为系统域名`);
+  }
+  const tasks = (onboarding?.results ?? []) as { domain: string; id: number }[];
+  if (tasks.length) {
+    return new AppError('conflict', `${tasks.map((row) => `${row.domain} 正在自动接入（任务 #${row.id}）`).join('、')}，请在接入完成或取消后再修改`);
   }
   return new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
 }
 
-/** 写设置：逐 key 校验后落库并失效缓存 */
-export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx?: ExecCtx | null): Promise<void> {
+/**
+ * domains 的 revision CAS：?1 新值，?2 期望的 revision，guard 为附加守卫（其绑定从 ?3 起）。没有写入时不返回行。
+ * 守卫与 revision 比较在同一条语句里，D1 串行执行写入，检查与写入之间不会插进别的写入。
+ */
+export function domainsCasSql(guard: string): string {
+  return `INSERT INTO settings (key, value)
+      SELECT 'domains', ?1 WHERE ?2 = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
+        AND ${guard}
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ?2 RETURNING key`;
+}
+
+/** 写设置：逐 key 校验后落库并失效本 isolate 缓存 */
+export async function updateSettings(env: Env, patch: UpdateSettingsRequest): Promise<void> {
   const db = createDb(env);
   const writes: { key: string; value: string }[] = [];
   let fresh: Settings | undefined;
@@ -170,13 +169,9 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     }
   }
   if (domains) {
-    // 用户托管的域名由其所有者管理，不能同时登记为系统域名。检查写在这条 CAS 里，
-    // 与托管域名创建（hosted-domain.ts）互相守卫，两边交错时只有先执行的一方写入成功
-    const result = await env.db.prepare(`INSERT INTO settings (key, value)
-      SELECT 'domains', ?1 WHERE ?2 = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
-        AND NOT ${anyHostedSql('?3')}
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ?2 RETURNING key`)
+    // 用户托管的域名由其所有者管理、正在自动接入的域名由接入任务在完成时写入，都不能同时登记为系统域名。
+    // 检查写在这条 CAS 里，与托管域名创建（hosted-domain.ts）、接入任务占位（system-domain.ts）互相守卫，交错时只有先执行的一方成功
+    const result = await env.db.prepare(domainsCasSql(`NOT ${anyHostedSql('?3')} AND NOT ${anyOnboardingSql('?3')}`))
       .bind(domains.value, domains.expected, domains.listed).first();
     if (!result) throw await domainsWriteConflict(env, domains.listed);
   }
@@ -184,7 +179,7 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     await db.insert(settingsTable).values(w)
       .onConflictDoUpdate({ target: settingsTable.key, set: { value: w.value } });
   }
-  await invalidateSettingsCache(env, ctx);
+  invalidateSettingsMemory();
 }
 
 /** 管理端回显：AI 模型 apiKey 已配置时显示 SECRET_MASK（飞书/webhook 密钥已下放个人偏好） */

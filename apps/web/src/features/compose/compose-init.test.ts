@@ -70,4 +70,14 @@ describe('buildReply / buildForward', () => {
     expect(result.bcc).toEqual(['failed-secret@example.com']);
     expect(message.recipients.bcc).toEqual(['failed-secret@example.com']);
   });
+  it('bounced recipients from delivery receipts are retried like failed ones; delivered and complained are not', () => {
+    const message = makeDetail({direction:'outbound',recipients:{to:['ok@example.com','spam@example.com','gone@example.com'],cc:[],bcc:[]},recipientOutcomes:[{address:'ok@example.com',status:'delivered',event:'delivered'},{address:'spam@example.com',status:'complained',event:'complained'},{address:'gone@example.com',status:'bounced',event:'bounced',error:'550 5.1.1 User unknown'}]});
+    expect(buildResend(message,true)).toMatchObject({to:['gone@example.com'],cc:[],bcc:[]});
+  });
+  it('unconfirmed (unknown) recipients may already have the mail: listed, never retried automatically', () => {
+    const message = makeDetail({direction:'outbound',status:'unknown',recipients:{to:['ok@example.com','maybe@example.com'],cc:['failed@example.com'],bcc:[]},recipientOutcomes:[{address:'ok@example.com',status:'sent'},{address:'maybe@example.com',status:'unknown',error:'投递中断，结果未确认'},{address:'failed@example.com',status:'failed',error:'rejected'}]});
+    const retry = buildResend(message,true);
+    expect(retry).toMatchObject({to:[],cc:['failed@example.com'],bcc:[],unconfirmed:['maybe@example.com']});
+    expect(buildResend(message)).not.toHaveProperty('unconfirmed');
+  });
 });

@@ -1,7 +1,5 @@
 import {
   API_KEY_PREFIX,
-  MAX_API_GLOBAL_REQUESTS_PER_MINUTE,
-  MAX_API_USER_REQUESTS_PER_MINUTE,
   type ApiScope,
   type Role,
   type Settings,
@@ -9,28 +7,18 @@ import {
 } from '@hpc-mail/shared';
 import type { Context, MiddlewareHandler } from 'hono';
 import { sha256Hex } from '../lib/crypto.js';
-import { AppError } from '../lib/errors.js';
-import { execCtx, routeLabel } from '../lib/http.js';
+import { AppError, missingScopeHints } from '../lib/errors.js';
+import { bearerToken, clientIp, execCtx, routeLabel, runDetached } from '../lib/http.js';
+import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
+import { writeApiRequestLog } from '../services/api-request-log.js';
 import { getSettings, settingsQuery } from '../services/setting.js';
-import {
-  andGuards,
-  API_REJECT_SCOPE,
-  counterResult,
-  counterStatement,
-  counterWithinGuard,
-  minuteWindow,
-} from '../services/rate-counter.js';
-import type { AppContext, Env } from '../types.js';
+import { limitApiKeyRequest } from '../services/rate-limit.js';
+import type { ApiKeyContext, AppContext, Env } from '../types.js';
 
 const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
 const LAST_USED_THROTTLE_MS = 60_000;
 const AUDIT_PATH_MAX = 256;
-
-function clientIp(c: Context<AppContext>): string {
-  const value = c.req.header('CF-Connecting-IP') || '';
-  return (value.split(',')[0] ?? '').trim().toLowerCase() || 'unknown';
-}
 
 /** api_keys LEFT JOIN users 读出的鉴权所需列 */
 interface ApiKeyRecord {
@@ -38,11 +26,15 @@ interface ApiKeyRecord {
   user_id: number;
   scopes: string;
   allowed_ips: string;
+  allowed_mailbox_ids: string;
+  allowed_domains: string;
   rate_limit: number;
   status: 'active' | 'disabled' | 'revoked';
   expires_at: number | null;
+  last_used_at: number | null;
   user_status: UserStatus | null;
   role: Role | null;
+  username: string | null;
 }
 
 /**
@@ -52,8 +44,8 @@ interface ApiKeyRecord {
  */
 async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ settings: Settings; record: ApiKeyRecord | null }> {
   if (!keyHash) return { settings: await getSettings(env), record: null };
-  const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.rate_limit, k.status, k.expires_at,
-      u.status AS user_status, u.role
+  const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.allowed_mailbox_ids, k.allowed_domains,
+      k.rate_limit, k.status, k.expires_at, k.last_used_at, u.status AS user_status, u.role, u.username
     FROM api_keys k LEFT JOIN users u ON u.id = k.user_id WHERE k.key_hash = ? AND k.status <> 'revoked'`).bind(keyHash);
   const query = settingsQuery(env);
   if ('cached' in query) return { settings: query.cached, record: await keyStatement.first<ApiKeyRecord>() };
@@ -65,16 +57,31 @@ async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ s
 }
 
 /**
- * /v1 鉴权：设置 + hash 查 key → 状态/过期/IP → 滑窗限流 → finally 审计。
+ * 已在外层请求上完成鉴权与限流的内部请求（/mcp 的工具调用转发给 /v1 的请求）。只有服务端自己构造的 Request 对象
+ * 能登记，外部请求无从伪造；登记的请求沿用外层的 Key 上下文，不再查库、不再计限流，只写本身路径的审计。
+ */
+const preauthorized = new WeakMap<Request, { key: ApiKeyContext; ip: string }>();
+
+export function trustInternalRequest(request: Request, c: Context<AppContext>): void {
+  preauthorized.set(request, { key: c.get('apiKey')!, ip: c.get('apiClientIp') ?? 'unknown' });
+}
+
+/**
+ * /v1 鉴权：设置 + hash 查 key（唯一一次 D1 往返）→ 状态/过期/IP → 限流（Rate Limiting binding）→ finally 审计。
  * 中间件自身拒绝的请求（Key 禁用/过期、IP 白名单、用户停用、限流）每 Key 每分钟只写 1 行明细，
  * 其余只在 rate_counters 累加，拒绝请求再多也只是一行计数，写不满审计表。
  */
 export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   const startedAt = Date.now();
-  c.set('apiStartedAt', startedAt);
+  const inherited = preauthorized.get(c.req.raw);
+  if (inherited) {
+    c.set('apiClientIp', inherited.ip);
+    c.set('apiKey', inherited.key);
+    await auditing(c, inherited.key.id, inherited.ip, startedAt, next);
+    return;
+  }
 
-  const header = c.req.header('Authorization') || '';
-  const token = header.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? '';
+  const token = bearerToken(c);
   const keyHash = KEY_PATTERN.test(token) ? await sha256Hex(token) : null;
   const { settings, record } = await loadSettingsAndKey(c.env, keyHash);
   // API 关闭优先于 Key 校验
@@ -88,6 +95,8 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     userId: record.user_id,
     scopes: JSON.parse(record.scopes) as ApiScope[],
     allowedIps: JSON.parse(record.allowed_ips) as string[],
+    allowedMailboxIds: JSON.parse(record.allowed_mailbox_ids) as number[],
+    allowedDomains: JSON.parse(record.allowed_domains) as string[],
     rateLimit: Number(record.rate_limit),
     status: record.status,
     expiresAt: record.expires_at === null ? null : new Date(Number(record.expires_at)),
@@ -96,9 +105,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   };
 
   // key 已定位：从这里起的拒绝（状态/过期/IP/限流）都进审计，安全监控最需要这些
-  const ip = clientIp(c);
-  let statusCode = 200;
-  let admitted = false;
+  const ip = clientIp(c).toLowerCase();
   try {
     if (row.status !== 'active') throw new AppError('unauthorized', 'API Key 已禁用');
     if (row.userStatus !== 'active') throw new AppError('user_disabled', 'API Key 所属用户已被禁用');
@@ -111,113 +118,190 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     c.set('apiKey', {
       id: row.id,
       userId: row.userId,
-      role: row.role ?? 'user',
+      username: record.username ?? '',
+      // 管理员能力要 Key 显式带 admin scope；没有它的管理员 Key 按普通用户执行
+      role: row.role === 'admin' && row.scopes.includes('admin') ? 'admin' : 'user',
+      accountRole: row.role === 'admin' ? 'admin' : 'user',
       scopes: row.scopes,
+      allowedMailboxIds: row.allowedMailboxIds,
+      allowedDomains: row.allowedDomains,
     });
 
-    // 查到 key 之后的四次写合进一个 batch：Key 级窗口计数、用户级与实例级总桶、last_used。
-    // 后三条带守卫，保持原先的短路语义：Key 级超限时不计入总桶、任一超限时不刷新 last_used；
-    // 实例级总桶另要求用户级未超限，单个用户的超限请求不会把全站额度打满。
+    // 限流不写 D1：Key 档位 → 用户总桶 → 全站总桶依次短路（services/rate-limit.ts）。
+    // Key 级超限不占用户额度，用户级超限不计入全站，避免创建多个 Key 横向放大额度，也让单个用户打不满全站。
+    // 三种超限分开提示，调用方能区分是这把 Key、自己账户还是全站繁忙
     const now = Date.now();
-    const windowStart = Math.floor(now / 60000);
-    const minute = minuteWindow(1, now);
-    const keyWithinLimit = {
-      sql: `(SELECT request_count FROM api_rate_limits WHERE api_key_id = ? AND window_start = ?) <= ?`,
-      params: [row.id, windowStart, row.rateLimit],
-    };
-    const userSubject = String(row.userId);
-    const userWithinLimit = counterWithinGuard('api-user', userSubject, minute, MAX_API_USER_REQUESTS_PER_MINUTE);
-    const lastUsedGuard = andGuards(keyWithinLimit, userWithinLimit,
-      counterWithinGuard('api-global', 'instance', minute, MAX_API_GLOBAL_REQUESTS_PER_MINUTE));
-    const results = await c.env.db.batch([
-      // 已超限的窗口不再递增：计数停在上限 + 1，不返回行即视为超限
-      c.env.db.prepare(`INSERT INTO api_rate_limits (api_key_id, window_start, request_count) VALUES (?, ?, 1)
-        ON CONFLICT(api_key_id, window_start) DO UPDATE SET request_count = request_count + 1 WHERE request_count <= ?
-        RETURNING request_count`).bind(row.id, windowStart, row.rateLimit),
-      counterStatement(c.env, 'api-user', userSubject, minute, 1, 0, keyWithinLimit),
-      counterStatement(c.env, 'api-global', 'instance', minute, 1, 0, andGuards(keyWithinLimit, userWithinLimit)),
-      // last_used 最多 60 秒写一次，避免每个请求都写同一行
-      c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
-        WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?) AND ${lastUsedGuard.sql}`)
-        .bind(now, ip, row.id, now - LAST_USED_THROTTLE_MS, ...lastUsedGuard.params),
-    ]);
-    const counted = (results[0]?.results?.[0] as { request_count?: number } | undefined)?.request_count;
-    const requestCount = counted === undefined ? row.rateLimit + 1 : Number(counted);
+    const rate = await limitApiKeyRequest(c.env, { id: row.id, userId: row.userId, rateLimit: row.rateLimit }, now);
     c.header('X-RateLimit-Limit', String(row.rateLimit));
-    c.header('X-RateLimit-Remaining', String(Math.max(0, row.rateLimit - requestCount)));
-    c.header('X-RateLimit-Reset', String((windowStart + 1) * 60));
-    if (requestCount > row.rateLimit) throw new AppError('rate_limited', 'API 调用频率超限');
+    c.header('X-RateLimit-Remaining', String(rate.remaining));
+    c.header('X-RateLimit-Reset', String(rate.reset));
+    if (rate.rejectedBy === 'key') throw new AppError('rate_limited', 'API 调用频率超限');
+    if (rate.rejectedBy === 'user') throw new AppError('rate_limited', 'API 调用频率超限（账户级），请稍后重试');
+    if (rate.rejectedBy === 'global') throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
+    await touchLastUsed(c, record, ip, now);
+  } catch (err) {
+    await writeAudit(c, row.id, ip, startedAt, false, err instanceof AppError ? err.status : 500);
+    throw err;
+  }
+  await auditing(c, row.id, ip, startedAt, next);
+};
 
-    // Key 级限制之外再加用户级与实例级总桶，避免创建多个 Key 横向放大额度。
-    // 用户桶与 Key 级计数同一事务，Key 未超限时必有返回；实例桶的守卫包含 Key 级与用户级未超限，
-    // 无返回即用户桶已超限、未计入。两种超限分开提示，调用方能区分是自己账户超额还是全站繁忙
-    const userRate = counterResult(results[1]);
-    if (!userRate || userRate.count > MAX_API_USER_REQUESTS_PER_MINUTE) {
-      throw new AppError('rate_limited', 'API 调用频率超限（账户级），请稍后重试');
-    }
-    const globalRate = counterResult(results[2]);
-    if (!globalRate || globalRate.count > MAX_API_GLOBAL_REQUESTS_PER_MINUTE) {
-      throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
-    }
-
-    admitted = true;
+/** 放行的请求：执行后续处理，按结果逐条写审计 */
+async function auditing(c: Context<AppContext>, apiKeyId: number, ip: string, startedAt: number, next: () => Promise<void>): Promise<void> {
+  let statusCode = 200;
+  try {
     await next();
     statusCode = c.res.status;
   } catch (err) {
     statusCode = err instanceof AppError ? err.status : 500;
     throw err;
   } finally {
-    // 审计日志不阻塞响应；无 ExecutionContext（单测直调）时同步写入
-    const audit = writeAudit(c.env, admitted, {
-      apiKeyId: row.id,
-      requestId: c.get('requestId') ?? '',
-      method: c.req.method,
-      // 数字 id 段归一并截断，任意长的 URL 不会原样落库
-      path: routeLabel(c.req.path).slice(0, AUDIT_PATH_MAX),
-      statusCode,
-      ip,
-      durationMs: Math.max(0, Date.now() - startedAt),
-    }).catch((e: unknown) => console.error('api audit log failed:', e));
-    const ctx = execCtx(c);
-    if (ctx) ctx.waitUntil(audit);
-    else await audit;
+    await writeAudit(c, apiKeyId, ip, startedAt, true, statusCode);
   }
-};
+}
 
-interface AuditEntry {
-  apiKeyId: number;
-  requestId: string;
-  method: string;
-  path: string;
-  statusCode: number;
-  ip: string;
-  durationMs: number;
+/** 审计日志不阻塞响应；无 ExecutionContext（单测直调）时同步写入 */
+async function writeAudit(c: Context<AppContext>, apiKeyId: number, ip: string, startedAt: number, admitted: boolean, statusCode: number): Promise<void> {
+  await runDetached(execCtx(c), 'API 审计日志写入', () => writeApiRequestLog(c.env, admitted, {
+    apiKeyId,
+    requestId: c.get('requestId') ?? '',
+    method: c.req.method,
+    // 数字 id 段归一并截断，任意长的 URL 不会原样落库
+    path: routeLabel(c.req.path).slice(0, AUDIT_PATH_MAX),
+    statusCode,
+    ip,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  }));
 }
 
 /**
- * 放行的请求逐条记录；中间件拒绝的请求先累加本 Key 本分钟的拒绝计数，同一事务里只有
- * 第一次拒绝写明细。
+ * last_used 每把 Key 最多 60 秒写一次：查 key 时已读出旧值，未到期不发语句；写入走 waitUntil，不阻塞响应。
+ * 条件更新防止多个 isolate 同时写；无 ExecutionContext（单测直调）时同步写入。
  */
-async function writeAudit(env: Env, admitted: boolean, entry: AuditEntry): Promise<void> {
-  const values = [entry.apiKeyId, entry.requestId, entry.method, entry.path, entry.statusCode, entry.ip, entry.durationMs];
-  const columns = 'INSERT INTO api_request_logs (api_key_id, request_id, method, path, status_code, ip, duration_ms)';
-  if (admitted) {
-    await env.db.prepare(`${columns} VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(...values).run();
-    return;
-  }
-  const subject = String(entry.apiKeyId);
-  const minute = minuteWindow(1);
-  const firstReject = counterWithinGuard(API_REJECT_SCOPE, subject, minute, 1);
-  await env.db.batch([
-    counterStatement(env, API_REJECT_SCOPE, subject, minute),
-    env.db.prepare(`${columns} SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${firstReject.sql}`).bind(...values, ...firstReject.params),
-  ]);
+async function touchLastUsed(c: Context<AppContext>, record: ApiKeyRecord, ip: string, now: number): Promise<void> {
+  if (record.last_used_at !== null && Number(record.last_used_at) >= now - LAST_USED_THROTTLE_MS) return;
+  await runDetached(execCtx(c), 'API Key last_used 更新', () => c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
+    WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`)
+    .bind(now, ip, record.id, now - LAST_USED_THROTTLE_MS).run());
 }
 
 /** 校验 scope（v1 路由内调用） */
 export function requireScope(c: Context<AppContext>, scope: ApiScope): void {
+  requireAnyScope(c, [scope]);
+}
+
+/** Key 带其中任一 scope 即可（如 /identities：mail.send 或 mailbox.read）；没有 Key 时同样拒绝 */
+export function requireAnyScope(c: Context<AppContext>, scopes: readonly ApiScope[]): void {
   const apiKey = c.get('apiKey');
-  if (!apiKey || !apiKey.scopes.includes(scope)) {
-    throw new AppError('forbidden', `需要 API scope: ${scope}`);
+  if (apiKey && scopes.some((scope) => apiKey.scopes.includes(scope))) return;
+  const { message, ...hints } = missingScopeHints(scopes);
+  throw new AppError('forbidden', message, hints);
+}
+
+/** Key 限定范围；null 表示不限（含不经过 API Key 的请求） */
+export interface KeyRestriction {
+  mailboxIds: number[];
+  domains: string[];
+}
+
+/**
+ * 当前请求的 Key 限定范围。地址可用的判定（全站统一）：地址的域名在 domains 中，
+ * 或该地址当前的认领行 id 在 mailboxIds 中；未认领地址只看域名。
+ */
+export function keyRestriction(c: Context<AppContext>): KeyRestriction | null {
+  const key = c.get('apiKey');
+  if (!key || (!key.allowedMailboxIds.length && !key.allowedDomains.length)) return null;
+  return { mailboxIds: key.allowedMailboxIds, domains: key.allowedDomains };
+}
+
+/** Key 限定范围的 403（docs: /references/errors.md#key-restricted）；what 只写调用方自己给出的值或 id，不带出范围外对象的名称 */
+export function restrictedError(what: string): AppError {
+  return new AppError('forbidden', `这把 API Key 限定了可用的邮箱或域名，不能访问${what}`, {
+    fix: 'GET /v1/me 查看 key.allowedMailboxIds 与 key.allowedDomains；换用覆盖它的 Key，或请用户在网页「API Key」页面调整范围',
+    docs: '/references/errors.md#key-restricted',
+  });
+}
+
+/** 域名是否在限定范围内（只看 domains；只限定了邮箱的 Key 对任何域名都返回 false） */
+export function restrictionAllowsDomain(restriction: KeyRestriction, domain: string): boolean {
+  return restriction.domains.includes(domain.trim().toLowerCase());
+}
+
+/** 已知认领行时的判定：id 在 mailboxIds 或 domain 在 domains 中 */
+function restrictionAllowsMailbox(restriction: KeyRestriction, mailbox: { id: number; domain: string }): boolean {
+  return restriction.mailboxIds.includes(mailbox.id) || restrictionAllowsDomain(restriction, mailbox.domain);
+}
+
+/**
+ * 落在 Key 范围内的地址（规范化后）：域名命中的不查库，其余一条 json_each 查询取认领行 id 再比对，
+ * 地址再多也只有一次往返。
+ */
+export async function addressesWithinKey(
+  c: Context<AppContext>, restriction: KeyRestriction, addresses: readonly string[],
+): Promise<Set<string>> {
+  const normalized = [...new Set(addresses.map((address) => normalizeEmail(address)))];
+  const allowed = new Set(normalized.filter((address) => restrictionAllowsDomain(restriction, getEmailDomain(address))));
+  const rest = normalized.filter((address) => !allowed.has(address));
+  if (rest.length && restriction.mailboxIds.length) {
+    const { results } = await c.env.db.prepare('SELECT id, address FROM mailboxes WHERE address IN (SELECT value FROM json_each(?))')
+      .bind(JSON.stringify(rest)).all<{ id: number; address: string }>();
+    for (const row of results) if (restriction.mailboxIds.includes(Number(row.id))) allowed.add(row.address);
   }
+  return allowed;
+}
+
+/** 调用方传入的地址都要在 Key 限定范围内，否则 403 forbidden（docs: /references/errors.md#key-restricted），最多一次查询 */
+export async function assertKeyCanUseAddresses(c: Context<AppContext>, addresses: readonly string[]): Promise<void> {
+  const restriction = keyRestriction(c);
+  if (!restriction || !addresses.length) return;
+  const allowed = await addressesWithinKey(c, restriction, addresses);
+  const outside = addresses.map((address) => normalizeEmail(address)).find((address) => !allowed.has(address));
+  if (outside !== undefined) throw restrictedError(` ${outside}`);
+}
+
+/** 单个地址的 assertKeyCanUseAddresses */
+export function assertKeyCanUseAddress(c: Context<AppContext>, address: string): Promise<void> {
+  return assertKeyCanUseAddresses(c, [address]);
+}
+
+/** 域名不在 Key 限定的 domains 中时 403（只限定了邮箱的 Key 不能使用任何域名级能力，如认领） */
+export function assertKeyCanUseDomain(c: Context<AppContext>, domain: string): void {
+  const restriction = keyRestriction(c);
+  if (restriction && !restrictionAllowsDomain(restriction, domain)) throw restrictedError(`域名 ${domain.trim().toLowerCase()}`);
+}
+
+/**
+ * 按 id 确认邮箱都在 Key 范围内（一次查询，不限范围的 Key 不查库）；不存在的放过，交给调用方按原口径报错。
+ * 错误只带调用方给的 id、不带地址：id 可以逐个枚举，带出地址就泄露了范围外（包括别人的）邮箱
+ */
+export async function assertKeyCanUseMailboxIds(c: Context<AppContext>, ids: readonly number[]): Promise<void> {
+  const restriction = keyRestriction(c);
+  if (!restriction || !ids.length) return;
+  const { results } = await c.env.db.prepare('SELECT id, domain FROM mailboxes WHERE id IN (SELECT value FROM json_each(?))')
+    .bind(JSON.stringify(ids)).all<{ id: number; domain: string }>();
+  const outside = results.find((box) => !restrictionAllowsMailbox(restriction, { id: Number(box.id), domain: box.domain }));
+  if (outside) throw restrictedError(`邮箱 #${Number(outside.id)}`);
+}
+
+/** 限定了范围的 Key 只看得到范围内的邮箱（列表按认领行 id 与域名收窄；不限范围时原样返回） */
+export function filterWithinKey<T extends { domain: string }>(c: Context<AppContext>, list: T[], idOf: (item: T) => number): T[] {
+  const restriction = keyRestriction(c);
+  return restriction ? list.filter((item) => restrictionAllowsMailbox(restriction, { id: idOf(item), domain: item.domain })) : list;
+}
+
+/**
+ * 发件地址在 Key 范围内：from 解析后的 mailboxId 或 localPart+domain。发件邮箱不存在时放过，交给发信流程按原口径报 404。
+ */
+export async function assertKeyCanUseSender(
+  c: Context<AppContext>,
+  from: { mailboxId?: number; localPart?: string; domain?: string },
+): Promise<void> {
+  if (!keyRestriction(c)) return;
+  if (from.mailboxId !== undefined) return assertKeyCanUseMailboxIds(c, [from.mailboxId]);
+  if (from.localPart && from.domain) await assertKeyCanUseAddress(c, `${from.localPart}@${from.domain}`);
+}
+
+/** 限定了范围的 Key 不能用账户级能力（通知配置写入、通知健康等会涉及范围外邮件的接口） */
+export function assertKeyUnrestricted(c: Context<AppContext>, what: string): void {
+  if (keyRestriction(c)) throw restrictedError(what);
 }

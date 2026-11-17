@@ -1,5 +1,8 @@
 import { z } from 'zod';
-import { DEFAULT_RESERVED_LOCAL_PARTS, REGISTRATION_MODES } from '../constants.js';
+import {
+  DEFAULT_RELAY_DAILY_LIMIT, DEFAULT_RELAY_PER_USER_DAILY_LIMIT, DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT,
+  DEFAULT_RESERVED_LOCAL_PARTS, REGISTRATION_MODES,
+} from '../constants.js';
 import { emailAddressSchema } from './mail.js';
 import { domainSchema } from './mailbox.js';
 
@@ -99,6 +102,15 @@ export const quotaSettingSchema = z.object({
   dailyOutbound: z.number().int().min(0).max(100000),
   /** 普通用户每日外发唯一收件人（站内 + 站外）总数上限 */
   dailyRecipients: z.number().int().min(0).max(1000000),
+  /** 转发中转（no-reply@收件域名 重发）全站每日上限，含管理员（0=不限） */
+  relayDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_DAILY_LIMIT),
+  /** 转发中转按归属人每日上限，含管理员（0=不限） */
+  relayPerUserDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_PER_USER_DAILY_LIMIT),
+  /**
+   * 未认领地址（归管理员）的来信中转全站共用的每日上限（0=不限）。catch-all 地址谁都能灌信，
+   * 不按管理员人数叠加，免得外部来信把全站中转额度耗尽。
+   */
+  relayUnclaimedDaily: z.number().int().min(0).max(100000).default(DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT),
 });
 
 /** 邮箱认领策略：保留前缀防身份冒充 + 每用户认领上限防囤积（admin 豁免） */
@@ -182,6 +194,15 @@ export const hostedDomainsSettingSchema = z.object({
   autoClaimLimit: z.number().int().min(0).max(100000).default(0),
 });
 
+/**
+ * 外发投递回执：开启且 Worker 配置了 Cloudflare 凭据时，定时任务为每个系统域名与已开通发信的托管域名
+ * 建立 Email Sending 事件订阅；送达、退信、投诉写回逐收件人结果，退信与投诉进入抑制名单。
+ * 关闭只停止新建订阅，已有订阅的事件仍会回写。
+ */
+export const deliveryEventsSettingSchema = z.object({
+  enabled: z.boolean(),
+});
+
 // gmail_forward / feishu / notify_webhook 已从系统设置下放为「每用户的个人转发与通知偏好」
 // （见 schemas/notify-prefs.ts）；下面三个 schema 定义保留、被个人偏好复用。
 export const SETTING_SCHEMAS = {
@@ -198,6 +219,7 @@ export const SETTING_SCHEMAS = {
   translation: translationSettingSchema,
   claim_random: claimRandomSettingSchema,
   hosted_domains: hostedDomainsSettingSchema,
+  delivery_events: deliveryEventsSettingSchema,
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
 
@@ -214,7 +236,11 @@ export const DEFAULT_SETTINGS: Settings = {
   // 保留策略默认关闭（0），避免升级即意外删除历史邮件；管理员按需开启（建议未认领 90 天）
   retention: { unclaimedDays: 0, allMessagesDays: 0 },
   // 外发配额默认对普通用户生效（admin 豁免），防脚本群发
-  quota: { dailyOutbound: 200, dailyRecipients: 500 },
+  quota: {
+    dailyOutbound: 200, dailyRecipients: 500,
+    relayDaily: DEFAULT_RELAY_DAILY_LIMIT, relayPerUserDaily: DEFAULT_RELAY_PER_USER_DAILY_LIMIT,
+    relayUnclaimedDaily: DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT,
+  },
   mailbox_policy: {
     perUserLimit: 50,
     reservedLocalParts: [...DEFAULT_RESERVED_LOCAL_PARTS],
@@ -224,6 +250,7 @@ export const DEFAULT_SETTINGS: Settings = {
   translation: { enabled: false, dailyCharsPerUser: 200_000 },
   claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
   hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 },
+  delivery_events: { enabled: true },
 };
 
 export const updateSettingsRequestSchema = z
@@ -242,11 +269,13 @@ export const updateSettingsRequestSchema = z
     translation: translationSettingSchema.optional(),
     claim_random: claimRandomSettingSchema.optional(),
     hosted_domains: hostedDomainsSettingSchema.optional(),
+    delivery_events: deliveryEventsSettingSchema.optional(),
   })
   .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',
   });
-export type UpdateSettingsRequest = z.infer<typeof updateSettingsRequestSchema>;
+/** 输入形状：带缺省值的字段可省略（updateSettings 会逐项按 SETTING_SCHEMAS 重新解析补齐） */
+export type UpdateSettingsRequest = z.input<typeof updateSettingsRequestSchema>;
 
 /** 管理员查看的每域 Claude 统计（GET /api/admin/settings/domain-claude-stats），根据历史来信判定 */
 export interface DomainClaudeStats {

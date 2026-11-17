@@ -1,12 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
 import { Search } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import type { UserSearchResult } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 export interface UserSearchProps {
   /** 输入框的无障碍名称 */
@@ -25,12 +26,8 @@ export interface UserSearchProps {
 /** 按用户名搜索启用中的用户：复用邮箱共享的选人接口，普通用户与管理员都可调用 */
 export function UserSearch({ label, actionLabel, excludeUserId, hiddenIds = [], disabled, autoFocus, onPick }: UserSearchProps) {
   const [search, setSearch] = useState('');
-  const [debounced, setDebounced] = useState('');
   const normalized = search.trim().toLowerCase();
-  useEffect(() => {
-    const timer = globalThis.setTimeout(() => setDebounced(normalized), 250);
-    return () => globalThis.clearTimeout(timer);
-  }, [normalized]);
+  const debounced = useDebouncedValue(normalized, 250);
   const ready = normalized.length > 0 && normalized === debounced;
   const users = useQuery({
     queryKey: queryKeys.mailboxes.shareUsers(debounced, excludeUserId),
@@ -67,7 +64,6 @@ export function UserSearch({ label, actionLabel, excludeUserId, hiddenIds = [], 
           {results.map((user) => (
             <li key={user.id} className="flex items-center gap-3 border-b border-line px-3 py-2 text-sm last:border-b-0">
               <span className="min-w-0 flex-1 truncate text-ink">{user.username}</span>
-              <span className="shrink-0 text-xs text-ink-tertiary">{user.role === 'admin' ? '管理员' : '普通用户'}</span>
               <Button
                 size="sm"
                 variant="secondary"

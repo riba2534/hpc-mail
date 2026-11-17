@@ -7,7 +7,6 @@ import { hashPassword } from '../lib/password.js';
 import type { Env, ExecCtx } from '../types.js';
 import { revokeAllApiKeysQuery } from './api-key.js';
 import { avatarUrl } from './avatar.js';
-import { mirrorUserEpoch } from './session.js';
 import { getSettingsFresh } from './setting.js';
 
 type UserRow = typeof users.$inferSelect;
@@ -24,17 +23,6 @@ async function assertNotLastAdmin(db: Db, targetId: number): Promise<void> {
     .where(and(eq(users.role, 'admin'), eq(users.status, 'active'), ne(users.id, targetId)))
     .get();
   if (!other) throw new AppError('forbidden', '至少保留一个可用管理员，无法执行此操作');
-}
-
-/** 全部启用状态的管理员 id：未认领地址收到的邮件按这些管理员的个人偏好处理 */
-export async function getActiveAdminIds(env: Env): Promise<number[]> {
-  const db = createDb(env);
-  const rows = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(and(eq(users.role, 'admin'), eq(users.status, 'active')))
-    .all();
-  return rows.map((r) => r.id);
 }
 
 const apiKeyCountSql = sql<number>`(SELECT COUNT(*) FROM api_keys WHERE api_keys.user_id = users.id)`;
@@ -87,9 +75,11 @@ export async function listUsers(env: Env): Promise<AdminUser[]> {
   return rows.map((r) => serialize(r.user, byUser.get(r.user.id) ?? [], Number(r.apiKeyCount)));
 }
 
-/** 过户和共享候选搜索：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计。 */
-/** 选人搜索（共享成员、托管域名成员、过户目标）：系统保留账号（CI 冒烟用户）不出现在候选里 */
-export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<UserSearchResults> {
+/**
+ * 选人搜索（共享成员、托管域名成员、过户目标）：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计；
+ * 系统保留账号（CI 冒烟用户）不出现在候选里。
+ */
+export async function searchUsers(env: Env, req: SearchUsersQuery, opts: { includeRole?: boolean } = {}): Promise<UserSearchResults> {
   const rows = await createDb(env).select({ id: users.id, username: users.username, role: users.role })
     .from(users)
     .where(and(eq(users.status, 'active'),
@@ -99,7 +89,9 @@ export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<User
     .orderBy(sql`CASE WHEN lower(${users.username}) = ${req.q} THEN 0
       WHEN substr(lower(${users.username}), 1, ${req.q.length}) = ${req.q} THEN 1 ELSE 2 END`, asc(users.username))
     .limit(req.limit + 1).all();
-  return { items: rows.slice(0, req.limit), hasMore: rows.length > req.limit };
+  // 只有管理员的搜索带角色：普通用户的共享候选搜索不能用来定位管理员账号
+  const items = rows.slice(0, req.limit).map((row) => (opts.includeRole ? row : { id: row.id, username: row.username }));
+  return { items, hasMore: rows.length > req.limit };
 }
 
 export async function createUser(env: Env, req: CreateUserRequest): Promise<AdminUser> {
@@ -110,7 +102,7 @@ export async function createUser(env: Env, req: CreateUserRequest): Promise<Admi
   const passwordHash = await hashPassword(req.password);
   const [row] = await db
     .insert(users)
-    .values({ username: req.username, passwordHash, role: req.role, status: 'active' })
+    .values({ username: req.username, passwordHash, role: req.role, status: 'active', authVersionMigrated: true })
     .returning();
   return serialize(row!, [], 0);
 }
@@ -124,7 +116,6 @@ export async function updateUser(
   actingUserId: number,
   id: number,
   req: UpdateUserRequest,
-  ctx?: ExecCtx | null,
 ): Promise<{ user: AdminUser; revokedApiKeys: number }> {
   const db = createDb(env);
   const target = await db.select().from(users).where(eq(users.id, id)).get();
@@ -176,7 +167,7 @@ export async function updateUser(
   try {
     const update = db.update(users).set({ ...patch,
       ...(req.mailboxPolicy !== undefined || req.role !== undefined ? { mailboxPolicyRevision: sql`${users.mailboxPolicyRevision} + 1` } : {}),
-      ...(bumpEpoch ? { authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true } : {}),
+      ...(bumpEpoch ? { authVersion: sql`${users.authVersion} + 1` } : {}),
     }).where(and(eq(users.id, id),
       req.mailboxPolicy === undefined ? undefined : eq(users.mailboxPolicyRevision, req.expectedMailboxPolicyRevision!),
       domainsRevision === undefined ? undefined : sql`COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ${domainsRevision}`,
@@ -195,7 +186,6 @@ export async function updateUser(
     throw error;
   }
   if (!row) throw new AppError('conflict', '用户或域名配置已改变，请刷新后重试');
-  if (bumpEpoch && row) await mirrorUserEpoch(env, id, row.authVersion, ctx);
 
   const count = await db
     .select({ apiKeyCount: apiKeyCountSql })
@@ -253,5 +243,4 @@ export async function deleteUser(env: Env, actingUserId: number, id: number, ctx
     if (ctx) ctx.waitUntil(removal);
     else await removal;
   }
-  // 用户行已删除，鉴权中间件会立即拒绝旧 token；KV 兼容版本不再需要额外 bump。
 }

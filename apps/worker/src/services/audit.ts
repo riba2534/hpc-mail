@@ -1,9 +1,11 @@
 import { SETTING_SCHEMAS, type AdminAuditLogEntry, type Page, type SettingKey, type Settings } from '@hpc-mail/shared';
 import { desc, lt } from 'drizzle-orm';
+import type { Context } from 'hono';
 import { createDb } from '../db/client.js';
 import { adminAuditLogs } from '../db/schema.js';
-import { decodeCursor, encodeCursor } from '../lib/pagination.js';
-import type { AuthUser, Env } from '../types.js';
+import { clientIp } from '../lib/http.js';
+import { decodeCursor, toPage } from '../lib/pagination.js';
+import type { AppContext, AuthUser, Env } from '../types.js';
 
 /** 记录一条管理操作（best-effort，写失败不阻断主流程） */
 export async function logAdminAction(
@@ -21,6 +23,64 @@ export async function logAdminAction(
   } catch (e) {
     console.error('管理审计日志写入失败:', e);
   }
+}
+
+/**
+ * 审计里的操作者：/api 为登录用户，/v1 为 Key 所属用户。
+ * Key 鉴权不读用户名，用户名统一在写入语句里按 id 查出（ACTOR_NAME_SQL），不为审计多一次往返。
+ */
+export interface AuditActor {
+  id: number;
+  ip: string;
+  /** 经 API Key 调用时的 Key id，标注在 detail 末尾 */
+  apiKeyId?: number;
+}
+
+export function auditActorOf(c: Context<AppContext>): AuditActor {
+  const key = c.get('apiKey');
+  if (key) return { id: key.userId, ip: c.get('apiClientIp') ?? clientIp(c), apiKeyId: key.id };
+  return { id: c.get('user')!.id, ip: clientIp(c) };
+}
+
+/** detail 末尾的来源标注：/v1 写明 Key，便于从审计追到具体 Key */
+export function auditSuffix(actor: AuditActor): string {
+  return actor.apiKeyId === undefined ? '' : `（API Key #${actor.apiKeyId}）`;
+}
+
+/** 操作者用户名（?1 = 操作者 id） */
+export const ACTOR_NAME_SQL = `COALESCE((SELECT username FROM users WHERE id = ?1), '')`;
+
+/** 一条审计 INSERT，可并入调用方的 batch，与业务写入同一事务提交 */
+export function auditStatement(env: Env, actor: AuditActor, action: string, target: string, detail: string): D1PreparedStatement {
+  return env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+    SELECT ?1, ${ACTOR_NAME_SQL}, ?2, ?3, ?4, ?5`).bind(actor.id, action, target, `${detail}${auditSuffix(actor)}`, actor.ip);
+}
+
+/** 业务写入已提交、审计无法同事务时用：失败只记日志，不把已成功的操作变成报错 */
+export async function writeAudit(env: Env, actor: AuditActor, action: string, target: string, detail: string): Promise<void> {
+  try {
+    await auditStatement(env, actor, action, target, detail).run();
+  } catch (e) {
+    console.error('管理审计日志写入失败:', e);
+  }
+}
+
+/** 管理员以 scope=user 读取他人邮件（列表、同步、详情、线程、原始邮件、附件等） */
+export const MAIL_READ_USER_ACTION = 'mail.read_user';
+
+const DAY_MS = 86_400_000;
+
+/**
+ * 读取他人邮件的审计按（管理员、目标用户、UTC 日）只留一条：去重与写入是同一条语句，并发请求也只写一条。
+ * NOT EXISTS 用 created_at 索引只扫当天的审计行；D1 没有 STAT4，用 INDEXED BY 固定计划。
+ */
+export function userMailReadAuditStatement(env: Env, actor: AuditActor, targetUserId: number, via: string, now = Date.now()): D1PreparedStatement {
+  return env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
+    SELECT ?1, ${ACTOR_NAME_SQL}, '${MAIL_READ_USER_ACTION}', ?2,
+      '查看 ' || COALESCE((SELECT username FROM users WHERE id = ?3), '已删除的用户') || ' 的邮件，当日首次：' || ?4, ?5
+    WHERE NOT EXISTS (SELECT 1 FROM admin_audit_logs INDEXED BY idx_admin_audit_created
+      WHERE created_at >= ?6 AND actor_id = ?1 AND action = '${MAIL_READ_USER_ACTION}' AND target = ?2)`)
+    .bind(actor.id, `user#${targetUserId}`, targetUserId, `${via}${auditSuffix(actor)}`, actor.ip, now - (now % DAY_MS));
 }
 
 const AUDIT_DETAIL_MAX = 1000;
@@ -120,10 +180,9 @@ export async function listAdminAuditLogs(
     .orderBy(desc(adminAuditLogs.id))
     .limit(limit + 1)
     .all();
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
+  const page = toPage(rows, limit, (r) => r.id);
   return {
-    items: page.map((r) => ({
+    items: page.items.map((r) => ({
       id: r.id,
       actorName: r.actorName,
       action: r.action,
@@ -132,6 +191,6 @@ export async function listAdminAuditLogs(
       ip: r.ip,
       createdAt: r.createdAt.toISOString(),
     })),
-    nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.id) : null,
+    nextCursor: page.nextCursor,
   };
 }

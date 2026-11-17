@@ -10,7 +10,6 @@ import { login } from '../src/services/auth.js';
 import { retainExternalAttachments } from '../src/services/external-attachment.js';
 import { claimMailbox, releaseMailbox } from '../src/services/mailbox.js';
 import { getMessageDetail, getThread, listMessages, purgeMessages, restoreMessages } from '../src/services/message.js';
-import { getUserEpoch } from '../src/services/session.js';
 import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
 import { runScheduled } from '../src/services/scheduled.js';
 import { processStorageCleanup, expireDeliveryObjectLeases } from '../src/services/storage-cleanup.js';
@@ -62,16 +61,6 @@ describe('mail functional safety regressions', () => {
     });
     await expect(login(racing, { username: 'reset-race', password: 'old-password-123' }, '127.0.0.25')).rejects.toMatchObject({ code: 'bad_credentials' });
     expect((await db.select().from(users).where(eq(users.id, user!.id)).get())!.authVersion).toBe(1);
-  });
-
-  it('legacy KV migration cannot undo a concurrent D1 credential version bump', async () => {
-    const db = createDb(env);
-    const user = await db.insert(users).values({ username: 'epoch-race', passwordHash: 'x' }).returning().get();
-    const racing = { ...env, kv: { get: async () => {
-      await db.update(users).set({ authVersion: 9, authVersionMigrated: true }).where(eq(users.id, user!.id));
-      return '2';
-    } } } as unknown as Env;
-    expect(await getUserEpoch(racing, user!.id)).toBe(9);
   });
 
   it('long literal UTF-8 searches and thread subjects work beyond the D1 LIKE limit', async () => {
@@ -149,15 +138,14 @@ describe('mail functional safety regressions', () => {
     expect((await claimMailbox(env, s.viewer.userId, 'admin', { localPart: 'claim-history-count', domain: 'review.example' })).messageCount).toBe(1);
   });
 
-  it('failed draft-object cleanup retains the draft row for later retry', async () => {
+  it('consuming a sent draft only removes the draft row; the object stays for the attachment rows that reference it', async () => {
     const s = await seed('draft-cleanup'); const token = crypto.randomUUID(); const r2Key = `draft/${token}`;
     await env.r2.put(r2Key, 'file');
     await s.db.insert(draftAttachments).values({ userId: s.viewer.userId, token, r2Key, filename: 'file.txt', status: 'ready' });
     const broken = { ...env, r2: { delete: async () => { throw new Error('R2 failure'); } } } as unknown as Env;
     await consumeDraftAttachments(broken, s.viewer.userId, [token]);
-    expect(await s.db.select().from(draftAttachments).where(eq(draftAttachments.token, token)).get()).toBeDefined();
-    await consumeDraftAttachments(env, s.viewer.userId, [token]);
     expect(await s.db.select().from(draftAttachments).where(eq(draftAttachments.token, token)).get()).toBeUndefined();
+    expect(await (await env.r2.get(r2Key))?.text()).toBe('file');
   });
 
   it('expired crashed delivery leases reclaim orphan references without touching a live send', async () => {

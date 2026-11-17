@@ -35,6 +35,15 @@ const STATUS_META: Record<ApiKeyStatus, { label: string; tone: BadgeTone }> = {
   revoked: { label: '已吊销', tone: 'critical' },
 };
 
+/** 限定范围的简述：限定了邮箱或域名时显示，不限时为空 */
+export function restrictionLabel(key: Pick<ApiKeySummary, 'allowedMailboxIds' | 'allowedDomains'>): string {
+  const parts = [
+    key.allowedMailboxIds.length ? `${key.allowedMailboxIds.length} 个邮箱` : '',
+    key.allowedDomains.length ? key.allowedDomains.join('、') : '',
+  ].filter(Boolean);
+  return parts.length ? `仅限 ${parts.join(' 与 ')}` : '';
+}
+
 export function ApiKeysPage() {
   const user = useCurrentUser();
   const isAdmin = user.role === 'admin';
@@ -54,7 +63,7 @@ export function ApiKeysPage() {
     mutationFn: (key: ApiKeySummary) =>
       apiKeyApi.update(key.id, { status: key.status === 'active' ? 'disabled' : 'active' }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.root }),
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '状态切换失败' },
   });
 
   const remove = useMutation({
@@ -64,7 +73,7 @@ export function ApiKeysPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.root });
       setDeleting(null);
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '删除失败' },
   });
 
   const items = data ?? [];
@@ -126,6 +135,7 @@ export function ApiKeysPage() {
                     <Badge tone={status.tone}>{status.label}</Badge>
                     {view === 'all' && key.ownerUsername && <span>{key.ownerUsername}</span>}
                     <span title={key.scopes.join(', ')}>{key.scopes.length} 项权限</span>
+                    {restrictionLabel(key) && <span>{restrictionLabel(key)}</span>}
                     <span title={key.lastUsedAt ? formatDateTime(key.lastUsedAt) : ''}>
                       {key.lastUsedAt ? `最近使用 ${formatRelativeTime(key.lastUsedAt)}` : '从未使用'}
                     </span>
@@ -198,6 +208,7 @@ export function ApiKeysPage() {
                           {scope}
                         </Badge>
                       ))}
+                      {restrictionLabel(key) && <Badge tone="caution">{restrictionLabel(key)}</Badge>}
                     </div>
                   </TableCell>
                   <TableCell>

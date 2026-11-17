@@ -14,6 +14,7 @@ import { useCurrentUser } from '@/lib/use-session';
 import { ForwardingSection } from './forwarding-section';
 import { TwoFactorSection } from './two-factor-section';
 import { NotificationHealthPanel } from './notification-health';
+import { WebhooksSection } from '@/features/webhooks/webhooks-section';
 
 const ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const;
 
@@ -22,6 +23,7 @@ const SECTIONS = [
   { id: 'profile-account', label: '账户' },
   { id: 'profile-2fa', label: '两步验证' },
   { id: 'profile-notify', label: '转发与通知' },
+  { id: 'profile-webhooks', label: 'Webhook' },
   { id: 'profile-delivery', label: '投递结果' },
 ] as const;
 
@@ -88,7 +90,7 @@ export function ProfilePage() {
       setPreview(null);
       toast({ title: '头像已删除', variant: 'success' });
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '删除头像失败' },
   });
 
   const handleFile = async (file: File | undefined) => {
@@ -178,6 +180,7 @@ export function ProfilePage() {
         <TwoFactorSection id="profile-2fa" />
 
         <ForwardingSection id="profile-notify" />
+        <WebhooksSection id="profile-webhooks" />
         <div id="profile-delivery" tabIndex={-1} className="scroll-mt-20 focus:outline-none">
           <NotificationHealthPanel />
         </div>

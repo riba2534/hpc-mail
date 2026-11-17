@@ -1,6 +1,11 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { MessageRecipients, RecipientOutcome, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
+import {
+  DNSSEC_STATES, SYSTEM_DOMAIN_ONBOARDING_MODES, SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_STEP_STATES, SYSTEM_DOMAIN_ZONE_ORIGINS,
+  type DraftStatus, type MessageAuth, type MessageRecipients, type RecipientOutcome, type StoredDraftContent, type SystemDomainAck,
+  type SystemDomainChangeKind, type SystemDomainCheck, type SystemDomainOnboardingState, type SystemDomainVerdict, type SystemDomainWriteStep,
+  type UserMailboxPolicy, type UserNotifyPrefs,
+} from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -20,7 +25,11 @@ export const users = sqliteTable('users', {
     .default('active'),
   /** 强一致鉴权版本：改密/禁用时原子 +1，旧 JWT 立即失效 */
   authVersion: integer('auth_version').notNull().default(0),
-  /** 是否已把旧 KV uepoch 惰性迁入 D1；避免版本 0 用户每请求读取 KV */
+  /**
+   * 已废弃：曾标记旧 KV uepoch 是否已惰性迁入 D1。0030 迁移把存量全部置 1，当前代码不再读取；
+   * 列保留（迁移只增不删），建户时显式写 1，回滚到上一版本时可直接走其快路径。
+   * 不改列默认值：SQLite 改默认值要整表重建
+   */
   authVersionMigrated: integer('auth_version_migrated', { mode: 'boolean' }).notNull().default(false),
   inviteId: integer('invite_id'),
   /** 头像 R2 key（null 表示无头像）；随每次上传变化，用于 URL 版本号防缓存 */
@@ -31,6 +40,8 @@ export const users = sqliteTable('users', {
   totpEnabledAt: integer('totp_enabled_at', { mode: 'timestamp_ms' }),
   /** 恢复码哈希列表（JSON，SHA-256）；每个用一次即移除 */
   totpRecoveryCodes: text('totp_recovery_codes', { mode: 'json' }).$type<string[]>(),
+  /** 最近一次成功使用的 TOTP 时间步（unix 秒 / 30）；同一步及更早的码不再接受（防重放） */
+  totpLastStep: integer('totp_last_step'),
   /** 个人转发与通知偏好（JSON）：飞书/通用 webhook/邮箱转发。null=未配置，走默认（管理员则继承旧全局） */
   notifyPrefs: text('notify_prefs', { mode: 'json' }).$type<UserNotifyPrefs>(),
   /** null=使用公共配置；专属配置只约束新增认领/过户，存量邮箱保持可用。 */
@@ -55,7 +66,12 @@ export const mailboxes = sqliteTable(
     displayName: text('display_name').notNull().default(''),
     createdAt: createdAtColumn(),
   },
-  (t) => [index('idx_mailboxes_user').on(t.userId), index('idx_mailboxes_domain').on(t.domain)],
+  (t) => [
+    index('idx_mailboxes_user').on(t.userId),
+    index('idx_mailboxes_domain').on(t.domain),
+    // domain 视图把 domain 下推到认领地址子查询（user_id = ? AND domain = ?），按用户取某个域的地址不必回表
+    index('idx_mailboxes_user_domain').on(t.userId, t.domain),
+  ],
 );
 
 export const messages = sqliteTable(
@@ -93,6 +109,8 @@ export const messages = sqliteTable(
     verificationCode: text('verification_code').notNull().default(''),
     /** 收件时识别出的验证/登录链接（仅 http/https，≤2048）；识别不到或历史邮件为空串 */
     verificationLink: text('verification_link').notNull().default(''),
+    /** 收件时采信的发件认证结果（lib/auth-results.ts）；null=没有可信结果（历史邮件、站内互投、发件） */
+    auth: text('auth', { mode: 'json' }).$type<MessageAuth>(),
     messageId: text('message_id'),
     inReplyTo: text('in_reply_to'),
     references: text('references').notNull().default(''),
@@ -101,6 +119,8 @@ export const messages = sqliteTable(
     errorDetail: text('error_detail').notNull().default(''),
     isRead: integer('is_read', { mode: 'boolean' }).notNull().default(false),
     size: integer('size').notNull().default(0),
+    /** 入站 pending 自愈（定时任务用 R2 原文重走收件）已失败的次数；达到上限标为 degraded */
+    inboundRepairAttempts: integer('inbound_repair_attempts').notNull().default(0),
     createdAt: createdAtColumn(),
   },
   (t) => [
@@ -125,10 +145,14 @@ export const messages = sqliteTable(
     index('idx_messages_purge_token').on(t.purgeToken).where(sql`${t.purgeToken} IS NOT NULL`),
     index('idx_messages_body_r2').on(t.bodyR2Key).where(sql`${t.bodyR2Key} IS NOT NULL`),
     index('idx_messages_raw_r2').on(t.rawR2Key).where(sql`${t.rawR2Key} IS NOT NULL`),
+    // 外发 pending 恢复：定时任务找出超过 1 小时仍未回填结果的发件行，正常时只有正在投递的少数几行
+    index('idx_messages_outbound_pending').on(t.createdAt).where(sql`${t.direction} = 'outbound' AND ${t.status} = 'pending'`),
+    // 入站 pending 自愈：附件等未保存完整的收件行，正常时为 0 行
+    index('idx_messages_inbound_pending').on(t.createdAt).where(sql`${t.direction} = 'inbound' AND ${t.status} = 'pending'`),
   ],
 );
 
-/** 强一致会话表。KV 仅在过渡期双写，鉴权以本表为准。 */
+/** 强一致会话表，鉴权唯一真源（不再写 KV 镜像）。 */
 export const sessions = sqliteTable(
   'sessions',
   {
@@ -145,7 +169,8 @@ export const sessions = sqliteTable(
 export const idempotencyRecords = sqliteTable(
   'idempotency_records',
   {
-    actorType: text('actor_type', { enum: ['user', 'api_key'] }).notNull(),
+    /** draft：服务端草稿的发送（actor_id 为草稿 id，key 为第几次发送），由草稿发送流程自己占用 */
+    actorType: text('actor_type', { enum: ['user', 'api_key', 'draft'] }).notNull(),
     actorId: integer('actor_id').notNull(),
     key: text('key').notNull(),
     requestHash: text('request_hash').notNull(),
@@ -199,11 +224,16 @@ export const draftAttachments = sqliteTable(
     /** 已上传分片 [{partNumber, etag}]（JSON，单片直传为 null） */
     parts: text('parts', { mode: 'json' }).$type<{ partNumber: number; etag: string }[]>(),
     status: text('status', { enum: ['uploading', 'ready'] }).notNull().default('uploading'),
+    /** 被哪个服务端草稿（drafts.id）引用：引用期间不按 24h 过期清理，也不能被其他草稿或直接发信消费 */
+    draftId: integer('draft_id'),
     createdAt: createdAtColumn(),
   },
   (t) => [
     index('idx_draft_user').on(t.userId),
+    index('idx_draft_attachments_draft').on(t.draftId).where(sql`${t.draftId} IS NOT NULL`),
     index('idx_draft_status').on(t.status, t.createdAt),
+    // 发信直接引用草稿对象后，对象清理要按 r2_key 判断草稿是否仍在（未发送的草稿不能被回收）
+    index('idx_draft_r2_key').on(t.r2Key),
   ],
 );
 
@@ -305,10 +335,31 @@ export const hostedDomains = sqliteTable(
     memberLimit: integer('member_limit').notNull().default(0),
     checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
     activatedAt: integer('activated_at', { mode: 'timestamp_ms' }),
+    /** 核对租约到期时间：定时巡检与「立即检测」领取后才核对，同一域名不会被并发核对；处理完清空 */
+    syncLeaseUntil: integer('sync_lease_until', { mode: 'timestamp_ms' }),
+    /** 首次确认 Cloudflare 中查不到该 zone 的时间：间隔复核仍查不到才判为已迁走，期间可照常收信 */
+    zoneMissingAt: integer('zone_missing_at', { mode: 'timestamp_ms' }),
     updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
     createdAt: createdAtColumn(),
   },
   (t) => [index('idx_hosted_domains_user').on(t.userId), index('idx_hosted_domains_status').on(t.status, t.checkedAt)],
+);
+
+/**
+ * 托管域名墓碑：删除或过期后保留前所有者与本站分配过的 NS。保留期内其他用户重新添加同名域名前
+ * 要核对公开委派，防止 NS 仍指向本账户时被他人接管来信；迁移 0024 按审计日志回填了此前删除的域名。
+ */
+export const hostedDomainTombstones = sqliteTable(
+  'hosted_domain_tombstones',
+  {
+    domain: text('domain').primaryKey(),
+    userId: integer('user_id').notNull(),
+    nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    /** expire / delete / backfill */
+    reason: text('reason').notNull().default(''),
+    deletedAt: integer('deleted_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+  },
+  (t) => [index('idx_hosted_domain_tombstones_deleted').on(t.deletedAt)],
 );
 
 /** 托管域名成员：可在该域名下认领地址，不改变域名归属，也看不到他人地址的邮件 */
@@ -323,6 +374,100 @@ export const hostedDomainMembers = sqliteTable(
   (t) => [
     primaryKey({ columns: [t.domainId, t.userId] }),
     index('idx_hosted_domain_members_user').on(t.userId),
+  ],
+);
+
+/** 远端变更台账事件（system_domain_onboarding.changes，只追加）；at 为毫秒时间戳，before 为写入前读到的原值 */
+export interface OnboardingChangeEvent {
+  seq: number;
+  kind: SystemDomainChangeKind;
+  status: 'started' | 'done' | 'unknown' | 'failed';
+  at: number;
+  target?: string;
+  before?: unknown;
+  error?: string;
+}
+
+/** 已确认的变更：ack 与确认时观察值的哈希一致才算确认（远端又变了需要重新确认） */
+export interface OnboardingAcceptance {
+  ack: SystemDomainAck;
+  observed: string;
+}
+
+/** 最近一次预检快照（system_domain_onboarding.preflight）：结构与 shared SystemDomainPrecheck 一致，另带每个需确认项的观察值 */
+export interface OnboardingPreflightSnapshot {
+  checkedAt: number;
+  fingerprint: string;
+  verdict: SystemDomainVerdict;
+  checks: SystemDomainCheck[];
+  steps: { kind: SystemDomainWriteStep; detail: string }[];
+  /** 需确认项：ack → 观察值哈希 */
+  observed: { ack: SystemDomainAck; observed: string }[];
+  registrar: { name: string | null; cloudflare: boolean | null } | null;
+}
+
+/**
+ * 系统域名自动接入任务。完成后域名写入 settings.domains.list，本表只保留接入历史；公开范围、限额仍以 settings 为准。
+ * 同一域名在非终态中只能有一条（部分唯一索引）；系统列表、hosted_domains 与进行中的任务三方同名互斥（domain-occupancy.ts）。
+ * linked / unknown 来源的 zone 永不删除。状态写入都带 lease_token（fencing），取消只置 cancel_requested_at。
+ */
+export const systemDomainOnboarding = sqliteTable(
+  'system_domain_onboarding',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    domain: text('domain').notNull(),
+    mode: text('mode', { enum: SYSTEM_DOMAIN_ONBOARDING_MODES }).notNull(),
+    state: text('state', { enum: SYSTEM_DOMAIN_ONBOARDING_STATES }).notNull().$type<SystemDomainOnboardingState>(),
+    stateChangedAt: integer('state_changed_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+    /** 创建时的 cf_account_id：凭据换了账户则进入 blocked，不再调用 Cloudflare */
+    accountId: text('account_id').notNull(),
+    zoneId: text('zone_id'),
+    zoneOrigin: text('zone_origin', { enum: SYSTEM_DOMAIN_ZONE_ORIGINS }).notNull().default('unknown'),
+    /** 最近读到的 zone 状态：initializing / pending / active / moved / missing；未读为空串 */
+    zoneStatus: text('zone_status').notNull().default(''),
+    nameServers: text('name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalNameServers: text('original_name_servers', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+    originalRegistrar: text('original_registrar').notNull().default(''),
+    dnssec: text('dnssec', { enum: DNSSEC_STATES }).notNull().default('unknown'),
+    routingState: text('routing_state', { enum: SYSTEM_DOMAIN_STEP_STATES }).notNull().default('unknown'),
+    /** Cloudflare 原始 routing.status */
+    routingStatus: text('routing_status').notNull().default(''),
+    catchAllState: text('catch_all_state', { enum: SYSTEM_DOMAIN_STEP_STATES }).notNull().default('unknown'),
+    sendingState: text('sending_state', { enum: SYSTEM_DOMAIN_STEP_STATES }).notNull().default('unknown'),
+    /** Cloudflare 原始发信 DNS status */
+    sendingStatus: text('sending_status').notNull().default(''),
+    sendingTag: text('sending_tag'),
+    preflight: text('preflight', { mode: 'json' }).$type<OnboardingPreflightSnapshot>(),
+    accepted: text('accepted', { mode: 'json' }).notNull().$type<OnboardingAcceptance[]>().default(sql`'[]'`),
+    confirmedBy: integer('confirmed_by'),
+    confirmedAt: integer('confirmed_at', { mode: 'timestamp_ms' }),
+    changes: text('changes', { mode: 'json' }).notNull().$type<OnboardingChangeEvent[]>().default(sql`'[]'`),
+    errorCode: text('error_code').notNull().default(''),
+    lastError: text('last_error').notNull().default(''),
+    /** 连续失败次数，用于退避；取得进展时清零 */
+    attempts: integer('attempts').notNull().default(0),
+    /** cron 下次处理时间；NULL 不自动处理 */
+    nextCheckAt: integer('next_check_at', { mode: 'timestamp_ms' }),
+    /** 最近一次与 Cloudflare 核对的时间（手动检测节流） */
+    checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+    leaseToken: text('lease_token'),
+    leaseUntil: integer('lease_until', { mode: 'timestamp_ms' }),
+    cancelRequestedAt: integer('cancel_requested_at', { mode: 'timestamp_ms' }),
+    cancelRequestedBy: integer('cancel_requested_by'),
+    /** 取消时同时删除本任务创建、从未激活的 zone */
+    cancelDeleteZone: integer('cancel_delete_zone', { mode: 'boolean' }).notNull().default(false),
+    createdBy: integer('created_by').notNull(),
+    /** 完成时写入的 domains revision */
+    settingsRevision: integer('settings_revision'),
+    activatedAt: integer('activated_at', { mode: 'timestamp_ms' }),
+    finishedAt: integer('finished_at', { mode: 'timestamp_ms' }),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    uniqueIndex('uniq_system_onboarding_active_domain').on(t.domain)
+      .where(sql`${t.state} NOT IN ('completed', 'cancelled', 'failed')`),
+    index('idx_system_onboarding_due').on(t.state, t.nextCheckAt),
   ],
 );
 
@@ -356,6 +501,10 @@ export const apiKeys = sqliteTable(
     userId: integer('user_id').notNull(),
     scopes: text('scopes', { mode: 'json' }).notNull().$type<string[]>(),
     allowedIps: text('allowed_ips', { mode: 'json' }).notNull().$type<string[]>(),
+    /** 限定的邮箱认领行 id（JSON 数组）；与 allowedDomains 都为空表示不限 */
+    allowedMailboxIds: text('allowed_mailbox_ids', { mode: 'json' }).notNull().$type<number[]>().default(sql`'[]'`),
+    /** 限定的域名（JSON 数组）；与 allowedMailboxIds 都为空表示不限 */
+    allowedDomains: text('allowed_domains', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
     rateLimit: integer('rate_limit').notNull().default(120),
     status: text('status', { enum: ['active', 'disabled', 'revoked'] })
       .notNull()
@@ -379,11 +528,16 @@ export const apiRequestLogs = sqliteTable(
     statusCode: integer('status_code').notNull(),
     ip: text('ip').notNull().default(''),
     durationMs: integer('duration_ms').notNull().default(0),
+    /** 本行代表的请求数：成功的 GET 按分钟聚合时累加，逐条记录的恒为 1 */
+    requestCount: integer('request_count').notNull().default(1),
+    /** 聚合行的分钟号（epoch 分钟）；逐条记录的为 NULL，不进聚合唯一索引 */
+    minute: integer('minute'),
     createdAt: createdAtColumn(),
   },
   (t) => [
     index('idx_api_logs_key').on(t.apiKeyId, t.id),
     index('idx_api_logs_created').on(t.createdAt),
+    uniqueIndex('idx_api_logs_minute').on(t.apiKeyId, t.minute, t.method, t.path, t.statusCode).where(sql`${t.minute} IS NOT NULL`),
   ],
 );
 
@@ -440,7 +594,7 @@ export const adminAuditLogs = sqliteTable(
   (t) => [index('idx_admin_audit_created').on(t.createdAt)],
 );
 
-/** Long-lived delivery links keep an independent R2 reference after sent-mail deletion. */
+/** 外发的大附件链接：发件删除后仍独立引用 R2 对象（承诺 90 天有效）。 */
 export const externalAttachmentLinks = sqliteTable('external_attachment_links', {
   attachmentId: integer('attachment_id').primaryKey(),
   r2Key: text('r2_key').notNull(),
@@ -450,7 +604,7 @@ export const externalAttachmentLinks = sqliteTable('external_attachment_links', 
   expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
 }, (t) => [index('idx_external_links_expiry').on(t.expiresAt), index('idx_external_links_r2').on(t.r2Key)]);
 
-/** Durable garbage references survive failed R2 cleanup. */
+/** R2 清理台账：删除失败的对象留在这里由 cron 重试。 */
 export const storageCleanupJobs = sqliteTable('storage_cleanup_jobs', {
   r2Key: text('r2_key').primaryKey(),
   createdAt: createdAtColumn(),
@@ -473,14 +627,203 @@ export const notificationJobs = sqliteTable('notification_jobs', {
   lastAttemptAt: integer('last_attempt_at', { mode: 'timestamp_ms' }),
   lastError: text('last_error').notNull().default(''),
   lastHttpStatus: integer('last_http_status'),
+  /** 邮箱转发走的通道：native 原生 forward()、relay no-reply 中转；未尝试（跳过）或其他通道为空串 */
+  forwardMode: text('forward_mode', { enum: ['', 'native', 'relay'] }).notNull().default(''),
   dedupeKey: text('dedupe_key').notNull().unique(),
 }, (t) => [index('idx_notification_due').on(t.status, t.nextAttemptAt), index('idx_notification_user').on(t.userId, t.createdAt),
   // 通知健康页按 (用户, 通道) 取最新一条
   index('idx_notification_user_channel').on(t.userId, t.channel, t.id)]);
 
-/** Temporary references protect delivery objects while sending or copying metadata. */
+/** 投递期间的临时租约：发送或复制元数据时保护对象不被清理。 */
 export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
   r2Key: text('r2_key').notNull(),
   token: text('token').notNull(),
   expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
 }, (t) => [primaryKey({ columns: [t.r2Key, t.token] }), index('idx_delivery_lease_expiry').on(t.expiresAt)]);
+
+/**
+ * 服务端草稿与定时发送（/v1/drafts、/api/drafts）。内容存解析后的发信字段（content JSON，只含附件 token），
+ * 正文不进 JSON，按邮件正文的规则落 R2（D1 只留短文本）。
+ * 状态见 shared DRAFT_STATUSES；发送时按 (actor_type='draft', actor_id=id, key=attempt) 占用幂等记录，
+ * 发件行在外发前绑定，进程中断后可据此判断是否已经外发，绝不自动重发。
+ */
+export const drafts = sqliteTable(
+  'drafts',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    userId: integer('user_id').notNull(),
+    status: text('status').$type<DraftStatus>().notNull().default('draft'),
+    version: integer('version').notNull().default(1),
+    content: text('content', { mode: 'json' }).notNull().$type<StoredDraftContent>(),
+    /** 正文与邮件同一口径（services/mail-body.ts）：完整 text/html 在 R2（bodyR2Key），D1 只留短文本，读全文用 readMailBody */
+    bodyText: text('body_text').notNull().default(''),
+    bodyHtml: text('body_html').notNull().default(''),
+    bodyR2Key: text('body_r2_key'),
+    /** 列表摘要（同 messages.preview） */
+    preview: text('preview').notNull().default(''),
+    sendAt: integer('send_at', { mode: 'timestamp_ms' }),
+    /** web | api */
+    createdVia: text('created_via').$type<'web' | 'api'>().notNull(),
+    /** 创建草稿的 API Key（网页创建为 null） */
+    apiKeyId: integer('api_key_id'),
+    /** 最近一次安排定时发送的 API Key（网页安排为 null）：到点时该 Key 已失效则取消发送 */
+    scheduledByKeyId: integer('scheduled_by_key_id'),
+    /** 安排定时发送时所有者的 users.auth_version：到点时已变化（改密、重置、禁用）则取消发送 */
+    scheduledAuthVersion: integer('scheduled_auth_version'),
+    /** 创建或安排时请求的 origin；定时发送没有请求时用于附件下载链接（优先 env.site_origin） */
+    origin: text('origin').notNull().default(''),
+    /** 发送次数（每次发送占用一个新的幂等键 = 该值） */
+    attempt: integer('attempt').notNull().default(0),
+    /** sending 状态的开始时间（租约）；超时由定时任务按幂等记录判定结果 */
+    claimedAt: integer('claimed_at', { mode: 'timestamp_ms' }),
+    /** 发送后对应的发件行 */
+    messageId: integer('message_id'),
+    errorDetail: text('error_detail').notNull().default(''),
+    /** 创建请求的幂等键：`<actorType>:<actorId>:<Idempotency-Key>`；request_hash 为创建请求体的哈希 */
+    idempotencyKey: text('idempotency_key'),
+    requestHash: text('request_hash'),
+    createdAt: createdAtColumn(),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+    sentAt: integer('sent_at', { mode: 'timestamp_ms' }),
+  },
+  (t) => [
+    index('idx_drafts_user').on(t.userId, t.id),
+    index('idx_drafts_due').on(t.sendAt).where(sql`${t.status} = 'scheduled'`),
+    index('idx_drafts_sending').on(t.claimedAt).where(sql`${t.status} = 'sending'`),
+    index('idx_drafts_sent').on(t.sentAt).where(sql`${t.status} = 'sent'`),
+    // 对象清理按 r2_key 判断草稿正文是否仍被引用
+    index('idx_drafts_body_r2').on(t.bodyR2Key).where(sql`${t.bodyR2Key} IS NOT NULL`),
+    uniqueIndex('idx_drafts_idempotency').on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
+  ],
+);
+
+/**
+ * 新增的邮箱转发目标在确认前不生效：发确认链接到目标邮箱，确认后才写进 users.notify_prefs.forward.addresses。
+ * token 只存 SHA-256；同一用户同一地址只保留一行（重发会换 token）。
+ */
+export const forwardConfirmations = sqliteTable('forward_confirmations', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: integer('user_id').notNull(),
+  address: text('address').notNull(),
+  tokenHash: text('token_hash').notNull(),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('uq_forward_confirmations_token').on(t.tokenHash),
+  uniqueIndex('uq_forward_confirmations_user_address').on(t.userId, t.address),
+]);
+
+/** Webhook v2 端点：每个用户最多 MAX_WEBHOOK_ENDPOINTS_PER_USER 个 */
+export const webhookEndpoints = sqliteTable('webhook_endpoints', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: integer('user_id').notNull(),
+  url: text('url').notNull(),
+  description: text('description').notNull().default(''),
+  /** whsec_ 加 base64 的签名密钥（Svix 格式） */
+  secret: text('secret').notNull(),
+  /** 订阅的事件类型（JSON 数组） */
+  events: text('events', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  /** 地址与域名过滤（JSON 数组，「或」关系；都为空表示不过滤） */
+  addresses: text('addresses', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  domains: text('domains', { mode: 'json' }).notNull().$type<string[]>().default(sql`'[]'`),
+  includeBody: integer('include_body', { mode: 'boolean' }).notNull().default(false),
+  status: text('status', { enum: ['active', 'disabled'] }).notNull().default('active'),
+  disabledReason: text('disabled_reason').notNull().default(''),
+  consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+  lastSuccessAt: integer('last_success_at', { mode: 'timestamp_ms' }),
+  lastFailureAt: integer('last_failure_at', { mode: 'timestamp_ms' }),
+  /**
+   * 最近一次写入端点的凭据的有效角色（没有 admin scope 的管理员 Key 是 user）。实际角色取它与 users.role 中较低的：
+   * user 的端点只收所有者自己认领地址的来信，不收未认领地址（未认领地址的来信归管理员）
+   */
+  accessRole: text('access_role', { enum: ['admin', 'user'] }).notNull().default('admin'),
+  createdAt: createdAtColumn(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+}, (t) => [index('idx_webhook_endpoints_user').on(t.userId, t.status)]);
+
+/** Webhook v2 投递：同一端点同一事件（event_key）只有一行，重试在同一行上累加 attempts */
+export const webhookDeliveries = sqliteTable('webhook_deliveries', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  endpointId: integer('endpoint_id').notNull(),
+  userId: integer('user_id').notNull(),
+  /** 请求头 webhook-id：同一事件的所有重试保持不变 */
+  eventId: text('event_id').notNull(),
+  eventType: text('event_type').notNull(),
+  /** 去重键，如 mail.received:123 */
+  eventKey: text('event_key').notNull(),
+  /** 首次投递前构造并保存的完整请求体（JSON 文本），重试原样发送；终态后可清空 */
+  payload: text('payload').notNull().default('{}'),
+  status: text('status', { enum: ['pending', 'processing', 'succeeded', 'failed'] }).notNull().default('pending'),
+  attempts: integer('attempts').notNull().default(0),
+  nextAttemptAt: integer('next_attempt_at', { mode: 'timestamp_ms' }).notNull(),
+  lastAttemptAt: integer('last_attempt_at', { mode: 'timestamp_ms' }),
+  lastError: text('last_error').notNull().default(''),
+  lastHttpStatus: integer('last_http_status'),
+  createdAt: createdAtColumn(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch() * 1000)`),
+}, (t) => [
+  uniqueIndex('uq_webhook_deliveries_event').on(t.endpointId, t.eventKey),
+  index('idx_webhook_deliveries_due').on(t.status, t.nextAttemptAt),
+  index('idx_webhook_deliveries_endpoint').on(t.endpointId, t.id),
+]);
+
+/**
+ * 外发与 Cloudflare 投递事件的对应：每个外部收件人一次 send() 一行。事件到达时依次按 send() 返回的
+ * Cloudflare 消息 ID、本站 Message-ID（同收件人）、同一发件人与收件人唯一一条未回执且没有消息 ID 的记录查找。
+ * 保留 30 天，由每日维护清理。
+ */
+export const emailDeliveryRefs = sqliteTable('email_delivery_refs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  /** send() 返回的 Cloudflare 消息 ID；没有返回时为 null */
+  providerMessageId: text('provider_message_id'),
+  /** 本站写进原文的 Message-ID（不含尖括号）；中转转发为 null */
+  rfcMessageId: text('rfc_message_id'),
+  /** message：发件行（messages.id）；forward：中转转发，messageId 为被转发的收件行 */
+  kind: text('kind', { enum: ['message', 'forward'] }).notNull(),
+  messageId: integer('message_id').notNull(),
+  sender: text('sender').notNull(),
+  recipient: text('recipient').notNull(),
+  /** forward：该目标的转发结果归属人（notification_jobs.user_id） */
+  ownerIds: text('owner_ids', { mode: 'json' }).notNull().$type<number[]>().default(sql`'[]'`),
+  /** 收到终态事件的时间；null 表示还没有回执 */
+  resolvedAt: integer('resolved_at', { mode: 'timestamp_ms' }),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('idx_delivery_refs_provider').on(t.providerMessageId).where(sql`${t.providerMessageId} IS NOT NULL`),
+  index('idx_delivery_refs_rfc').on(t.rfcMessageId).where(sql`${t.rfcMessageId} IS NOT NULL`),
+  // 兜底匹配只看还没有回执的记录
+  index('idx_delivery_refs_pending_pair').on(t.recipient, t.sender, t.id).where(sql`${t.resolvedAt} IS NULL`),
+  index('idx_delivery_refs_created').on(t.createdAt),
+]);
+
+/**
+ * 外发抑制名单：退信与投诉后，同一发信域名再发给该地址直接失败（范围与 Cloudflare 的 sending_domain 一致）。
+ * expires_at 为 null 长期有效，由管理员解除；到期的行由每日维护清理。
+ */
+export const emailSuppressions = sqliteTable('email_suppressions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  address: text('address').notNull(),
+  sendingDomain: text('sending_domain').notNull(),
+  reason: text('reason', { enum: ['hard_bounce', 'soft_bounce', 'complaint'] }).notNull(),
+  detail: text('detail').notNull().default(''),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
+  /** 最近一次写入该条目的 Cloudflare 事件 ID */
+  eventId: text('event_id').notNull().default(''),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex('idx_suppressions_address_domain').on(t.address, t.sendingDomain),
+  index('idx_suppressions_expires').on(t.expiresAt).where(sql`${t.expiresAt} IS NOT NULL`),
+]);
+
+/** 发信域名的 Cloudflare 事件订阅（系统域名与托管域名共用） */
+export const emailEventSubscriptions = sqliteTable('email_event_subscriptions', {
+  domain: text('domain').primaryKey(),
+  kind: text('kind', { enum: ['system', 'hosted'] }).notNull(),
+  zoneId: text('zone_id').notNull().default(''),
+  subscriptionId: text('subscription_id'),
+  status: text('status', { enum: ['active', 'error'] }).notNull(),
+  lastError: text('last_error').notNull().default(''),
+  checkedAt: integer('checked_at', { mode: 'timestamp_ms' }),
+  createdAt: createdAtColumn(),
+});

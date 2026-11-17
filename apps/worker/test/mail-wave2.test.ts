@@ -1,5 +1,5 @@
 import {
-  API_SCOPES, DEFAULT_SETTINGS, type CreatedApiKey, type ListMessagesQuery, type MessageDetail, type MessageSummary, type Settings,
+  DEFAULT_SETTINGS, type CreatedApiKey, type ListMessagesQuery, type MessageDetail, type MessageSummary, type Settings,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq, inArray, sql } from 'drizzle-orm';
@@ -15,6 +15,7 @@ import { enqueueMailNotifications, processNotificationJobs } from '../src/servic
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { createSession } from '../src/services/session.js';
 import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 
 const app = createApp();
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -51,10 +52,12 @@ async function baseSettings(patch: Partial<Settings> = {}) {
 async function account(prefix: string, role: 'admin' | 'user' = 'user') {
   const username = `${prefix}-${rand()}`;
   const [user] = await createDb(env).insert(users)
-    .values({ username, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+    .values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`, scopes: [...API_SCOPES], rateLimit: 120 })), 201);
+  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`, scopes: USER_SCOPES, rateLimit: 120, password: TEST_PASSWORD })), 201);
+  // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope）
+  if (role === 'admin') await grantLegacyAdminScope(env, key.id);
   return { id: user!.id, jwt, key: key.key };
 }
 
@@ -231,14 +234,14 @@ describe('全部已读按筛选执行', () => {
     }
   });
 
-  it('列表带 domain 时认领/共享范围不改走 idx_messages_domain；非默认视图的计划与不带 domain 相同', async () => {
+  it('列表带 domain 时认领/共享范围不改走 idx_messages_domain，domain 下推进地址子查询', async () => {
     await baseSettings();
     const admin = await account('w2-list-plan-admin', 'admin');
     const user = await account('w2-list-plan');
     await own(user.id, `w2-list-plan-${rand()}@hpc.email`);
     const viewer = { userId: user.id, role: 'user' as const };
-    // 默认视图不带 domain 时按地址索引取数（带方向/未读筛选的走 idx_messages_visible），
-    // 带 domain 回到原计划（逐地址回表判断 domain 读取量反而更大）
+    // 默认视图不带 domain 时按地址索引取数（带方向/未读筛选的走 idx_messages_visible）；
+    // 带 domain 时把它下推进认领/共享地址子查询（idx_mailboxes_user_domain），messages 上不再判断 domain
     const views: [Parameters<typeof listMessages>[1], Partial<ListMessagesQuery>, string | null][] = [
       [viewer, {}, 'idx_messages_address_deleted_id'], [viewer, { direction: 'inbound' }, 'idx_messages_visible'],
       [viewer, { q: 'x' }, null], [viewer, { unread: true }, 'idx_messages_visible'],
@@ -250,12 +253,11 @@ describe('全部已读按筛选执行', () => {
         listMessages(db, who, { limit: 30, ...query, ...extra } as ListMessagesQuery));
       const withDomain = await list({ domain: 'hpc.email' });
       expect(withDomain, JSON.stringify(query)).not.toContain('idx_messages_domain');
+      expect(withDomain, JSON.stringify(query)).toMatch(/idx_mailboxes_user_domain \(user_id=\? AND domain=\?\)/);
       if (byAddress) {
         const plain = await list({});
-        expect(plain, JSON.stringify(query)).toContain(`SEARCH messages USING INDEX ${byAddress} (address=?`);
+        expect(plain, JSON.stringify(query)).toMatch(new RegExp(`SEARCH messages USING (?:COVERING )?INDEX ${byAddress} \\(address=\\?`));
         expect(plain, JSON.stringify(query)).not.toContain('idx_messages_live');
-      } else {
-        expect(withDomain, JSON.stringify(query)).toBe(await list({}));
       }
     }
     // 未认领范围没有地址集合可走，仍由规划器按域名索引收窄
@@ -321,7 +323,7 @@ describe('wait 过滤与 scannedThroughId', () => {
     const m2 = await mail(address, { fromAddress: 'noreply@github.com', subject: 'Welcome aboard', preview: 'hello there' });
     const m3 = await mail(address, { fromAddress: 'security@github.com', subject: '[GitHub] Verify sign in', preview: 'Your verification code is 482913', verificationCode: '482913' });
     const m4 = await mail(address, { fromAddress: 'login@other.example', subject: 'Login code', preview: 'Your login code: 774411', verificationCode: '774411' });
-    const next = (filters: Parameters<typeof findNextMessage>[2]) => findNextMessage(env, viewer, { address, ...filters });
+    const next = (filters: Parameters<typeof findNextMessage>[2]) => findNextMessage(env, viewer, { address: [address], ...filters });
 
     expect(await next({ afterId: base })).toMatchObject({ message: { id: m1 }, scannedThroughId: m1 });
     expect(await next({ afterId: base, from: '@github.com' })).toMatchObject({ message: { id: m2 }, scannedThroughId: m2 });
@@ -360,14 +362,14 @@ describe('wait 过滤与 scannedThroughId', () => {
     const base = await maxMessageId();
     const fresh = await mail(address, { subject: 'Sign in to Example', preview: 'Use the code below' });
     const later = await mail(address, { subject: 'Your code', preview: 'Your verification code is 135790', verificationCode: '135790' });
-    expect(await findNextMessage(env, viewer, { afterId: base, address, hasCode: true })).toEqual({ message: null, scannedThroughId: base });
+    expect(await findNextMessage(env, viewer, { afterId: base, address: [address], hasCode: true })).toEqual({ message: null, scannedThroughId: base });
     await createDb(env).update(messages).set({ createdAt: new Date(Date.now() - 60_000) }).where(eq(messages.id, fresh));
-    expect(await findNextMessage(env, viewer, { afterId: base, address, hasCode: true })).toMatchObject({ message: { id: later }, scannedThroughId: later });
+    expect(await findNextMessage(env, viewer, { afterId: base, address: [address], hasCode: true })).toMatchObject({ message: { id: later }, scannedThroughId: later });
 
     await baseSettings({ code_extract: { enabled: true, aiEnabled: true }, ai_model: { baseUrl: '', apiKey: '', model: '' } });
     await mail(address, { subject: 'Sign in again', preview: 'Use the code below' });
     const coded = await mail(address, { subject: 'Your code', preview: 'Your verification code is 246813', verificationCode: '246813' });
-    expect(await findNextMessage(env, viewer, { afterId: later, address, hasCode: true })).toMatchObject({ message: { id: coded }, scannedThroughId: coded });
+    expect(await findNextMessage(env, viewer, { afterId: later, address: [address], hasCode: true })).toMatchObject({ message: { id: coded }, scannedThroughId: coded });
     await baseSettings();
   });
 });

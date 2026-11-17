@@ -1,18 +1,14 @@
 import { Search } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { PageHeader } from '@/components/page-header';
 import { MailList } from '@/features/inbox/mail-list';
 import { SEARCH_SHORTCUT_ATTR } from '@/lib/use-keyboard-shortcuts';
+import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 export function SentPage() {
   const [q, setQ] = useState('');
-  const [debouncedQ, setDebouncedQ] = useState('');
-
-  useEffect(() => {
-    const timer = setTimeout(() => setDebouncedQ(q.trim()), 250);
-    return () => clearTimeout(timer);
-  }, [q]);
+  const debouncedQ = useDebouncedValue(q.trim(), 250);
 
   return (
     <div className="mx-auto max-w-4xl">

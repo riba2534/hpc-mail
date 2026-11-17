@@ -584,7 +584,7 @@ describe('上限与限流', () => {
     await bumpCounter(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', minuteWindow(1), MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - 2 - 7);
     await data(await call('POST', path, owner.jwt, input), 201);
     const calls = cf.calls.length;
-    expect(await errorOf(await call('GET', path, owner.jwt), 429)).toEqual({ code: 'rate_limited', message: '当前解析操作较多，请稍后再试' });
+    expect(await errorOf(await call('GET', path, owner.jwt), 429)).toMatchObject({ code: 'rate_limited', message: '当前解析操作较多，请稍后再试' });
     expect((await errorOf(await call('POST', path, admin.jwt, { ...input, name: 'api' }), 429)).message).toBe('当前解析操作较多，请稍后再试');
     expect(cf.calls).toHaveLength(calls);
   }, 30_000);
@@ -651,7 +651,7 @@ describe('Cloudflare 错误映射', () => {
     expect(await errorOf(await call('POST', path, owner.jwt, input), 500)).toEqual(unsure);
     cf.failNext('GET', 429, 10000);
     expect(await errorOf(await call('GET', path, owner.jwt), 429))
-      .toEqual({ code: 'rate_limited', message: 'Cloudflare 接口繁忙，请稍后再试' });
+      .toMatchObject({ code: 'rate_limited', message: 'Cloudflare 接口繁忙，请稍后再试' });
     // fetch 抛错（超时或断网）即 status 0
     cf.failNext('GET', 0);
     expect(await errorOf(await call('GET', path, owner.jwt), 500)).toEqual(unsure);

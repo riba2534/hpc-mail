@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port 3002",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/check-bundle.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json"
   },
@@ -41,7 +41,7 @@
     "jsdom": "^29.1.1",
     "tailwindcss": "^4.3.2",
     "typescript": "^5.9.3",
-    "vite": "^8.1.4",
-    "vitest": "^4.1.10"
+    "vite": "^8.1.7",
+    "vitest": "^4.1.12"
   }
 }

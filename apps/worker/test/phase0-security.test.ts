@@ -1,10 +1,4 @@
-import {
-  MAX_API_GLOBAL_REQUESTS_PER_MINUTE,
-  MAX_API_USER_REQUESTS_PER_MINUTE,
-  MAX_AUTH_USER_REQUESTS_PER_MINUTE,
-  type ApiScope,
-  type ChangePasswordResponse,
-} from '@hpc-mail/shared';
+import { type ApiScope, type ChangePasswordResponse } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq, sql } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -38,10 +32,15 @@ import { sendMail } from '../src/services/outbound.js';
 import { runScheduled } from '../src/services/scheduled.js';
 import { enqueueMailNotifications, processNotificationJobs, retryNotificationJob } from '../src/services/notification-jobs.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
-import { bumpCounter, minuteWindow, readCounter } from '../src/services/rate-counter.js';
+import { minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
+import { fakeRateLimits } from './fake-rate-limits.js';
+import { collectBackground } from './support/background.js';
+
+/** sendMail 等登记的后台任务在每个用例结束前等完，拆环境时不能还有任务在写日志 */
+const background = collectBackground();
 
 const app = createApp();
 const IP = '198.51.100.23';
@@ -75,12 +74,12 @@ async function keyFor(userId: number, opts: { rateLimit?: number; allowedIps?: s
   });
 }
 
-async function call(path: string, token: string, init: RequestInit = {}) {
+async function call(path: string, token: string, init: RequestInit = {}, target: Env = env) {
   const ctx = createExecutionContext();
   const response = await app.request(path, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, 'CF-Connecting-IP': IP, ...(init.headers as Record<string, string> | undefined) },
-  }, env, ctx);
+  }, target, ctx);
   await waitOnExecutionContext(ctx);
   return response;
 }
@@ -135,8 +134,9 @@ describe('R03 /v1 审计写入受控', () => {
       expect(id).not.toBe(bad);
       expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     }
+    // 成功的 GET 按分钟聚合成一行（跨分钟边界时两行），requestId 取该分钟第一次请求
     const logs = await logsOf(key.id);
-    expect(logs).toHaveLength(5);
+    expect(logs.reduce((sum, log) => sum + log.requestCount, 0)).toBe(5);
     expect(logs.every((log) => /^[A-Za-z0-9._:-]{1,64}$/.test(log.requestId))).toBe(true);
     expect(logs.map((log) => log.requestId)).toContain('trace-1:Ab.9_x');
   });
@@ -192,7 +192,7 @@ describe('R03 /v1 审计写入受控', () => {
     expect(await logsOf(stoppedKey.id)).toHaveLength(1);
   });
 
-  it('超限后不再递增 api_rate_limits，429 只写 1 行明细；正常请求逐条记录', async () => {
+  it('Key 超限后 429 只写 1 行明细、不写 api_rate_limits；成功请求按分钟聚合', async () => {
     await enableApi();
     await awayFromMinuteBoundary();
     const user = await seedUser('p0-429');
@@ -200,82 +200,67 @@ describe('R03 /v1 审计写入受控', () => {
     const statuses: number[] = [];
     for (let i = 0; i < 6; i++) statuses.push((await call('/v1/status', key.key)).status);
     expect(statuses).toEqual([200, 200, 429, 429, 429, 429]);
-    const counters = await createDb(env).select().from(apiRateLimits).where(eq(apiRateLimits.apiKeyId, key.id)).all();
-    expect(counters).toHaveLength(1);
-    expect(counters[0]!.requestCount).toBe(3);
+    expect(await createDb(env).select().from(apiRateLimits).where(eq(apiRateLimits.apiKeyId, key.id)).all()).toEqual([]);
     const logs = await logsOf(key.id);
-    expect(logs.map((log) => log.statusCode).sort()).toEqual([200, 200, 429]);
+    expect(logs.map((log) => [log.statusCode, log.requestCount]).sort()).toEqual([[200, 2], [429, 1]]);
   });
 });
 
 describe('R04 全站限流桶不被单个用户打满', () => {
-  it('/api 快路径：用户已超限的请求返回 429 且不推高 auth-global', async () => {
-    await awayFromMinuteBoundary();
-    const minute = minuteWindow(1);
+  // 限流走 Rate Limiting binding：用户桶拒绝的请求不再调用全站桶，binding 被拒的调用也不计数
+  it('/api 快路径：用户已超限的请求返回 429 且不进全站桶', async () => {
+    const { env: target, fakes } = fakeRateLimits();
     const hot = await seedUser('p0-auth-hot');
     const calm = await seedUser('p0-auth-calm');
-    await bumpCounter(env, 'auth-user', String(hot.id), minute, MAX_AUTH_USER_REQUESTS_PER_MINUTE);
+    fakes.rl_auth_user.fill(String(hot.id));
     const hotJwt = await jwtFor(hot.id);
-    const before = (await readCounter(env, 'auth-global', 'instance', minute)).count;
-    for (let i = 0; i < 5; i++) expect((await call('/api/auth/me', hotJwt)).status).toBe(429);
-    expect((await readCounter(env, 'auth-global', 'instance', minute)).count).toBe(before);
-    expect((await readCounter(env, 'auth-user', String(hot.id), minute)).count).toBe(MAX_AUTH_USER_REQUESTS_PER_MINUTE + 5);
+    for (let i = 0; i < 5; i++) expect((await call('/api/auth/me', hotJwt, {}, target)).status).toBe(429);
+    expect(fakes.rl_auth_global.calls).toEqual([]);
+    expect(fakes.rl_auth_user.calls).toHaveLength(5);
     // 对照：未超限的用户照常计入全站桶
-    expect((await call('/api/auth/me', await jwtFor(calm.id))).status).toBe(200);
-    expect((await readCounter(env, 'auth-global', 'instance', minute)).count).toBe(before + 1);
+    expect((await call('/api/auth/me', await jwtFor(calm.id), {}, target)).status).toBe(200);
+    expect(fakes.rl_auth_global.calls).toEqual(['instance']);
   });
 
-  it('/api 慢路径（鉴权版本待迁移）同样不推高 auth-global', async () => {
-    await awayFromMinuteBoundary();
-    const minute = minuteWindow(1);
+  it('/api 旧标记（auth_version_migrated=0）的用户走同一路径，同样不进全站桶', async () => {
+    const { env: target, fakes } = fakeRateLimits();
     const hot = await seedUser('p0-auth-slow', { migrated: false });
-    await bumpCounter(env, 'auth-user', String(hot.id), minute, MAX_AUTH_USER_REQUESTS_PER_MINUTE);
-    const before = (await readCounter(env, 'auth-global', 'instance', minute)).count;
-    expect((await call('/api/auth/me', await jwtFor(hot.id))).status).toBe(429);
-    expect((await readCounter(env, 'auth-global', 'instance', minute)).count).toBe(before);
+    fakes.rl_auth_user.fill(String(hot.id));
+    expect((await call('/api/auth/me', await jwtFor(hot.id), {}, target)).status).toBe(429);
+    expect(fakes.rl_auth_global.calls).toEqual([]);
     const calm = await seedUser('p0-auth-slow-calm', { migrated: false });
-    expect((await call('/api/auth/me', await jwtFor(calm.id))).status).toBe(200);
-    expect((await readCounter(env, 'auth-global', 'instance', minute)).count).toBe(before + 1);
+    expect((await call('/api/auth/me', await jwtFor(calm.id), {}, target)).status).toBe(200);
+    expect(fakes.rl_auth_global.calls).toEqual(['instance']);
   });
 
-  it('/v1：用户总桶已超限的请求返回 429 且不推高 api-global', async () => {
+  it('/v1：用户总桶已超限的请求返回 429 且不进全站桶', async () => {
     await enableApi();
-    await awayFromMinuteBoundary();
-    const minute = minuteWindow(1);
+    const { env: target, fakes } = fakeRateLimits();
     const hot = await seedUser('p0-api-hot');
     const hotKey = await keyFor(hot.id);
-    await bumpCounter(env, 'api-user', String(hot.id), minute, MAX_API_USER_REQUESTS_PER_MINUTE);
-    const before = (await readCounter(env, 'api-global', 'instance', minute)).count;
+    fakes.rl_api_user.fill(String(hot.id));
     for (let i = 0; i < 4; i++) {
-      const response = await call('/v1/status', hotKey.key);
+      const response = await call('/v1/status', hotKey.key, {}, target);
       expect(response.status).toBe(429);
       expect(((await response.json()) as { error: { message: string } }).error.message).toContain('账户级');
     }
-    expect((await readCounter(env, 'api-global', 'instance', minute)).count).toBe(before);
+    expect(fakes.rl_api_global.calls).toEqual([]);
     const calm = await seedUser('p0-api-calm');
-    expect((await call('/v1/status', (await keyFor(calm.id)).key)).status).toBe(200);
-    expect((await readCounter(env, 'api-global', 'instance', minute)).count).toBe(before + 1);
+    expect((await call('/v1/status', (await keyFor(calm.id)).key, {}, target)).status).toBe(200);
+    expect(fakes.rl_api_global.calls).toEqual(['instance']);
   });
 
   it('/v1：全站总桶超限与账户级超限给出不同的 429 文案', async () => {
     await enableApi();
-    await awayFromMinuteBoundary();
-    const minute = minuteWindow(1);
+    const { env: target, fakes } = fakeRateLimits();
+    fakes.rl_api_global.fill('instance');
     const user = await seedUser('p0-api-global');
     const key = await keyFor(user.id);
-    const before = (await readCounter(env, 'api-global', 'instance', minute)).count;
-    const fill = MAX_API_GLOBAL_REQUESTS_PER_MINUTE - before;
-    await bumpCounter(env, 'api-global', 'instance', minute, fill);
-    try {
-      const response = await call('/v1/status', key.key);
-      expect(response.status).toBe(429);
-      const message = ((await response.json()) as { error: { message: string } }).error.message;
-      expect(message).toContain('API 总调用频率超限');
-      expect(message).not.toContain('账户级');
-    } finally {
-      // 全站桶同文件共享，撤掉人为填充，后续用例不受影响
-      await bumpCounter(env, 'api-global', 'instance', minute, -fill);
-    }
+    const response = await call('/v1/status', key.key, {}, target);
+    expect(response.status).toBe(429);
+    const message = ((await response.json()) as { error: { message: string } }).error.message;
+    expect(message).toContain('API 总调用频率超限');
+    expect(message).not.toContain('账户级');
   });
 });
 
@@ -301,9 +286,9 @@ describe('API Key 管理的并发守卫', () => {
   });
 
   it('网页创建 Key 带令牌鉴权版本，正常会话照常创建', async () => {
-    const user = await seedUser('p0-create-http');
+    const user = await seedUser('p0-create-http', { password: 'p0-create-http-pass' });
     const response = await call('/api/api-keys', await jwtFor(user.id),
-      jsonInit('POST', { name: 'web', scopes: ['mail.read'], rateLimit: 60 }));
+      jsonInit('POST', { name: 'web', scopes: ['mail.read'], rateLimit: 60, password: 'p0-create-http-pass' }));
     expect(response.status).toBe(201);
   });
 });
@@ -337,8 +322,9 @@ describe('R10 改密与重置密码吊销 API Key', () => {
     const user = await seedUser('p0-chpw-keep', { password: 'old-password-123' });
     const key = await keyFor(user.id);
     const jwt = await jwtFor(user.id);
+    // 原密码错误与重新验证同一口径：403 reauth_failed（不是 401，网页端不会因此清掉会话）
     expect((await call('/api/auth/password', jwt,
-      jsonInit('PUT', { oldPassword: 'wrong-password-000', newPassword: 'new-password-456' }))).status).toBe(401);
+      jsonInit('PUT', { oldPassword: 'wrong-password-000', newPassword: 'new-password-456' }))).status).toBe(403);
     expect((await call('/v1/status', key.key)).status).toBe(200);
     const response = await call('/api/auth/password', jwt,
       jsonInit('PUT', { oldPassword: 'old-password-123', newPassword: 'new-password-456', revokeApiKeys: false }));
@@ -600,7 +586,7 @@ describe('R22 幂等发信可以安全重试', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } }) } as Env;
-    await expect(sendMail(faulty, { waitUntil: () => {} }, { userId: user.id, role: 'user' }, req, [], 'https://hpc.email', handle))
+    await expect(sendMail(faulty, background.ctx, { userId: user.id, role: 'user' }, req, [], 'https://hpc.email', handle))
       .rejects.toThrow('injected D1 failure');
     const row = await createDb(env).select().from(messages).where(eq(messages.subject, subject)).get();
     expect(row).toMatchObject({ direction: 'outbound', status: 'failed' });

@@ -1,23 +1,17 @@
 import {
-  createHostedDomainRequestSchema, hostedDnsRecordInputSchema, replaceHostedDomainMembersRequestSchema, transferHostedDomainRequestSchema,
+  batchCheckHostedDomainsRequestSchema, batchCreateHostedDomainsRequestSchema, createHostedDomainRequestSchema, hostedDnsRecordInputSchema, replaceHostedDomainMembersRequestSchema, transferHostedDomainRequestSchema,
   updateHostedDomainRequestSchema,
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { AppError } from '../lib/errors.js';
-import { clientIp, execCtx, ok, parseBody, parseId } from '../lib/http.js';
+import { clientIp, execCtx, ok, parseBody, parseId, parseRecordId } from '../lib/http.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
   checkHostedDomain, createHostedDomain, deleteHostedDomain, getHostedDomain, listHostedDomainMembers, listMyHostedDomains,
-  removeHostedDomainMember, replaceHostedDomainMembers, transferHostedDomain, updateHostedDomain,
+  reconnectHostedDomain, removeHostedDomainMember, replaceHostedDomainMembers, transferHostedDomain, updateHostedDomain,
 } from '../services/hosted-domain.js';
+import { checkHostedDomains, createHostedDomains } from '../services/hosted-domain-batch.js';
 import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../services/hosted-dns.js';
 import type { AppContext } from '../types.js';
-
-/** Cloudflare 记录 ID 为 32 位十六进制，格式不对按记录不存在处理 */
-function parseRecordId(value: string | undefined): string {
-  if (!value || !/^[0-9a-f]{32}$/.test(value)) throw new AppError('not_found', '解析记录不存在');
-  return value;
-}
 
 /** 托管域名（JWT）：所有者与管理员管理，成员只读并可退出共享；没有权限的域名一律 404 */
 const app = new Hono<AppContext>();
@@ -30,9 +24,24 @@ app.post('/', async (c) => {
   return ok(c, await createHostedDomain(c.env, c.get('user')!, req.domain, execCtx(c), clientIp(c)), 201);
 });
 
+/** 批量添加与批量立即检测：逐项独立结果，单项规则与单个接口相同 */
+app.post('/batch', async (c) => {
+  const req = await parseBody(c, batchCreateHostedDomainsRequestSchema);
+  return ok(c, await createHostedDomains(c.env, c.get('user')!, req.domains, execCtx(c), clientIp(c)));
+});
+
+app.post('/batch-check', async (c) => {
+  const req = await parseBody(c, batchCheckHostedDomainsRequestSchema);
+  return ok(c, await checkHostedDomains(c.env, c.get('user')!, req.ids));
+});
+
 app.get('/:id', async (c) => ok(c, await getHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')))));
 
-app.post('/:id/check', async (c) => ok(c, await checkHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')))));
+app.post('/:id/check', async (c) => ok(c, await checkHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')), execCtx(c))));
+
+// 已迁走的域名重新接入：zone 仍在时复查 NS，已被删除时重建 zone 并分配新的名称服务器，地址与历史保留
+app.post('/:id/reconnect', async (c) =>
+  ok(c, await reconnectHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')), execCtx(c), clientIp(c))));
 
 app.put('/:id', async (c) => {
   const req = await parseBody(c, updateHostedDomainRequestSchema);

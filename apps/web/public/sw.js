@@ -7,7 +7,8 @@
  * - 缓存的外壳所引用的 /assets/ 文件必须都还在浏览器 HTTP 缓存里才使用它，否则改走网络：
  *   发版后旧文件已从服务器删除，HTTP 缓存又被清掉时，旧外壳只会得到一张白屏。
  *   旧外壳能启动时，之后缺失的 chunk 由页面的 chunk-reload 自动刷新一次换到新版本；
- *   刷新紧跟在上一次导航之后时，先等那次后台更新写入新外壳，避免刷新回同一个旧版本。
+ *   刷新紧跟在上一次导航之后时，先等那次后台更新写入新外壳，避免刷新回同一个旧版本；
+ *   最多等 PREVIOUS_UPDATE_WAIT_MS，弱网下上一次请求迟迟不返回时不让这次导航一直白屏。
  * - 修改本文件的缓存逻辑时同步递增 SHELL_CACHE 的版本号，activate 时清理旧版本缓存。
  *
  * 紧急关闭：把本文件整体替换为下面的内容并部署（/sw.js 为 no-cache，浏览器下次导航即取到新版本），
@@ -28,6 +29,8 @@ const SHELL_CACHE_PREFIX = 'hpc-shell-';
 const SHELL_KEY = '/';
 const BYPASS_EXACT = ['/api', '/v1', '/skill.md', '/llms.txt', '/sw.js'];
 const BYPASS_PREFIXES = ['/api/', '/v1/', '/assets/', '/references/', '/cdn-cgi/', '/.well-known/'];
+/** 导航等待上一次后台更新的上限：超时就按现有缓存或本次网络请求应答 */
+const PREVIOUS_UPDATE_WAIT_MS = 1_500;
 
 /** 是否由本 Worker 返回应用外壳：同源 GET 导航，且路径是前端路由 */
 function isShellNavigation(request, origin) {
@@ -114,7 +117,9 @@ self.addEventListener('fetch', (event) => {
   event.waitUntil(update);
   event.respondWith(
     (async () => {
-      if (previousUpdate) await previousUpdate;
+      if (previousUpdate) {
+        await Promise.race([previousUpdate, new Promise((resolve) => setTimeout(resolve, PREVIOUS_UPDATE_WAIT_MS))]);
+      }
       return (await cachedShell().catch(() => null)) || network;
     })(),
   );

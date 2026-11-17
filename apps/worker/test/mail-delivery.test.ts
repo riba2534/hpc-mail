@@ -1,18 +1,20 @@
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import PostalMime from 'postal-mime';
 import { createDb } from '../src/db/client.js';
 import { attachments, deliveryObjectLeases, idempotencyRecords, mailboxes, messages, users } from '../src/db/schema.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { beginIdempotentSend } from '../src/services/idempotency.js';
-import { sendMail } from '../src/services/outbound.js';
+import { finalWriteRetry, sendMail } from '../src/services/outbound.js';
 import { getMessageDetail, purgeMessages } from '../src/services/message.js';
 import { updateSettings } from '../src/services/setting.js';
 import { releaseMailbox } from '../src/services/mailbox.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
+import { BODY_PREVIEW_BYTES } from '../src/services/mail-body.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { createApp } from '../src/app.js';
+import { collectBackground } from './support/background.js';
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -43,6 +45,8 @@ function captureEnv() {
   });
   return { customEnv: { ...env, email: { send } } as any, send, captured };
 }
+
+const background = collectBackground();
 
 const cidMime = (to: string, subject: string) => [
   'From: Sender <sender@example.net>', `To: ${to}`, `Subject: ${subject}`, 'MIME-Version: 1.0',
@@ -136,7 +140,7 @@ describe('收发件功能与故障恢复', () => {
     const [source] = await createDb(env).insert(messages).values({ direction: 'inbound', address: 'functional-missing-forward@hpc.email', domain: 'hpc.email', status: 'received', subject: 'source' }).returning({ id: messages.id });
     await createDb(env).insert(attachments).values({ messageId: source!.id, r2Key: 'att/missing-functional-forward.bin', filename: 'important.bin', mimeType: 'application/octet-stream', size: 12 });
     const { customEnv, captured } = captureEnv();
-    await expect(sendMail(customEnv, { waitUntil: () => {} }, sender, {
+    await expect(sendMail(customEnv, background.ctx, sender, {
       from: { localPart: 'functional-missing-forward', domain: 'hpc.email' }, to: ['recipient@example.net'], cc: [], bcc: [], subject: 'functional-missing-forward', text: 'Important file attached', forwardAttachmentsFrom: source!.id,
     }, [], 'https://hpc.email')).rejects.toThrow('已丢失');
     expect(captured).toHaveLength(0);
@@ -153,7 +157,7 @@ describe('收发件功能与故障恢复', () => {
     }
     await createDb(env).insert(attachments).values(rows);
     const { customEnv, captured } = captureEnv();
-    await expect(sendMail(customEnv, { waitUntil: () => {} }, sender, {
+    await expect(sendMail(customEnv, background.ctx, sender, {
       from: { localPart: 'functional-forward-cap', domain: 'hpc.email' }, to: ['recipient@example.net'], cc: [], bcc: [], subject: 'functional-forward-cap', text: 'All original files plus a new file', forwardAttachmentsFrom: source!.id,
     }, [{ filename: 'new-file.txt', mimeType: 'text/plain', bytes: new TextEncoder().encode('new file'), contentId: '', disposition: 'attachment' }], 'https://hpc.email')).rejects.toThrow('合计最多');
     expect(captured).toHaveLength(0);
@@ -162,7 +166,7 @@ describe('收发件功能与故障恢复', () => {
   it('大内联图片转独立下载链接，并同步替换 HTML CID', async () => {
     const sender = await seedUser('functional-external-cid');
     const { customEnv, captured } = captureEnv();
-    await sendMail(customEnv, { waitUntil: () => {} }, sender, {
+    await sendMail(customEnv, background.ctx, sender, {
       from: { localPart: 'functional-external-cid', domain: 'hpc.email' }, to: ['recipient@example.net'], cc: [], bcc: [], subject: 'functional-external-cid', html: '<p>Inline image</p><img src="cid:large-image">',
     }, [{ filename: 'large.png', mimeType: 'image/png', bytes: new Uint8Array(4 * 1024 * 1024), contentId: 'large-image', disposition: 'inline' }], 'https://hpc.email');
     expect(captured).toHaveLength(1);
@@ -177,7 +181,7 @@ describe('收发件功能与故障恢复', () => {
     const references = Array.from({ length: 20 }, (_, i) => `<${String(i).padStart(4, '0')}-${'a'.repeat(40)}@example.net>`).join(' ');
     const [source] = await createDb(env).insert(messages).values({ direction: 'inbound', address: 'functional-long-headers@hpc.email', domain: 'hpc.email', status: 'received', subject: 'Original', messageId: '<original@example.net>', references }).returning({ id: messages.id });
     const { customEnv, captured } = captureEnv();
-    await sendMail(customEnv, { waitUntil: () => {} }, sender, {
+    await sendMail(customEnv, background.ctx, sender, {
       from: { localPart: 'functional-long-headers', domain: 'hpc.email' }, to: ['recipient@example.net'], cc: [], bcc: [], subject: '中'.repeat(300), text: 'reply body', replyToMessageId: source!.id,
     }, [], 'https://hpc.email');
     const headerLines = captured[0]!.raw.split('\r\n\r\n')[0]!.split('\r\n');
@@ -192,7 +196,7 @@ describe('收发件功能与故障恢复', () => {
     const { customEnv, captured } = captureEnv();
     const body = '中文正文和🙂表情'.repeat(200);
     const bytes = new TextEncoder().encode('actual attachment content');
-    await sendMail(customEnv, { waitUntil: () => {} }, sender, {
+    await sendMail(customEnv, background.ctx, sender, {
       from: { localPart: 'functional-thread-good', domain: 'hpc.email' }, to: ['recipient@example.net'], cc: [], bcc: [], subject: 'Re: Original', text: body, replyToMessageId: source!.id,
     }, [{ filename: 'test.txt', mimeType: 'text/plain', bytes, contentId: '', disposition: 'attachment' }], 'https://hpc.email');
     expect(captured[0]!.mail.inReplyTo).toBe('<original-good@example.net>');
@@ -205,7 +209,7 @@ describe('收发件功能与故障恢复', () => {
   it('90 天外部附件链接在发件人永久删除邮件后仍可下载', async () => {
     const sender = await seedUser('functional-link-lifetime');
     const { customEnv, captured } = captureEnv();
-    const summary = await sendMail(customEnv, { waitUntil: () => {} }, sender, {
+    const summary = await sendMail(customEnv, background.ctx, sender, {
       from: { localPart: 'functional-link-lifetime', domain: 'hpc.email' }, to: ['recipient@example.net'], cc: [], bcc: [], subject: 'functional-link-lifetime', text: 'Attached file',
     }, [{ filename: 'large.bin', mimeType: 'application/octet-stream', bytes: new Uint8Array(4 * 1024 * 1024), contentId: '', disposition: 'attachment' }], 'https://hpc.email');
     const url = captured[0]!.mail.text.match(/https:\/\/hpc\.email\/api\/attachments\/\d+\?exp=\d+&sig=[^\s]+/)![0];
@@ -239,7 +243,8 @@ describe('收发件功能与故障恢复', () => {
     await Promise.all([waitOnExecutionContext(ctx1), waitOnExecutionContext(ctx2)]);
     const rows = await createDb(env).select().from(messages).where(eq(messages.subject, 'functional-inbound-normal')).all();
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.bodyText.length).toBe(64 * 1024);
+    expect(rows[0]!.bodyText.length).toBe(BODY_PREVIEW_BYTES);
+    expect(rows[0]!.bodyHtml).toBe('');
     expect(rows[0]!.rawR2Key).not.toBeNull();
     expect(rows[0]!.bodyR2Key).not.toBeNull();
     expect((await getMessageDetail(env, viewer, rows[0]!.id)).bodyText === parsed.text).toBe(true);
@@ -259,14 +264,15 @@ describe('收发件功能与故障恢复', () => {
       if (property === 'prepare') return (query: string) => {
         if (failures === 0 && query.startsWith('update "messages"') && query.includes('"recipient_outcomes"')) {
           failures++;
-          throw new Error('injected status failure');
+          // 执行时失败（与线上 D1 报错同一时机）
+          return target.prepare('SELECT * FROM injected_status_failure');
         }
         return target.prepare(query);
       };
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    const summary = await sendMail({ ...env, db: faultDb }, { waitUntil: () => {} }, sender, req, [], 'https://hpc.email', owner.handle);
+    const summary = await sendMail({ ...env, db: faultDb }, background.ctx, sender, req, [], 'https://hpc.email', owner.handle);
     expect(summary.status).toBe('delivered');
     expect(summary.recipientOutcomes).toEqual([{ address: 'status-receiver@another.test', status: 'delivered' }]);
     expect(failures).toBe(1);
@@ -278,6 +284,10 @@ describe('收发件功能与故障恢复', () => {
   });
 
   it('所有结果回填均失败时返回真实投递结果，pending 幂等键阻止重复发送', async () => {
+    // 后台退避重试同样失败；缩短间隔，免得重试在用例结束后还挂着
+    const delays = finalWriteRetry.delaysMs;
+    finalWriteRetry.delaysMs = [1, 1];
+    onTestFinished(() => { finalWriteRetry.delaysMs = delays; });
     const sender = await seedUser('functional-status-unknown');
     const req = { from: { localPart: 'functional-status-unknown', domain: 'hpc.email' },
       to: ['unknown@example.net'], cc: [], bcc: [], subject: 'status-unknown', text: 'body' };
@@ -287,14 +297,20 @@ describe('收发件功能与故障恢复', () => {
     const { customEnv, captured } = captureEnv();
     const db = new Proxy(env.db, { get(target, property) {
       if (property === 'prepare') return (query: string) => {
-        if (query.startsWith('update "messages"') && query.includes('"recipient_outcomes"')) throw new Error('persistent D1 failure');
+        // 执行时失败（与线上 D1 报错同一时机）
+        if (query.startsWith('update "messages"') && query.includes('"recipient_outcomes"')) return target.prepare('SELECT * FROM persistent_d1_failure');
         return target.prepare(query);
       };
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    const summary = await sendMail({ ...customEnv, db }, { waitUntil: () => {} }, sender, req, [], 'https://hpc.email', owner.handle);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+    const summary = await sendMail({ ...customEnv, db }, background.ctx, sender, req, [], 'https://hpc.email', owner.handle);
     expect(summary.status).toBe('sent');
+    // 后台退避重试在用例内跑完：放弃后留给 cron 标 unknown，不能拖到拆环境时才写日志
+    await background.settle();
+    expect(errors).toHaveBeenCalledWith(expect.stringContaining('最终结果回填放弃'));
     expect(captured).toHaveLength(1);
     const row = await createDb(env).select().from(messages).where(eq(messages.id, summary.id)).get();
     expect(row?.status).toBe('pending');
@@ -307,10 +323,10 @@ describe('收发件功能与故障恢复', () => {
     const { customEnv, captured } = captureEnv();
     const realSend = customEnv.email.send;
     customEnv.email.send = async (mail: any) => {
-      if (mail.to === 'failed@example.net') throw new Error('rejected');
+      if (mail.to === 'failed@example.net') throw Object.assign(new Error('rejected'), { code: 'E_DELIVERY_FAILED' });
       return realSend(mail);
     };
-    const summary = await sendMail(customEnv, { waitUntil: () => {} }, sender, {
+    const summary = await sendMail(customEnv, background.ctx, sender, {
       from: { localPart: 'functional-partial', domain: 'hpc.email' }, to: ['good@example.net', 'failed@example.net'],
       cc: ['good@example.net'], bcc: ['local@another.test'], subject: 'partial-outcomes', text: 'body',
     }, [], 'https://hpc.email');
@@ -329,14 +345,14 @@ describe('收发件功能与故障恢复', () => {
     const sender = await seedUser('functional-body-limit');
     const req = { from: { localPart: 'functional-body-limit', domain: 'hpc.email' },
       to: ['body-receiver@another.test'], cc: [], bcc: [], subject: 'body-limit', text: '中'.repeat(400 * 1024) };
-    await expect(sendMail(env, { waitUntil: () => {} }, sender, req, [], 'https://hpc.email')).rejects.toThrow('1MB');
+    await expect(sendMail(env, background.ctx, sender, req, [], 'https://hpc.email')).rejects.toThrow('1MB');
     const text = '中🙂'.repeat(70 * 1024);
-    const summary = await sendMail(env, { waitUntil: () => {} }, sender, { ...req, text }, [], 'https://hpc.email');
+    const summary = await sendMail(env, background.ctx, sender, { ...req, text }, [], 'https://hpc.email');
     const rows = await createDb(env).select().from(messages).where(eq(messages.subject, 'body-limit')).all();
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map(row => row.bodyR2Key)).size).toBe(2);
     for (const row of rows) {
-      expect(new TextEncoder().encode(row.bodyText).length).toBeLessThanOrEqual(64 * 1024);
+      expect(new TextEncoder().encode(row.bodyText).length).toBeLessThanOrEqual(BODY_PREVIEW_BYTES);
       expect(row.bodyText).not.toContain('�');
       expect(JSON.parse(await (await env.r2.get(row.bodyR2Key!))!.text()).text).toBe(text);
     }
@@ -358,6 +374,7 @@ describe('收发件功能与故障恢复', () => {
     } });
     const ctx = createExecutionContext();
     await expect(handleInbound(incoming(`${name}@hpc.email`, raw), { ...env, r2 }, ctx)).rejects.toThrow('injected R2 outage');
+    await waitOnExecutionContext(ctx);
     expect(await createDb(env).select().from(messages).where(eq(messages.subject, name)).all()).toHaveLength(0);
     const restored = createExecutionContext();
     await handleInbound(incoming(`${name}@hpc.email`, raw), env, restored);
@@ -382,7 +399,9 @@ describe('收发件功能与故障恢复', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    await expect(handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), { ...env, r2 }, createExecutionContext())).rejects.toThrow('attachment R2 unavailable');
+    const failed = createExecutionContext();
+    await expect(handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), { ...env, r2 }, failed)).rejects.toThrow('attachment R2 unavailable');
+    await waitOnExecutionContext(failed);
     const pending = await createDb(env).select().from(messages).where(eq(messages.subject, 'functional-repair-attachment')).get();
     expect(pending?.status).toBe('pending');
     const ctx1 = createExecutionContext(), ctx2 = createExecutionContext();
@@ -426,10 +445,12 @@ describe('收发件功能与故障恢复', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    await expect(sendMail({ ...env, db }, { waitUntil: () => {} }, sender, {
+    // 全部失败时 sendMail 返回 failed 结果，由路由转成 422
+    const summary = await sendMail({ ...env, db }, background.ctx, sender, {
       from: { localPart: 'functional-atomic-internal', domain: 'hpc.email' },
       to: ['atomic-receiver@another.test'], cc: [], bcc: [], subject: 'atomic-internal', text: 'body',
-    }, [{ filename: 'important.txt', mimeType: 'text/plain', contentId: '', disposition: 'attachment', bytes: new TextEncoder().encode('important') }], 'https://hpc.email')).rejects.toThrow();
+    }, [{ filename: 'important.txt', mimeType: 'text/plain', contentId: '', disposition: 'attachment', bytes: new TextEncoder().encode('important') }], 'https://hpc.email');
+    expect(summary.status).toBe('failed');
     const rows = await createDb(env).select().from(messages).where(eq(messages.subject, 'atomic-internal')).all();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.direction).toBe('outbound');
@@ -482,12 +503,12 @@ describe('收发件功能与故障恢复', () => {
     const { customEnv, captured } = captureEnv();
     const req = { from: { localPart: 'functional-resend-cid', domain: 'hpc.email' },
       to: ['original@example.net'], cc: [], bcc: [], subject: 'resend-cid', html: '<img src="cid:resend-image">' };
-    const original = await sendMail(customEnv, { waitUntil: () => {} }, sender, req, [{
+    const original = await sendMail(customEnv, background.ctx, sender, req, [{
       filename: 'inline.png', mimeType: 'image/png', contentId: 'resend-image', disposition: 'inline', bytes: new TextEncoder().encode('picture'),
     }], 'https://hpc.email');
     const detail = await getMessageDetail(env, sender, original.id);
     expect(detail.bodyHtml).toContain('/api/attachments/');
-    await sendMail(customEnv, { waitUntil: () => {} }, sender, { ...req,
+    await sendMail(customEnv, background.ctx, sender, { ...req,
       to: ['retry@example.net'], html: detail.bodyHtml, forwardAttachmentsFrom: original.id,
     }, [], 'https://hpc.email');
     expect(captured[1]!.mail.html).toBe('<img src="cid:resend-image">');
@@ -528,7 +549,7 @@ describe('收发件功能与故障恢复', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    const summary = await sendMail({ ...env, db }, { waitUntil: () => {} }, sender, {
+    const summary = await sendMail({ ...env, db }, background.ctx, sender, {
       from: { localPart: name, domain: 'hpc.email' }, to: [`target-${mode}@another.test`],
       cc: [], bcc: [], subject: name, text: 'body',
     }, [{ filename: 'proof.txt', mimeType: 'text/plain', contentId: '', disposition: 'attachment', bytes: new TextEncoder().encode('durable bytes') }], 'https://hpc.email');
@@ -563,7 +584,7 @@ describe('收发件功能与故障恢复', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    const summary = await sendMail({ ...env, r2 }, { waitUntil: () => {} }, sender, {
+    const summary = await sendMail({ ...env, r2 }, background.ctx, sender, {
       from: { localPart: 'functional-late-attachment', domain: 'hpc.email' },
       to: ['late-target@another.test'], cc: [], bcc: [], subject: 'functional-late-attachment', text: 'body',
     }, [{ filename: 'late.txt', mimeType: 'text/plain', contentId: '', disposition: 'attachment', bytes: new TextEncoder().encode('kept until delivered') }], 'https://hpc.email');
@@ -595,7 +616,7 @@ describe('收发件功能与故障恢复', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    const summary = await sendMail({ ...customEnv, db }, { waitUntil: () => {} }, sender, {
+    const summary = await sendMail({ ...customEnv, db }, background.ctx, sender, {
       from: { localPart: 'functional-lease-release-fault', domain: 'hpc.email' },
       to: ['lease-receiver@example.net'], cc: [], bcc: [], subject: 'functional-lease-release-fault', text: 'body',
     }, [{ filename: 'fault.txt', mimeType: 'text/plain', contentId: '', disposition: 'attachment', bytes: new TextEncoder().encode('sent bytes') }], 'https://hpc.email');

@@ -17,9 +17,12 @@ import { NotificationDeliveryError } from './notification-http.js';
 import { sendPushDeerNotification } from './pushdeer.js';
 import { dayWindow } from './rate-counter.js';
 import { sendNotifyWebhook, type WebhookMailPayload } from './webhook-notify.js';
-import { getJson } from './storage.js';
+import { mailReceivedDeliveriesStatement, processWebhookDeliveries } from './webhooks.js';
+import { readMailBody } from './mail-body.js';
 
 type Channel = typeof notificationJobs.$inferSelect.channel;
+/** 邮箱转发实际走的通道：native 原生 forward()、relay 中转；跳过或失败前未选定通道为空串 */
+export type ForwardMode = typeof notificationJobs.$inferSelect.forwardMode;
 type DeliveryStatus = typeof notificationJobs.$inferSelect.status;
 type Job = typeof notificationJobs.$inferSelect;
 export interface MailNotificationInput {
@@ -55,6 +58,7 @@ export async function enqueueMailNotifications(
   input: MailNotificationInput,
 ): Promise<number[]> {
   const ids: number[] = [];
+  const webhookIds: number[] = [];
   try {
     const ownerIds = [...new Set(input.ownerIds ?? await resolveNotifyOwnerIds(env, input.message.address))];
     // 单个用户偏好读取失败不应压制其他管理员的正常通知。
@@ -96,6 +100,8 @@ export async function enqueueMailNotifications(
         .onConflictDoNothing({ target: notificationJobs.dedupeKey }).returning({ id: notificationJobs.id })));
     }
     const insertCount = statements.length;
+    // Webhook v2 的 mail.received 投递在同一事务里入队（不多一次往返），载荷在首次投递时构造
+    if (ownerIds.length) statements.push(mailReceivedDeliveriesStatement(env, ownerIds, input.message, now.getTime()));
     // 只有全部偏好读取和任务写入成功才标记；部分任务可由 cron 按快照补齐，已有 dedupe 不重复发。
     if (prefs.every(result => result.status === 'fulfilled')) {
       statements.push(d1Statement(env, db.update(messages).set({ notificationsQueuedAt: now })
@@ -104,6 +110,7 @@ export async function enqueueMailNotifications(
     if (statements.length) {
       const results = await env.db.batch<{ id: number }>(statements);
       for (const result of results.slice(0, insertCount)) ids.push(...result.results.map(row => Number(row.id)));
+      if (ownerIds.length) webhookIds.push(...(results[insertCount]?.results ?? []).map(row => Number(row.id)));
     }
   } catch {
     console.error('邮件通知任务保存失败（邮件已入库）');
@@ -111,6 +118,9 @@ export async function enqueueMailNotifications(
   if (ctx && ids.length) {
     ctx.waitUntil(processNotificationJobs(env, { jobIds: ids, owners: input.owners })
       .catch(() => console.error('通知队列处理失败')));
+  }
+  if (ctx && webhookIds.length) {
+    ctx.waitUntil(processWebhookDeliveries(env, { ids: webhookIds }).catch(() => console.error('Webhook 投递处理失败')));
   }
   return ids;
 }
@@ -141,13 +151,7 @@ export async function repairUnqueuedNotifications(env: Env, options: { limit?: n
       const body = await env.db.prepare('SELECT body_text, body_html, body_r2_key FROM messages WHERE id = ?')
         .bind(row.id).first<{ body_text: string; body_html: string; body_r2_key: string | null }>();
       if (!body) continue;
-      let text = body.body_text;
-      let html = body.body_html;
-      if (body.body_r2_key) {
-        const full = await getJson<{ text?: string; html?: string }>(env, body.body_r2_key);
-        if (typeof full?.text === 'string') text = full.text;
-        if (typeof full?.html === 'string') html = full.html;
-      }
+      const { bodyText: text, bodyHtml: html } = await readMailBody(env, { bodyText: body.body_text, bodyHtml: body.body_html, bodyR2Key: body.body_r2_key });
       queued += (await enqueueMailNotifications(env, null, { ownerIds: ownerIds as number[],
         message: { id: row.id, address: row.address, fromAddress: row.from_address, fromName: row.from_name,
           subject: row.subject, verificationCode: row.verification_code, verificationLink: row.verification_link ?? '', preview: row.preview,
@@ -276,18 +280,21 @@ export async function processNotificationJobs(
 export async function recordDeliveryResult(env: Env, input: {
   userId: number; messageId: number | null; channel: Channel; target?: string;
   status: 'succeeded' | 'failed' | 'skipped' | 'unknown'; error?: string; httpStatus?: number | null;
+  forwardMode?: ForwardMode;
 }): Promise<void> {
   const now = new Date();
   const target = input.target || '';
+  const forwardMode = input.forwardMode ?? '';
   const dedupeKey = input.messageId === null ? `test:${crypto.randomUUID()}` : `mail:${input.messageId}:${input.userId}:${input.channel}:${target}`;
   try {
     await createDb(env).insert(notificationJobs).values({
       userId: input.userId, messageId: input.messageId, channel: input.channel, target,
       payload: {}, status: input.status, attempts: 1, maxAttempts: 1, nextAttemptAt: now,
       createdAt: now, updatedAt: now, lastAttemptAt: now, lastError: (input.error || '').slice(0, 300),
-      lastHttpStatus: input.httpStatus ?? null, dedupeKey,
+      lastHttpStatus: input.httpStatus ?? null, dedupeKey, forwardMode,
     }).onConflictDoUpdate({ target: notificationJobs.dedupeKey, set: {
       status: input.status, lastError: (input.error || '').slice(0, 300), lastHttpStatus: input.httpStatus ?? null, updatedAt: now,
+      forwardMode,
     } });
   } catch {
     console.error('通知/转发结果保存失败');

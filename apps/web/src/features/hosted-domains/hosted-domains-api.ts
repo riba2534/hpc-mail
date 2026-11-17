@@ -7,6 +7,7 @@ import type {
   HostedDomainMember,
   HostedDomainsHealth,
   HostedDomainTransferResult,
+  Page,
   ReplaceHostedDomainMembersRequest,
   TransferHostedDomainRequest,
   UpdateHostedDomainRequest,
@@ -24,6 +25,9 @@ export const hostedDomainApi = {
   get: (id: number) => api.get<HostedDomain>(`/hosted-domains/${id}`),
   /** 立即向 Cloudflare 检测并推进开通 */
   check: (id: number) => api.post<HostedDomain>(`/hosted-domains/${id}/check`, undefined, { timeoutMs: CHECK_TIMEOUT_MS }),
+  /** NS 已改走的域名重新接入：zone 已被删除时重建并分配新的名称服务器 */
+  reconnect: (id: number) =>
+    api.post<HostedDomain>(`/hosted-domains/${id}/reconnect`, undefined, { timeoutMs: CHECK_TIMEOUT_MS }),
   update: (id: number, body: UpdateHostedDomainRequest) =>
     api.put<HostedDomain, UpdateHostedDomainRequest>(`/hosted-domains/${id}`, body),
   remove: (id: number) => api.delete<{ success: boolean }>(`/hosted-domains/${id}`),
@@ -47,9 +51,12 @@ export const hostedDomainApi = {
     api.delete<{ success: boolean }>(`/hosted-domains/${id}/dns-records/${recordId}`),
 };
 
+export type AdminHostedDomainFilters = Pick<AdminHostedDomainsQuery, 'status' | 'q'>;
+
 export const adminHostedDomainApi = {
-  list: (query: AdminHostedDomainsQuery) =>
-    api.get<HostedDomain[]>('/admin/hosted-domains', { query: { status: query.status, q: query.q } }),
+  /** 带 limit 即返回 Page（按 id 倒序）；cursor 为空表示首页 */
+  list: (filters: AdminHostedDomainFilters, cursor: string, limit: number) =>
+    api.get<Page<HostedDomain>>('/admin/hosted-domains', { query: { status: filters.status, q: filters.q, cursor, limit } }),
   suspend: (id: number) => api.post<HostedDomain>(`/admin/hosted-domains/${id}/suspend`),
   resume: (id: number) => api.post<HostedDomain>(`/admin/hosted-domains/${id}/resume`),
   health: () => api.get<HostedDomainsHealth>('/admin/hosted-domains/health'),

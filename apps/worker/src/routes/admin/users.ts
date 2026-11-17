@@ -10,7 +10,7 @@ const app = new Hono<AppContext>();
 app.use('*', requireAuth, requireAdmin);
 
 app.get('/', async (c) => ok(c, await listUsers(c.env)));
-app.get('/search', async (c) => ok(c, await searchUsers(c.env, parseQuery(c, searchUsersQuerySchema))));
+app.get('/search', async (c) => ok(c, await searchUsers(c.env, parseQuery(c, searchUsersQuerySchema), { includeRole: true })));
 
 app.post('/', async (c) => {
   const acting = c.get('user')!;
@@ -24,7 +24,7 @@ app.put('/:id', async (c) => {
   const acting = c.get('user')!;
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, updateUserRequestSchema);
-  const { user: updated, revokedApiKeys } = await updateUser(c.env, acting.id, id, req, execCtx(c));
+  const { user: updated, revokedApiKeys } = await updateUser(c.env, acting.id, id, req);
   const changes: string[] = [];
   if (req.status) changes.push(req.status === 'disabled' ? '禁用' : '启用');
   if (req.role) changes.push(`角色→${req.role}`);

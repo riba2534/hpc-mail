@@ -1,5 +1,7 @@
 /** RFC 6238 TOTP（SHA-1、6 位、30s 步长）+ base32 + 恢复码，纯 Web Crypto 实现 */
 
+import { bytesToHex, sha256Hex } from './crypto.js';
+
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const PERIOD = 30;
 const DIGITS = 6;
@@ -76,15 +78,23 @@ export async function generateCode(secret: string, counter: number): Promise<str
   return (bin % 10 ** DIGITS).toString().padStart(DIGITS, '0');
 }
 
-/** 校验 TOTP 码：容忍 ±window 个时间步（默认 ±1，即前后 30s） */
-export async function verifyTotp(secret: string, token: string, window = 1): Promise<boolean> {
+/**
+ * 校验 TOTP 码并返回命中的时间步（unix 秒 / 30）：容忍 ±window 个时间步（默认 ±1，即前后 30s），不命中返回 null。
+ * 防重放由调用方用返回的时间步与 users.totp_last_step 比较（同一步及更早的码不再接受）。
+ */
+export async function matchTotpStep(secret: string, token: string, window = 1): Promise<number | null> {
   const normalized = token.replace(/\s/g, '');
-  if (!/^\d{6}$/.test(normalized)) return false;
+  if (!/^\d{6}$/.test(normalized)) return null;
   const counter = Math.floor(Date.now() / 1000 / PERIOD);
   for (let w = -window; w <= window; w++) {
-    if ((await generateCode(secret, counter + w)) === normalized) return true;
+    if ((await generateCode(secret, counter + w)) === normalized) return counter + w;
   }
-  return false;
+  return null;
+}
+
+/** 只判断码是否有效，不记录时间步（不防重放） */
+export async function verifyTotp(secret: string, token: string, window = 1): Promise<boolean> {
+  return (await matchTotpStep(secret, token, window)) !== null;
 }
 
 /** 生成 otpauth:// URI 供 Authenticator 扫码 */
@@ -109,17 +119,12 @@ export async function generateRecoveryCodes(
   for (let i = 0; i < count; i++) {
     const bytes = new Uint8Array(5);
     crypto.getRandomValues(bytes);
-    const code = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    const code = bytesToHex(bytes);
     const formatted = `${code.slice(0, 5)}-${code.slice(5)}`;
     plain.push(formatted);
     hashes.push(await sha256Hex(formatted));
   }
   return { plain, hashes };
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export { sha256Hex as hashRecoveryCode };

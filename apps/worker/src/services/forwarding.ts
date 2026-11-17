@@ -1,16 +1,19 @@
-import { EXTERNAL_MESSAGE_MAX_BYTES, type UserNotifyPrefs } from '@hpc-mail/shared';
+import { EXTERNAL_MESSAGE_MAX_BYTES, type Settings, type UserNotifyPrefs } from '@hpc-mail/shared';
 import { eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { attachments } from '../db/schema.js';
-import { hmacSha256Base64 } from '../lib/crypto.js';
+import { deriveSubkey, hmacSha256Base64 } from '../lib/crypto.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
-import { convertHtmlToText, type MailText } from '../lib/text.js';
+import { convertHtmlToText, escapeHtml, type MailText } from '../lib/text.js';
 import type { Env } from '../types.js';
-import { counterResult, counterStatement, dayWindow } from './rate-counter.js';
+import { dayWindow, releaseCounters, reserveCounters, type CounterLimit } from './rate-counter.js';
 import { retainExternalAttachments } from './external-attachment.js';
 import { injectAttachmentLinks } from './attachment-links.js';
-import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT, recordDeliveryResult } from './notification-jobs.js';
+import { saveDeliveryRefs } from './delivery-refs.js';
+import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT, recordDeliveryResult, type ForwardMode } from './notification-jobs.js';
+import type { NotifyOwner } from './notify-prefs.js';
+import { getSettings } from './setting.js';
 
 export interface ForwardAttachment {
   content: Uint8Array;
@@ -20,14 +23,6 @@ export interface ForwardAttachment {
   disposition: string;
 }
 
-const HTML_ESCAPES: Record<string, string> = {
-  '&': '&amp;',
-  '<': '&lt;',
-  '>': '&gt;',
-  '"': '&quot;',
-  "'": '&#39;',
-};
-const escapeHtml = (s: string): string => s.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
 const RELAY_TEXT_TRUNCATED = '（正文过长，纯文本版本只包含开头部分，完整内容请查看 HTML 版本）';
 
 export interface ForwardMail {
@@ -46,16 +41,24 @@ export interface ForwardMail {
   mailText?: MailText;
 }
 
+/** 中转信的防环头：用 jwt_secret 派生的中转子密钥计算 */
 export async function relayMarker(env: Env): Promise<string> {
-  return hmacSha256Base64(new TextEncoder().encode(env.jwt_secret), 'hpc-mail-relay:v1');
+  return hmacSha256Base64(new TextEncoder().encode(await deriveSubkey(env.jwt_secret, 'relay')), 'hpc-mail-relay:v1');
+}
+
+/** 收到的信是否是本站中转出去的：新旧两种防环头都认（改用子密钥前发出、仍在投递途中的中转信） */
+export async function isOwnRelay(env: Env, header: string | null | undefined): Promise<boolean> {
+  if (!header) return false;
+  if (header === await relayMarker(env)) return true;
+  return header === await hmacSha256Base64(new TextEncoder().encode(env.jwt_secret), 'hpc-mail-relay:v1');
 }
 
 /**
  * 中转转发：原生 forward() 仅对 Email Routing 已验证 destination 生效，目标未验证时
  * 降级为 send_email binding 以 no-reply@收件域名 重新打包发送——保留原始标题/正文/附件，
- * Reply-To 指回原发件人，正文顶部加转发元信息块。
+ * Reply-To 指回原发件人，正文顶部加转发元信息块。返回 send() 给出的 Cloudflare 消息 ID（投递回执据此关联）。
  */
-async function relayForward(env: Env, target: string, mail: ForwardMail): Promise<void> {
+async function relayForward(env: Env, target: string, mail: ForwardMail): Promise<string | null> {
   // 动态 import：`cloudflare:email`/`mimetext` 静态加载会让 vitest 的 workerd 崩（同 outbound.ts）
   const [{ EmailMessage }, { createMimeMessage }] = await Promise.all([
     import('cloudflare:email'),
@@ -101,6 +104,8 @@ async function relayForward(env: Env, target: string, mail: ForwardMail): Promis
   msg.setRecipient(target);
   msg.setSubject(mail.subject || '(无主题)');
   msg.setHeader('X-HPC-Mail-Relay', await relayMarker(env));
+  // RFC 3834：自动转发的信，收件方不应再自动回复（假期回复、退信机器人）
+  msg.setHeader('Auto-Submitted', 'auto-forwarded');
   const replies = mail.replyTo.length ? mail.replyTo : [mail.fromAddress].filter(Boolean);
   msg.addMessage({
     contentType: 'text/plain',
@@ -136,58 +141,140 @@ async function relayForward(env: Env, target: string, mail: ForwardMail): Promis
   // mimetext 的 Reply-To Setter 只允许单个 Mailbox；最终原文添加完整地址列表。
   const raw = msg.asRaw();
   const replyHeader = replies.length ? `Reply-To: ${replies.map(normalizeEmail).join(', ')}\r\n` : '';
-  await env.email.send(new EmailMessage(sender, target, foldMimeHeaders(replyHeader + raw)));
+  return (await env.email.send(new EmailMessage(sender, target, foldMimeHeaders(replyHeader + raw))))?.messageId || null;
 }
 
-/** 原生收件与站内互投使用同一归属偏好、限额及环路保护。 */
+/** 中转转发的日计数：全站一格（subject `instance`），未认领地址的来信另共用一格（subject `unclaimed`），按天窗口 */
+export const FORWARD_RELAY_SCOPE = 'fwd-relay';
+/** 已认领地址的中转按归属人日计数（subject 为用户 id） */
+export const FORWARD_RELAY_USER_SCOPE = 'fwd-relay-user';
+
+interface Forwarders {
+  list: { userId: number; prefs: UserNotifyPrefs }[];
+  /** 来信时地址未被认领（归属人是全体管理员） */
+  unclaimed: boolean;
+}
+
+/**
+ * 开启转发且仍启用的归属人（owners 为 loadNotifyOwners 读出的状态与偏好），以及来信时地址是否未认领。
+ * 有人开启转发时才查一次地址当前的认领人（在 waitUntil 里，不在收件 Ack 前）。已停用的归属人原生与中转都不转发。
+ * 已认领地址的归属快照只有认领人一个；快照里有多人（全体管理员），或唯一那人不是当前认领人，按未认领计。
+ */
+async function loadForwarders(env: Env, mail: ForwardMail, owners: Map<number, NotifyOwner>): Promise<Forwarders> {
+  const list = mail.ownerIds.flatMap((userId) => {
+    const owner = owners.get(userId);
+    return owner?.active && owner.prefs.forward.enabled ? [{ userId, prefs: owner.prefs }] : [];
+  });
+  if (!list.length) return { list: [], unclaimed: false };
+  const claim = await env.db.prepare('SELECT user_id AS id FROM mailboxes WHERE address = ?1').bind(mail.toAddress).first<{ id: number }>();
+  const unclaimed = !(mail.ownerIds.length === 1 && claim !== null && Number(claim.id) === mail.ownerIds[0]);
+  return { list, unclaimed };
+}
+
+type RelayQuota = Pick<Settings['quota'], 'relayDaily' | 'relayPerUserDaily' | 'relayUnclaimedDaily'>;
+
+/**
+ * 中转额度：全站一格，再加来信地址那一格——已认领地址计在认领人名下；未认领地址（归全体管理员）共用
+ * `unclaimed` 一格：catch-all 谁都能灌信，不能按管理员人数叠加。返回跳过原因（有额度时为空串）
+ * 与占到的格子（中转失败时退还）。
+ */
+async function reserveRelay(
+  env: Env, window: number, forwarders: Forwarders, ownerId: number, quota: RelayQuota,
+): Promise<{ skipped: string; taken: CounterLimit[] }> {
+  const site: CounterLimit = { scope: FORWARD_RELAY_SCOPE, subject: 'instance', window, limit: quota.relayDaily };
+  const own: CounterLimit = forwarders.unclaimed
+    ? { scope: FORWARD_RELAY_SCOPE, subject: 'unclaimed', window, limit: quota.relayUnclaimedDaily }
+    : { scope: FORWARD_RELAY_USER_SCOPE, subject: String(ownerId), window, limit: quota.relayPerUserDaily };
+  const [siteFull, ownFull] = await reserveCounters(env, [site, own]);
+  if (siteFull) return { skipped: '全站今日中转转发额度已用尽', taken: [] };
+  if (ownFull) return { skipped: forwarders.unclaimed ? '未认领地址今日中转转发额度已用尽' : '今日中转转发额度已用尽', taken: [] };
+  return { skipped: '', taken: [site, own] };
+}
+
+/** 退还没用上的额度；退还失败只记日志，不改变这次转发的结果 */
+async function releaseQuota(env: Env, items: CounterLimit[]): Promise<void> {
+  try {
+    await releaseCounters(env, items);
+  } catch (error) {
+    console.error('转发额度退还失败:', error);
+  }
+}
+
+/**
+ * 原生收件与站内互投使用同一归属偏好、限额及环路保护。
+ * 每个目标先占域名与目标两个日计数（已满不再累加），再试原生 forward()；原生失败才走中转并占中转额度。
+ * 中转因额度跳过时退还域名与目标计数（这次什么也没发出去）；中转抛错时退还中转额度。
+ */
 export async function forwardReceivedMail(
   env: Env,
   mail: ForwardMail,
-  prefs: UserNotifyPrefs[],
+  owners: Map<number, NotifyOwner>,
   native?: ForwardableEmailMessage,
 ): Promise<void> {
-  if (native?.headers.get('x-hpc-mail-relay') === await relayMarker(env)) return;
-  const ownersByTarget = new Map<string, number[]>();
-  prefs.forEach((pref, index) => {
-    if (!pref.forward.enabled) return;
-    for (const rawTarget of pref.forward.addresses) {
+  if (await isOwnRelay(env, native?.headers.get('x-hpc-mail-relay'))) return;
+  const forwarders = await loadForwarders(env, mail, owners);
+  const ownersByTarget = new Map<string, Set<number>>();
+  for (const { userId, prefs } of forwarders.list) {
+    for (const rawTarget of prefs.forward.addresses) {
       const target = normalizeEmail(rawTarget);
       if (!target || target === mail.toAddress) continue;
-      const owners = ownersByTarget.get(target) ?? [];
-      if (mail.ownerIds[index] !== undefined) owners.push(mail.ownerIds[index]!);
-      ownersByTarget.set(target, owners);
+      ownersByTarget.set(target, (ownersByTarget.get(target) ?? new Set()).add(userId));
     }
-  });
+  }
   const window = dayWindow();
-  for (const [target, owners] of ownersByTarget) {
+  let quota: Promise<RelayQuota> | undefined;
+  for (const [target, owned] of ownersByTarget) {
+    const userIds = [...owned];
     let status: 'succeeded' | 'failed' | 'skipped' = 'succeeded';
     let detail = '';
+    let forwardMode: ForwardMode = '';
+    let providerMessageId: string | null = null;
     try {
-      // 域名与目标两个日计数合成一个 D1 往返
-      const [domainUsage, targetUsage] = (await env.db.batch([
-        counterStatement(env, 'fwd-domain', mail.domain, window),
-        counterStatement(env, 'fwd-target', target, window),
-      ])).map(result => counterResult(result)?.count ?? 1) as [number, number];
-      if (domainUsage > FORWARD_DOMAIN_DAILY_LIMIT || targetUsage > FORWARD_TARGET_DAILY_LIMIT) {
+      const limits: CounterLimit[] = [
+        { scope: 'fwd-domain', subject: mail.domain, window, limit: FORWARD_DOMAIN_DAILY_LIMIT },
+        { scope: 'fwd-target', subject: target, window, limit: FORWARD_TARGET_DAILY_LIMIT },
+      ];
+      const [domainFull, targetFull] = await reserveCounters(env, limits);
+      if (domainFull || targetFull) {
         status = 'skipped';
         detail = '今日转发额度已用尽';
       } else {
-        let nativeSucceeded = false;
         if (native) {
-          try { await native.forward(target); nativeSucceeded = true; }
+          try { await native.forward(target); forwardMode = 'native'; }
           catch { /* 未验证目标改用 Cloudflare 中转。 */ }
         }
-        if (!nativeSucceeded) await relayForward(env, target, mail);
+        if (!forwardMode) {
+          quota ??= getSettings(env).then((settings) => settings.quota);
+          const relay = await reserveRelay(env, window, forwarders, userIds[0]!, await quota);
+          if (relay.skipped) {
+            status = 'skipped';
+            detail = relay.skipped;
+            await releaseQuota(env, limits);
+          } else {
+            forwardMode = 'relay';
+            try {
+              providerMessageId = await relayForward(env, target, mail);
+            } catch (error) {
+              await releaseQuota(env, relay.taken);
+              throw error;
+            }
+          }
+        }
       }
     } catch (error) {
       status = 'failed';
       detail = error instanceof Error ? error.message : String(error);
       console.error(`转发到 ${target} 失败:`, error);
     }
-    for (const userId of new Set(owners)) {
+    for (const userId of userIds) {
       try { await recordDeliveryResult(env, { userId, messageId: mail.messageId,
-        channel: 'forward', target, status, error: detail }); }
+        channel: 'forward', target, status, error: detail, forwardMode }); }
       catch (error) { console.error('转发结果记录失败:', error); }
+    }
+    // 中转在 Cloudflare 侧的最终结果（退信等）经投递回执回写到上面的转发记录；原生 forward() 没有回执
+    if (forwardMode === 'relay' && status === 'succeeded') {
+      await saveDeliveryRefs(env, { kind: 'forward', messageId: mail.messageId, sender: `no-reply@${mail.domain}`,
+        rfcMessageId: null, ownerIds: userIds, targets: [{ recipient: target, providerMessageId }] });
     }
   }
 }

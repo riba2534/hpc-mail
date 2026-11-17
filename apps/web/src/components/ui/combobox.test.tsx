@@ -68,4 +68,36 @@ describe('Combobox', () => {
     expect(screen.queryByRole('listbox')).toBeNull();
     expect(trigger).toHaveTextContent('beta@b.test');
   });
+
+  it('焦点留在搜索框，键盘高亮项通过 aria-activedescendant 播报；选项不可聚焦，鼠标点选照常', () => {
+    const onChange = vi.fn();
+    render(<Harness onChange={onChange} />);
+    fireEvent.click(screen.getByRole('combobox', { name: '选择地址' }));
+    const search = screen.getByRole('searchbox');
+    expect(search).toHaveAttribute('aria-autocomplete', 'list');
+    const options = within(screen.getByRole('listbox')).getAllByRole('option');
+    const ids = options.map((option) => option.id);
+    expect(new Set(ids).size).toBe(3);
+    for (const option of options) {
+      expect(option.tagName).toBe('DIV');
+      expect(option).not.toHaveAttribute('tabindex');
+    }
+    // 打开时高亮当前值（第 3 项），方向键移动后跟随
+    expect(search).toHaveAttribute('aria-activedescendant', ids[2]);
+    fireEvent.keyDown(search, { key: 'ArrowUp' });
+    expect(search).toHaveAttribute('aria-activedescendant', ids[1]);
+    // 过滤后高亮回到第一项；没有匹配项时不指向任何选项
+    fireEvent.change(search, { target: { value: 'gamma' } });
+    expect(search).toHaveAttribute('aria-activedescendant', within(screen.getByRole('listbox')).getByRole('option').id);
+    fireEvent.change(search, { target: { value: 'zzz' } });
+    expect(search).not.toHaveAttribute('aria-activedescendant');
+    fireEvent.change(search, { target: { value: '' } });
+
+    const alpha = within(screen.getByRole('listbox')).getAllByRole('option')[0]!;
+    expect(fireEvent.mouseDown(alpha)).toBe(false);
+    expect(search).toHaveFocus();
+    fireEvent.click(alpha);
+    expect(onChange).toHaveBeenCalledWith('1');
+    expect(screen.queryByRole('listbox')).toBeNull();
+  });
 });

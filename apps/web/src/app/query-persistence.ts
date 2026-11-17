@@ -5,6 +5,8 @@ import { queryKeys } from '@/api/query-keys';
 import { inboxListQuery, parseInboxFilters } from '@/features/inbox/inbox-query';
 import type { MessageListData } from '@/features/inbox/message-cache';
 import { getAuthRevision, getAuthToken, subscribeAuthToken } from '@/lib/auth-token';
+import { safeStorage, storageKeys } from '@/lib/local-storage';
+import { isObject, readTokenClaims } from '@/lib/token-claims';
 
 /**
  * 首屏查询的按用户持久化：再次打开时先用上次的数据渲染外壳与收件箱，挂载后照常在后台刷新。
@@ -31,7 +33,6 @@ interface PersistedQuery {
   valid?: (data: unknown, userId: number) => boolean;
 }
 
-const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 /** 缓存里的会话用户必须就是 token 所属账户 */
 const isSessionOf = (data: unknown, userId: number) => isObject(data) && data.id === userId;
 
@@ -61,45 +62,12 @@ interface StoredEntry {
   updatedAt: number;
 }
 
-function storage(): Storage | null {
-  try {
-    return globalThis.localStorage ?? null;
-  } catch {
-    return null;
-  }
-}
 
-/**
- * 读 JWT payload 的 sub/exp。只用来挑选缓存 key（以及跳过明显已过期 token 的恢复），
- * 不验签、不做鉴权判断：会话是否有效始终以 /auth/me 为准。
- */
-export function readTokenClaims(token: string | null): { sub: number; exp?: number } | null {
-  const payload = token?.split('.')[1];
-  if (!payload) return null;
-  try {
-    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-    const claims: unknown = JSON.parse(atob(base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=')));
-    if (!isObject(claims) || typeof claims.sub !== 'number' || !Number.isSafeInteger(claims.sub)) return null;
-    return { sub: claims.sub, exp: typeof claims.exp === 'number' ? claims.exp : undefined };
-  } catch {
-    return null;
-  }
-}
-
-function persistedKeys(): string[] {
-  const store = storage();
-  if (!store) return [];
-  const keys: string[] = [];
-  for (let index = 0; index < store.length; index += 1) {
-    const key = store.key(index);
-    if (key?.startsWith(QUERY_CACHE_PREFIX)) keys.push(key);
-  }
-  return keys;
-}
+const persistedKeys = () => storageKeys((key) => key.startsWith(QUERY_CACHE_PREFIX));
 
 /** 删除所有账户的持久缓存（退出登录、401、切换账户），下一个使用这台电脑的人看不到上一位的邮件 */
 export function clearPersistedQueryCache(): void {
-  const store = storage();
+  const store = safeStorage();
   for (const key of persistedKeys()) {
     try {
       store?.removeItem(key);
@@ -123,7 +91,7 @@ export function restoreQueryCache(client: QueryClient, now = Date.now()): boolea
     return false;
   }
   const storageKey = queryCacheStorageKey(claims.sub);
-  const store = storage();
+  const store = safeStorage();
   // 其他账户与旧版本的残留一并清掉
   for (const key of persistedKeys()) if (key !== storageKey) store?.removeItem(key);
   // token 已过期时服务端必然 401：不先闪现旧收件箱再跳登录页
@@ -190,10 +158,10 @@ export function writeQueryCache(client: QueryClient, now = Date.now()): void {
   }
   const key = queryCacheStorageKey(claims.sub);
   try {
-    storage()?.setItem(key, `{"savedAt":${now},"entries":{${parts.join(',')}}}`);
+    safeStorage()?.setItem(key, `{"savedAt":${now},"entries":{${parts.join(',')}}}`);
   } catch {
     // 配额不足等：宁可不留，也不留半截旧数据
-    storage()?.removeItem(key);
+    safeStorage()?.removeItem(key);
   }
 }
 

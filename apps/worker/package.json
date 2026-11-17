@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --port 8787 --local",
-    "test": "node scripts/check-migrations-selftest.mjs && node scripts/check-migrations.mjs && node scripts/check-inject-asset-routes.mjs && vitest run",
+    "test": "node scripts/check-migrations-selftest.mjs && node scripts/check-migrations.mjs && node scripts/check-inject-asset-routes.mjs && node scripts/check-ensure-delivery-queue.mjs && vitest run",
     "typecheck": "tsc -p tsconfig.json",
-    "build:assets": "rm -rf dist && cp -R ../web/dist ./dist",
+    "build:assets": "rm -rf dist && cp -R ../web/dist ./dist && node scripts/inject-asset-routes.mjs --check",
     "deploy": "wrangler d1 migrations apply db --remote && node scripts/seed-admin.mjs --if-env && wrangler deploy",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply hpc-cloud-mail-db --local",
@@ -16,17 +16,17 @@
   },
   "dependencies": {
     "@hpc-mail/shared": "workspace:*",
-    "drizzle-orm": "^0.45.2",
-    "hono": "^4.13.13",
+    "drizzle-orm": "^0.45.4",
+    "hono": "^4.13.19",
     "mimetext": "^3.0.28",
-    "postal-mime": "^2.7.6"
+    "postal-mime": "^4.2.1"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.18.4",
-    "@cloudflare/workers-types": "^5.20260714.1",
+    "@cloudflare/vitest-plugin": "^1.8.4",
+    "@cloudflare/workers-types": "^5.20261117.1",
     "drizzle-kit": "^0.31.10",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.10",
-    "wrangler": "^4.110.0"
+    "vitest": "^4.1.12",
+    "wrangler": "^4.164.0"
   }
 }

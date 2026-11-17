@@ -119,9 +119,13 @@ describe('批量认领', () => {
     expect(result.claimed.map((box) => box.address)).toEqual([`${first.localPart}@${openDomain}`, `${history.localPart}@${openDomain}`]);
     expect(result.claimed.map((box) => box.messageCount)).toEqual([0, 2]);
     expect(result).toMatchObject({ taken: [taken, first], notAttempted: [], stoppedBy: null });
-    // 与 GET /mailboxes（单个认领后读回的同一形状）逐字段一致
+    // 与 GET /mailboxes（单个认领后读回的同一形状）逐字段一致；canSend 只由列表接口返回
     const listed = await data<Mailbox[]>(await request('/mailboxes', f.user.jwt));
-    for (const box of result.claimed) expect(box).toEqual(listed.find((entry) => entry.id === box.id));
+    for (const box of result.claimed) {
+      const { canSend, ...entry } = listed.find((item) => item.id === box.id)!;
+      expect(canSend).toBe(true);
+      expect(box).toEqual(entry);
+    }
     const single = await data<Mailbox>(await request('/mailboxes', f.user.jwt, 'POST', f.item('single')), 201);
     expect(Object.keys(result.claimed[0]!).sort()).toEqual(Object.keys(single).sort());
   });
@@ -217,12 +221,13 @@ describe('批量认领', () => {
       if (!explained && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
         explained = true;
         const bindings = [JSON.stringify([{ address: 'explain@batch.test', domain: openDomain, perUserLimit: 1000, perDomainLimit: 500,
-          ownedDomain: 0, wasTaken: 0, code: null, message: null }]), f.user.id, 0, 0, 'user', 0];
+          ownedDomain: 0, wasTaken: 0, code: null, message: null }]), f.user.id, 0, 0, 'user', 0, 'user'];
         for (const statement of sqls) {
           const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement}`).bind(...bindings).all<{ detail: string }>();
           const details = plan.results.map((row) => row.detail);
           expect(details.filter((detail) => detail === 'MATERIALIZE live_owned')).toHaveLength(1);
-          expect(details.filter((detail) => /SEARCH mailboxes USING (?:COVERING )?INDEX idx_mailboxes_user \(user_id=\?\)/.test(detail))).toHaveLength(1);
+          // 0025 起 (user_id, domain) 复合索引同样能按 user_id 前缀取数，规划器可能选它
+          expect(details.filter((detail) => /SEARCH mailboxes USING (?:COVERING )?INDEX idx_mailboxes_user(?:_domain)? \(user_id=\?\)/.test(detail))).toHaveLength(1);
           expect(details.some((detail) => /SCAN mailboxes\b/.test(detail))).toBe(false);
         }
       }

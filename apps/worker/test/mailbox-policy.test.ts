@@ -1,7 +1,7 @@
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
-import { API_SCOPES, createApiKeyRequestSchema, type AdminUser, type UserMailboxPolicy } from '@hpc-mail/shared';
+import { createApiKeyRequestSchema, type AdminUser, type UserMailboxPolicy } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
@@ -13,6 +13,7 @@ import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { updateUser } from '../src/services/user.js';
 import type { Env } from '../src/types.js';
+import { grantLegacyAdminScope, USER_SCOPES } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -39,7 +40,9 @@ async function fixture() {
       authVersionMigrated: true }).returning().get())!;
     const sid = await createSession(env, user.id);
     const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
-    const key = await createApiKey(env, user.id, createApiKeyRequestSchema.parse({ name: 'policy-tests', scopes: [...API_SCOPES], rateLimit: 600 }));
+    const key = await createApiKey(env, user.id, createApiKeyRequestSchema.parse({ name: 'policy-tests', scopes: USER_SCOPES, rateLimit: 600, password: 'unused' }));
+    // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope）
+    if (role === 'admin') await grantLegacyAdminScope(env, key.id);
     return { ...user, jwt, key: key.key };
   }
   const admin = await account('admin', 'admin');

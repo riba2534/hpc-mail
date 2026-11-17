@@ -70,12 +70,19 @@ export function AuditLogDialog({
                         <span className="font-mono text-xs text-ink">
                           {log.method} {log.path}
                         </span>
+                        {log.count > 1 && (
+                          <span className="ml-1.5 text-xs text-ink-tertiary" title="成功的读取请求按分钟合并为一行">
+                            ×{log.count}
+                          </span>
+                        )}
                       </TableCell>
                       <TableCell>
                         <Badge tone={statusTone(log.statusCode)}>{log.statusCode}</Badge>
                       </TableCell>
                       <TableCell className="font-mono text-xs text-ink-secondary">{log.ip}</TableCell>
-                      <TableCell className="text-ink-tertiary">{log.durationMs} ms</TableCell>
+                      <TableCell className="whitespace-nowrap text-ink-tertiary">
+                        {log.count > 1 ? `平均 ${Math.round(log.durationMs / log.count)} ms` : `${log.durationMs} ms`}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>

@@ -1,15 +1,23 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
+import { useEffect } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryKeys } from '@/api/query-keys';
+import { draftKeyForUser } from '@/features/compose/compose-draft';
 import { getAuthRevision, setAuthToken } from '@/lib/auth-token';
+import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
+import { readTokenClaims } from '@/lib/token-claims';
 import { useCurrentUser } from '@/lib/use-session';
 
+const shellMounts = vi.hoisted(() => ({ count: 0 }));
 vi.mock('./route-modules', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./route-modules')>();
   function StubShell() {
     const user = useCurrentUser();
+    useEffect(() => {
+      shellMounts.count += 1;
+    }, []);
     return <p>shell {user.username} {user.role}</p>;
   }
   return { ...actual, loadAppShell: actual.preloadable(async () => ({ AppShell: StubShell })) };
@@ -97,5 +105,101 @@ describe('AuthGuard 使用恢复的会话', () => {
     await waitFor(() => expect(client.getQueryState(queryKeys.sessionForRevision(getAuthRevision()))?.status).toBe('error'));
     expect(screen.getByText('shell cached user')).toBeInTheDocument();
     expect(localStorage.getItem('token')).toBe(TOKEN);
+  });
+});
+
+describe('守卫错误页的退出登录', () => {
+  const seed = () => {
+    localStorage.setItem(draftKeyForUser(1, 'reply:9'), '{}');
+    trustSender('friend@example.com', 1);
+    localStorage.setItem(draftKeyForUser(2), '{}');
+  };
+  const logoutCalls = (fetchMock: ReturnType<typeof vi.fn>) =>
+    fetchMock.mock.calls.filter(([url, init]) => url === '/api/auth/logout' && (init as RequestInit | undefined)?.method === 'POST');
+
+  it('账号已禁用时与外壳菜单走同一条清理路径：吊销会话、删除该账户的本机数据，回到登录页', async () => {
+    const fetchMock = vi.fn(async () => json(403, { error: { code: 'user_disabled', message: '账号已被禁用' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    bootWithPersistedSession();
+    seed();
+    await screen.findByText('账号已被禁用');
+
+    screen.getByRole('button', { name: '退出登录' }).click();
+    expect(await screen.findByText('login page')).toBeInTheDocument();
+    expect(logoutCalls(fetchMock)).toHaveLength(1);
+    expect(localStorage.getItem('token')).toBeNull();
+    expect(localStorage.getItem(draftKeyForUser(1, 'reply:9'))).toBeNull();
+    expect(isTrustedSender('friend@example.com', 1)).toBe(false);
+    expect(localStorage.getItem(draftKeyForUser(2))).not.toBeNull();
+  });
+
+  it('没有用户数据（网络失败、无缓存）时按 token 里的账户清理', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    setAuthToken(TOKEN);
+    seed();
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    uninstall = () => {};
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/inbox']}>
+          <Routes>
+            <Route path="/inbox" element={<AuthGuard />} />
+            <Route path="/login" element={<p>login page</p>} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await screen.findByText('暂时无法加载账户');
+
+    screen.getByRole('button', { name: '退出登录' }).click();
+    expect(await screen.findByText('login page')).toBeInTheDocument();
+    expect(logoutCalls(fetchMock)).toHaveLength(1);
+    expect(localStorage.getItem(draftKeyForUser(1, 'reply:9'))).toBeNull();
+    expect(localStorage.getItem(draftKeyForUser(2))).not.toBeNull();
+  });
+});
+
+describe('同一账户换发 token', () => {
+  const jwt = (sub: number, sid: string) => `${b64url({ alg: 'HS256' })}.${b64url({ sub, sid })}.sig`;
+
+  it('其他标签页改密换发 token：外壳不重挂、不闪全屏加载、查询缓存保留；换成其他账户才重挂并清缓存', async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const sub = readTokenClaims(new Headers(init?.headers).get('Authorization')!.slice('Bearer '.length))!.sub;
+      return json(200, { data: { ...cachedUser, id: sub, username: `user${sub}` } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    setAuthToken(jwt(1, 'before'));
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    uninstall = () => {};
+    shellMounts.count = 0;
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/inbox']}>
+          <Routes>
+            <Route path="/inbox" element={<AuthGuard />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText('shell user1 user')).toBeInTheDocument();
+    expect(shellMounts.count).toBe(1);
+    client.setQueryData(['messages', 'detail', 1], { body: 'mine' });
+
+    act(() => setAuthToken(jwt(1, 'after-password-change')));
+    // 新一代会话在后台校验，期间沿用上一代的用户，不出现全屏加载
+    expect(screen.getByText('shell user1 user')).toBeInTheDocument();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(client.getQueryState(queryKeys.sessionForRevision(getAuthRevision()))?.status).toBe('success'));
+    expect(shellMounts.count).toBe(1);
+    expect(client.getQueryData(['messages', 'detail', 1])).toEqual({ body: 'mine' });
+
+    act(() => setAuthToken(jwt(2, 'someone-else')));
+    expect(screen.queryByText('shell user1 user')).toBeNull();
+    expect(await screen.findByText('shell user2 user')).toBeInTheDocument();
+    expect(shellMounts.count).toBe(2);
+    expect(client.getQueryData(['messages', 'detail', 1])).toBeUndefined();
   });
 });

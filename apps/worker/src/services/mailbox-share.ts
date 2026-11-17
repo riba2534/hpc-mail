@@ -1,11 +1,13 @@
-import { MAX_MAILBOX_GRANTEES, RESERVED_USERNAMES, type MailboxShareGrant, type SharedMailboxView } from '@hpc-mail/shared';
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { MAX_MAILBOX_GRANTEES, RESERVED_USERNAMES, type MailboxShareGrant, type Page, type SharedMailboxView } from '@hpc-mail/shared';
+import { and, asc, desc, eq, inArray, lt, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/sqlite-core';
 import { createDb } from '../db/client.js';
 import { mailboxShares, mailboxes, users } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
+import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { Env } from '../types.js';
+import { mailboxSearchSql } from './mailbox.js';
 
 function assertManageableMailbox<T extends { userId: number }>(
   box: T | undefined,
@@ -19,8 +21,8 @@ function assertManageableMailbox<T extends { userId: number }>(
 
 const owners = alias(users, 'owners');
 
-/** 被分享人复核：存在、不是系统保留账号（共享给 CI 冒烟用户会干扰部署流水线）、已启用 */
-function assertShareTargets(targets: readonly { username: string; status: string }[], expected: number): void {
+/** 被分享人复核：存在、不是系统保留账号（共享给 CI 冒烟用户会干扰部署流水线）、已启用；共享、批量共享与管理员批量共享共用 */
+export function assertShareTargets(targets: readonly { username: string; status: string }[], expected: number): void {
   if (targets.length !== expected) {
     throw new AppError('validation_failed', '包含不存在的用户');
   }
@@ -74,12 +76,36 @@ function toShareGrants(rows: readonly ShareGrantRow[]): MailboxShareGrant[] {
   return [...grants.values()];
 }
 
+export interface MailboxShareListOptions {
+  /** 只取该邮箱（0 或 1 项） */
+  mailboxId?: number;
+  /** 地址或所有者用户名的子串（已转小写） */
+  q?: string;
+}
+
 /**
- * 自有或全站已认领邮箱，附带所有者与共享名单（含尚未分享的）。
- * 一条 JOIN 查询：邮箱按地址、共享按被分享人用户名排序；mailboxId 只取该邮箱（0 或 1 项）。
+ * 自有或全站已认领邮箱，附带所有者与共享名单（含尚未分享的），一条 JOIN 查询。
+ * 数组模式邮箱按地址排序；分页模式先在 mailboxes 上按 id 倒序取一页 id（多取一条判断下一页）再 JOIN，
+ * LIMIT 不受每个邮箱被分享人数影响。共享都按被分享人用户名排序。
  */
-export async function listMailboxShares(env: Env, actorId: number, all = false, mailboxId?: number): Promise<MailboxShareGrant[]> {
+export async function listMailboxShares(env: Env, actorId: number, all?: boolean, opts?: MailboxShareListOptions): Promise<MailboxShareGrant[]>;
+export async function listMailboxShares(
+  env: Env, actorId: number, all: boolean, opts: MailboxShareListOptions, page: PageRequest | null,
+): Promise<MailboxShareGrant[] | Page<MailboxShareGrant>>;
+export async function listMailboxShares(
+  env: Env, actorId: number, all = false, opts: MailboxShareListOptions = {}, page: PageRequest | null = null,
+): Promise<MailboxShareGrant[] | Page<MailboxShareGrant>> {
   const db = createDb(env);
+  const scope = and(
+    all ? undefined : eq(mailboxes.userId, actorId),
+    opts.mailboxId === undefined ? undefined : eq(mailboxes.id, opts.mailboxId),
+    opts.q ? mailboxSearchSql(opts.q) : undefined,
+  );
+  const where = page
+    ? inArray(mailboxes.id, db.select({ id: mailboxes.id }).from(mailboxes)
+      .where(and(scope, page.cursorId ? lt(mailboxes.id, page.cursorId) : undefined))
+      .orderBy(desc(mailboxes.id)).limit(fetchLimit(page)))
+    : scope;
   const rows = await db
     .select({
       mailboxId: mailboxes.id,
@@ -97,10 +123,11 @@ export async function listMailboxShares(env: Env, actorId: number, all = false, 
     .innerJoin(owners, eq(owners.id, mailboxes.userId))
     .leftJoin(mailboxShares, eq(mailboxShares.mailboxId, mailboxes.id))
     .leftJoin(users, eq(users.id, mailboxShares.userId))
-    .where(and(all ? undefined : eq(mailboxes.userId, actorId), mailboxId === undefined ? undefined : eq(mailboxes.id, mailboxId)))
-    .orderBy(asc(mailboxes.address), asc(users.username))
+    .where(where)
+    .orderBy(page ? desc(mailboxes.id) : asc(mailboxes.address), asc(users.username))
     .all();
-  return toShareGrants(rows);
+  const grants = toShareGrants(rows);
+  return page ? toPage(grants, page.limit, (grant) => grant.mailboxId) : grants;
 }
 
 /**
@@ -259,13 +286,14 @@ export async function shareMailboxes(
   return boxIds.flatMap((id) => grants.get(id) ?? []);
 }
 
+/** 返回被操作邮箱的地址，供管理审计写明对象 */
 export async function revokeMailboxShare(
   env: Env,
   actorId: number,
   mailboxId: number,
   userId: number,
   isAdmin = false,
-): Promise<void> {
+): Promise<{ address: string }> {
   const db = createDb(env);
   const box = await db.select().from(mailboxes).where(eq(mailboxes.id, mailboxId)).get();
   assertManageableMailbox(box, actorId, isAdmin);
@@ -275,6 +303,7 @@ export async function revokeMailboxShare(
       sql`EXISTS (SELECT 1 FROM mailboxes WHERE id = ${mailboxId} AND user_id = ${box.userId})`))
     .run();
   if ((result.meta.changes ?? 0) === 0) throw new AppError('not_found', '该用户不在共享名单中');
+  return { address: box.address };
 }
 
 /** 登录用户被分享、且所有者仍启用的邮箱。 */

@@ -1,6 +1,6 @@
 import type { PushDeerConfig } from '@hpc-mail/shared';
 import { AppError } from '../lib/errors.js';
-import { isBlockedHost } from './webhook-notify.js';
+import { isBlockedHost } from '../lib/ssrf.js';
 import { NotificationDeliveryError, notificationRequest } from './notification-http.js';
 
 export const DEFAULT_PUSHDEER_ENDPOINT = 'https://api2.pushdeer.com';

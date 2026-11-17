@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getAuthToken, setAuthToken } from '@/lib/auth-token';
+import { uploadsApi } from './resources';
 import { xhrSend } from './upload-client';
 let last:FakeXhr;
 class FakeXhr {
@@ -26,5 +27,17 @@ describe('upload authentication races',()=>{
     setAuthToken('new');last.status=200;last.responseText=JSON.stringify({data:{token:'private-old-upload'}});
     last.onload?.();
     await expect(result).rejects.toMatchObject({code:'session_changed'});
+  });
+});
+describe('uploadsApi',()=>{
+  it('loads the XHR channel on demand and resolves the envelope data',async()=>{
+    setAuthToken('t');
+    const previous=last;
+    const result=uploadsApi.single(new Blob(['x']),'a.txt','text/plain');
+    await vi.waitFor(()=>expect(last).not.toBe(previous));
+    expect(last.open).toHaveBeenCalledWith('POST','/api/uploads?filename=a.txt&mimeType=text%2Fplain');
+    last.status=200;last.responseText=JSON.stringify({data:{token:'u1'}});
+    last.onload?.();
+    await expect(result).resolves.toEqual({token:'u1'});
   });
 });

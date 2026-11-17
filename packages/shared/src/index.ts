@@ -1,10 +1,13 @@
 export * from './constants.js';
 export * from './envelope.js';
 export * from './attachment-types.js';
+export * from './mail-address.js';
+export * from './mail-headers.js';
 export * from './schemas/auth.js';
 export * from './schemas/mailbox.js';
 export * from './schemas/mailbox-policy.js';
 export * from './schemas/mail.js';
+export * from './schemas/draft.js';
 export * from './schemas/api-key.js';
 export * from './schemas/invite.js';
 export * from './schemas/admin-settings.js';
@@ -12,4 +15,8 @@ export * from './schemas/notify-prefs.js';
 export * from './schemas/audit.js';
 export * from './schemas/hosted-domain.js';
 export * from './schemas/hosted-dns.js';
+export * from './schemas/webhook.js';
+export * from './schemas/delivery-events.js';
 export * from './schemas/ops.js';
+export * from './schemas/system-domain.js';
+// MCP 工具参数只有 worker 用，经子路径 @hpc-mail/shared/mcp 导入，不进前端按需加载的整包契约 chunk

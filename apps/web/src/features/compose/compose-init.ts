@@ -1,4 +1,5 @@
 import type { MessageDetail } from '@hpc-mail/shared';
+import { isFailedOutcome } from '@/features/message/delivery-outcomes';
 import { formatDateTime } from '@/lib/format';
 
 /** 通过 router location.state 传给写邮件页的预填数据 */
@@ -19,6 +20,10 @@ export interface ComposeInitial {
   mode?: 'reply' | 'forward' | 'resend';
   /** 来源邮件 id：决定草稿场景（reply:/forward:/resend:<id>），各场景草稿互不覆盖 */
   sourceMessageId?: number;
+  /** 只重试失败收件人时，投递结果未确认（unknown）的地址：可能已经送达，不自动加入收件人，只提示用户 */
+  unconfirmed?: string[];
+  /** 从草稿箱进入：编辑这份服务端草稿（内容从服务器读取，不用本机草稿） */
+  serverDraftId?: number;
 }
 
 function withPrefix(subject: string, prefix: 'Re' | 'Fwd'): string {
@@ -112,9 +117,16 @@ export function buildForward(message: MessageDetail): ComposeInitial {
   };
 }
 
-/** 重新发送一封失败的外发邮件：沿用原收件人/主题/正文，让用户可修正后重发 */
+/**
+ * 重新发送一封失败的外发邮件：沿用原收件人/主题/正文，让用户可修正后重发。
+ * failedOnly 只带回明确失败的目标；结果未确认的目标可能已经收到，列在 unconfirmed 里由用户核实后手动添加。
+ */
 export function buildResend(message: MessageDetail, failedOnly = false): ComposeInitial {
-  const failures = new Set((message.recipientOutcomes ?? []).filter((outcome) => outcome.status === 'failed').map((outcome) => outcome.address.toLowerCase()));
+  const outcomes = message.recipientOutcomes ?? [];
+  // 投递回执的退信与发送时被拒一样算失败（对方已恢复时可直接重试；仍在抑制名单里会得到明确错误）
+  const failures = new Set(outcomes.filter(isFailedOutcome)
+    .map((outcome) => outcome.address.toLowerCase()));
+  const unconfirmed = failedOnly ? outcomes.filter((outcome) => outcome.status === 'unknown').map((outcome) => outcome.address) : [];
   const recipients = (addresses: string[]) => failedOnly ? addresses.filter((address) => failures.has(address.toLowerCase())) : addresses;
   const to = recipients(message.recipients.to);
   const cc = recipients(message.recipients.cc);
@@ -130,5 +142,6 @@ export function buildResend(message: MessageDetail, failedOnly = false): Compose
     forwardAttachmentsFrom: message.attachments.length ? message.id : undefined,
     mode: 'resend',
     sourceMessageId: message.id,
+    ...(unconfirmed.length ? { unconfirmed } : {}),
   };
 }

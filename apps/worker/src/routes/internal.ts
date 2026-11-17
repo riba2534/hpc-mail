@@ -39,7 +39,7 @@ app.post('/canary', async (c) => {
   try {
     await sendCanaryMail(c.env, from, to, nonce);
   } catch (error) {
-    throw new AppError('internal', `金丝雀外发失败: ${error instanceof Error ? error.message : String(error)}`, 502);
+    throw new AppError('internal', `金丝雀外发失败: ${error instanceof Error ? error.message : String(error)}`, {}, 502);
   }
   return ok(c, { nonce, from, to, build: buildId(c.env), sentAt: new Date().toISOString() });
 });

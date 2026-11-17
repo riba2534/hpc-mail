@@ -1,21 +1,28 @@
 import {
+  adminKeyIssues,
   API_KEY_PREFIX,
   MAX_API_KEYS_PER_USER,
+  MAX_API_USER_REQUESTS_PER_MINUTE,
+  MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
+  type ApiKeySelf,
   type ApiKeySummary,
   type ApiRequestLogEntry,
   type ApiScope,
   type CreateApiKeyRequest,
   type CreatedApiKey,
   type Page,
+  type Role,
   type UpdateApiKeyRequest,
 } from '@hpc-mail/shared';
 import { and, desc, eq, lt, ne, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
-import { apiKeys, apiRequestLogs, users } from '../db/schema.js';
+import { apiKeys, apiRequestLogs, rateCounters, users } from '../db/schema.js';
 import { bytesToHex, sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { encodeCursor, decodeCursor } from '../lib/pagination.js';
+import { decodeCursor, toPage } from '../lib/pagination.js';
 import type { Env } from '../types.js';
+import { dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
+import { getSettings } from './setting.js';
 
 type ApiKeyRow = typeof apiKeys.$inferSelect;
 
@@ -27,7 +34,7 @@ function generateKey(): { key: string; keyPrefix: string; keySuffix: string } {
   return { key, keyPrefix: key.slice(0, API_KEY_PREFIX.length + 6), keySuffix: hex.slice(-4) };
 }
 
-export function hashApiKey(key: string): Promise<string> {
+function hashApiKey(key: string): Promise<string> {
   return sha256Hex(key);
 }
 
@@ -44,8 +51,34 @@ function serialize(row: ApiKeyRow, ownerUsername?: string): ApiKeySummary {
     expiresAt: row.expiresAt ? row.expiresAt.toISOString() : null,
     lastUsedAt: row.lastUsedAt ? row.lastUsedAt.toISOString() : null,
     createdAt: row.createdAt.toISOString(),
+    allowedMailboxIds: row.allowedMailboxIds,
+    allowedDomains: row.allowedDomains,
     ...(ownerUsername !== undefined ? { ownerUsername } : {}),
   };
+}
+
+/**
+ * 授予与修改 admin scope 的规则：只有管理员能让 Key 带 admin；结果状态带 admin 时必须有 IP 白名单
+ * 与不超过 90 天的有效期（shared 的 adminKeyIssues，与前端表单同一份校验）。
+ */
+function assertAdminScopeRules(
+  role: Role,
+  key: { scopes: readonly string[]; allowedIps: readonly string[]; expiresAt: Date | null },
+  granting: boolean,
+): void {
+  if (granting && role !== 'admin') throw new AppError('forbidden', '只有管理员可以授予 admin scope');
+  const [issue] = adminKeyIssues({ ...key, expiresAt: key.expiresAt?.toISOString() ?? null });
+  if (issue) throw new AppError('validation_failed', issue.message);
+}
+
+/** 限定的邮箱必须是该用户当前认领的：一次查询数命中个数 */
+async function assertOwnedMailboxes(env: Env, userId: number, ids: readonly number[]): Promise<void> {
+  if (!ids.length) return;
+  const row = await env.db.prepare(`SELECT COUNT(*) AS n FROM mailboxes
+    WHERE user_id = ? AND id IN (SELECT value FROM json_each(?))`).bind(userId, JSON.stringify(ids)).first<{ n: number }>();
+  if (Number(row?.n ?? 0) !== ids.length) {
+    throw new AppError('validation_failed', 'allowedMailboxIds 只能包含你当前认领的邮箱 id（GET /api/mailboxes 的 id）');
+  }
 }
 
 function normalizeExpiry(value: string | undefined): Date | null {
@@ -61,22 +94,34 @@ function normalizeExpiry(value: string | undefined): Date | null {
  * 创建 Key。authEpoch 传入会话令牌的用户鉴权版本（uepoch）时，插入条件同时要求用户的
  * auth_version 仍等于它：改密会递增版本并吊销全部 Key，与之并发的旧令牌请求不能在吊销后再插入新 Key。
  */
+/** 服务层入参：密码重新验证在路由里做；限定范围缺省为不限 */
+export type CreateApiKeyParams = Omit<CreateApiKeyRequest, 'password' | 'allowedMailboxIds' | 'allowedDomains'>
+  & Partial<Pick<CreateApiKeyRequest, 'allowedMailboxIds' | 'allowedDomains'>>;
+
 export async function createApiKey(
   env: Env,
   userId: number,
-  req: CreateApiKeyRequest,
+  req: CreateApiKeyParams,
   authEpoch?: number,
+  role?: Role,
 ): Promise<CreatedApiKey> {
   const db = createDb(env);
   const { key, keyPrefix, keySuffix } = generateKey();
   const keyHash = await hashApiKey(key);
   const expiresAt = normalizeExpiry(req.expiresAt);
+  const allowedMailboxIds = req.allowedMailboxIds ?? [];
+  const allowedDomains = req.allowedDomains ?? [];
+  // role 由路由传入（会话用户的角色）；服务层直调（脚本、测试）时读库
+  const ownerRole = role ?? (await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).get())?.role ?? 'user';
+  assertAdminScopeRules(ownerRole, { scopes: req.scopes, allowedIps: req.allowedIps, expiresAt }, req.scopes.includes('admin'));
+  await assertOwnedMailboxes(env, userId, allowedMailboxIds);
   const epochGuard = authEpoch === undefined ? '' : 'AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_version = ?)';
   const inserted = await env.db
     .prepare(
       `INSERT INTO api_keys
-        (name, key_prefix, key_suffix, key_hash, user_id, scopes, allowed_ips, rate_limit, status, expires_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?
+        (name, key_prefix, key_suffix, key_hash, user_id, scopes, allowed_ips, allowed_mailbox_ids, allowed_domains,
+         rate_limit, status, expires_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?
        WHERE (SELECT COUNT(*) FROM api_keys WHERE user_id = ? AND status <> 'revoked') < ? ${epochGuard}
        RETURNING id`,
     )
@@ -88,6 +133,8 @@ export async function createApiKey(
       userId,
       JSON.stringify(req.scopes),
       JSON.stringify(req.allowedIps),
+      JSON.stringify(allowedMailboxIds),
+      JSON.stringify(allowedDomains),
       req.rateLimit,
       expiresAt?.getTime() ?? null,
       userId,
@@ -136,26 +183,84 @@ async function requireKey(db: Db, id: number, userId?: number): Promise<ApiKeyRo
   return row;
 }
 
+/**
+ * GET /v1/me：Key 行、用户行与今日外发计数合成一个 batch；配额上限取设置（鉴权刚读过，命中 isolate 缓存）。
+ * 管理员不占外发配额，上限按 0 返回并标 exempt。
+ */
+export async function getApiKeySelf(env: Env, keyId: number, userId: number, now = new Date()): Promise<ApiKeySelf> {
+  const db = createDb(env);
+  const [[keyRows, userRows, counterRows], settings] = await Promise.all([
+    db.batch([
+      db.select().from(apiKeys).where(eq(apiKeys.id, keyId)),
+      db.select({ id: users.id, username: users.username, role: users.role }).from(users).where(eq(users.id, userId)),
+      db.select({ count: rateCounters.count, units: rateCounters.units }).from(rateCounters)
+        .where(and(eq(rateCounters.scope, OUTBOUND_QUOTA_SCOPE), eq(rateCounters.subject, String(userId)), eq(rateCounters.window, dayWindow(now)))),
+    ]),
+    getSettings(env),
+  ]);
+  const [key] = keyRows;
+  const [user] = userRows;
+  // 鉴权之后、读取之前被吊销或删除：按无效 Key 处理
+  if (!key || key.status === 'revoked' || !user) throw new AppError('unauthorized', 'API Key 无效');
+  const effectiveRole: Role = user.role === 'admin' && (key.scopes as ApiScope[]).includes('admin') ? 'admin' : 'user';
+  // 外发配额按 Key 的执行角色：没有 admin scope 的管理员 Key 与普通用户一样受配额约束
+  const exempt = effectiveRole === 'admin';
+  return {
+    key: {
+      id: key.id, name: key.name, keyPrefix: key.keyPrefix, keySuffix: key.keySuffix, scopes: key.scopes as ApiScope[],
+      rateLimit: key.rateLimit, allowedIps: key.allowedIps,
+      expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null, createdAt: key.createdAt.toISOString(),
+      allowedMailboxIds: key.allowedMailboxIds, allowedDomains: key.allowedDomains,
+      effectiveRole,
+    },
+    user,
+    limits: { userRequestsPerMinute: MAX_API_USER_REQUESTS_PER_MINUTE, waitPollsPerMinute: MAX_WAIT_POLLS_PER_USER_PER_MINUTE },
+    outbound: {
+      sent: counterRows[0]?.count ?? 0,
+      recipients: counterRows[0]?.units ?? 0,
+      dailyLimit: exempt ? 0 : settings.quota.dailyOutbound,
+      dailyRecipientLimit: exempt ? 0 : settings.quota.dailyRecipients,
+      exempt,
+      resetsAt: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString(),
+    },
+  };
+}
+
 export async function getApiKey(env: Env, id: number, userId?: number): Promise<ApiKeySummary> {
   const db = createDb(env);
   const row = await requireKey(db, id, userId);
   return serialize(row);
 }
 
+/**
+ * 修改 Key。改到 scopes / allowedIps / expiresAt 时按修改后的结果校验 admin scope 规则（只改名、状态等不校验，
+ * 迁移时自动加上 admin scope 的旧管理员 Key 因此照常可用）；新授予 admin 需要管理员。
+ */
 export async function updateApiKey(
   env: Env,
   id: number,
   req: UpdateApiKeyRequest,
   userId?: number,
+  role?: Role,
 ): Promise<ApiKeySummary> {
   const db = createDb(env);
-  await requireKey(db, id, userId);
+  const current = await requireKey(db, id, userId);
+  if (req.scopes !== undefined || req.allowedIps !== undefined || req.expiresAt !== undefined) {
+    const scopes = req.scopes ?? current.scopes;
+    const expiresAt = req.expiresAt === undefined ? current.expiresAt : req.expiresAt === null ? null : new Date(req.expiresAt);
+    const ownerRole = role ?? (await db.select({ role: users.role }).from(users).where(eq(users.id, current.userId)).get())?.role ?? 'user';
+    assertAdminScopeRules(ownerRole, { scopes, allowedIps: req.allowedIps ?? current.allowedIps, expiresAt },
+      scopes.includes('admin') && !current.scopes.includes('admin'));
+  }
+  if (req.allowedMailboxIds) await assertOwnedMailboxes(env, current.userId, req.allowedMailboxIds);
   const patch: Partial<ApiKeyRow> = {};
   if (req.name !== undefined) patch.name = req.name;
   if (req.scopes !== undefined) patch.scopes = req.scopes;
   if (req.rateLimit !== undefined) patch.rateLimit = req.rateLimit;
   if (req.allowedIps !== undefined) patch.allowedIps = req.allowedIps;
   if (req.status !== undefined) patch.status = req.status;
+  if (req.allowedMailboxIds !== undefined) patch.allowedMailboxIds = req.allowedMailboxIds;
+  if (req.allowedDomains !== undefined) patch.allowedDomains = req.allowedDomains;
   // 续期：null 改为永久，字符串按新过期时间；undefined 不动
   if (req.expiresAt !== undefined) {
     patch.expiresAt = req.expiresAt === null ? null : normalizeExpiry(req.expiresAt);
@@ -205,10 +310,9 @@ export async function listApiKeyLogs(
     .orderBy(desc(apiRequestLogs.id))
     .limit(limit + 1)
     .all();
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
+  const page = toPage(rows, limit, (r) => r.id);
   return {
-    items: page.map((r) => ({
+    items: page.items.map((r) => ({
       id: r.id,
       requestId: r.requestId,
       method: r.method,
@@ -216,8 +320,9 @@ export async function listApiKeyLogs(
       statusCode: r.statusCode,
       ip: r.ip,
       durationMs: r.durationMs,
+      count: r.requestCount,
       createdAt: r.createdAt.toISOString(),
     })),
-    nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.id) : null,
+    nextCursor: page.nextCursor,
   };
 }

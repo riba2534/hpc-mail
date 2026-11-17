@@ -3,6 +3,7 @@ import {
   AtSign,
   ChevronDown,
   Earth,
+  FilePen,
   Keyboard,
   Globe,
   Inbox,
@@ -25,8 +26,6 @@ import {
 } from 'lucide-react';
 import { type MouseEvent, Suspense, useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation, useMatches, useNavigate } from 'react-router-dom';
-import { clearAuthToken } from '@/lib/auth-token';
-import { authApi } from '@/api/resources';
 import logoUrl from '@/assets/logo.webp';
 import {
   DropdownMenu,
@@ -36,24 +35,37 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Avatar } from '@/components/ui/avatar';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { GithubIconLink } from '@/components/ui/github-link';
 import { IconButton } from '@/components/ui/icon-button';
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
+import { purgeExpiredDrafts, userDraftKeys } from '@/features/compose/draft-retention';
 import { useUnreadCount } from '@/features/inbox/use-unread-count';
 import { cn } from '@/lib/cn';
 import { usePublicConfig } from '@/lib/use-config';
 import { formatDocumentTitle, useTitleOverride } from '@/lib/use-document-title';
 import { useKeyboardShortcuts } from '@/lib/use-keyboard-shortcuts';
 import { useCurrentUser } from '@/lib/use-session';
+import { useBuildVersionCheck } from './build-version';
 import { lazyWithReload } from './chunk-reload';
 import { PageLoader } from './page-loader';
 import { preloadable } from './route-modules';
 import type { RouteHandle } from './router';
 import { ShortcutsHelpDialog } from './shortcuts-help-dialog';
+import { signOut } from './user-local-data';
+
+// 只在外壳主内容区渲染的路由组件随外壳 chunk 下发（router 经 loadAppShell 取用）
+export { AdminGuard } from './admin-guard';
+export { NotFoundPage } from './not-found-page';
+export { PageError } from './page-error';
 
 const ChangePasswordDialog = lazyWithReload(
   preloadable(() => import('./change-password-dialog')),
   (m) => m.ChangePasswordDialog,
+);
+const TwoFactorSection = lazyWithReload(
+  preloadable(() => import('@/features/profile/two-factor-section')),
+  (m) => m.TwoFactorSection,
 );
 
 interface NavEntry {
@@ -66,6 +78,7 @@ const PRIMARY_NAV: NavEntry[] = [
   { to: '/inbox', label: '收件箱', icon: Inbox },
   { to: '/starred', label: '星标', icon: Star },
   { to: '/sent', label: '已发送', icon: Send },
+  { to: '/drafts', label: '草稿箱', icon: FilePen },
   { to: '/mailboxes', label: '我的邮箱', icon: AtSign },
   { to: '/domains', label: '我的域名', icon: Earth },
   { to: '/trash', label: '回收站', icon: Trash2 },
@@ -250,16 +263,20 @@ function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
   const [passwordOpen, setPasswordOpen] = useState(false);
   // 首次打开才加载对话框 chunk；之后保持挂载，关闭动画与原先一致
   const [passwordMounted, setPasswordMounted] = useState(false);
+  // 本机还有未发送草稿时先确认：退出会一并删除它们
+  const [unsentDrafts, setUnsentDrafts] = useState(0);
+  const [loggingOut, setLoggingOut] = useState(false);
 
-  const handleLogout = async () => {
-    try {
-      await authApi.logout();
-    } catch {
-      // 忽略：本地清理照常进行
-    }
-    clearAuthToken();
-    queryClient.clear();
+  const logout = async () => {
+    setLoggingOut(true);
+    await signOut(queryClient, user.id);
     navigate('/login', { replace: true });
+  };
+
+  const handleLogout = () => {
+    const drafts = userDraftKeys(user.id).length;
+    if (drafts > 0) setUnsentDrafts(drafts);
+    else void logout();
   };
 
   return (
@@ -309,6 +326,18 @@ function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
         </DropdownMenuContent>
       </DropdownMenu>
       {passwordMounted && <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />}
+      <ConfirmDialog
+        open={unsentDrafts > 0}
+        onOpenChange={(open) => {
+          if (!open && !loggingOut) setUnsentDrafts(0);
+        }}
+        title="退出并删除本机草稿？"
+        description={`本机还保存着 ${unsentDrafts} 封未发送的草稿。退出登录会一并删除它们，以及本机为该账户保存的其他数据。`}
+        confirmLabel="退出登录"
+        tone="danger"
+        loading={loggingOut}
+        onConfirm={() => void logout()}
+      />
     </>
   );
 }
@@ -316,7 +345,10 @@ function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
 export function AppShell() {
   const user = useCurrentUser();
   const { data: config } = usePublicConfig();
-  const { data: unread } = useUnreadCount();
+  // 站点强制两步验证而本账号未绑定：除绑定所需接口外后端都返回 403，只渲染绑定引导，停掉全局轮询
+  const twoFactorBlocked = config?.require2fa === true && !user.twoFactorEnabled;
+  // 配置读到之前不知道是否被拦，先不发未读数请求（配置在启动时已并行预取）
+  const { data: unread } = useUnreadCount(config !== undefined && !twoFactorBlocked);
   const { pathname } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -327,6 +359,9 @@ export function AppShell() {
   const bottomNavHidden = hidesBottomNav(pathname);
   useKeyboardShortcuts({ onHelp: () => setShortcutsOpen(true) });
   useShellDocumentTitle(siteTitle, unreadCount);
+  useBuildVersionCheck();
+  // 回收本机遗弃的写信草稿（最后保存超过 30 天）
+  useEffect(() => void purgeExpiredDrafts(), []);
 
   return (
     <div className="flex min-h-dvh flex-col bg-canvas md:flex-row">
@@ -392,25 +427,23 @@ export function AppShell() {
               : 'pb-[calc(6rem+env(safe-area-inset-bottom))]',
           )}
         >
-          {config?.require2fa && !user.twoFactorEnabled ? (
+          {twoFactorBlocked ? (
             // 后端此时会对除 2FA 绑定以外的接口返回 totp_setup_required(403)，
-            // 继续渲染常规页面只会满屏报错——直接换成阻塞式引导
-            <div className="mx-auto mb-4 max-w-4xl rounded-lg border border-caution/40 bg-caution-soft/40 px-4 py-4 text-sm">
-              <p className="font-medium text-ink">本站要求所有账户开启两步验证</p>
-              <p className="mt-1 text-ink-secondary">
-                完成绑定后才能继续使用邮箱功能。绑定入口在「个人设置 - 安全」。
-              </p>
-              <NavLink
-                to="/profile"
-                className="mt-3 inline-block rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-on-accent hover:bg-accent-hover"
-              >
-                去绑定两步验证
-              </NavLink>
+            // 渲染常规页面只会满屏报错——任何路由都只显示引导与绑定区块，绑定后会话刷新即恢复
+            <div className="mx-auto flex max-w-2xl flex-col gap-4">
+              <div className="rounded-lg border border-caution/40 bg-caution-soft/40 px-4 py-4 text-sm">
+                <p className="font-medium text-ink">本站要求所有账户开启两步验证</p>
+                <p className="mt-1 text-ink-secondary">完成下面的绑定后才能继续使用邮箱功能。</p>
+              </div>
+              <Suspense fallback={<PageLoader />}>
+                <TwoFactorSection />
+              </Suspense>
             </div>
-          ) : null}
-          <Suspense fallback={<PageLoader />}>
-            <Outlet />
-          </Suspense>
+          ) : (
+            <Suspense fallback={<PageLoader />}>
+              <Outlet />
+            </Suspense>
+          )}
         </main>
       </div>
 

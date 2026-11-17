@@ -1,4 +1,4 @@
-import { userMailboxPolicySchema, type Settings, type UserMailboxPolicy } from '@hpc-mail/shared';
+import { userMailboxPolicySchema, type Role, type Settings, type UserMailboxPolicy } from '@hpc-mail/shared';
 import type { Db } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
@@ -12,6 +12,14 @@ export interface EffectiveMailboxPolicy {
   perUserLimit: number;
   domains: UserMailboxPolicy['domains'];
   reservedLocalParts: string[];
+}
+
+/**
+ * 按凭据的有效角色收窄：账户角色与凭据角色取较低的。没有 admin scope 的管理员 Key 按普通用户规则认领、
+ * 看可认领域名（公共域名、保留前缀与额度），不按 users.role 套用管理员规则
+ */
+export function asActor(user: MailboxPolicyUser, actorRole: Role): MailboxPolicyUser {
+  return actorRole === 'admin' || user.role !== 'admin' ? user : { ...user, role: 'user' };
 }
 
 /** 唯一的权限解析：专属配置替代公共域名及额度，但仍需域名存在于系统中。 */

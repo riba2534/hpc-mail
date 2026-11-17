@@ -2,7 +2,9 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AtSign, MailOpen, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { UNREAD_COUNT_CAP, type MarkAllReadRequest } from '@hpc-mail/shared';
+import type { MarkAllReadRequest } from '@hpc-mail/shared';
+// 运行时常量走零依赖子路径：主入口会把全部 zod schema 拉进 /inbox 首屏
+import { UNREAD_COUNT_CAP } from '@hpc-mail/shared/constants';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { useRestoredQueryRefreshing } from '@/app/query-persistence';
@@ -32,7 +34,7 @@ const byAddress = (a: { address: string }, b: { address: string }) => compareTex
 export function InboxPage() {
   const { filters, setDomain, setAddress, setUnread, setQuery, clearFacets, reset } = useInboxFilters();
   const { data: visibleDomains } = useDomains();
-  const ownedQuery = useMailboxesQuery(false);
+  const ownedQuery = useMailboxesQuery();
   const sharedQuery = useSharedMailboxesQuery();
   const { data: mailboxes } = ownedQuery;
   const { data: sharedMailboxes } = sharedQuery;
@@ -67,7 +69,7 @@ export function InboxPage() {
         ownedAddresses: mailboxes ? new Set(mailboxes.map((mailbox) => mailbox.address)) : undefined,
       });
     },
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '全部标为已读失败' },
   });
 
   // 地址下拉：按地址字典序排列（自己的在前、共享的在后），选了域名时只列该域名下的地址

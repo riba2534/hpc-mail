@@ -1,13 +1,12 @@
 import {
+  apiMarkReadRequestSchema,
   deleteMessagesRequestSchema,
-  internalSendMailSchema,
   listMessagesQuerySchema,
-  markReadRequestSchema,
   markAllReadRequestSchema,
   starMessagesRequestSchema,
   translateMessageRequestSchema,
+  type MarkReadResult,
   type MessageListPage,
-  type MessageSummary,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { execCtx, ok, parseBody, parseId, parseQuery } from '../lib/http.js';
@@ -15,13 +14,13 @@ import { requireAuth } from '../middleware/auth.js';
 import {
   countUnread,
   deleteMessages,
-  getMessageDetail,
+  getMessageDetailConditional,
   getRawMessageObject,
   getRecentContacts,
   getThread,
   listMessages,
   markAllRead,
-  markMessages,
+  markMessagesAndCount,
   purgeMessages,
   restoreMessages,
   starMessages,
@@ -29,17 +28,12 @@ import {
   UNREAD_COUNT_CAP,
   type Viewer,
 } from '../services/message.js';
-import { messageViewer, mutationViewer } from '../lib/message-viewer.js';
+import { auditUnclaimedPurge, listViewer, messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
+import { conditionalDetailResponse } from '../lib/etag.js';
 import { pageHead } from '../lib/pagination.js';
-import { decodeInlineAttachments, sendMail } from '../services/outbound.js';
-import {
-  beginIdempotentSend,
-  completeIdempotentSend,
-  failIdempotentSend,
-} from '../services/idempotency.js';
 import { translateMessage } from '../services/translate.js';
-import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
+import { handleSend } from './send-handler.js';
 import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
@@ -55,13 +49,6 @@ function mutationViewerOf(c: Context<AppContext>, bodyScope?: 'mine' | 'unclaime
   return mutationViewer(c, { userId: user.id, role: user.role }, bodyScope);
 }
 
-function viewerFromListQuery(
-  user: { id: number; role: Viewer['role'] },
-  query: { scope?: Viewer['scope']; userId?: number },
-): Viewer {
-  return { userId: user.id, role: user.role, scope: query.scope, targetUserId: query.userId };
-}
-
 /**
  * 首页（不带 cursor）附带 head，与 /sync 同一算法；带 afterId 的增量页不是 sync 所描述的首页，同样不带。
  * /v1 列表不返回 head。
@@ -69,60 +56,24 @@ function viewerFromListQuery(
 app.get('/', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  const page = await listMessages(c.env, viewerFromListQuery(user, query), query);
+  const page = await listMessages(c.env, listViewer(c, { userId: user.id, role: user.role }, query), query);
   if (query.cursor !== undefined || query.afterId !== undefined) return ok(c, page);
   const body: MessageListPage = { ...page, head: await pageHead(page) };
   return ok(c, body);
 });
 
-app.post('/send', async (c) => {
+app.post('/send', (c) => {
   const user = c.get('user')!;
-  const req = await parseBody(c, internalSendMailSchema);
-  const idem = await beginIdempotentSend(
-    c.env,
-    { type: 'user', id: user.id },
-    c.req.header('Idempotency-Key'),
-    req,
-  );
-  if (idem.kind === 'replay') return ok(c, idem.response, 201);
-  let summary: MessageSummary;
-  try {
-    // 兼容两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端），合并后送 sendMail
-    const decoded = decodeInlineAttachments(req.attachments);
-    const fromTokens = await resolveDraftAttachments(c.env, user.id, req.attachmentTokens);
-    const attachments = [...decoded, ...fromTokens];
-    const origin = new URL(c.req.url).origin;
-    summary = await sendMail(
-      c.env,
-      c.executionCtx,
-      { userId: user.id, role: user.role },
-      req,
-      attachments,
-      origin,
-      idem.handle,
-    );
-    try { await completeIdempotentSend(c.env, idem.handle, summary); }
-    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
-  } catch (error) {
-    await failIdempotentSend(c.env, idem.handle, error);
-    throw error;
-  }
-  // 发送成功后回收 token 引用的草稿附件（base64 内联的无草稿，跳过）。
-  // 不能让回收失败翻转整个请求的结果：邮件此刻已经真发出去了，这里再抛 500 会让前端提示
-  // 「发送失败，请重试」，用户一重发、token 又还在，收件人就收到两封。回收失败留给
-  // 24h 的草稿清理任务兜底
-  try {
-    await consumeDraftAttachments(c.env, user.id, req.attachmentTokens);
-  } catch (e) {
-    console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', e);
-  }
-  return ok(c, summary, 201);
+  return handleSend(c, { type: 'user', id: user.id }, { userId: user.id, role: user.role });
 });
 
+/** includeUnread：个人视图顺带返回标记后的未读数（与 GET /unread-count 同口径），详情页省掉一次未读数请求 */
 app.post('/read', async (c) => {
-  const req = await parseBody(c, markReadRequestSchema);
-  const changed = await markMessages(c.env, mutationViewerOf(c, req.scope), req.ids, req.isRead);
-  return ok(c, { changed });
+  const req = await parseBody(c, apiMarkReadRequestSchema);
+  const viewer = mutationViewerOf(c, req.scope);
+  const withUnread = req.includeUnread && (viewer.scope === undefined || viewer.scope === 'mine');
+  const result: MarkReadResult = await markMessagesAndCount(c.env, viewer, req.ids, req.isRead, withUnread ? UNREAD_COUNT_CAP : undefined);
+  return ok(c, result);
 });
 
 /**
@@ -153,7 +104,9 @@ app.post('/restore', async (c) => {
 /** 永久删除（回收站里彻底删） */
 app.post('/purge', async (c) => {
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewerOf(c, req.scope), req.ids, execCtx(c));
+  const viewer = mutationViewerOf(c, req.scope);
+  const purged = await purgeMessages(c.env, viewer, req.ids, execCtx(c));
+  await auditUnclaimedPurge(c, viewer, req.ids, purged);
   return ok(c, { purged, changed: purged });
 });
 
@@ -176,7 +129,7 @@ app.get('/unread-count', async (c) => {
 app.get('/sync', async (c) => {
   const query = parseQuery(c, listMessagesQuerySchema);
   const user = c.get('user')!;
-  return ok(c, await syncMessages(c.env, viewerFromListQuery(user, query), query));
+  return ok(c, await syncMessages(c.env, listViewer(c, { userId: user.id, role: user.role }, query), query));
 });
 
 /** 写信收件人自动补全：近期联系人 */
@@ -216,7 +169,8 @@ app.get('/:id/raw', async (c) => {
 
 app.get('/:id', async (c) => {
   const id = parseId(c.req.param('id'));
-  return ok(c, await getMessageDetail(c.env, viewerOf(c), id));
+  const ifNoneMatch = c.req.header('If-None-Match');
+  return conditionalDetailResponse(c, await getMessageDetailConditional(c.env, viewerOf(c), id, { ifNoneMatch }));
 });
 
 export default app;

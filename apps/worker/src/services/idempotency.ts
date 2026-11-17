@@ -1,13 +1,14 @@
 import type { MessageSummary } from '@hpc-mail/shared';
 import { and, eq, isNull, sql } from 'drizzle-orm';
-import { createDb } from '../db/client.js';
-import { idempotencyRecords, messages, attachments } from '../db/schema.js';
+import { createDb, type Db } from '../db/client.js';
+import { idempotencyRecords, messages } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { summarize } from './message.js';
+import { loadMessageSummary } from './message.js';
 import type { Env } from '../types.js';
 
-export type IdempotencyActor = { type: 'user' | 'api_key'; id: number };
+/** draft：服务端草稿发送占用的幂等记录（id 为草稿 id，key 为第几次发送），与调用方自己的 Idempotency-Key 互不干扰 */
+export type IdempotencyActor = { type: 'user' | 'api_key' | 'draft'; id: number };
 
 export interface IdempotencyHandle {
   actor: IdempotencyActor;
@@ -19,7 +20,8 @@ export type IdempotencyStart =
   | { kind: 'owner'; handle: IdempotencyHandle | null }
   | { kind: 'replay'; response: MessageSummary };
 
-function normalizeKey(value: string | undefined): string | null {
+/** Idempotency-Key 头：空白视为未给；其余必须是 1-128 位可见 ASCII（发信与创建草稿共用） */
+export function normalizeIdempotencyKey(value: string | undefined): string | null {
   const key = value?.trim();
   if (!key) return null;
   if (key.length > 128 || !/^[\x21-\x7e]+$/.test(key)) {
@@ -46,7 +48,7 @@ export async function beginIdempotentSend(
   rawKey: string | undefined,
   request: unknown,
 ): Promise<IdempotencyStart> {
-  const key = normalizeKey(rawKey);
+  const key = normalizeIdempotencyKey(rawKey);
   if (!key) return { kind: 'owner', handle: null };
   const requestHash = await sha256Hex(JSON.stringify(request));
   const db = createDb(env);
@@ -81,10 +83,8 @@ export async function beginIdempotentSend(
       }
     }
     if (existing.messageId) {
-      const row = await db.select().from(messages).where(eq(messages.id, existing.messageId)).get();
-      if (row && row.status !== 'pending') {
-        const attachment = await db.select({ id: attachments.id }).from(attachments).where(eq(attachments.messageId, row.id)).get();
-        const response = summarize(row, !!attachment, false);
+      const response = await loadMessageSummary(env, existing.messageId);
+      if (response && response.status !== 'pending') {
         try { await completeIdempotentSend(env, handle, response); }
         catch (error) { console.error('Idempotency recovery persistence deferred:', error); }
         return { kind: 'replay', response };
@@ -134,17 +134,21 @@ export async function bindIdempotentSend(
   if (!bound.length) throw new AppError('send_in_progress', `${detail}，请查询发送记录`);
 }
 
+/** 记下本次发送的响应（含全部失败的 422 结果），同 Key 重放直接返回它；可与发件行的最终结果合进同一个 batch */
+export function completeIdempotentStatement(db: Db, handle: IdempotencyHandle, response: MessageSummary) {
+  return db
+    .update(idempotencyRecords)
+    .set({ status: 'completed', responseJson: JSON.stringify(response), errorDetail: '', updatedAt: new Date() })
+    .where(and(recordOf(handle), eq(idempotencyRecords.status, 'pending')));
+}
+
 export async function completeIdempotentSend(
   env: Env,
   handle: IdempotencyHandle | null,
   response: MessageSummary,
 ): Promise<void> {
   if (!handle) return;
-  const db = createDb(env);
-  await db
-    .update(idempotencyRecords)
-    .set({ status: 'completed', responseJson: JSON.stringify(response), errorDetail: '', updatedAt: new Date() })
-    .where(and(recordOf(handle), eq(idempotencyRecords.status, 'pending')));
+  await completeIdempotentStatement(createDb(env), handle, response);
 }
 
 /**

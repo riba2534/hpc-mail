@@ -148,6 +148,83 @@
       "when": 1792571378985,
       "tag": "0020_hosted_domains",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1794913645111,
+      "tag": "0021_agent_send_reliability",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1794913646111,
+      "tag": "0022_key_scopes_account_security",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1794913647111,
+      "tag": "0023_webhooks_v2",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1795400000000,
+      "tag": "0024_hosted_domain_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1795400001000,
+      "tag": "0025_api_log_aggregation",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1795400001500,
+      "tag": "0027_drafts_scheduled_send",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1795400002000,
+      "tag": "0028_inbound_auth_results",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1795420800000,
+      "tag": "0029_delivery_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1795420800001,
+      "tag": "0030_maintenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1795420800002,
+      "tag": "0031_system_domain_onboarding",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1795420800003,
+      "tag": "0032_webhook_access_role",
+      "breakpoints": true
     }
   ]
 }

@@ -1,20 +1,30 @@
 import {
+  MAX_INLINE_ATTACHMENT_TOTAL_BYTES,
+  batchSendRequestSchema,
   deleteMessagesRequestSchema,
+  inlineAttachmentBytes,
+  internalSendMailSchema,
   listMessagesQuerySchema,
   markReadRequestSchema,
   MAX_WAIT_POLLS_PER_USER_PER_MINUTE,
-  internalSendMailSchema,
   starMessagesRequestSchema,
   markAllReadRequestSchema,
   waitMessagesQuerySchema,
+  type BatchSendItemResult,
+  type BatchSendResult,
 } from '@hpc-mail/shared';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
-import { messageViewer, mutationViewer } from '../../lib/message-viewer.js';
+import { auditUnclaimedPurge, listViewer, messageViewer, mutationViewer } from '../../lib/message-viewer.js';
+import { runLimited } from '../../lib/concurrency.js';
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
-import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
-import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
+import { conditionalDetailResponse } from '../../lib/etag.js';
+import { execCtx, ok, parseBody, parseId, parseQuery, parseValue } from '../../lib/http.js';
+import {
+  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseAddresses, assertKeyCanUseDomain, keyRestriction, requireScope,
+} from '../../middleware/api-key-auth.js';
+import { errorObject } from '../../middleware/error.js';
 import {
   countUnread,
   deleteMessages,
@@ -26,19 +36,13 @@ import {
   restoreMessages,
   purgeMessages,
   findNextMessage,
-  getMessageDetail,
+  getMessageDetailConditional,
   listMessages,
   loadAttachmentForViewer,
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import { decodeInlineAttachments, sendMail } from '../../services/outbound.js';
-import {
-  beginIdempotentSend,
-  completeIdempotentSend,
-  failIdempotentSend,
-} from '../../services/idempotency.js';
-import { consumeDraftAttachments, resolveDraftAttachments } from '../../services/upload.js';
+import { assertRequestSize, authorizeSendContent, handleCompose, handleSend, sendEnvironment, sendOne } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -51,45 +55,93 @@ app.get('/', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const query = parseQuery(c, listMessagesQuerySchema);
-  return ok(c, await listMessages(c.env, viewerFromKey(key, query), query));
+  // 显式给出范围外的地址或域名直接 403，而不是静默返回空列表
+  if (query.address) await assertKeyCanUseAddress(c, query.address);
+  if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
+  return ok(c, await listMessages(c.env, listViewer(c, { userId: key.userId, role: key.role }, query), query));
 });
 
-app.post('/', async (c) => {
+app.post('/', (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
-  const req = await parseBody(c, internalSendMailSchema);
-  // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
-  if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
-  const idem = await beginIdempotentSend(
-    c.env,
-    { type: 'api_key', id: key.id },
-    c.req.header('Idempotency-Key'),
-    req,
-  );
-  if (idem.kind === 'replay') return ok(c, idem.response, 201);
-  try {
-    const attachments = [...decodeInlineAttachments(req.attachments),
-      ...await resolveDraftAttachments(c.env, key.userId, req.attachmentTokens)];
-    const origin = new URL(c.req.url).origin;
-    const summary = await sendMail(
-      c.env,
-      c.executionCtx,
-      { userId: key.userId, role: key.role },
-      req,
-      attachments,
-      origin,
-      idem.handle,
-    );
-    try { await completeIdempotentSend(c.env, idem.handle, summary); }
-    catch (error) { console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error); }
-    try { await consumeDraftAttachments(c.env, key.userId, req.attachmentTokens); }
-    catch (error) { console.error('已发送邮件的草稿回收延迟:', error); }
-    return ok(c, summary, 201);
-  } catch (error) {
-    await failIdempotentSend(c.env, idem.handle, error);
-    throw error;
-  }
+  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role });
 });
+
+/** 批量发送并发上限：项与项之间互不等待，又不至于同时持有太多附件或占满出站连接 */
+const BATCH_SEND_CONCURRENCY = 4;
+
+/**
+ * 批量发送：每项是一份独立的发信请求，与单发同一流程（校验、mail.read、幂等、URL 附件、配额、发送、回收）。
+ * 外层不合法、请求体或 base64 附件合计超限才整体失败；单项失败（含配额用尽的 429）只体现在该项结果里。
+ * 幂等键：项的 idempotencyKey 优先，否则由请求头 Idempotency-Key 派生 `<头>:<index>`，整批重试时逐项重放。
+ */
+app.post('/batch', async (c) => {
+  requireScope(c, 'mail.send');
+  await assertRequestSize(c);
+  const key = c.get('apiKey')!;
+  const { items } = await parseBody(c, batchSendRequestSchema);
+  const headerKey = c.req.header('Idempotency-Key')?.trim() || undefined;
+  const parsed = items.map((raw, index) => {
+    try {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new AppError('validation_failed', '每一项都需要是发信请求对象');
+      const { idempotencyKey, ...request } = raw as Record<string, unknown>;
+      if (idempotencyKey !== undefined && typeof idempotencyKey !== 'string') {
+        throw new AppError('validation_failed', 'idempotencyKey 需为字符串');
+      }
+      const itemKey = idempotencyKey?.trim() || (headerKey ? `${headerKey}:${index}` : undefined);
+      return { index, itemKey, req: parseValue(internalSendMailSchema, request) };
+    } catch (error) {
+      return { index, error };
+    }
+  });
+  // base64 附件在内存里要解码、组装 MIME，整批合计与单发同一上限，超了整体拒绝
+  const inlineBytes = parsed.reduce((sum, item) => sum + ('req' in item && item.req ? inlineAttachmentBytes(item.req.attachments) : 0), 0);
+  if (inlineBytes > MAX_INLINE_ATTACHMENT_TOTAL_BYTES) {
+    throw new AppError('payload_too_large', `批量请求里的 base64 附件合计超过 ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024}MB 上限`);
+  }
+  const se = sendEnvironment(c);
+  const sender = { userId: key.userId, role: key.role };
+  const results: BatchSendItemResult[] = [];
+  await runLimited(parsed, BATCH_SEND_CONCURRENCY, async (item) => {
+    const itemKey = 'itemKey' in item ? item.itemKey : undefined;
+    try {
+      if ('error' in item) throw item.error;
+      await authorizeSendContent(c, item.req);
+      const message = await sendOne(se, { type: 'api_key', id: key.id }, sender, item.req, itemKey);
+      results.push({ index: item.index, ok: true, httpStatus: 201, ...(itemKey ? { idempotencyKey: itemKey } : {}), message });
+    } catch (error) {
+      const { status, error: body } = errorObject(error, c);
+      results.push({ index: item.index, ok: false, httpStatus: status, ...(itemKey ? { idempotencyKey: itemKey } : {}), error: body });
+    }
+  });
+  results.sort((a, b) => a.index - b.index);
+  const succeeded = results.filter((result) => result.ok).length;
+  const body: BatchSendResult = { items: results, succeeded, failed: results.length - succeeded };
+  return ok(c, body);
+});
+
+/**
+ * 按域名收窄：域名在 allowedDomains 中，或只限定了邮箱时该域名下有允许的邮箱（列表照常只返回允许的邮箱），
+ * 否则 403。只限定邮箱的 Key 按域名筛自己邮箱的邮件是合理用法，不应一律拒绝。
+ */
+function assertKeyCanUseDomainOrMailboxes(c: Context<AppContext>, domain: string): void {
+  const restriction = keyRestriction(c);
+  if (!restriction || restriction.domains.includes(domain) || restriction.mailboxIds.length) return;
+  assertKeyCanUseDomain(c, domain);
+}
+
+/**
+ * 回复与转发：服务端按原信算收件人、主题、引用与线程头，from 缺省用原信的收件地址。
+ * 会读出原信内容，与 POST / 引用来源邮件一样同时需要 mail.send 与 mail.read。
+ */
+for (const op of ['reply', 'forward'] as const) {
+  app.post(`/:id/${op}`, (c) => {
+    requireScope(c, 'mail.send');
+    requireScope(c, 'mail.read');
+    const key = c.get('apiKey')!;
+    return handleCompose(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, op, parseId(c.req.param('id')));
+  });
+}
 
 /** 标记已读/未读——Agent 处理完邮件后维护状态用（需 mail.write） */
 app.post('/read', async (c) => {
@@ -135,7 +187,9 @@ app.post('/restore', async (c) => {
 app.post('/purge', async (c) => {
   requireScope(c, 'mail.write');
   const req = await parseBody(c, deleteMessagesRequestSchema);
-  const purged = await purgeMessages(c.env, mutationViewer(c, c.get('apiKey')!, req.scope), req.ids, execCtx(c));
+  const viewer = mutationViewer(c, c.get('apiKey')!, req.scope);
+  const purged = await purgeMessages(c.env, viewer, req.ids, execCtx(c));
+  await auditUnclaimedPurge(c, viewer, req.ids, purged);
   return ok(c, { purged, changed: purged });
 });
 
@@ -152,7 +206,7 @@ app.get('/unread-count', async (c) => {
   if (scope !== undefined && scope !== 'mine') {
     throw new AppError('validation_failed', '未读数只统计调用者认领的地址，scope 只能为 mine');
   }
-  return ok(c, { unread: await countUnread(c.env, key.userId, key.role) });
+  return ok(c, { unread: await countUnread(c.env, key.userId, key.role, undefined, keyRestriction(c) ?? undefined) });
 });
 
 /**
@@ -160,11 +214,18 @@ app.get('/unread-count', async (c) => {
  * 轮询配额在请求开始时按本次最多轮询次数一次性预占（1 次写），结束时退还未用部分，
  * 不再每 2 秒写一次计数；预占超限即拒绝，并发长轮询仍受同一上限约束。
  * from/subjectContains/hasCode 跳过不匹配的新邮件；scannedThroughId 让调用方超时后也能推进游标。
+ * address（最多 20 个）与 domain 收窄范围；include=body 命中时直接返回详情结构，省一次详情请求。
  */
 app.get('/wait', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
-  const query = parseQuery(c, waitMessagesQuerySchema);
+  // 重复的 address 参数（?address=a&address=b）先用逗号合并，与逗号分隔写法走同一校验
+  const addresses = c.req.queries('address');
+  const query = parseQuery(c, {
+    safeParse: (raw) => waitMessagesQuerySchema.safeParse({ ...(raw as Record<string, string>), address: addresses?.join(',') }),
+  });
+  if (query.address) await assertKeyCanUseAddresses(c, query.address);
+  if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
   const signal = c.req.raw.signal;
@@ -186,9 +247,9 @@ app.get('/wait', async (c) => {
       if (signal.aborted) return empty();
       polls++;
       const found = await findNextMessage(c.env, viewer, {
-        afterId: cursor, address: query.address,
+        afterId: cursor, address: query.address, domain: query.domain, include: query.include,
         from: query.from, subjectContains: query.subjectContains, hasCode: query.hasCode,
-      });
+      }, V1_ATTACHMENT_TTL_SECONDS);
       cursor = found.scannedThroughId;
       if (found.message) return ok(c, found);
       const remaining = deadline - Date.now();
@@ -216,13 +277,6 @@ function waitForPoll(signal: AbortSignal, milliseconds: number): Promise<void> {
   });
 }
 
-function viewerFromKey(
-  key: { userId: number; role: Viewer['role'] },
-  query: { scope?: Viewer['scope']; userId?: number },
-): Viewer {
-  return { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId };
-}
-
 app.get('/:id/thread', async (c) => {
   requireScope(c, 'mail.read');
   return ok(c, { items: await getThread(c.env, messageViewer(c, c.get('apiKey')!), parseId(c.req.param('id'))) });
@@ -243,7 +297,10 @@ app.get('/:id', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
-  return ok(c, await getMessageDetail(c.env, messageViewer(c, key), id, V1_ATTACHMENT_TTL_SECONDS));
+  const ifNoneMatch = c.req.header('If-None-Match');
+  return conditionalDetailResponse(c, await getMessageDetailConditional(c.env, messageViewer(c, key), id, {
+    attachmentTtlSeconds: V1_ATTACHMENT_TTL_SECONDS, ifNoneMatch,
+  }));
 });
 
 app.get('/:id/attachments/:attId', async (c) => {

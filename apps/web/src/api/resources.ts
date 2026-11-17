@@ -15,8 +15,11 @@ import type {
   ClaimPlan,
   ClaimPlanStrategy,
   CompleteMultipartUploadRequest,
-  CreateApiKeyRequest,
+  ConfirmForwardResult,
+  CreateApiKeyInput,
   CreatedApiKey,
+  NotifyPrefsView,
+  TwoFactorDisabled,
   CreateInviteRequest,
   CreateUserRequest,
   DisableTwoFactorRequest,
@@ -28,6 +31,8 @@ import type {
   ListMessagesQuery,
   LoginRequest,
   MarkAllReadRequest,
+  ApiMarkReadRequest,
+  MarkReadResult,
   LoginResponse,
   Mailbox,
   MailboxAvailability,
@@ -54,13 +59,15 @@ import type {
   UpdateUserRequest,
   UploadAvatarRequest,
   UploadedPart,
-  UserNotifyPrefs,
   NotificationHealth,
   TwoFactorEnabled,
   TwoFactorSetup,
 } from '@hpc-mail/shared';
 import { api, type QueryParams } from './client';
-import { xhrSend, type UploadProgress } from './upload-client';
+import type { UploadProgress, XhrSendOptions } from './upload-client';
+
+/** 带进度的 XHR 上传通道只有写信附件用到：按需加载，不随入口下载 */
+const xhrSend = async <T>(options: XhrSendOptions) => (await import('./upload-client')).xhrSend<T>(options);
 
 // ---- auth ----
 export const authApi = {
@@ -74,10 +81,11 @@ export const authApi = {
   uploadAvatar: (body: UploadAvatarRequest) =>
     api.post<SessionUser, UploadAvatarRequest>('/auth/avatar', body),
   deleteAvatar: () => api.delete<SessionUser>('/auth/avatar'),
-  setup2fa: () => api.post<TwoFactorSetup>('/auth/2fa/setup'),
+  setup2fa: (password: string) => api.post<TwoFactorSetup, { password: string }>('/auth/2fa/setup', { password }),
+  /** 启用与关闭都会让其他会话失效，返回的 token 要立即替换当前会话令牌 */
   enable2fa: (code: string) => api.post<TwoFactorEnabled, { code: string }>('/auth/2fa/enable', { code }),
   disable2fa: (body: DisableTwoFactorRequest) =>
-    api.post<{ success: boolean }, DisableTwoFactorRequest>('/auth/2fa/disable', body),
+    api.post<TwoFactorDisabled, DisableTwoFactorRequest>('/auth/2fa/disable', body),
 };
 
 // ---- 公开配置 ----
@@ -92,9 +100,12 @@ export const domainApi = {
 
 // ---- 个人转发与通知偏好 ----
 export const notifyPrefsApi = {
-  get: () => api.get<UserNotifyPrefs>('/me/notify-prefs'),
+  get: () => api.get<NotifyPrefsView>('/me/notify-prefs'),
   update: (body: UpdateNotifyPrefsRequest) =>
-    api.put<UserNotifyPrefs, UpdateNotifyPrefsRequest>('/me/notify-prefs', body),
+    api.put<NotifyPrefsView, UpdateNotifyPrefsRequest>('/me/notify-prefs', body),
+  /** 目标邮箱的主人确认接收转发（公开，凭确认信里的 token） */
+  confirmForward: (token: string) =>
+    api.post<ConfirmForwardResult, { token: string }>('/forward-confirmations/confirm', { token }, { token: null }),
   testFeishu: () => api.post<{ ok: boolean }>('/me/notify-prefs/feishu-test'),
   testPushdeer: () => api.post<{ ok: boolean }>('/me/notify-prefs/pushdeer-test'),
   health: () => api.get<NotificationHealth>('/me/notify-prefs/health'),
@@ -103,7 +114,7 @@ export const notifyPrefsApi = {
 
 // ---- 邮箱 ----
 export const mailboxApi = {
-  list: (all = false) => api.get<Mailbox[]>('/mailboxes', { query: { all: all ? 1 : undefined } }),
+  list: () => api.get<Mailbox[]>('/mailboxes'),
   claim: (body: ClaimMailboxRequest) => api.post<Mailbox, ClaimMailboxRequest>('/mailboxes', body),
   update: (id: number, body: UpdateMailboxRequest) =>
     api.put<Mailbox, UpdateMailboxRequest>(`/mailboxes/${id}`, body),
@@ -151,8 +162,10 @@ export const messageApi = {
       headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
     }),
   unreadCount: () => api.get<{ unread: number }>('/messages/unread-count'),
-  markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed') =>
-    api.post<{ changed: number }, { ids: number[]; isRead: boolean }>('/messages/read', { ids, isRead }, { query: { scope } }),
+  /** includeUnread：个人视图的响应顺带带回标记后的未读数，省掉一次 unread-count 请求 */
+  markRead: (ids: number[], isRead: boolean, scope?: 'mine' | 'unclaimed', includeUnread = false) =>
+    api.post<MarkReadResult, ApiMarkReadRequest>('/messages/read', { ids, isRead, ...(includeUnread ? { includeUnread } : {}) },
+      { query: { scope } }),
   /** 按筛选（domain/address/q）收窄范围的全部已读；只处理自己认领的地址 */
   markAllRead: (body: MarkAllReadRequest = {}) =>
     api.post<{ changed: number }, MarkAllReadRequest>('/messages/read-all', body),
@@ -223,7 +236,7 @@ export const uploadsApi = {
 // ---- API Keys（自助） ----
 export const apiKeyApi = {
   list: () => api.get<ApiKeySummary[]>('/api-keys'),
-  create: (body: CreateApiKeyRequest) => api.post<CreatedApiKey, CreateApiKeyRequest>('/api-keys', body),
+  create: (body: CreateApiKeyInput) => api.post<CreatedApiKey, CreateApiKeyInput>('/api-keys', body),
   update: (id: number, body: UpdateApiKeyRequest) =>
     api.put<ApiKeySummary, UpdateApiKeyRequest>(`/api-keys/${id}`, body),
   remove: (id: number) => api.delete<void>(`/api-keys/${id}`),

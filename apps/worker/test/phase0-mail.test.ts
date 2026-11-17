@@ -13,6 +13,7 @@ import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { deleteMessages, findNextMessage, getMessageDetail } from '../src/services/message.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 afterEach(() => { vi.restoreAllMocks(); });
@@ -58,10 +59,13 @@ async function baseSettings(patch: Partial<Settings> = {}) {
 async function account(prefix: string, role: 'admin' | 'user' = 'user', scopes: ApiScope[] = [...API_SCOPES]) {
   const username = `${prefix}-${rand()}`;
   const [user] = await createDb(env).insert(users)
-    .values({ username, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+    .values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`, scopes, rateLimit: 120 })), 201);
+  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`,
+    scopes: scopes.filter((scope) => scope !== 'admin'), rateLimit: 120, password: TEST_PASSWORD })), 201);
+  // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope）
+  if (role === 'admin' && scopes.includes('admin')) await grantLegacyAdminScope(env, key.id);
   const localPart = username.toLowerCase();
   const address = `${localPart}@hpc.email`;
   const [box] = await createDb(env).insert(mailboxes).values({ address, domain: 'hpc.email', userId: user!.id }).returning({ id: mailboxes.id });
@@ -183,7 +187,7 @@ describe('X03 wait 不越过附件未就绪的收件', () => {
     const base = await maxMessageId();
     const pending = await mail(owner.address, { fromAddress: 'billing@vendor.example', subject: 'Invoice attached', status: 'pending' });
     const later = await mail(owner.address, { fromAddress: 'login@other.example', subject: 'Your code', preview: 'Your verification code is 135790', verificationCode: '135790' });
-    const next = (filters: Omit<Parameters<typeof findNextMessage>[2], 'address'>) => findNextMessage(env, viewer, { address: owner.address, ...filters });
+    const next = (filters: Omit<Parameters<typeof findNextMessage>[2], 'address'>) => findNextMessage(env, viewer, { address: [owner.address], ...filters });
 
     expect(await next({ afterId: base })).toEqual({ message: null, scannedThroughId: base });
     expect(await next({ afterId: base, from: '@vendor.example' })).toEqual({ message: null, scannedThroughId: base });
@@ -253,10 +257,10 @@ describe('R09 发信引用来源邮件需要读取权限与可见性', () => {
       for (const [field, message] of Object.entries(unavailable)) {
         const subject = `r09-hidden-${rand()}`;
         expect(await failure(await send(owner.key, owner.localPart, { subject, [field]: source }), 404), `${field}=${source}`)
-          .toEqual({ code: 'source_unavailable', message });
+          .toMatchObject({ code: 'source_unavailable', message });
         expect(await failure(await request('/api/messages/send', json(owner.jwt, {
           from: { localPart: owner.localPart, domain: 'hpc.email' }, to: [`r09-sink-${rand()}@hpc.email`], text: 'body', subject, [field]: source,
-        })), 404), `/api ${field}=${source}`).toEqual({ code: 'source_unavailable', message });
+        })), 404), `/api ${field}=${source}`).toMatchObject({ code: 'source_unavailable', message });
         expect(await outboundCount(subject)).toBe(0);
       }
     }
@@ -265,7 +269,7 @@ describe('R09 发信引用来源邮件需要读取权限与可见性', () => {
     const broken = await mail(owner.address, { subject: 'Broken original' });
     await createDb(env).insert(attachments).values({ messageId: broken, r2Key: `att/${broken}/gone`, filename: 'gone.txt', mimeType: 'text/plain', size: 4 });
     expect(await failure(await send(owner.key, owner.localPart, { subject: `r09-broken-${rand()}`, forwardAttachmentsFrom: broken }), 404))
-      .toEqual({ code: 'source_unavailable', message: '附件「gone.txt」已丢失，无法完整转发' });
+      .toMatchObject({ code: 'source_unavailable', message: '附件「gone.txt」已丢失，无法完整转发' });
     expect(await failure(await request('/v1/messages', json(owner.key, {
       from: { mailboxId: 999_999_999 }, to: [`r09-sink-${rand()}@hpc.email`], subject: `r09-nobox-${rand()}`, text: 'body',
     })), 404)).toEqual({ code: 'not_found', message: '发件邮箱不存在' });

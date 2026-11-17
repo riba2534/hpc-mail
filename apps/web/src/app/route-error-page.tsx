@@ -1,4 +1,5 @@
 import { AlertTriangle, RefreshCw, WifiOff } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { isRouteErrorResponse, useRouteError } from 'react-router-dom';
 import { ApiError, isFetchFailure } from '@/api/errors';
 import { Button } from '@/components/ui/button';
@@ -29,7 +30,11 @@ function technicalDetail(error: unknown): string {
   return String(error);
 }
 
-export function RouteErrorPage() {
+/**
+ * 路由错误的说明区（图标、标题、说明与技术细节）。根错误页整屏显示并提供刷新；
+ * 外壳内的页面错误只替换主内容区。容器样式与操作按钮由调用方给出。
+ */
+export function RouteErrorView({ className, actions }: { className: string; actions: ReactNode }) {
   const error = useRouteError();
   const kind = isRouteErrorResponse(error) ? 'other' : classifyRouteError(error);
   const offline = globalThis.navigator?.onLine === false;
@@ -56,7 +61,7 @@ export function RouteErrorPage() {
   const Icon = kind === 'network' || offline ? WifiOff : friendly ? RefreshCw : AlertTriangle;
 
   return (
-    <div className="grid min-h-dvh place-items-center bg-canvas px-6">
+    <div className={className}>
       <div className="flex w-full max-w-sm flex-col items-center gap-4 text-center">
         <div
           className={
@@ -71,7 +76,7 @@ export function RouteErrorPage() {
           <h1 className="text-lg font-semibold text-ink">{title}</h1>
           <p className="text-sm text-ink-secondary">{message}</p>
         </div>
-        <Button onClick={() => globalThis.location.reload()}>刷新页面</Button>
+        {actions}
         {friendly && (
           <details className="w-full rounded-md border border-line bg-surface text-left text-xs">
             <summary className="cursor-pointer select-none px-3 py-2 text-ink-tertiary">技术细节</summary>
@@ -82,5 +87,15 @@ export function RouteErrorPage() {
         )}
       </div>
     </div>
+  );
+}
+
+/** 根路由错误页：外壳本身没能渲染（外壳 chunk 加载失败、登录页出错等），整屏显示 */
+export function RouteErrorPage() {
+  return (
+    <RouteErrorView
+      className="grid min-h-dvh place-items-center bg-canvas px-6"
+      actions={<Button onClick={() => globalThis.location.reload()}>刷新页面</Button>}
+    />
   );
 }

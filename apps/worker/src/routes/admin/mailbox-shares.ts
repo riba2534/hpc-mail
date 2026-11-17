@@ -1,7 +1,7 @@
-import { replaceMailboxSharesRequestSchema } from '@hpc-mail/shared';
+import { adminMailboxSharesQuerySchema, replaceMailboxSharesRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { AppError } from '../../lib/errors.js';
-import { clientIp, ok, parseBody, parseId } from '../../lib/http.js';
+import { clientIp, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
+import { pageRequestOf } from '../../lib/pagination.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { logAdminAction } from '../../services/audit.js';
 import { listMailboxShares, replaceMailboxShares, revokeMailboxShare } from '../../services/mailbox-share.js';
@@ -10,15 +10,12 @@ import type { AppContext } from '../../types.js';
 const app = new Hono<AppContext>();
 app.use('*', requireAuth, requireAdmin);
 
-/** ?mailboxId= 只返回该邮箱（0 或 1 项）；缺省返回全站已认领邮箱 */
+/** ?mailboxId= 只返回该邮箱（0 或 1 项的数组）；否则为全站已认领邮箱，带 cursor 或 limit 时返回 Page */
 app.get('/', async (c) => {
   const acting = c.get('user')!;
-  const raw = c.req.query('mailboxId');
-  const mailboxId = raw === undefined ? undefined : Number(raw);
-  if (raw !== undefined && !(/^[1-9]\d*$/.test(raw) && Number.isSafeInteger(mailboxId))) {
-    throw new AppError('validation_failed', 'mailboxId 需为正整数');
-  }
-  return ok(c, await listMailboxShares(c.env, acting.id, true, mailboxId));
+  const { mailboxId, q, ...rest } = parseQuery(c, adminMailboxSharesQuerySchema);
+  const page = mailboxId === undefined ? pageRequestOf(rest) : null;
+  return ok(c, await listMailboxShares(c.env, acting.id, true, { mailboxId, q }, page));
 });
 
 app.put('/', async (c) => {
@@ -40,8 +37,9 @@ app.delete('/:mailboxId/grantees/:userId', async (c) => {
   const acting = c.get('user')!;
   const mailboxId = parseId(c.req.param('mailboxId'));
   const userId = parseId(c.req.param('userId'));
-  await revokeMailboxShare(c.env, acting.id, mailboxId, userId, true);
-  await logAdminAction(c.env, acting, 'mailbox.unshare', `mailbox#${mailboxId}`, `user#${userId}`, clientIp(c));
+  const { address } = await revokeMailboxShare(c.env, acting.id, mailboxId, userId, true);
+  // target 写地址（与 mailbox.share、过户一致），按地址就能查到这只邮箱的全部共享变更
+  await logAdminAction(c.env, acting, 'mailbox.unshare', address, `移除共享 user#${userId}（mailbox#${mailboxId}）`, clientIp(c));
   return ok(c, { success: true });
 });
 

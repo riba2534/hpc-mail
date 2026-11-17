@@ -12,6 +12,7 @@ import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { toast } from '@/components/ui/toast';
+import { setAuthToken } from '@/lib/auth-token';
 import { useCurrentUser } from '@/lib/use-session';
 import { QrCode } from './qr-code';
 
@@ -112,7 +113,11 @@ function SetupPanel({ setup, onCancel }: { setup: TwoFactorSetup; onCancel: () =
 
   const enable = useMutation({
     mutationFn: () => authApi.enable2fa(code.trim()),
-    onSuccess: (data) => setRecoveryCodes(data.recoveryCodes),
+    onSuccess: (data) => {
+      // 启用会让其他会话全部失效，服务端返回的新 token 立即替换，当前会话才不掉线
+      setAuthToken(data.token);
+      setRecoveryCodes(data.recoveryCodes);
+    },
     onError: (err) => setError(err instanceof ApiError ? err.message : '验证失败'),
   });
 
@@ -199,21 +204,30 @@ export function TwoFactorSection({ id }: { id?: string }) {
   const user = useCurrentUser();
   const queryClient = useQueryClient();
   const [setup, setSetup] = useState<TwoFactorSetup | null>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [setupPassword, setSetupPassword] = useState('');
   const [disableOpen, setDisableOpen] = useState(false);
   const [disablePassword, setDisablePassword] = useState('');
 
   const invalidateSession = () => queryClient.invalidateQueries({ queryKey: queryKeys.session });
 
+  // 开始登记与关闭都要先输入当前密码：拿到会话的人不能给账号绑上自己的验证器，也不能只凭验证码关掉它
   const startSetup = useMutation({
-    mutationFn: () => authApi.setup2fa(),
-    onSuccess: (data) => setSetup(data),
+    mutationFn: () => authApi.setup2fa(setupPassword),
+    onSuccess: (data) => {
+      setSetupOpen(false);
+      setSetupPassword('');
+      setSetup(data);
+    },
     onError: (err) => toast({ title: err instanceof ApiError ? err.message : '启动失败', variant: 'error' }),
   });
 
   const disable = useMutation({
-    mutationFn: () => authApi.disable2fa({ password: disablePassword || undefined }),
-    onSuccess: () => {
-      toast({ title: '两步验证已关闭', variant: 'success' });
+    mutationFn: () => authApi.disable2fa({ password: disablePassword }),
+    onSuccess: (data) => {
+      // 关闭会让其他会话全部失效，换上服务端返回的新 token
+      setAuthToken(data.token);
+      toast({ title: '两步验证已关闭', description: '其他设备上的登录已退出', variant: 'success' });
       setDisableOpen(false);
       setDisablePassword('');
       void invalidateSession();
@@ -249,17 +263,49 @@ export function TwoFactorSection({ id }: { id?: string }) {
             开启后登录需 Authenticator 验证码，显著提升账户安全（本系统聚合各站验证码，账户价值高，建议开启）。
           </p>
           <div>
-            <Button variant="secondary" size="sm" loading={startSetup.isPending} onClick={() => startSetup.mutate()}>
+            <Button variant="secondary" size="sm" onClick={() => setSetupOpen(true)}>
               启用两步验证
             </Button>
           </div>
         </div>
       )}
 
+      {/* 开始登记前确认密码 */}
+      <Dialog open={setupOpen} onOpenChange={(next) => !next && setSetupOpen(false)}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader title="启用两步验证" description="请输入当前密码确认。启用后其他设备上的登录会退出。" />
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (setupPassword) startSetup.mutate();
+            }}
+          >
+            <DialogBody>
+              <PasswordInput
+                autoFocus
+                aria-label="当前密码"
+                placeholder="当前密码"
+                autoComplete="current-password"
+                value={setupPassword}
+                onChange={(event) => setSetupPassword(event.target.value)}
+              />
+            </DialogBody>
+            <DialogFooter>
+              <Button type="button" variant="secondary" onClick={() => setSetupOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" loading={startSetup.isPending} disabled={!setupPassword}>
+                继续
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
       {/* 关闭确认 */}
       <Dialog open={disableOpen} onOpenChange={(next) => !next && setDisableOpen(false)}>
         <DialogContent className="max-w-sm">
-          <DialogHeader title="关闭两步验证" description="请输入当前密码确认。" />
+          <DialogHeader title="关闭两步验证" description="请输入当前密码确认。关闭后其他设备上的登录会退出。" />
           <DialogBody>
             <PasswordInput
               autoFocus
@@ -273,7 +319,7 @@ export function TwoFactorSection({ id }: { id?: string }) {
             <Button variant="secondary" onClick={() => setDisableOpen(false)}>
               取消
             </Button>
-            <Button variant="danger" loading={disable.isPending} onClick={() => disable.mutate()}>
+            <Button variant="danger" loading={disable.isPending} disabled={!disablePassword} onClick={() => disable.mutate()}>
               关闭
             </Button>
           </DialogFooter>
