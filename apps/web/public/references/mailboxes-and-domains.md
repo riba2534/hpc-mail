@@ -18,7 +18,7 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发�
 | `GET /domains` | `data` 为域名字符串数组；系统域名之后附上已生效的托管域名：普通用户为自己拥有或被共享的，管理员为全部 | `data:{domains:[...]}`，任一有效 Key，范围同左 |
 | `GET /identities` | 发件身份 `{identities,domains}`，见[发件身份](#发件身份) | 同左，`mail.send` 或 `mailbox.read` 之一 |
 | `GET /mailboxes` | 自己认领的数组 | 同左，`mailbox.read` |
-| `GET /mailboxes?all=1` | 管理员全站数组；普通用户不能请求全站范围 | 同左，`mailbox.read` 加管理员角色 |
+| `GET /mailboxes?all=1` | 管理员全站数组；带 `limit` 或 `cursor` 时分页，见下文；普通用户不能请求全站范围 | 同左，`mailbox.read` 加管理员角色 |
 | `GET /mailboxes/shared` | 分享给自己的只读邮箱数组 | 同左，`mailbox.read` |
 | `GET /mailboxes/availability?localPart=…&domain=…&strategy=claude` | `{address,available,reason?}` | 同左，`mailbox.read` |
 | `POST /mailboxes/availability/batch` | `{items:[{localPart,domain,strategy?}...]}`（1–999 个）→ 按请求顺序的 availability 数组 | 同左，`mailbox.read` |
@@ -27,6 +27,8 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发�
 | `POST /mailboxes/batch` | `{items:[{localPart,domain,strategy?}...]}`（1–999 个）→ `{claimed,taken,notAttempted,stoppedBy}`，见[批量认领](#批量认领) | 同左，`mailbox.write` |
 | `PUT /mailboxes/:id` | `{displayName}` → 邮箱 | 同左，`mailbox.write` |
 | `DELETE /mailboxes/:id` | `{success:true,deletedMessages}` | 同左，`mailbox.write` |
+
+`GET /mailboxes` 按邮箱 id 倒序，可加 `q`（地址或所有者用户名的子串，不区分大小写，按字面匹配）与 `domain`（精确）。不带 `cursor` 和 `limit` 时返回完整数组（旧行为）；只要出现其中一个（值可为空）就返回 `{items,nextCursor}`，`limit` 1–200、缺省 50，`nextCursor` 原样传回取下一页，为 `null` 即末页，无效游标返回 400。全站邮箱可能有数千个，管理员脚本应带 `all=1&limit=200` 翻页，或用 `q`、`domain` 缩小范围。
 
 邮箱字段 `id,address,domain,userId,displayName,messageCount,createdAt,canSend`；管理员全站列表还有 `ownerUsername`。`canSend` 只反映该邮箱的域名当前能否发信（系统域名恒为 true，托管域名要求域名可用且发信已开通），不代表调用者有权用它发信。共享视图字段为 `mailboxId,address,domain,displayName,ownerUsername`，其 mailboxId 不是自己的发件权限。`messageCount` 包括地址下历史与软删除记录，不应作为是否删除历史的唯一依据。
 
@@ -108,7 +110,7 @@ hpc '/mailboxes/batch' -X POST -H 'Content-Type: application/json' --data-binary
 | `POST /mailboxes/shares/batch` | `{mailboxIds:[...],userIds:[...]}`（各 1–100 个）把自己的多只邮箱一次**追加**共享给同一批用户：已在名单的保留原授权时间，不移除任何人，重复调用幂等；每只邮箱追加后最多 100 人。出错时整单不写入任何邮箱：任一邮箱不归自己（管理员也一样）返回 403；用户含自己、不存在或已禁用，或追加后某只邮箱会超过 100 人，返回 400；校验通过后、写入前状态被并发改变返回 409，例如邮箱被过户或释放、被分享人被禁用或删除、并发写入使某只邮箱超过 100 人。并发的追加或替换共享本身不报错，按先后合并（已在名单的按主键跳过）。返回各邮箱本次写入后的完整名单，按去重后的 `mailboxIds` 顺序，重复 id 只返回一次 |
 | `DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | 所有者撤销一个成员；`{success:true}` |
 | `GET /mailboxes/share-users?q=...&excludeUserId=...&limit=20` | JWT 专用；搜索启用用户，仅返回 `{items:[{id,username,role}],hasMore}`，不含账户隐私或邮箱列表 |
-| `GET /admin/mailbox-shares` | 管理员查看全站已认领邮箱与 `grantees:[{userId,username,status,grantedAt}]`，包含尚未共享邮箱；`?mailboxId=` 只返回该邮箱（0 或 1 项） |
+| `GET /admin/mailbox-shares` | 管理员查看全站已认领邮箱与 `grantees:[{userId,username,status,grantedAt}]`，包含尚未共享邮箱；`?mailboxId=` 只返回该邮箱（0 或 1 项的数组）；`q` 按地址或所有者用户名过滤；分页参数同 `GET /mailboxes`，按邮箱 id 倒序，`limit` 计邮箱数，每项仍是完整名单 |
 | `PUT /admin/mailbox-shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` **整体替换任意已认领邮箱**的名单，`[]` 撤销全部；返回更新后的共享邮箱 |
 | `DELETE /admin/mailbox-shares/:mailboxId/grantees/:userId` | 只撤销一人；`{success:true}` |
 
@@ -145,7 +147,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 
 | 路径（JWT `/api`；Key `/v1` 的范围见[下节](#用-api-key-接入)） | 说明 |
 |---|---|
-| `GET /hosted-domains` | 自己拥有（`role:"owner"`）与被共享（`role:"member"`）的域名；管理员全站用 `GET /admin/hosted-domains?status=&q=` |
+| `GET /hosted-domains` | 自己拥有（`role:"owner"`）与被共享（`role:"member"`）的域名；管理员全站用 `GET /admin/hosted-domains?status=&q=`（不分页时最多 1000 条，带 `limit`/`cursor` 按 id 倒序分页，规则同 `GET /mailboxes`） |
 | `POST /hosted-domains` | `{domain}`，填已注册的根域名 → 201，`status:"pending"`、`nameServers` 两条、`originalNameServers`、`warnings`（如需先关闭 DNSSEC）、`expiresAt`（到期未改 NS 自动删除） |
 | `GET /hosted-domains/:id` | 进度：`status` 与 `steps:{nameServers,routing,catchAll,sending}`（各为 waiting/ready/error）、`lastError`、`checkedAt` |
 | `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态；每人每分钟最多 10 次（被节流、无权限的也计），超出或全站 Cloudflare 额度用完返回 429；真正触发复查时计 4 次全站额度，托管功能关闭或站点缺少 Cloudflare 凭据时不计 |

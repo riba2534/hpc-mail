@@ -6,7 +6,7 @@ import { MemoryRouter } from 'react-router-dom';
 import type { MailboxShareGrant } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 
-const mocks = vi.hoisted(() => ({ list: vi.fn(), replace: vi.fn(), toast: vi.fn(), mobile: false }));
+const mocks = vi.hoisted(() => ({ list: vi.fn(), replace: vi.fn(), toast: vi.fn(), get: vi.fn(), mobile: false }));
 const grants: MailboxShareGrant[] = [
   {
     mailboxId: 1, address: 'first@example.com', domain: 'example.com', displayName: '',
@@ -33,14 +33,12 @@ vi.mock('@/api/resources', () => ({
 }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.mock('@/lib/use-media-query', () => ({ useIsMobile: () => mocks.mobile }));
-vi.mock('@/features/mailboxes/use-mailboxes', () => ({
-  useMailboxesQuery: () => ({
-    data: grants.map(grant => ({ id: grant.mailboxId, address: grant.address, userId: grant.ownerUserId,
-      ownerUsername: grant.ownerUsername, messageCount: 12 })),
-    isLoading: false, isError: false,
-  }),
-}));
+vi.mock('@/api/client', () => ({ api: { get: mocks.get } }));
 import { AddressesPage } from './addresses-page';
+import { fakeAdminMailboxesApi } from './fake-admin-mailboxes';
+
+const boxes = grants.map(grant => ({ id: grant.mailboxId, address: grant.address, domain: grant.domain, userId: grant.ownerUserId,
+  ownerUsername: grant.ownerUsername, displayName: '', messageCount: 12, createdAt: '2026-10-06T00:00:00Z' }));
 
 // jsdom 未实现 scrollTo：窗口虚拟列表挂载时会把滚动位置同步一次
 window.scrollTo = vi.fn() as typeof window.scrollTo;
@@ -58,6 +56,7 @@ function mount(seed?: (client: QueryClient) => void) {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.mobile = false;
+  mocks.get.mockImplementation(fakeAdminMailboxesApi(boxes));
   mocks.list.mockImplementation(sharesOf);
   mocks.replace.mockImplementation(async ({ userIds }: { userIds: number[] }) => ({ grantees: userIds.map(userId => ({ userId })) }));
 });
@@ -65,8 +64,9 @@ beforeEach(() => {
 describe('按地址行共享邮箱', () => {
   it('点击第二行直接编辑该邮箱，保留现有成员并只提交该邮箱的共享', async () => {
     const { client, view } = mount();
+    const share = await screen.findByRole('button', { name: '共享邮箱 second@example.com' });
     expect(mocks.list).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(share);
     const member = await screen.findByRole('checkbox', { name: 'active-member' });
     // 只按这一个邮箱读共享名单，缓存在该邮箱自己的 key 下
     expect(mocks.list.mock.calls).toEqual([[7]]);
@@ -87,7 +87,9 @@ describe('按地址行共享邮箱', () => {
   it('关闭后保留地址筛选并将焦点还给当前行按钮', async () => {
     const user = userEvent.setup();
     const { client, view } = mount();
+    await screen.findByRole('button', { name: '共享邮箱 second@example.com' });
     await user.type(screen.getByPlaceholderText('搜索地址或用户名'), 'second-owner');
+    await waitFor(() => expect(screen.queryByRole('button', { name: '共享邮箱 first@example.com' })).toBeNull());
     await user.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
     await screen.findByRole('checkbox', { name: 'active-member' });
     await user.click(screen.getByRole('button', { name: '取消' }));
@@ -99,7 +101,7 @@ describe('按地址行共享邮箱', () => {
 
   it('切换到另一行不会沿用之前未保存的成员，允许移除失效成员', async () => {
     const { client, view } = mount();
-    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(await screen.findByRole('button', { name: '共享邮箱 second@example.com' }));
     fireEvent.click(await screen.findByRole('checkbox', { name: 'active-admin' }));
     fireEvent.click(screen.getByRole('button', { name: '取消' }));
     fireEvent.click(screen.getByRole('button', { name: '共享邮箱 first@example.com' }));
@@ -118,7 +120,7 @@ describe('按地址行共享邮箱', () => {
     // TanStack 用 setTimeout 合批通知订阅者：让出一个宏任务，界面才会反映查询状态
     const flush = () => act(() => new Promise((resolve) => setTimeout(resolve, 10)));
     const { client, view } = mount();
-    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(await screen.findByRole('button', { name: '共享邮箱 second@example.com' }));
     fireEvent.click(await screen.findByRole('checkbox', { name: 'active-member' }));
     expect(screen.getByRole('checkbox', { name: 'active-member' })).not.toBeChecked();
 
@@ -144,7 +146,7 @@ describe('按地址行共享邮箱', () => {
 
   it('可取消全部成员来撤销当前邮箱的共享', async () => {
     const { client, view } = mount();
-    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(await screen.findByRole('button', { name: '共享邮箱 second@example.com' }));
     fireEvent.click(await screen.findByRole('checkbox', { name: 'active-member' }));
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
     await waitFor(() => expect(mocks.replace).toHaveBeenCalledWith({ mailboxId: 7, userIds: [], expectedOwnerId: 100 }));
@@ -154,7 +156,7 @@ describe('按地址行共享邮箱', () => {
   it('名单加载失败不能用空名单覆盖，重试后仍打开指定邮箱', async () => {
     mocks.list.mockRejectedValueOnce(new Error('network unavailable'));
     const { client, view } = mount();
-    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(await screen.findByRole('button', { name: '共享邮箱 second@example.com' }));
     await screen.findByRole('button', { name: '重新加载' });
     expect(screen.queryByRole('button', { name: '保存' })).toBeNull();
     expect(mocks.replace).not.toHaveBeenCalled();
@@ -167,7 +169,7 @@ describe('按地址行共享邮箱', () => {
   it('该邮箱已释放（名单为空）时提示刷新，不能编辑', async () => {
     mocks.list.mockResolvedValueOnce([]);
     const { client, view } = mount();
-    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(await screen.findByRole('button', { name: '共享邮箱 second@example.com' }));
     expect(await screen.findByText('该邮箱已释放或不存在，请关闭并刷新地址列表。')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '保存' })).toBeNull();
     view.unmount(); client.clear();
@@ -180,7 +182,7 @@ describe('按地址行共享邮箱', () => {
       c.setQueryData(queryKeys.admin.mailboxSharesOf(7), [grants[1]]);
       void c.invalidateQueries({ queryKey: queryKeys.admin.mailboxShares });
     });
-    fireEvent.click(screen.getByRole('button', { name: '共享邮箱 second@example.com' }));
+    fireEvent.click(await screen.findByRole('button', { name: '共享邮箱 second@example.com' }));
     expect(await screen.findByRole('status')).toHaveTextContent('正在加载共享名单…');
     expect(screen.queryByRole('checkbox', { name: 'active-member' })).toBeNull();
     finish([{ ...grants[1]!, ownerUserId: 200, ownerUsername: 'new-owner', grantees: [] }]);
@@ -194,6 +196,7 @@ describe('按地址行共享邮箱', () => {
   it('窄屏卡片的共享操作直接打开当前邮箱', async () => {
     mocks.mobile = true;
     const { client, view } = mount();
+    await screen.findByText('second@example.com');
     fireEvent.keyDown(screen.getAllByRole('button', { name: '更多操作' })[1]!, { key: 'Enter' });
     fireEvent.click(await screen.findByRole('menuitem', { name: '共享邮箱' }));
     await screen.findByRole('checkbox', { name: 'active-member' });

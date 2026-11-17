@@ -30,6 +30,15 @@ vi.mock('@/features/inbox/mail-list', () => ({
 }));
 
 import { AdminAddressMailPage } from './address-mail-page';
+import { adminMailboxesQueryOptions } from './admin-mailboxes';
+
+/** 全站地址页已加载的分页缓存（任一搜索词下的任一页都算） */
+function seedPages(client: QueryClient, pages: (typeof box)[][], q?: string) {
+  client.setQueryData(adminMailboxesQueryOptions({ q }).queryKey, {
+    pages: pages.map((items, i) => ({ items, nextCursor: i < pages.length - 1 ? String(i + 1) : null })),
+    pageParams: pages.map((_, i) => (i ? String(i) : '')),
+  });
+}
 
 function Probe() {
   const location = useLocation();
@@ -150,7 +159,7 @@ describe('管理员查看单个地址的收发件', () => {
   it('全站地址列表已在缓存里时先用列表里的这一行显示头部；邮件列表等真实数据返回后按最新归属人挂载', async () => {
     let resolve!: (value: typeof box) => void;
     mocks.getMailbox.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
-    const { client } = mount('/admin/addresses/42/mail', (c) => c.setQueryData(queryKeys.mailboxes.list('all'), [box]));
+    const { client } = mount('/admin/addresses/42/mail', (c) => seedPages(c, [[{ ...box, id: 7 }], [box]]));
     expect(screen.getByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
     expect(screen.getByText(/共 12 封邮件/)).toBeInTheDocument();
     expect(mocks.getMailbox).toHaveBeenCalledWith(42);
@@ -167,8 +176,7 @@ describe('管理员查看单个地址的收发件', () => {
   });
 
   it('列表缓存里还在、但单个邮箱已释放（404）时转为空态', async () => {
-    const { client } = mount('/admin/addresses/999/mail', (c) =>
-      c.setQueryData(queryKeys.mailboxes.list('all'), [{ ...box, id: 999 }]));
+    const { client } = mount('/admin/addresses/999/mail', (c) => seedPages(c, [[{ ...box, id: 999 }]], 'exist'));
     expect(screen.getByRole('heading', { name: 'existing@example.com' })).toBeInTheDocument();
     expect(await screen.findByText('没有找到这个地址')).toBeInTheDocument();
     expect(screen.queryByTestId('mail-list')).toBeNull();

@@ -1,8 +1,8 @@
 import { API_SCOPES, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
-  mailboxBatchPaths, mutationQuery, object, operation, positiveId, query, ref, scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths,
-  usedSchemas, type Paths,
+  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, describePaths, domainName, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription,
+  int, listQuery, mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, operation, optionalPageQuery, positiveId, query, ref,
+  scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths, usedSchemas, type Paths,
 } from '../openapi-common.js';
 
 /** Public API-key contract. Session/admin operations are described separately. */
@@ -20,7 +20,8 @@ export function buildOpenApiSpec(origin: string) {
     '/domains': { get: operation('List configured domains available to this user', object({ domains: array(str) }),
       { description: 'Domains the key owner may claim new addresses on. No additional scope. Ordinary users see public domains or their dedicated mailboxPolicy domains, including explicitly granted private domains; administrators see all configured domains. Active hosted domains follow the system domains: those the key owner owns or was granted (see GET /hosted-domains), or every active hosted domain for administrators. Claim only a returned domain. Removed domains remain usable for existing owned mailbox identities but are absent from this new-claim list.' }) },
     '/mailboxes': {
-      get: operation('List owned mailboxes', array(ref('Mailbox')), { scope: 'mailbox.read', parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator-only, explicit all=1 lists every owner. Default lists caller-owned mailboxes.')] }),
+      get: operation('List owned mailboxes', arrayOrPage(ref('Mailbox')), { scope: 'mailbox.read', parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator-only, explicit all=1 lists every owner. Default lists caller-owned mailboxes.'),
+        ...mailboxSearchQuery, ...optionalPageQuery], description: mailboxListDescription }),
       post: operation('Claim a mailbox in an existing configured domain', ref('Mailbox'), { request: 'ClaimMailboxRequest', scope: 'mailbox.write', status: 201,
         description: 'Use a domain returned by GET /domains. Does not register a domain or provision DNS. Ordinary users obey system reserved-prefix restrictions and their effective public or dedicated domain/total/per-domain quotas. Dedicated policies replace public limits. Claiming inherits all historical mail at this address. A concurrent domain or user permission change returns 409. Existing owned mailboxes remain usable after permissions tighten. Optional strategy=claude rejects any domain with a historical Claude suspension with 403 forbidden, including for administrators and hosted domains; checked atomically at insertion. Omitted or uniform preserves ordinary claims.' }),
     },
