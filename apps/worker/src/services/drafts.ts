@@ -241,20 +241,21 @@ async function materialize(
 ): Promise<AttachmentTokenRef[]> {
   if (!items.length) return [];
   const urls = items.filter(isUrlAttachment);
+  // base64 与发信同一解码；合计超限时一个都不转存，也不去占拉取额度
+  const decoded = decodeInlineAttachments(items.filter((item) => !isUrlAttachment(item)));
+  const total = decoded.reduce((sum, att) => sum + att.bytes.byteLength, usedBytes);
+  if (total > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
   if (urls.length) {
-    // 拉取之前先占每分钟拉取额度；新建时同一次往返读出未发送草稿数，已到上限就不去拉（不然每次被拒前都先拉一遍）
-    const [unsent] = await reserveUrlFetches(env, userId, urls.length, draftId === null
-      ? [env.db.prepare(`SELECT COUNT(*) AS n FROM drafts WHERE user_id = ? AND status <> 'sent'`).bind(userId)] : []);
-    if (draftId === null && Number((unsent?.results[0] as { n?: number } | undefined)?.n ?? 0) >= MAX_DRAFTS_PER_USER) {
+    // 拉取之前先占每分钟拉取额度；新建时未发送草稿数上限是同一条语句的守卫，已到上限就既不计数也不去拉
+    const draftLimit = draftId === null
+      ? { sql: `(SELECT COUNT(*) FROM drafts WHERE user_id = ? AND status <> 'sent') < ?`, params: [userId, MAX_DRAFTS_PER_USER] }
+      : undefined;
+    if (!await reserveUrlFetches(env, userId, urls.length, draftLimit)) {
       throw new AppError('draft_limit_reached', `未发送的草稿最多 ${MAX_DRAFTS_PER_USER} 份`);
     }
   }
   const created: { token: string }[] = [];
   try {
-    // base64 与发信同一解码；合计超限时一个都不转存
-    const decoded = decodeInlineAttachments(items.filter((item) => !isUrlAttachment(item)));
-    const total = decoded.reduce((sum, att) => sum + att.bytes.byteLength, usedBytes);
-    if (total > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
     for (const att of decoded) created.push({ token: await storeBase64(env, userId, att) });
     const stored = [...created];
     const fetched = await fetchUrlAttachments(env, userId, urls, {

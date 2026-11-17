@@ -282,8 +282,11 @@ async function assertOutboundQuota(
     const overMails = quota.dailyOutbound > 0 && cur.count > quota.dailyOutbound;
     const overRecipients = quota.dailyRecipients > 0 && cur.units > quota.dailyRecipients;
     if (overMails || overRecipients) {
-      // 拒绝的这次不该占额度，立即回退
-      await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, subject, window, -1, -recipientCount);
+      // 拒绝的这次不该占额度：外发配额与同批占的 URL 拉取额度（还没拉取）一起回退，仍是一次往返
+      await env.db.batch([
+        counterStatement(env, OUTBOUND_QUOTA_SCOPE, subject, window, -1, -recipientCount),
+        ...(urlCount ? [urlFetchStatement(env, sender.userId, -urlCount, minute)] : []),
+      ]);
       throw new AppError(
         'rate_limited',
         overMails

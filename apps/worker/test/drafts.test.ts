@@ -1,5 +1,5 @@
 import {
-  MAX_DRAFTS_PER_USER, type ApiScope, type CreatedApiKey, type Draft, type DraftSummary, type MessageSummary, type Page,
+  MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFTS_PER_USER, type ApiScope, type CreatedApiKey, type Draft, type DraftSummary, type MessageSummary, type Page,
   type SingleUploadResult,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
@@ -606,6 +606,18 @@ describe('草稿里的 URL 附件（A12）', () => {
       expect((await failure(await call('/v1/drafts', req(me.key, 'POST', { attachments: [{ url: 'https://files.example.com/b.pdf' }] })), 409)).code)
         .toBe('draft_limit_reached');
       expect(fetchMock).not.toHaveBeenCalled();
+      // A12'：被拒的这次没有拉取，不占拉取额度（草稿数守卫与计数同一条语句，超限时不写入）
+      const fetches = async () => (await env.db.prepare(`SELECT SUM(count) AS n FROM rate_counters WHERE scope = 'url-fetch' AND subject = ?`)
+        .bind(String(me.id)).first<{ n: number }>())!.n;
+      expect(await fetches()).toBe(1);
+      // base64 合计已超总额时同样在拉取、计数之前拒绝
+      const [huge] = await db.insert(draftAttachments).values({ userId: me.id, token: 'draft-url-limit-huge', filename: 'h.bin', mimeType: 'application/octet-stream',
+        size: MAX_ATTACHMENT_TOTAL_BYTES, r2Key: `draft/${me.id}/huge`, status: 'ready' }).returning({ token: draftAttachments.token });
+      expect((await failure(await call(`/v1/drafts/${saved.id}`, req(me.key, 'PATCH', { attachmentTokens: [huge!.token],
+        attachments: [{ filename: 'a.txt', contentType: 'text/plain', content: btoa('aaa') }, { url: 'https://files.example.com/c.pdf' }] })), 413)).code)
+        .toBe('payload_too_large');
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(await fetches()).toBe(1);
     } finally {
       vi.unstubAllGlobals();
     }

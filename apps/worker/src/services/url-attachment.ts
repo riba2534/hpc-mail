@@ -166,12 +166,13 @@ function pickMimeType(requested: string | undefined, response: Response): string
 }
 
 /**
- * 没有 Content-Length（或经过压缩、长度不可信）时边读边计数：单个不超过 cap，同时从整个请求共用的缓冲预算里逐块扣减，
- * 并发的几路拉取合计也封顶。只保留读到的分块、不拼成一整块（拼接会让峰值翻倍），写 R2 时按分块流式写入。
+ * 没有 Content-Length（或经过压缩、长度不可信）时边读边计数：超过 limit（单文件或剩余总额）报 tooLarge；
+ * 否则单个不超过 MAX_URL_ATTACHMENT_BUFFER_BYTES，同时从整个请求共用的缓冲预算里逐块扣减，并发的几路拉取合计也封顶。
+ * 只保留读到的分块、不拼成一整块（拼接会让峰值翻倍），写 R2 时按分块流式写入。
  */
 async function readChunks(
   body: ReadableStream<Uint8Array>,
-  cap: number,
+  limit: number,
   memory: UrlBufferBudget,
   shown: string,
   tooLarge: () => AppError,
@@ -184,17 +185,19 @@ async function readChunks(
     if (done) break;
     total += value.byteLength;
     memory.remaining -= value.byteLength;
-    if (total > cap) {
+    if (total > limit) {
       await reader.cancel();
       throw tooLarge();
     }
-    if (memory.remaining < 0) {
+    if (total > MAX_URL_ATTACHMENT_BUFFER_BYTES || memory.remaining < 0) {
       await reader.cancel();
-      throw new AppError('payload_too_large',
-        `没有 Content-Length 的 URL 附件在一个请求里合计最多读 ${MAX_URL_ATTACHMENT_BUFFER_BYTES / 1024 / 1024}MiB`, {
-          fix: '换成会返回 Content-Length 的地址（如对象存储的直链），或先用 POST /v1/uploads 上传后写进 attachmentTokens',
-          details: { url: shown },
-        });
+      const mib = MAX_URL_ATTACHMENT_BUFFER_BYTES / 1024 / 1024;
+      throw new AppError('payload_too_large', total > MAX_URL_ATTACHMENT_BUFFER_BYTES
+        ? `附件超过 ${mib}MiB 上限（没有 Content-Length 的响应最多读 ${mib}MiB）`
+        : `没有 Content-Length 的 URL 附件在一个请求里合计最多读 ${mib}MiB`, {
+        fix: '换成会返回 Content-Length 的地址（如对象存储的直链），或先用 POST /v1/uploads 上传后写进 attachmentTokens',
+        details: { url: shown },
+      });
     }
     chunks.push(value);
   }
@@ -235,7 +238,7 @@ async function fetchOne(env: Env, userId: number, item: UrlAttachment, options: 
   // 长度已知时直接流式写 R2（FixedLengthStream 在实际字节数与声明不符时报错）；未知时先有上限地分块读进内存
   let buffered: { chunks: Uint8Array[]; total: number } | null = null;
   if (declared === null) {
-    try { buffered = await readChunks(response.body, Math.min(limit, MAX_URL_ATTACHMENT_BUFFER_BYTES), options.memory, shown, tooLarge); }
+    try { buffered = await readChunks(response.body, limit, options.memory, shown, tooLarge); }
     catch (error) {
       if (error instanceof AppError) throw error;
       throw fetchFailed(shown, signal.aborted ? deadline.message : '读取内容中断');

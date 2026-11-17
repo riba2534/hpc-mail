@@ -262,8 +262,16 @@ describe('URL 附件：拉取函数的边界', () => {
         start(controller) { controller.enqueue(bytes('abc')); controller.enqueue(bytes('def')); controller.close(); },
       }), { headers: { 'Content-Type': 'text/plain' } }),
     });
-    await expect(fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/stream' }], opts())).rejects.toMatchObject({ code: 'payload_too_large' });
+    // A12'：单个 11MiB 的无长度响应报的是无长度缓冲的 10MiB 上限（并给出换直链或先上传的 fix），不是 50MiB 单文件上限
+    const tooLong = fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/stream' }], opts());
+    await expect(tooLong).rejects.toMatchObject({ code: 'payload_too_large', message: expect.stringContaining('没有 Content-Length 的响应最多读 10MiB'),
+      hints: { fix: expect.stringContaining('Content-Length') } });
+    await expect(tooLong).rejects.not.toMatchObject({ message: expect.stringContaining('50MiB') });
     expect(sent).toBeLessThanOrEqual(12);
+    // 前面的附件占了大部分总额时，超出剩余总额的仍报合计上限
+    sent = 0;
+    await expect(fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/stream' }], { ...opts(), budgetBytes: 2 * 1024 * 1024 }))
+      .rejects.toMatchObject({ code: 'payload_too_large', message: '附件合计超过大小上限' });
     const [small] = await fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/small' }], opts());
     expect(small).toMatchObject({ size: 6, mimeType: 'text/plain', filename: 'small' });
     expect(await (await env.r2.get(small!.r2Key))!.text()).toBe('abcdef');
@@ -301,6 +309,10 @@ describe('URL 附件：先授权与配额、再拉取（A12）', () => {
     try {
       await data<MessageSummary>(await call(env, '/v1/messages', json(me.key, { ...body(me.address), attachments: [] })));
       expect((await failure(await call(env, '/v1/messages', json(me.key, body(me.address))), 429)).message).toContain('每日外发上限');
+      // A12'：被日配额拒绝的这次没有拉取，与配额同批占的拉取额度一并退回
+      const fetches = await env.db.prepare(`SELECT COALESCE(SUM(count), 0) AS n FROM rate_counters WHERE scope = 'url-fetch' AND subject = ?`)
+        .bind(String(me.id)).first<{ n: number }>();
+      expect(fetches!.n).toBe(0);
     } finally {
       await updateSettings(env, { quota: { dailyOutbound: 0, dailyRecipients: 0 } });
     }
