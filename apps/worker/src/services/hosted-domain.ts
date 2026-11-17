@@ -769,17 +769,20 @@ async function zoneGone(env: Env, creds: CloudflareCredentials, claim: SyncClaim
  * 重新接入后到期仍未改 NS：撤回这次接入，删除新建的 zone 并回到 moved/missing，不再占等待额度；
  * 地址、邮件与成员保留，可以再点「重新接入」。删除 zone 失败保留 pending 等下一轮
  */
-async function expireReconnect(env: Env, creds: CloudflareCredentials, claim: SyncClaim, now: Date, pendingDays: number): Promise<boolean> {
+async function expireReconnect(
+  env: Env, creds: CloudflareCredentials, claim: SyncClaim, now: Date, pendingDays: number, ctx?: ExecCtx | null,
+): Promise<boolean> {
   const { row, lease } = claim;
   try {
     if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain, await zoneGuard(env, row));
   } catch (error) {
     return saveChecked(env, row.id, { lastError: `撤回到期的重新接入失败：${errorText(error)}`, checkedAt: now }, lease);
   }
-  return saveChecked(env, row.id, {
-    status: 'moved', zoneStatus: 'missing', zoneMissingAt: now, routingStatus: '', catchAllReady: false, sendingStatus: '', sendingTag: null,
+  // 与其他转入 moved 的路径一样发 hosted_domain.moved 事件并提醒所有者
+  return markMoved(env, claim, {
+    zoneStatus: 'missing', zoneMissingAt: now, routingStatus: '', catchAllReady: false, sendingStatus: '', sendingTag: null,
     lastError: `重新接入后 ${pendingDays} 天内未完成 NS 修改，已撤回；改好 NS 前可再次重新接入`, checkedAt: now,
-  }, lease);
+  }, ctx);
 }
 
 /**
@@ -810,7 +813,7 @@ async function syncClaimed(env: Env, creds: CloudflareCredentials, claim: SyncCl
         await dropPending(env, creds, row, `${cfg.pendingDays} 天内未完成 NS 修改，已自动删除`);
         return false;
       }
-      return expireReconnect(env, creds, claim, now, cfg.pendingDays);
+      return expireReconnect(env, creds, claim, now, cfg.pendingDays, opts.ctx);
     }
     if (opts.activationCheck) await requestActivationCheck(creds, zone.id);
     const dnssec = await hasDnssec(row.domain).catch(() => row.dnssec);

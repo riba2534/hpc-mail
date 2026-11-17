@@ -253,3 +253,15 @@ describe('修复轮：回复/转发的主题上限与收件人上限', () => {
     expect(await db.select().from(messages).where(eq(messages.inReplyTo, flood.messageId!)).all()).toEqual([]);
   });
 });
+
+describe('修复轮二：原信主题里的换行', () => {
+  it("A9'：原信主题含 CR/LF/TAB（解码后的折行残留）时折叠成单个空格再加前缀，回复与转发都能发出", async () => {
+    const w = await world('rf12');
+    const src = await source({ address: w.mine.address, fromAddress: w.boss, subject: 'hello\r\n world\tagain\n\nend' });
+    const reply = await result<MessageSummary>(await request(`/v1/messages/${src.id}/reply`, post(w.alice.key, { text: 'ok', quote: false })), 201);
+    expect(reply.subject).toBe('Re: hello world again end');
+    const forward = await result<MessageSummary>(await request(`/v1/messages/${src.id}/forward`,
+      post(w.alice.key, { to: [w.peer.address], note: 'fyi', includeOriginal: false })), 201);
+    expect(forward.subject).toBe('Fwd: hello world again end');
+  });
+});

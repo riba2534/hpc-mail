@@ -402,12 +402,12 @@ Key（`/v1`）可直接调用回复与转发接口，由服务器按原信算收
 
 **`POST /v1/messages/:id/reply`** `{replyAll?,text?,html?,quote?,from?,attachments?,attachmentTokens?,headers?}`：
 
-- 收件人：来信回给它的 `replyTo`（非空时），否则回给发件人；回复自己发出的信则回给原 To。`replyAll:true` 另把原 To/Cc 里的其他人放进 Cc，去掉你自己的地址（本次发件地址、原收件地址与你认领的地址），**从不带原 Bcc**。没有任何可回复的人时 400。
-- 主题自动加 `Re: `（已有则不重复）；In-Reply-To/References 由服务器按原信生成，`headers` 里再给这两个头返回 400。
+- 收件人：来信回给它的 `replyTo`（非空时），否则回给发件人；回复自己发出的信则回给原 To。`replyAll:true` 另把原 To/Cc 里的其他人放进 Cc，去掉你自己的地址（本次发件地址、原收件地址与你认领的地址），**从不带原 Bcc**。没有任何可回复的人时 400；算出的 To+Cc 去重后超过 100 个（例如来信的 Reply-To 或收件人很多）时 400 `validation_failed`「收件人合计不能超过 100 个」，改用 `POST /v1/messages` 自己选收件人并带 `replyToMessageId`。
+- 主题自动加 `Re: `（已有则不重复），原主题里的换行与制表符折叠成空格，加前缀后超过 998 个 UTF-8 字节时截断；In-Reply-To/References 由服务器按原信生成，`headers` 里再给这两个头返回 400。
 - `text`/`html` 至少一个非空。`quote` 默认 `true`：正文后附「----- 原始邮件 -----」、发件人、时间（UTC）、主题与 `> ` 引用的原文；给了 `html` 时另在 HTML 里用 blockquote 引用原 HTML。原文过长会截断并注明，不报错。
 - `from` 缺省用原信的收件地址（回复自己发出的信则是原发件地址），写法同普通发送。原信在共享给你的邮箱里时这个地址不是你的发件身份，返回 400 `from_required`，改在 `from` 指定自己的地址（见[错误说明](errors.md#from_required)）。
 
-**`POST /v1/messages/:id/forward`** `{to,cc?,bcc?,note?,includeOriginal?,from?}`：收件人写法同普通发送（合计 1–100 个）；主题加 `Fwd: `；`note` 是写在最前面的纯文本；`includeOriginal` 默认 `true`，附上「---------- 转发的邮件 ----------」头部（发件人、时间、主题、收件人、抄送）与原文 text 和 HTML。原信的全部附件（含内嵌图）总会带上，规则同 `forwardAttachmentsFrom`，附件已丢失返回 404 `source_unavailable`。`includeOriginal:false` 时 `note` 不能为空。`from` 规则同回复。
+**`POST /v1/messages/:id/forward`** `{to,cc?,bcc?,note?,includeOriginal?,from?}`：收件人写法同普通发送（合计 1–100 个）；主题加 `Fwd: `（换行折叠与截断规则同回复）；`note` 是写在最前面的纯文本；`includeOriginal` 默认 `true`，附上「---------- 转发的邮件 ----------」头部（发件人、时间、主题、收件人、抄送）与原文 text 和 HTML。原信的全部附件（含内嵌图）总会带上，规则同 `forwardAttachmentsFrom`，附件已丢失返回 404 `source_unavailable`。`includeOriginal:false` 时 `note` 不能为空。`from` 规则同回复。
 
 ```bash
 # HPC_MSG_ID 为原信 ID；回复正文、转发目标与说明都须由用户确认。Idempotency-Key 按「幂等与重试」持久化

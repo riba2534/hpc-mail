@@ -828,6 +828,11 @@ describe('PR4b：回复/转发接口与托管域名任意前缀在 OpenAPI 与�
     expect(errorsDoc).toMatch(/^## from_required$/m);
     expect(skillDoc).toContain('/reply');
     expect(mailboxesDoc).toContain('kind:"hosted"');
+    // 回复的收件人上限与主题处理写进文档与规格
+    const replySection = mailDoc.slice(mailDoc.indexOf('**`POST /v1/messages/:id/reply`**'), mailDoc.indexOf('**`POST /v1/messages/:id/forward`**'));
+    expect(replySection).toContain('收件人合计不能超过 100 个');
+    expect(replySection).toContain('998 个 UTF-8 字节');
+    expect(specs.v1.components.schemas.ReplyMessageRequest!.description).toMatch(/exceed 100 addresses after deduplication/);
   });
 });
 
