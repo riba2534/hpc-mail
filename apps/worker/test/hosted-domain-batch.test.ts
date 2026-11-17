@@ -18,6 +18,7 @@ import {
 import { bumpCounter, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope } from './key-helpers.js';
 import type { Env } from '../src/types.js';
 
 const app = createApp();
@@ -237,8 +238,11 @@ describe('批量立即检测', () => {
 });
 
 describe('/v1 批量接口', () => {
-  async function keyFor(userId: number, scopes: ApiScope[]) {
-    return (await createApiKey(env, userId, { name: `batch-${scopes.join('-')}`, scopes, rateLimit: 120, allowedIps: [] })).key;
+  /** 管理员的 Key 沿用存量形态补上 admin scope（迁移 0022），保持管理员的额度 */
+  async function keyFor(userId: number, scopes: ApiScope[], legacyAdmin = true) {
+    const created = await createApiKey(env, userId, { name: `batch-${scopes.join('-')}`, scopes, rateLimit: 120, allowedIps: [] });
+    if (legacyAdmin) await grantLegacyAdminScope(env, created.id);
+    return created.key;
   }
 
   it('需要 domain.write；审计记为 API Key；每个请求只鉴权一次', async () => {

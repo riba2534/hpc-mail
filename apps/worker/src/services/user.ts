@@ -86,9 +86,11 @@ export async function listUsers(env: Env): Promise<AdminUser[]> {
   return rows.map((r) => serialize(r.user, byUser.get(r.user.id) ?? [], Number(r.apiKeyCount)));
 }
 
-/** 过户和共享候选搜索：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计。 */
-/** 选人搜索（共享成员、托管域名成员、过户目标）：系统保留账号（CI 冒烟用户）不出现在候选里 */
-export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<UserSearchResults> {
+/**
+ * 选人搜索（共享成员、托管域名成员、过户目标）：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计；
+ * 系统保留账号（CI 冒烟用户）不出现在候选里。
+ */
+export async function searchUsers(env: Env, req: SearchUsersQuery, opts: { includeRole?: boolean } = {}): Promise<UserSearchResults> {
   const rows = await createDb(env).select({ id: users.id, username: users.username, role: users.role })
     .from(users)
     .where(and(eq(users.status, 'active'),
@@ -98,7 +100,9 @@ export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<User
     .orderBy(sql`CASE WHEN lower(${users.username}) = ${req.q} THEN 0
       WHEN substr(lower(${users.username}), 1, ${req.q.length}) = ${req.q} THEN 1 ELSE 2 END`, asc(users.username))
     .limit(req.limit + 1).all();
-  return { items: rows.slice(0, req.limit), hasMore: rows.length > req.limit };
+  // 只有管理员的搜索带角色：普通用户的共享候选搜索不能用来定位管理员账号
+  const items = rows.slice(0, req.limit).map((row) => (opts.includeRole ? row : { id: row.id, username: row.username }));
+  return { items, hasMore: rows.length > req.limit };
 }
 
 export async function createUser(env: Env, req: CreateUserRequest): Promise<AdminUser> {

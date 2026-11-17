@@ -9,6 +9,7 @@ import type { Context, MiddlewareHandler } from 'hono';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { execCtx, routeLabel } from '../lib/http.js';
+import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { writeApiRequestLog } from '../services/api-request-log.js';
 import { getSettings, settingsQuery } from '../services/setting.js';
@@ -30,6 +31,8 @@ interface ApiKeyRecord {
   user_id: number;
   scopes: string;
   allowed_ips: string;
+  allowed_mailbox_ids: string;
+  allowed_domains: string;
   rate_limit: number;
   status: 'active' | 'disabled' | 'revoked';
   expires_at: number | null;
@@ -45,8 +48,8 @@ interface ApiKeyRecord {
  */
 async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ settings: Settings; record: ApiKeyRecord | null }> {
   if (!keyHash) return { settings: await getSettings(env), record: null };
-  const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.rate_limit, k.status, k.expires_at,
-      k.last_used_at, u.status AS user_status, u.role
+  const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.allowed_mailbox_ids, k.allowed_domains,
+      k.rate_limit, k.status, k.expires_at, k.last_used_at, u.status AS user_status, u.role
     FROM api_keys k LEFT JOIN users u ON u.id = k.user_id WHERE k.key_hash = ? AND k.status <> 'revoked'`).bind(keyHash);
   const query = settingsQuery(env);
   if ('cached' in query) return { settings: query.cached, record: await keyStatement.first<ApiKeyRecord>() };
@@ -81,6 +84,8 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     userId: record.user_id,
     scopes: JSON.parse(record.scopes) as ApiScope[],
     allowedIps: JSON.parse(record.allowed_ips) as string[],
+    allowedMailboxIds: JSON.parse(record.allowed_mailbox_ids) as number[],
+    allowedDomains: JSON.parse(record.allowed_domains) as string[],
     rateLimit: Number(record.rate_limit),
     status: record.status,
     expiresAt: record.expires_at === null ? null : new Date(Number(record.expires_at)),
@@ -104,8 +109,11 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     c.set('apiKey', {
       id: row.id,
       userId: row.userId,
-      role: row.role ?? 'user',
+      // 管理员能力要 Key 显式带 admin scope；没有它的管理员 Key 按普通用户执行
+      role: row.role === 'admin' && row.scopes.includes('admin') ? 'admin' : 'user',
       scopes: row.scopes,
+      allowedMailboxIds: row.allowedMailboxIds,
+      allowedDomains: row.allowedDomains,
     });
 
     // 限流不写 D1：Key 档位 → 用户总桶 → 全站总桶依次短路（services/rate-limit.ts）。
@@ -169,4 +177,86 @@ export function requireScope(c: Context<AppContext>, scope: ApiScope): void {
       docs: '/references/errors.md#forbidden-scope',
     });
   }
+}
+
+/** Key 限定范围；null 表示不限（含不经过 API Key 的请求） */
+export interface KeyRestriction {
+  mailboxIds: number[];
+  domains: string[];
+}
+
+/**
+ * 当前请求的 Key 限定范围。地址可用的判定（全站统一）：地址的域名在 domains 中，
+ * 或该地址当前的认领行 id 在 mailboxIds 中；未认领地址只看域名。
+ */
+export function keyRestriction(c: Context<AppContext>): KeyRestriction | null {
+  const key = c.get('apiKey');
+  if (!key || (!key.allowedMailboxIds.length && !key.allowedDomains.length)) return null;
+  return { mailboxIds: key.allowedMailboxIds, domains: key.allowedDomains };
+}
+
+function restrictedError(what: string): AppError {
+  return new AppError('forbidden', `这把 API Key 限定了可用的邮箱或域名，不能访问${what}`, {
+    fix: 'GET /v1/me 查看 key.allowedMailboxIds 与 key.allowedDomains；换用覆盖它的 Key，或请用户在网页「API Key」页面调整范围',
+    docs: '/references/errors.md#key-restricted',
+  });
+}
+
+/** 域名是否在限定范围内（只看 domains；只限定了邮箱的 Key 对任何域名都返回 false） */
+export function restrictionAllowsDomain(restriction: KeyRestriction, domain: string): boolean {
+  return restriction.domains.includes(domain.trim().toLowerCase());
+}
+
+/** 已知认领行时的判定：id 在 mailboxIds 或 domain 在 domains 中 */
+export function restrictionAllowsMailbox(restriction: KeyRestriction, mailbox: { id: number; domain: string }): boolean {
+  return restriction.mailboxIds.includes(mailbox.id) || restrictionAllowsDomain(restriction, mailbox.domain);
+}
+
+/** 地址不在 Key 限定范围内时 403 forbidden（docs: /references/errors.md#key-restricted）。域名命中时不查库 */
+export async function assertKeyCanUseAddress(c: Context<AppContext>, address: string): Promise<void> {
+  const restriction = keyRestriction(c);
+  if (!restriction) return;
+  const normalized = normalizeEmail(address);
+  if (restrictionAllowsDomain(restriction, getEmailDomain(normalized))) return;
+  if (restriction.mailboxIds.length) {
+    const row = await c.env.db.prepare('SELECT id FROM mailboxes WHERE address = ?').bind(normalized).first<{ id: number }>();
+    if (row && restriction.mailboxIds.includes(Number(row.id))) return;
+  }
+  throw restrictedError(` ${normalized}`);
+}
+
+/** 域名不在 Key 限定的 domains 中时 403（只限定了邮箱的 Key 不能使用任何域名级能力，如认领） */
+export function assertKeyCanUseDomain(c: Context<AppContext>, domain: string): void {
+  const restriction = keyRestriction(c);
+  if (restriction && !restrictionAllowsDomain(restriction, domain)) throw restrictedError(`域名 ${domain.trim().toLowerCase()}`);
+}
+
+/** 已知认领行时的判定（免一次查询）：id 在 mailboxIds 或 domain 在 domains 中 */
+export function assertKeyCanUseMailbox(c: Context<AppContext>, mailbox: { id: number; domain: string; address?: string }): void {
+  const restriction = keyRestriction(c);
+  if (restriction && !restrictionAllowsMailbox(restriction, mailbox)) {
+    throw restrictedError(mailbox.address ? ` ${mailbox.address}` : `邮箱 #${mailbox.id}`);
+  }
+}
+
+/**
+ * 发件地址在 Key 范围内：from 解析后的 mailboxId 或 localPart+domain。发件邮箱不存在时放过，交给发信流程按原口径报 404。
+ */
+export async function assertKeyCanUseSender(
+  c: Context<AppContext>,
+  from: { mailboxId?: number; localPart?: string; domain?: string },
+): Promise<void> {
+  if (!keyRestriction(c)) return;
+  if (from.mailboxId !== undefined) {
+    const box = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id = ?')
+      .bind(from.mailboxId).first<{ id: number; domain: string; address: string }>();
+    if (box) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
+    return;
+  }
+  if (from.localPart && from.domain) await assertKeyCanUseAddress(c, `${from.localPart}@${from.domain}`);
+}
+
+/** 限定了范围的 Key 不能用账户级能力（通知配置写入、通知健康等会涉及范围外邮件的接口） */
+export function assertKeyUnrestricted(c: Context<AppContext>, what: string): void {
+  if (keyRestriction(c)) throw restrictedError(what);
 }

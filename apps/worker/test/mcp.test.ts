@@ -10,6 +10,7 @@ import { signToken } from '../src/lib/jwt.js';
 import { replyEnvelope } from '../src/routes/mcp/tools.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 import type { Env } from '../src/types.js';
 import { fakeRateLimits } from './fake-rate-limits.js';
 import wranglerToml from '../wrangler.toml?raw';
@@ -71,14 +72,17 @@ async function actor(username: string, scopes: ApiScope[] = [...API_SCOPES], rol
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const user = (await db.insert(users).values({ username, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning().get())!;
+  const user = (await db.insert(users).values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning().get())!;
   const sid = await createSession(env, user.id);
   const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
   const keyFor = async (keyScopes: ApiScope[]) => {
     const response = await request('/api/api-keys', { method: 'POST', headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: `mcp-${keyScopes.length}`, scopes: keyScopes, rateLimit: 600 }) });
+      body: JSON.stringify({ name: `mcp-${keyScopes.length}`, scopes: keyScopes.filter((scope) => scope !== 'admin'), rateLimit: 600, password: TEST_PASSWORD }) });
     expect(response.status).toBe(201);
-    return ((await response.json()) as { data: CreatedApiKey }).data;
+    const created = ((await response.json()) as { data: CreatedApiKey }).data;
+    // admin scope 按存量管理员 Key 的形态补上（新建要求 IP 白名单，测试请求不带来源 IP）
+    if (role === 'admin' && keyScopes.includes('admin')) await grantLegacyAdminScope(env, created.id);
+    return created;
   };
   const key = await keyFor(scopes);
   return { id: user.id, jwt, key: key.key, keyId: key.id, keyFor };
@@ -203,7 +207,7 @@ describe('MCP 工具调用', () => {
     const user = await actor('mcp-flow');
     const me = await ok<{ user: { username: string }; key: { scopes: string[] }; domains: string[] }>(user.key, 'get_me');
     expect(me.user.username).toBe('mcp-flow');
-    expect(me.key.scopes).toEqual([...API_SCOPES]);
+    expect(me.key.scopes).toEqual(API_SCOPES.filter((scope) => scope !== 'admin'));
     expect(me.domains).toEqual([DOMAIN]);
 
     const sender = await ok<{ id: number; address: string }>(user.key, 'claim_mailbox', { localPart: 'mcp-flow-a', domain: DOMAIN });

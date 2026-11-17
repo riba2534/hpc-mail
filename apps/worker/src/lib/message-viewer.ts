@@ -1,12 +1,13 @@
 import { messageViewQuerySchema, type MessageMutationScope } from '@hpc-mail/shared';
 import type { Context } from 'hono';
+import { keyRestriction } from '../middleware/api-key-auth.js';
 import { auditActorOf, userMailReadAuditStatement, writeAudit } from '../services/audit.js';
 import type { Viewer } from '../services/message.js';
 import type { AppContext } from '../types.js';
 import { AppError } from './errors.js';
 import { execCtx, parseQuery } from './http.js';
 
-/** JWT 与 API Key 路由必须使用同一范围解析，避免默默忽略作用范围。 */
+/** JWT 与 API Key 路由必须使用同一范围解析，避免默默忽略作用范围；API Key 的限定范围随之带上。 */
 export function messageViewer(
   c: Context<AppContext>,
   actor: { userId: number; role: Viewer['role'] },
@@ -24,7 +25,8 @@ export function messageViewer(
   if (actor.role !== 'admin' && scope !== undefined && scope !== 'mine') {
     throw new AppError('forbidden', '无权使用该可见范围');
   }
-  const viewer: Viewer = { ...actor, scope, targetUserId: query.userId };
+  const restrict = keyRestriction(c) ?? undefined;
+  const viewer: Viewer = { ...actor, scope, targetUserId: query.userId, ...(restrict ? { restrict } : {}) };
   if (!mutation) auditUserScopeRead(c, viewer);
   return viewer;
 }

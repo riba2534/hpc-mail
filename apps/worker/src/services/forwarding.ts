@@ -2,7 +2,7 @@ import { EXTERNAL_MESSAGE_MAX_BYTES, type Settings, type UserNotifyPrefs } from 
 import { eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { attachments } from '../db/schema.js';
-import { hmacSha256Base64 } from '../lib/crypto.js';
+import { deriveSubkey, hmacSha256Base64 } from '../lib/crypto.js';
 import { chunk } from '../lib/d1.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
@@ -50,8 +50,16 @@ export interface ForwardMail {
   mailText?: MailText;
 }
 
+/** 中转信的防环头：用 jwt_secret 派生的中转子密钥计算 */
 export async function relayMarker(env: Env): Promise<string> {
-  return hmacSha256Base64(new TextEncoder().encode(env.jwt_secret), 'hpc-mail-relay:v1');
+  return hmacSha256Base64(new TextEncoder().encode(await deriveSubkey(env.jwt_secret, 'relay')), 'hpc-mail-relay:v1');
+}
+
+/** 收到的信是否是本站中转出去的：新旧两种防环头都认（改用子密钥前发出、仍在投递途中的中转信） */
+export async function isOwnRelay(env: Env, header: string | null | undefined): Promise<boolean> {
+  if (!header) return false;
+  if (header === await relayMarker(env)) return true;
+  return header === await hmacSha256Base64(new TextEncoder().encode(env.jwt_secret), 'hpc-mail-relay:v1');
 }
 
 /**
@@ -225,7 +233,7 @@ export async function forwardReceivedMail(
   owners: ForwardOwners,
   native?: ForwardableEmailMessage,
 ): Promise<void> {
-  if (native?.headers.get('x-hpc-mail-relay') === await relayMarker(env)) return;
+  if (await isOwnRelay(env, native?.headers.get('x-hpc-mail-relay'))) return;
   const forwarders = await loadForwarders(env, mail, owners);
   const ownersByTarget = new Map<string, Set<number>>();
   for (const { userId, prefs } of forwarders.list) {

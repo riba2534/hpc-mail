@@ -54,6 +54,26 @@ export interface Viewer {
   scope?: 'mine' | 'unclaimed' | 'user';
   /** admin + scope=user 时的目标用户 */
   targetUserId?: number;
+  /** API Key 限定的邮箱认领行 id 与域名（见 keyRestriction）；不限时不传 */
+  restrict?: AddressRestriction;
+}
+
+/** 地址可用 ⇔ 域名在 domains 中，或该地址当前认领行的 id 在 mailboxIds 中（未认领地址只看域名） */
+export interface AddressRestriction {
+  mailboxIds: number[];
+  domains: string[];
+}
+
+/**
+ * Key 限定范围的附加条件，叠加在可见范围之外；不限时返回 undefined，生成的 SQL 与原来完全相同。
+ * 两个列表各以一个 JSON 数组绑定（json_each），列表再长也只占两个参数，不受 D1 的 100 参数上限影响。
+ * 列写全限定名：单表查询里 drizzle 输出不带表名的列，子查询里同名列会被解析成内层表。
+ */
+function restrictCondition(restrict: AddressRestriction | undefined): SQL | undefined {
+  if (!restrict) return undefined;
+  return sql`("messages"."domain" IN (SELECT value FROM json_each(${JSON.stringify(restrict.domains)}))
+    OR "messages"."address" IN (SELECT key_range.address FROM mailboxes AS key_range
+      WHERE key_range.id IN (SELECT value FROM json_each(${JSON.stringify(restrict.mailboxIds)}))))`;
 }
 
 type MessageRow = typeof messages.$inferSelect;
@@ -433,6 +453,7 @@ function messagePageQueries(db: Db, viewer: Viewer, query: ListMessagesQuery): [
       : undefined,
     searchCondition(query.q),
     query.afterId ? gt(messages.id, query.afterId) : undefined,
+    restrictCondition(viewer.restrict),
   ];
   const planner = (before: SQL | undefined) =>
     pageQuery(db, viewer, MESSAGES, [scopeCondition(db, scope, access, query.domain), ...filters, before], query.limit);
@@ -486,7 +507,7 @@ export async function syncMessages(env: Env, viewer: Viewer, query: ListMessages
   const db = createDb(env);
   const firstPage: ListMessagesQuery = { ...query, cursor: undefined, afterId: undefined };
   const [unread, ...pages] = await db.batch([
-    unreadCountQuery(db, viewer.userId, viewer.role, UNREAD_COUNT_CAP),
+    unreadCountQuery(db, viewer.userId, viewer.role, UNREAD_COUNT_CAP, viewer.restrict),
     ...messagePageQueries(db, viewer, firstPage),
   ]);
   const page = toPage(firstPage, pages as PageRow[][]);
@@ -552,7 +573,8 @@ export async function findNextMessage(
     .orderBy(asc(messages.id))
     .limit(limit);
   // 可见范围（含 domain、指定地址）；include=body 读整行时用同一组条件复核
-  const visible = [inboxScopeCondition(db, scope, access, input.domain), input.address ? inArray(messages.address, input.address) : undefined];
+  const visible = [inboxScopeCondition(db, scope, access, input.domain), input.address ? inArray(messages.address, input.address) : undefined,
+    restrictCondition(viewer.restrict)];
   const after = gt(messages.id, input.afterId);
   let statements: [ReturnType<typeof scan>, ...ReturnType<typeof scan>[]];
   if (input.address) {
@@ -623,18 +645,19 @@ export { UNREAD_COUNT_CAP };
  * admin 也按 scope=mine 只数自己认领地址（个人角标，非全站）。
  * cap 给定时最多数到 cap 封即停（/api 角标），不给则精确计数（/v1 对外契约）。
  */
-export async function countUnread(env: Env, userId: number, role: Role, cap?: number): Promise<number> {
-  const row = await unreadCountQuery(createDb(env), userId, role, cap).get();
+export async function countUnread(env: Env, userId: number, role: Role, cap?: number, restrict?: AddressRestriction): Promise<number> {
+  const row = await unreadCountQuery(createDb(env), userId, role, cap, restrict).get();
   return row?.value ?? 0;
 }
 
-function unreadCountQuery(db: Db, userId: number, role: Role, cap?: number) {
+function unreadCountQuery(db: Db, userId: number, role: Role, cap?: number, restrict?: AddressRestriction) {
   const scope = resolveScope({ userId, role, scope: 'mine' });
   const where = and(
     scopeCondition(db, scope),
     eq(messages.direction, 'inbound'),
     eq(messages.isRead, false),
     isNull(messages.deletedAt),
+    restrictCondition(restrict),
   );
   if (cap === undefined) return db.select({ value: count() }).from(messages).where(where);
   const capped = db.select({ one: sql`1`.as('one') }).from(messages).where(where).limit(cap).as('capped');
@@ -654,7 +677,7 @@ export async function getRecentContacts(env: Env, viewer: Viewer, limit = 100): 
       fromAddress: messages.fromAddress,
     }))
     .from(ownerId === null ? MESSAGES : MESSAGES_BY_ADDRESS)
-    .where(and(scopeCondition(db, scope), isNull(messages.deletedAt)))
+    .where(and(scopeCondition(db, scope), isNull(messages.deletedAt), restrictCondition(viewer.restrict)))
     .orderBy(desc(messages.id))
     .limit(400)
     .all();
@@ -731,6 +754,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
           )),
           isNull(messages.deletedAt),
           scopeCondition(db, scope, access),
+          restrictCondition(viewer.restrict),
         ),
       )
       .orderBy(asc(messages.id))
@@ -763,6 +787,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
       and(
         scopeCondition(db, scope, access),
         isNull(messages.deletedAt),
+        restrictCondition(viewer.restrict),
         eq(messages.address, target.address),
         gte(messages.createdAt, new Date(target.createdAt.getTime() - windowMs)),
         lte(messages.createdAt, new Date(target.createdAt.getTime() + windowMs)),
@@ -811,6 +836,9 @@ function visibilityColumns(viewer: Viewer, scope: Scope) {
       .mapWith(Boolean),
     claimed: sql<boolean>`EXISTS (SELECT 1 FROM mailboxes AS vis_claimed WHERE vis_claimed.address = "messages"."address")`
       .mapWith(Boolean),
+    // Key 限定范围：不限时恒为真，不改原来的语句
+    // 列名要唯一：D1 按列名回传结果，与其他同名表达式（如 1）重名会错位
+    inRange: (viewer.restrict ? sql<boolean>`${restrictCondition(viewer.restrict)}` : sql<boolean>`1`).mapWith(Boolean).as('vis_in_range'),
   };
 }
 
@@ -818,6 +846,8 @@ interface VisibilityFacts {
   owned: boolean;
   shared: boolean;
   claimed: boolean;
+  /** 在 API Key 的限定范围内（不限时恒为 true）；范围外与不可见一致 */
+  inRange: boolean;
 }
 
 /**
@@ -828,6 +858,7 @@ interface VisibilityFacts {
  * - admin 无 scope 时额外允许未认领
  */
 function isVisible(viewer: Viewer, scope: Scope, row: VisibilityRow, facts: VisibilityFacts): boolean {
+  if (!facts.inRange) return false;
   if (scope === 'unclaimed') return !facts.claimed;
   if (facts.owned) return true;
   if (shareAccess(viewer, scope) === 'readable' && row.direction === 'inbound' && row.deletedAt === null && facts.shared) return true;
@@ -1168,7 +1199,7 @@ export async function markMessages(
 ): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  return runInChunks(env, ids, (batch) => db.update(messages).set({ isRead }).where(scopedIdsCondition(db, scope, batch)));
+  return runInChunks(env, ids, (batch) => db.update(messages).set({ isRead }).where(scopedIdsCondition(db, scope, batch, viewer.restrict)));
 }
 
 /**
@@ -1193,6 +1224,7 @@ export async function markAllRead(
       isNull(messages.deletedAt),
       filters.address ? eq(messages.address, filters.address) : undefined,
       searchCondition(filters.q),
+      restrictCondition(viewer.restrict),
     ))
     .run();
   return result.meta.changes ?? 0;
@@ -1212,7 +1244,7 @@ export async function starMessages(
   const db = createDb(env);
   const scope = resolveScope(viewer);
   const access = shareAccess(viewer, scope);
-  const visible = (batch: number[]) => and(inArray(messages.id, batch), scopeCondition(db, scope, access));
+  const visible = (batch: number[]) => and(inArray(messages.id, batch), scopeCondition(db, scope, access), restrictCondition(viewer.restrict));
   return runInChunks(env, ids, (batch) => starred
     ? db.insert(stars)
       .select(db.select({ userId: sql`${viewer.userId}`.as('user_id'), messageId: messages.id, createdAt: sql`(unixepoch() * 1000)`.as('created_at') })
@@ -1224,8 +1256,8 @@ export async function starMessages(
     )));
 }
 
-function scopedIdsCondition(db: Db, scope: Scope, ids: number[]): SQL {
-  return and(inArray(messages.id, ids), scopeCondition(db, scope)) as SQL;
+function scopedIdsCondition(db: Db, scope: Scope, ids: number[], restrict?: AddressRestriction): SQL {
+  return and(inArray(messages.id, ids), scopeCondition(db, scope), restrictCondition(restrict)) as SQL;
 }
 
 /** 批量软删除（移入回收站）：仅置 deletedAt，7 天后由 scheduled 硬删 */
@@ -1234,7 +1266,7 @@ export async function deleteMessages(env: Env, viewer: Viewer, ids: number[]): P
   const scope = resolveMutationScope(viewer);
   const deletedAt = new Date();
   return runInChunks(env, ids, (batch) => db.update(messages).set({ deletedAt })
-    .where(and(scopedIdsCondition(db, scope, batch), isNull(messages.deletedAt))));
+    .where(and(scopedIdsCondition(db, scope, batch, viewer.restrict), isNull(messages.deletedAt))));
 }
 
 /** 从回收站恢复：清空 deletedAt */
@@ -1242,7 +1274,7 @@ export async function restoreMessages(env: Env, viewer: Viewer, ids: number[]): 
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
   return runInChunks(env, ids, (batch) => db.update(messages).set({ deletedAt: null })
-    .where(and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt), isNull(messages.purgeToken))));
+    .where(and(scopedIdsCondition(db, scope, batch, viewer.restrict), isNotNull(messages.deletedAt), isNull(messages.purgeToken))));
 }
 
 /**
@@ -1252,7 +1284,7 @@ export async function restoreMessages(env: Env, viewer: Viewer, ids: number[]): 
 export async function purgeMessages(env: Env, viewer: Viewer, ids: number[], ctx?: ExecCtx | null): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  const conditions = chunk(ids).map((batch) => and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt)) as SQL);
+  const conditions = chunk(ids).map((batch) => and(scopedIdsCondition(db, scope, batch, viewer.restrict), isNotNull(messages.deletedAt)) as SQL);
   if (conditions.length === 0) return 0;
   return purgeMatchingMessages(env, conditions, D1_ID_BATCH, ctx);
 }

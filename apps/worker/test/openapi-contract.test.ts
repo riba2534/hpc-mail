@@ -24,6 +24,7 @@ import mailDoc from '../../web/public/references/mail.md?raw';
 import mailboxesDoc from '../../web/public/references/mailboxes-and-domains.md?raw';
 import mcpDoc from '../../web/public/references/mcp.md?raw';
 import notificationsDoc from '../../web/public/references/notifications.md?raw';
+import webhooksDoc from '../../web/public/references/webhooks.md?raw';
 
 const app = createApp();
 const origin = 'https://mail.example';
@@ -523,7 +524,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
 
   it('超过 100 行的参考文件开头有目录', () => {
     const references = { administration: administrationDoc, attachments: attachmentsDoc, auth: authDoc, errors: errorsDoc,
-      mail: mailDoc, mailboxes: mailboxesDoc, mcp: mcpDoc, notifications: notificationsDoc };
+      mail: mailDoc, mailboxes: mailboxesDoc, mcp: mcpDoc, notifications: notificationsDoc, webhooks: webhooksDoc };
     for (const [name, doc] of Object.entries(references)) {
       if (doc.split('\n').length > 100) expect(doc.split('\n').slice(0, 5).join('\n'), name).toContain('## 目录');
     }
@@ -658,6 +659,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     'references/administration.md': administrationDoc, 'references/attachments.md': attachmentsDoc,
     'references/auth-and-http.md': authDoc, 'references/errors.md': errorsDoc, 'references/mail.md': mailDoc,
     'references/mailboxes-and-domains.md': mailboxesDoc, 'references/mcp.md': mcpDoc, 'references/notifications.md': notificationsDoc,
+    'references/webhooks.md': webhooksDoc,
   };
   /** 文档故意写出的不存在端点（提醒 Agent 不要调用），必须确实不存在 */
   const documentedAsMissing = ['POST /messages/{id}'];

@@ -76,15 +76,23 @@ export async function generateCode(secret: string, counter: number): Promise<str
   return (bin % 10 ** DIGITS).toString().padStart(DIGITS, '0');
 }
 
-/** 校验 TOTP 码：容忍 ±window 个时间步（默认 ±1，即前后 30s） */
-export async function verifyTotp(secret: string, token: string, window = 1): Promise<boolean> {
+/**
+ * 校验 TOTP 码并返回命中的时间步（unix 秒 / 30）：容忍 ±window 个时间步（默认 ±1，即前后 30s），不命中返回 null。
+ * 防重放由调用方用返回的时间步与 users.totp_last_step 比较（同一步及更早的码不再接受）。
+ */
+export async function matchTotpStep(secret: string, token: string, window = 1): Promise<number | null> {
   const normalized = token.replace(/\s/g, '');
-  if (!/^\d{6}$/.test(normalized)) return false;
+  if (!/^\d{6}$/.test(normalized)) return null;
   const counter = Math.floor(Date.now() / 1000 / PERIOD);
   for (let w = -window; w <= window; w++) {
-    if ((await generateCode(secret, counter + w)) === normalized) return true;
+    if ((await generateCode(secret, counter + w)) === normalized) return counter + w;
   }
-  return false;
+  return null;
+}
+
+/** 只判断码是否有效，不记录时间步（不防重放） */
+export async function verifyTotp(secret: string, token: string, window = 1): Promise<boolean> {
+  return (await matchTotpStep(secret, token, window)) !== null;
 }
 
 /** 生成 otpauth:// URI 供 Authenticator 扫码 */

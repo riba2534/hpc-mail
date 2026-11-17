@@ -1,16 +1,19 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { CreateApiKeyRequest, CreatedApiKey } from '@hpc-mail/shared';
+import type { CreateApiKeyInput, CreatedApiKey, SessionUser } from '@hpc-mail/shared';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  create: vi.fn(async (_body: CreateApiKeyRequest): Promise<CreatedApiKey> => {
+  create: vi.fn(async (_body: CreateApiKeyInput): Promise<CreatedApiKey> => {
     throw new Error('not stubbed');
   }),
   toast: vi.fn(),
 }));
-vi.mock('@/api/resources', () => ({ apiKeyApi: { create: mocks.create } }));
+vi.mock('@/api/resources', () => ({
+  apiKeyApi: { create: mocks.create },
+  mailboxApi: { list: async () => [{ id: 42, address: 'bot@hpc.email', domain: 'hpc.email' }, { id: 43, address: 'other@hpc.email', domain: 'hpc.email' }] },
+}));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 vi.stubGlobal(
   'ResizeObserver',
@@ -21,6 +24,7 @@ vi.stubGlobal(
   },
 );
 
+import { CurrentUserContext } from '@/lib/use-session';
 import {
   buildCurlExample,
   CreateApiKeyDialog,
@@ -31,13 +35,22 @@ import {
 
 const DAY = 24 * 60 * 60 * 1000;
 
-function renderDialog() {
+function renderDialog(role: SessionUser['role'] = 'user') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const user: SessionUser = { id: 1, username: 'alice', role, createdAt: '', avatarUrl: null, twoFactorEnabled: false };
   return render(
     <QueryClientProvider client={client}>
-      <CreateApiKeyDialog open onOpenChange={vi.fn()} />
+      <CurrentUserContext.Provider value={user}>
+        <CreateApiKeyDialog open onOpenChange={vi.fn()} />
+      </CurrentUserContext.Provider>
     </QueryClientProvider>,
   );
+}
+
+/** 名称与当前密码是提交前必填的两项 */
+async function fillRequired(user: ReturnType<typeof userEvent.setup>, name: string) {
+  await user.type(screen.getByLabelText(/名称/), name);
+  await user.type(screen.getByLabelText(/当前密码/), 'current-pass');
 }
 
 function createdKey(overrides: Partial<CreatedApiKey> = {}): CreatedApiKey {
@@ -53,6 +66,8 @@ function createdKey(overrides: Partial<CreatedApiKey> = {}): CreatedApiKey {
     expiresAt: null,
     lastUsedAt: null,
     createdAt: '2026-10-10T00:00:00Z',
+    allowedMailboxIds: [],
+    allowedDomains: [],
     key: 'hpcm_secret_value',
     ...overrides,
   };
@@ -63,8 +78,12 @@ describe('API Key 预设工具函数', () => {
     expect(matchScopePreset(['mailbox.read', 'mail.read'])).toBe('read');
     expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read'])).toBe('send');
     expect(
-      matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write', 'domain.read', 'domain.write']),
+      matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write', 'domain.read', 'domain.write',
+        'mailbox.share', 'webhook.write', 'notify.read', 'notify.write']),
     ).toBe('full');
+    // 「完全访问」不含管理员能力
+    expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write', 'domain.read', 'domain.write',
+      'mailbox.share', 'webhook.write', 'notify.read', 'notify.write', 'admin'])).toBe('custom');
     // 托管域名两项加入之前的「完全访问」：已有 Key 不自动获得新 scope，按自定义显示
     expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'])).toBe('custom');
     expect(matchScopePreset(['mail.read'])).toBe('custom');
@@ -110,7 +129,7 @@ describe('CreateApiKeyDialog', () => {
     expect(screen.getByRole('checkbox', { name: '读取邮件' })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: '发送邮件' })).not.toBeChecked();
 
-    await user.type(screen.getByLabelText(/名称/), '脚本');
+    await fillRequired(user, '脚本');
     await user.click(screen.getByRole('button', { name: '创建' }));
     await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
     const body = mocks.create.mock.calls[0]![0];
@@ -127,6 +146,7 @@ describe('CreateApiKeyDialog', () => {
 
     await user.click(screen.getByRole('checkbox', { name: '管理邮箱' }));
     await user.click(screen.getByRole('checkbox', { name: '查看托管域名' }));
+    for (const label of ['管理共享', '配置 Webhook', '读取通知配置', '修改通知配置']) await user.click(screen.getByRole('checkbox', { name: label }));
     expect(screen.getByRole('radio', { name: '完全访问' })).toHaveAttribute('aria-checked', 'false');
     await user.click(screen.getByRole('checkbox', { name: '接入域名与解析' }));
     expect(screen.getByRole('radio', { name: '完全访问' })).toHaveAttribute('aria-checked', 'true');
@@ -154,7 +174,7 @@ describe('CreateApiKeyDialog', () => {
     expect(screen.getByRole('checkbox', { name: '接入域名与解析' })).toBeChecked();
     expect(screen.getByText(/修改托管域名的 DNS 解析/)).toHaveClass('text-caution');
 
-    await user.type(screen.getByLabelText(/名称/), '域名脚本');
+    await fillRequired(user, '域名脚本');
     await user.click(screen.getByRole('button', { name: '创建' }));
     await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
     expect(mocks.create.mock.calls[0]![0].scopes).toEqual(expect.arrayContaining(['domain.read', 'domain.write']));
@@ -164,7 +184,7 @@ describe('CreateApiKeyDialog', () => {
     mocks.create.mockResolvedValue(createdKey());
     const user = userEvent.setup();
     renderDialog();
-    await user.type(screen.getByLabelText(/名称/), '脚本');
+    await fillRequired(user, '脚本');
 
     // 权限预设里也有「自定义」，后一个属于有效期
     const expiryGroup = screen.getByRole('radiogroup', { name: '有效期' });
@@ -185,11 +205,41 @@ describe('CreateApiKeyDialog', () => {
     expect(expiresAt).toBeLessThanOrEqual(Date.now() + 30 * DAY + 1000);
   });
 
+  it('提交带上当前密码与限定的邮箱、域名；没填密码时不能提交', async () => {
+    mocks.create.mockResolvedValue(createdKey());
+    const user = userEvent.setup();
+    renderDialog();
+    await user.type(screen.getByLabelText(/名称/), '单邮箱');
+    expect(screen.getByRole('button', { name: '创建' })).toBeDisabled();
+    await user.click(screen.getByText('限定邮箱或域名（可选）'));
+    await user.click(await screen.findByRole('checkbox', { name: 'bot@hpc.email' }));
+    await user.type(screen.getByLabelText(/限定域名/), 'mine.example');
+    await user.type(screen.getByLabelText(/当前密码/), 'current-pass');
+    await user.click(screen.getByRole('button', { name: '创建' }));
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    expect(mocks.create.mock.calls[0]![0]).toMatchObject({ password: 'current-pass', allowedMailboxIds: [42], allowedDomains: ['mine.example'] });
+  });
+
+  it('管理员能力只对管理员显示，勾选后提示并按规则校验白名单与有效期', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+    expect(screen.queryByRole('checkbox', { name: '管理员能力' })).toBeNull();
+    cleanup();
+
+    renderDialog('admin');
+    await user.click(screen.getByRole('checkbox', { name: '管理员能力' }));
+    expect(screen.getByText(/必须设置 IP 白名单/)).toBeInTheDocument();
+    await fillRequired(user, '运维');
+    await user.click(screen.getByRole('button', { name: '创建' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('IP 白名单');
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
   it('创建成功后展示 curl 示例、发信提示与接入说明链接', async () => {
     mocks.create.mockResolvedValue(createdKey({ scopes: ['mail.read', 'mail.send', 'mailbox.read'] }));
     const user = userEvent.setup();
     renderDialog();
-    await user.type(screen.getByLabelText(/名称/), '脚本');
+    await fillRequired(user, '脚本');
     await user.click(screen.getByRole('button', { name: '创建' }));
 
     const example = await screen.findByLabelText('curl 示例');

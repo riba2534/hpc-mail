@@ -2,7 +2,7 @@ import type {
   ApiKeySelf, ApiScope, BatchClaimMailboxResult, ClaimPlan, CreatedApiKey, Mailbox, MailboxAvailability, MessageDetail, MessageSummary,
   Page, SendIdentities, WaitMessageResult,
 } from '@hpc-mail/shared';
-import { API_SCOPES, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
+import { MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
@@ -12,6 +12,7 @@ import { signToken } from '../src/lib/jwt.js';
 import { bumpCounter, dayWindow } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash, USER_SCOPES } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -46,13 +47,16 @@ async function actor(username: string, role: 'admin' | 'user' = 'user') {
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  return { id: user!.id, jwt, key: await keyFor(jwt, [...API_SCOPES]) };
+  return { id: user!.id, jwt, key: await keyFor(jwt, USER_SCOPES, role === 'admin') };
 }
-async function keyFor(jwt: string, scopes: ApiScope[]) {
-  return (await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `k-${scopes.join('-') || 'none'}`.slice(0, 64), scopes, rateLimit: 600 })), 201)).key;
+/** legacyAdmin：按迁移 0022 后存量管理员 Key 的形态补上 admin scope */
+async function keyFor(jwt: string, scopes: ApiScope[], legacyAdmin = false) {
+  const created = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `k-${scopes.join('-').slice(0, 60) || 'none'}`, scopes, rateLimit: 600, password: TEST_PASSWORD })), 201);
+  if (legacyAdmin) await grantLegacyAdminScope(env, created.id);
+  return created.key;
 }
 async function own(userId: number, address: string) {
   return (await db.insert(mailboxes).values({ address, domain: address.split('@')[1]!, userId }).returning().get())!;
@@ -152,6 +156,7 @@ describe('GET /v1/me', () => {
       key: {
         id: expect.any(Number), name: 'k-mail.read', keyPrefix: key.slice(0, 11), keySuffix: key.slice(-4), scopes: ['mail.read'],
         rateLimit: 600, allowedIps: [], expiresAt: null, createdAt: expect.any(String),
+        allowedMailboxIds: [], allowedDomains: [], effectiveRole: 'user',
       },
       user: { id: user.id, username: 'w2-me-user', role: 'user' },
       limits: { userRequestsPerMinute: 1200, waitPollsPerMinute: 120 },
@@ -173,6 +178,7 @@ describe('GET /v1/me', () => {
     const admin = await actor('w2-me-admin', 'admin');
     const me = await data<ApiKeySelf>(await request('/v1/me', auth(admin.key)));
     expect(me.user.role).toBe('admin');
+    expect(me.key.effectiveRole).toBe('admin');
     expect(me.outbound).toMatchObject({ dailyLimit: 0, dailyRecipientLimit: 0, exempt: true });
   });
 });

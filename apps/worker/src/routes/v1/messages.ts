@@ -14,7 +14,9 @@ import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
 import { conditionalDetailResponse } from '../../lib/etag.js';
 import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
-import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
+import {
+  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, assertKeyCanUseSender, keyRestriction, requireScope,
+} from '../../middleware/api-key-auth.js';
 import {
   countUnread,
   deleteMessages,
@@ -29,9 +31,11 @@ import {
   getMessageDetailConditional,
   listMessages,
   loadAttachmentForViewer,
+  loadSourceMessage,
   markMessages,
   type Viewer,
 } from '../../services/message.js';
+import type { InternalSendMailRequest } from '@hpc-mail/shared';
 import { handleCompose, handleSend } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
@@ -45,17 +49,50 @@ app.get('/', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const query = parseQuery(c, listMessagesQuerySchema);
+  // 显式给出范围外的地址或域名直接 403，而不是静默返回空列表
+  if (query.address) await assertKeyCanUseAddress(c, query.address);
+  if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
   return ok(c, await listMessages(c.env, viewerFromKey(key, query, c), query));
 });
 
 app.post('/', (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
-  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, (req) => {
+  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, async (req) => {
     // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
     if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
+    await assertSendWithinRestriction(c, key, req);
   });
 });
+
+/**
+ * 限定了范围的 Key 发信：发件地址与回复、转发引用的来源邮件都要在范围内。
+ * 发件邮箱或来源不存在、不可见时交给 sendMail 按原有口径报 404，这里只拦范围外的。
+ */
+async function assertSendWithinRestriction(
+  c: Context<AppContext>,
+  key: { userId: number; role: Viewer['role'] },
+  req: InternalSendMailRequest,
+): Promise<void> {
+  if (!keyRestriction(c)) return;
+  await assertKeyCanUseSender(c, req.from);
+  const sources = [['reply', req.replyToMessageId], ['forward', req.forwardAttachmentsFrom]] as const;
+  for (const [source, id] of sources) {
+    if (id === undefined) continue;
+    const row = await loadSourceMessage(c.env, key, id, '引用的原邮件不存在或不可见', source);
+    await assertKeyCanUseAddress(c, row.address);
+  }
+}
+
+/**
+ * 按域名收窄：域名在 allowedDomains 中，或只限定了邮箱时该域名下有允许的邮箱（列表照常只返回允许的邮箱），
+ * 否则 403。只限定邮箱的 Key 按域名筛自己邮箱的邮件是合理用法，不应一律拒绝。
+ */
+function assertKeyCanUseDomainOrMailboxes(c: Context<AppContext>, domain: string): void {
+  const restriction = keyRestriction(c);
+  if (!restriction || restriction.domains.includes(domain) || restriction.mailboxIds.length) return;
+  assertKeyCanUseDomain(c, domain);
+}
 
 /**
  * 回复与转发：服务端按原信算收件人、主题、引用与线程头，from 缺省用原信的收件地址。
@@ -133,7 +170,7 @@ app.get('/unread-count', async (c) => {
   if (scope !== undefined && scope !== 'mine') {
     throw new AppError('validation_failed', '未读数只统计调用者认领的地址，scope 只能为 mine');
   }
-  return ok(c, { unread: await countUnread(c.env, key.userId, key.role) });
+  return ok(c, { unread: await countUnread(c.env, key.userId, key.role, undefined, keyRestriction(c) ?? undefined) });
 });
 
 /**
@@ -151,6 +188,8 @@ app.get('/wait', async (c) => {
   const query = parseQuery(c, {
     safeParse: (raw) => waitMessagesQuerySchema.safeParse({ ...(raw as Record<string, string>), address: addresses?.join(',') }),
   });
+  for (const address of query.address ?? []) await assertKeyCanUseAddress(c, address);
+  if (query.domain) assertKeyCanUseDomainOrMailboxes(c, query.domain);
   const viewer = messageViewer(c, key);
   const deadline = Date.now() + query.timeout * 1000;
   const signal = c.req.raw.signal;
@@ -207,7 +246,8 @@ function viewerFromKey(
   query: { scope?: Viewer['scope']; userId?: number },
   c: Context<AppContext>,
 ): Viewer {
-  const viewer: Viewer = { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId };
+  const restrict = keyRestriction(c) ?? undefined;
+  const viewer: Viewer = { userId: key.userId, role: key.role, scope: query.scope, targetUserId: query.userId, ...(restrict ? { restrict } : {}) };
   auditUserScopeRead(c, viewer);
   return viewer;
 }

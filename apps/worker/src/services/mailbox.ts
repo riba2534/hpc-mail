@@ -50,6 +50,16 @@ export interface ListMailboxesOptions {
   all?: boolean;
   q?: string;
   domain?: string;
+  /** API Key 限定范围：只列 id 在 mailboxIds 或域名在 domains 中的邮箱（两个列表各以一个 JSON 参数绑定） */
+  restrict?: { mailboxIds: number[]; domains: string[] };
+}
+
+function restrictedMailboxes(restrict: ListMailboxesOptions['restrict']): SQL | undefined {
+  if (!restrict) return undefined;
+  return or(
+    sql`${mailboxes.id} IN (SELECT value FROM json_each(${JSON.stringify(restrict.mailboxIds)}))`,
+    sql`${mailboxes.domain} IN (SELECT value FROM json_each(${JSON.stringify(restrict.domains)}))`,
+  );
 }
 
 /**
@@ -64,6 +74,7 @@ export async function listMailboxes(env: Env, opts: ListMailboxesOptions, page: 
     opts.all ? undefined : eq(mailboxes.userId, opts.userId!),
     opts.domain ? eq(mailboxes.domain, opts.domain) : undefined,
     opts.q ? mailboxSearchSql(opts.q) : undefined,
+    restrictedMailboxes(opts.restrict),
     page?.cursorId ? lt(mailboxes.id, page.cursorId) : undefined,
   );
   let items: Mailbox[];

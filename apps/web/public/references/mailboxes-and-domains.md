@@ -101,7 +101,7 @@ hpc '/mailboxes/batch' -X POST -H 'Content-Type: application/json' --data-binary
 
 所有者可以共享自己认领的邮箱，管理员可以共享全站任意已认领邮箱。共享公开邮箱的**全部现有及未来未删除收件**，不是自共享时刻起的新信，不包括发件或回收站。grantee 可以是启用中的普通用户或管理员，最多 100 人；邮箱所有者已经有访问权，无需加入名单。共享不能当发件身份，不能删除、恢复、purge、重命名或释放邮箱；允许查看详情/线程/附件/raw、设置自己独立的星标，共享来信也可以作为回复（`replyToMessageId`）或附件转发（`forwardAttachmentsFrom`）的来源，发件身份仍须是自己认领的地址。共享邮件的已读状态属于所有者：成员逐封标记计 0、全部已读不包含共享邮件；成员的未读数和 `unread=1` 筛选只统计自己认领的地址。仅被分享人的通知偏好不会因共享自动收到推送，通知按收信时实际 owner 结算。
 
-共享管理 JWT 接口（`/admin` 路径需要管理员）：
+共享管理 JWT 接口（`/admin` 路径需要管理员）。API Key 带 `mailbox.share` 时，`/v1/mailboxes/shares`、`/v1/mailboxes/shares/batch`、`/v1/mailboxes/shares/:mailboxId/grantees/:userId` 与下表前四行同形（只管理 Key 所属用户自己的邮箱）；Key 没有用户搜索，被分享人的 userId 向用户确认。限定了范围的 Key 只能看到、修改范围内的邮箱：
 
 | 方法与 `/api` 路径 | 契约 |
 |---|---|
@@ -109,7 +109,7 @@ hpc '/mailboxes/batch' -X POST -H 'Content-Type: application/json' --data-binary
 | `PUT /mailboxes/shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` 整体替换自己邮箱的名单；管理员通过此入口也只能修改自己邮箱 |
 | `POST /mailboxes/shares/batch` | `{mailboxIds:[...],userIds:[...]}`（各 1–100 个）把自己的多只邮箱一次**追加**共享给同一批用户：已在名单的保留原授权时间，不移除任何人，重复调用幂等；每只邮箱追加后最多 100 人。出错时整单不写入任何邮箱：任一邮箱不归自己（管理员也一样）返回 403；用户含自己、不存在或已禁用，或追加后某只邮箱会超过 100 人，返回 400；校验通过后、写入前状态被并发改变返回 409，例如邮箱被过户或释放、被分享人被禁用或删除、并发写入使某只邮箱超过 100 人。并发的追加或替换共享本身不报错，按先后合并（已在名单的按主键跳过）。返回各邮箱本次写入后的完整名单，按去重后的 `mailboxIds` 顺序，重复 id 只返回一次 |
 | `DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | 所有者撤销一个成员；`{success:true}` |
-| `GET /mailboxes/share-users?q=...&excludeUserId=...&limit=20` | JWT 专用；搜索启用用户，仅返回 `{items:[{id,username,role}],hasMore}`，不含账户隐私或邮箱列表 |
+| `GET /mailboxes/share-users?q=...&excludeUserId=...&limit=20` | JWT 专用；搜索启用用户，仅返回 `{items:[{id,username}],hasMore}`，不含角色、账户隐私或邮箱列表 |
 | `GET /admin/mailbox-shares` | 管理员查看全站已认领邮箱与 `grantees:[{userId,username,status,grantedAt}]`，包含尚未共享邮箱；`?mailboxId=` 只返回该邮箱（0 或 1 项的数组）；`q` 按地址或所有者用户名过滤；分页参数同 `GET /mailboxes`，按邮箱 id 倒序，`limit` 计邮箱数，每项仍是完整名单 |
 | `PUT /admin/mailbox-shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` **整体替换任意已认领邮箱**的名单，`[]` 撤销全部；返回更新后的共享邮箱 |
 | `DELETE /admin/mailbox-shares/:mailboxId/grantees/:userId` | 只撤销一人；`{success:true}` |

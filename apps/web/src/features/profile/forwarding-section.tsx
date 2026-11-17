@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { type ReactNode, useEffect, useState } from 'react';
-import { SECRET_MASK, type UserNotifyPrefs, updateNotifyPrefsRequestSchema } from '@hpc-mail/shared';
+import { SECRET_MASK, type NotifyPrefsView, type UserNotifyPrefs, updateNotifyPrefsRequestSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { notifyPrefsApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
+import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { QueryErrorState } from '@/components/query-error-state';
 import { UnsavedChangesGuard } from '@/components/unsaved-changes-guard';
 import { Input } from '@/components/ui/input';
@@ -70,6 +71,20 @@ function ChannelBlock({
 
 type TestChannel = 'feishu' | 'pushdeer';
 
+/**
+ * 编辑用的草稿：转发目标显示已确认与等待确认的全部地址。保存时整张列表发给服务端，
+ * 已确认的保留、仍在等待的不重发、新加的发确认信；从列表删掉的等待项撤销确认。
+ */
+export function toDraft(view: NotifyPrefsView): UserNotifyPrefs {
+  const pending = view.forwardPending.map((item) => item.address).filter((address) => !view.forward.addresses.includes(address));
+  return {
+    feishu: view.feishu,
+    webhook: view.webhook,
+    pushdeer: view.pushdeer,
+    forward: { enabled: view.forward.enabled, addresses: [...view.forward.addresses, ...pending] },
+  };
+}
+
 const TEST_HINT = '有未保存的改动时会先自动保存，再用保存后的配置发送测试。';
 
 export function ForwardingSection({ id }: { id?: string }) {
@@ -83,22 +98,40 @@ export function ForwardingSection({ id }: { id?: string }) {
   const [validationError, setValidationError] = useState<string | null>(null);
   const [draft, setDraft] = useState<UserNotifyPrefs | null>(null);
   const [testing, setTesting] = useState<TestChannel | null>(null);
+  // 新增转发目标或打开转发时服务端要求当前密码：先不带密码保存，收到 reauth_required 再弹窗补上
+  const [reauthOpen, setReauthOpen] = useState(false);
+  const [reauthPassword, setReauthPassword] = useState('');
+  const [reauthError, setReauthError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (data) setDraft(structuredClone(data));
+    if (data) setDraft(toDraft(data));
   }, [data]);
 
   const save = useMutation({
-    mutationFn: (payload: UserNotifyPrefs) => notifyPrefsApi.update(payload),
-    onSuccess: (saved) => {
+    mutationFn: ({ payload, password }: { payload: UserNotifyPrefs; password?: string }) =>
+      notifyPrefsApi.update(password ? { ...payload, password } : payload),
+    onSuccess: (saved, { payload }) => {
+      const before = data ? toDraft(data).forward.addresses : [];
       queryClient.setQueryData(queryKeys.notifyPrefs, saved);
-      setDraft(structuredClone(saved));
+      setDraft(toDraft(saved));
       setValidationError(null);
+      setReauthOpen(false);
+      setReauthPassword('');
       void queryClient.invalidateQueries({queryKey:queryKeys.notificationHealth});
-      toast({ title: '转发与通知已保存', variant: 'success' });
+      const invited = saved.forwardPending.map((item) => item.address)
+        .filter((address) => payload.forward.addresses.includes(address) && !before.includes(address));
+      toast(invited.length
+        ? { title: '已保存，确认邮件已发出', description: `${invited.join('、')} 的主人确认后才开始转发`, variant: 'success' }
+        : { title: '转发与通知已保存', variant: 'success' });
     },
-    onError: (err) =>
-      toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' }),
+    onError: (err) => {
+      if (err instanceof ApiError && (err.code === 'reauth_required' || err.code === 'reauth_failed')) {
+        setReauthError(err.code === 'reauth_failed' ? err.message : null);
+        setReauthOpen(true);
+        return;
+      }
+      toast({ title: err instanceof ApiError ? err.message : '保存失败，请重试', variant: 'error' });
+    },
   });
 
   const sendTest = useMutation({
@@ -119,7 +152,6 @@ export function ForwardingSection({ id }: { id?: string }) {
     );
   }
 
-
   if (isError || !draft || !data) {
     return (
       <div id={id} className="scroll-mt-20">
@@ -128,7 +160,8 @@ export function ForwardingSection({ id }: { id?: string }) {
     );
   }
 
-  const dirty = JSON.stringify(draft) !== JSON.stringify(data);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(toDraft(data));
+  const pendingByAddress = new Map(data.forwardPending.map((item) => [item.address, item.expiresAt]));
   const patch = (fn: (d: UserNotifyPrefs) => void) => {
     setDraft((prev) => {
       const next = structuredClone(prev!);
@@ -137,8 +170,8 @@ export function ForwardingSection({ id }: { id?: string }) {
     });
   };
 
-  /** 校验并保存当前草稿；校验或保存失败返回 false */
-  const saveDraft = async (): Promise<boolean> => {
+  /** 校验并保存当前草稿；校验或保存失败返回 false（需要密码时弹窗，确认后再保存一次） */
+  const saveDraft = async (password?: string): Promise<boolean> => {
     const parsed = updateNotifyPrefsRequestSchema.safeParse(draft);
     if (!parsed.success) {
       setValidationError(parsed.error.issues[0]?.message ?? '请检查配置');
@@ -146,7 +179,7 @@ export function ForwardingSection({ id }: { id?: string }) {
     }
     setValidationError(null);
     try {
-      await save.mutateAsync(draft);
+      await save.mutateAsync({ payload: draft, password });
       return true;
     } catch {
       return false;
@@ -190,9 +223,19 @@ export function ForwardingSection({ id }: { id?: string }) {
           onChange={(addresses) => patch((d) => void (d.forward.addresses = addresses))}
           placeholder="输入目标邮箱地址后回车"
         />
+        {draft.forward.addresses.some((address) => pendingByAddress.has(address)) && (
+          <ul aria-label="等待确认的转发目标" className="flex flex-col gap-1 text-xs text-caution">
+            {draft.forward.addresses.filter((address) => pendingByAddress.has(address)).map((address) => (
+              <li key={address}>
+                {address}：等待对方确认，确认链接 {new Date(pendingByAddress.get(address)!).toLocaleString('zh-CN', { hour12: false })} 前有效
+              </li>
+            ))}
+          </ul>
+        )}
         <p className="text-xs text-ink-tertiary">
-          任意邮箱均可转发。已在 Cloudflare Email Routing 验证过的地址走原生转发（原样保留邮件）；
-          未验证的地址由系统以 no-reply@收件域名 中转重发（标注原始发件人，直接回复即回给对方）。
+          新加的地址会先收到一封确认邮件，对方点确认后才开始转发；新增地址或打开转发需要输入当前密码。
+          已在 Cloudflare Email Routing 验证过的地址走原生转发（原样保留邮件）；
+          其余地址由系统以 no-reply@收件域名 中转重发（标注原始发件人，直接回复即回给对方）。
         </p>
       </ChannelBlock>
 
@@ -369,6 +412,42 @@ export function ForwardingSection({ id }: { id?: string }) {
           保存
         </Button>
       </div>
+
+      <Dialog open={reauthOpen} onOpenChange={(next) => !next && setReauthOpen(false)}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader title="确认当前密码" description="新增转发目标或打开转发会把来信发往外部邮箱，请输入当前密码确认。" />
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (reauthPassword) void saveDraft(reauthPassword);
+            }}
+          >
+            <DialogBody>
+              <PasswordInput
+                autoFocus
+                aria-label="当前密码"
+                placeholder="当前密码"
+                autoComplete="current-password"
+                value={reauthPassword}
+                invalid={reauthError !== null}
+                onChange={(event) => {
+                  setReauthPassword(event.target.value);
+                  setReauthError(null);
+                }}
+              />
+              {reauthError && <p role="alert" className="mt-2 text-sm text-critical">{reauthError}</p>}
+            </DialogBody>
+            <DialogFooter>
+              <Button type="button" variant="secondary" onClick={() => setReauthOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" loading={save.isPending} disabled={!reauthPassword}>
+                确认并保存
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

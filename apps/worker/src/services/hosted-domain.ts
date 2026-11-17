@@ -28,6 +28,7 @@ import { getUserNotifyPrefs } from './notify-prefs.js';
 import { sendPushDeerNotification } from './pushdeer.js';
 import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
+import { emitHostedDomainTransitions } from './webhooks.js';
 
 type HostedRow = typeof hostedDomains.$inferSelect;
 type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
@@ -714,7 +715,6 @@ async function runClaim(env: Env, base: CloudflareCredentials, claim: SyncClaim,
 export async function notifyHostedDomainMoved(
   env: Env, row: Pick<HostedRow, 'userId' | 'domain' | 'nameServers' | 'zoneStatus'>, ctx?: ExecCtx | null,
 ): Promise<void> {
-  // TODO(PR4a): emitUserEvent(env, row.userId, 'hosted_domain.moved', ctx)
   await runDetached(ctx, '托管域名迁走提醒', async () => {
     const [prefs, fromAddress] = await Promise.all([getUserNotifyPrefs(env, row.userId), getSystemFromAddress(env)]);
     const nameServers = row.nameServers.join('、');
@@ -744,6 +744,7 @@ async function markMoved(
 ): Promise<boolean> {
   const saved = await saveChecked(env, row.id, { ...fields, status: 'moved' }, lease);
   if (saved && row.status !== 'moved') {
+    await emitHostedDomainTransitions(env, row, { status: 'moved', zoneStatus: fields.zoneStatus ?? row.zoneStatus });
     await notifyHostedDomainMoved(env, { ...row, zoneStatus: fields.zoneStatus ?? row.zoneStatus }, ctx);
   }
   return saved;
@@ -816,8 +817,9 @@ async function syncClaimed(env: Env, creds: CloudflareCredentials, claim: SyncCl
   // 发信就绪后订阅投递回执（失败只记录在订阅状态里，不影响开通）
   if (config.sendingStatus === 'ready') await subscribeHostedDomainEvents(env, creds, row.domain, zone.id);
   const ready = config.routingStatus === 'ready' && config.catchAllReady && config.sendingStatus === 'ready';
-  return saveChecked(env, row.id, {
-    status: ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning',
+  const status = ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning';
+  const saved = await saveChecked(env, row.id, {
+    status,
     zoneStatus: 'active',
     activatedAt,
     routingStatus: config.routingStatus,
@@ -829,6 +831,9 @@ async function syncClaimed(env: Env, creds: CloudflareCredentials, claim: SyncCl
     lastError: ready ? '' : config.error,
     checkedAt: now,
   }, lease);
+  // Webhook v2：可以收信、发信就绪的状态变化（只在这次写入生效时）
+  if (saved) await emitHostedDomainTransitions(env, row, { status, zoneStatus: 'active', ...config });
+  return saved;
 }
 
 /** 核对单个域名：先领租约，正被其他请求或定时任务核对（或已暂停、不存在）时不调用 Cloudflare */

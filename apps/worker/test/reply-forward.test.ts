@@ -10,6 +10,7 @@ import { signToken } from '../src/lib/jwt.js';
 import { readMailBody } from '../src/services/mail-body.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -39,10 +40,10 @@ async function actor(username: string, scopes: ApiScope[] = [...API_SCOPES]) {
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username, role: 'user', passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username, role: 'user', passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = (await result<CreatedApiKey>(await request('/api/api-keys', post(jwt, { name: 'k', scopes, rateLimit: 600 })), 201)).key;
+  const key = (await result<CreatedApiKey>(await request('/api/api-keys', post(jwt, { name: 'k', scopes: scopes.filter((scope) => scope !== 'admin'), rateLimit: 600, password: TEST_PASSWORD })), 201)).key;
   return { id: user!.id, jwt, key };
 }
 async function own(userId: number, local: string) {
@@ -147,7 +148,7 @@ describe('POST /v1/messages/:id/reply', () => {
   it('需要 mail.send 与 mail.read；来源不可见为 source_unavailable；未知字段 400', async () => {
     const w = await world('rf6');
     const src = await source({ address: w.mine.address, fromAddress: w.boss });
-    const sendOnly = await result<CreatedApiKey>(await request('/api/api-keys', post(w.alice.jwt, { name: 's', scopes: ['mail.send'], rateLimit: 600 })), 201);
+    const sendOnly = await result<CreatedApiKey>(await request('/api/api-keys', post(w.alice.jwt, { name: 's', scopes: ['mail.send'], rateLimit: 600, password: TEST_PASSWORD })), 201);
     expect((await result<ErrorBody>(await request(`/v1/messages/${src.id}/reply`, post(sendOnly.key, { text: 'x' })), 403)).code).toBe('forbidden');
     expect((await result<ErrorBody>(await request(`/v1/messages/${src.id}/forward`, post(sendOnly.key, { to: [w.boss] })), 403)).code).toBe('forbidden');
     expect((await result<ErrorBody>(await request(`/v1/messages/${src.id}/reply`, post(w.bob.key, { text: 'x' })), 404)).code).toBe('source_unavailable');

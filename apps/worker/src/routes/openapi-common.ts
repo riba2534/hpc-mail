@@ -7,7 +7,7 @@ import {
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, userMailboxPolicySchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
   createInviteRequestSchema, replaceMailboxSharesRequestSchema, batchShareMailboxesRequestSchema, updateSettingsRequestSchema,
-  updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
+  updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, setupTwoFactorRequestSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
   HOSTED_DOMAIN_STATUSES, createHostedDomainRequestSchema, updateHostedDomainRequestSchema, replaceHostedDomainMembersRequestSchema,
   transferHostedDomainRequestSchema, HOSTED_DNS_CAA_TAGS, HOSTED_DNS_TTL_AUTO, hostedDnsRecordInputSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
@@ -194,6 +194,9 @@ for (const schema of [settingsResponse, settingsUpdate]) {
   properties.delivery_events!.description = `Outbound delivery receipts, default true. Takes effect only on deployments that enabled receipts (the operator set the GitHub Variable DELIVERY_EVENTS_QUEUE, e.g. ${DELIVERY_EVENTS_QUEUE}, so CI created the Queue and attached its consumer; GET /admin/delivery-events shows queue null otherwise). Then, with Cloudflare credentials on the Worker, the scheduled task subscribes every system domain (missing subscriptions every 5 minutes, all verified daily) and each hosted domain as soon as its sending is ready to Cloudflare Email Sending events (delivered, bounced, failed, rejected, complained). Receipts update recipientOutcomes and outbound status; bounces and complaints add the recipient to the suppression list. false stops creating new subscriptions; events from existing subscriptions are still applied. Domains without a subscription get no receipts and stay sent.`;
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
+(notifyPrefs.properties as Record<string, Schema>).forwardPending = { ...array(object({ address: str, expiresAt: date })),
+  description: 'Forwarding targets waiting for the target mailbox owner to confirm (the confirmation mail is valid for 72 hours). They are not in forward.addresses and receive nothing until confirmed.' };
+(notifyPrefs.required as string[] | undefined)?.push('forwardPending');
 notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webhook.secret and pushdeer.pushkey are returned as ******; plaintext secrets are never returned. In updates ****** preserves the secret (for PushDeer only while the endpoint keeps the same origin and path, ignoring a trailing slash, with an empty endpoint meaning the official one; otherwise 400 validation_failed asks for the pushkey again) and an explicit empty string clears it. Enabled configurations must have valid complete endpoints/keys/forward addresses. These are mail-owner notifications; shared mailbox readers do not receive owner notifications.';
 /** 逐收件人结果：发件摘要与 delivery_failed 错误的 details 共用 */
 const recipientOutcome = { ...object({ address: str,
@@ -246,8 +249,15 @@ const sendIdentityReason = { type: 'string', enum: ['hosted_sending_not_ready', 
   description: 'hosted_sending_not_ready: the hosted domain’s sending is not ready yet; hosted_domain_unavailable: the hosted domain is suspended, moved or being deleted; shared_readonly: a mailbox shared with the caller is read-only and can never send.' };
 const user = object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] }, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
 const { twoFactorEnabled: _twoFactorEnabled, ...adminUserProperties } = user.properties as Record<string, Schema>;
-const apiKey = object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: array({ type: 'string', enum: API_SCOPES }), rateLimit: positiveId,
-  allowedIps: array(str), status: { type: 'string', enum: ['active', 'disabled', 'revoked'] }, expiresAt: nullable(date), lastUsedAt: nullable(date), createdAt: date, ownerUsername: str }, ['ownerUsername']);
+const keyScopes: Schema = { ...array({ type: 'string', enum: API_SCOPES }),
+  description: 'admin is a capability flag: only administrators can grant it, it requires allowedIps and an expiry at most 90 days ahead, and only with it does an administrator key act as administrator (cross-user scopes, all=1, any mailboxId as sender, outbound-quota exemption). Without it an administrator key acts as an ordinary user.' };
+const keyRestriction = {
+  allowedMailboxIds: { ...array(positiveId), description: 'Mailbox (claim) ids this key may use. Together with allowedDomains: both empty means unrestricted; otherwise an address is usable when its domain is in allowedDomains or its current claim id is in allowedMailboxIds. Releasing and reclaiming an address gives it a new id that an old key no longer covers.' },
+  allowedDomains: { ...array(str), description: 'Domains whose addresses this key may use, including addresses claimed later. A key restricted only by mailbox ids cannot claim new addresses.' },
+};
+const apiKey = object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: keyScopes, rateLimit: positiveId,
+  allowedIps: array(str), status: { type: 'string', enum: ['active', 'disabled', 'revoked'] }, expiresAt: nullable(date), lastUsedAt: nullable(date), createdAt: date,
+  ...keyRestriction, ownerUsername: str }, ['ownerUsername']);
 const delivery = object({ id: positiveId, messageId: nullable(positiveId), target: str,
   status: { type: 'string', enum: ['pending', 'processing', 'succeeded', 'failed', 'skipped', 'unknown'] },
   attempts: int, maxAttempts: positiveId, lastError: str, lastHttpStatus: nullable(int), createdAt: date, updatedAt: date,
@@ -371,7 +381,8 @@ export const schemas: Record<string, Schema> = {
     taken: { ...array(ref('ClaimMailboxRequest')), description: 'Skipped because the address is already claimed; request order.' },
     notAttempted: { ...array(ref('ClaimMailboxRequest')), description: 'Not attempted after stoppedBy, including the item that stopped the batch; request order.' },
     stoppedBy: nullable(object({ code: { type: 'string', enum: ERROR_CODES }, message: str })) }),
-  UserSearchResults: object({ items: array(object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] } })), hasMore: bool }),
+  UserSearchResults: object({ items: array(object({ id: positiveId, username: str,
+    role: { type: 'string', enum: ['admin', 'user'], description: 'Only in the administrator user search.' } }, ['role'])), hasMore: bool }),
   MailboxTransferResult: object({ mailbox: ref('Mailbox'), previousUserId: positiveId, transferred: bool, revokedShares: int }),
   AdminBatchClaimRequest: fromZod(adminBatchClaimRequestSchema), AdminBatchReleaseRequest: fromZod(adminBatchReleaseRequestSchema),
   AdminBatchTransferRequest: fromZod(adminBatchTransferRequestSchema), AdminBatchShareRequest: fromZod(adminBatchShareRequestSchema),
@@ -402,9 +413,11 @@ export const schemas: Record<string, Schema> = {
     })), description: 'Domains where any local part may be used as from (localPart+domain or "Name <any@domain>"), matching what the caller may actually send from. Administrators get system domains in configured order, then hosted, then legacy domains, each sorted by domain. Ordinary users get only the hosted domains they own whose sending is ready (kind=hosted): an unclaimed address there is claimed for the owner when sending, without counting toward the per-user claim limit, and an address already claimed by someone else (for example a member) cannot be used. Members of a hosted domain and shared mailboxes get no entries.' },
   }),
   ApiKeySelf: object({
-    key: object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: array({ type: 'string', enum: API_SCOPES }),
-      rateLimit: { ...positiveId, description: 'Requests per minute for this key.' }, allowedIps: array(str), expiresAt: nullable(date), createdAt: date }),
-    user: object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] } }),
+    key: object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: keyScopes,
+      rateLimit: { ...positiveId, description: 'Requests per minute for this key.' }, allowedIps: array(str), expiresAt: nullable(date), createdAt: date,
+      ...keyRestriction,
+      effectiveRole: { type: 'string', enum: ['admin', 'user'], description: 'The role this key acts with: admin only when the owner is an administrator and the key has the admin scope.' } }),
+    user: object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'], description: 'The owner account role; see key.effectiveRole for what this key may do.' } }),
     limits: object({
       userRequestsPerMinute: { ...positiveId, description: 'Requests per minute across all keys of this user.' },
       waitPollsPerMinute: { ...positiveId, description: 'GET /messages/wait polls per user per minute.' },
@@ -412,9 +425,9 @@ export const schemas: Record<string, Schema> = {
     outbound: { ...object({
       sent: { ...int, description: 'Sends counted today (UTC).' }, recipients: { ...int, description: 'Recipients counted today (UTC).' },
       dailyLimit: { ...int, description: '0 means unlimited.' }, dailyRecipientLimit: { ...int, description: '0 means unlimited.' },
-      exempt: { ...bool, description: 'Administrators are not subject to the outbound quota; limits are returned as 0.' },
+      exempt: { ...bool, description: 'Keys acting as administrator (key.effectiveRole=admin) are not subject to the outbound quota; limits are returned as 0.' },
       resetsAt: { ...date, description: 'Next UTC midnight, when the daily counters reset.' },
-    }), description: 'Today’s outbound quota usage of the key owner (all keys and the web combined): each send adds 1 to sent and its unique recipients to recipients; a send where every recipient failed is given back. Nothing is counted for administrators or while both limits are 0.' },
+    }), description: 'Today’s outbound quota usage of the key owner (all keys and the web combined): each send adds 1 to sent and its unique recipients to recipients; a send where every recipient failed is given back. Nothing is counted for sends by administrators (web session or a key with the admin scope) or while both limits are 0.' },
   }),
   MailboxShareGrant: object({ mailboxId: positiveId, address: str, domain: str, displayName: str,
     ownerUserId: positiveId, ownerUsername: str,
@@ -581,12 +594,26 @@ export const schemas: Record<string, Schema> = {
     return schema;
   })(),
   UploadAvatarRequest: fromZod(uploadAvatarRequestSchema), EnableTwoFactorRequest: fromZod(enableTwoFactorRequestSchema), DisableTwoFactorRequest: fromZod(disableTwoFactorRequestSchema),
+  SetupTwoFactorRequest: fromZod(setupTwoFactorRequestSchema),
   CreateUserRequest: fromZod(createUserRequestSchema), UpdateUserRequest: {
     ...fromZod(updateUserRequestSchema), dependentRequired: { mailboxPolicy: ['expectedMailboxPolicyRevision'] },
-  }, CreateApiKeyRequest: fromZod(createApiKeyRequestSchema),
+  }, CreateApiKeyRequest: (() => {
+    const schema = fromZod(createApiKeyRequestSchema);
+    const properties = schema.properties as Record<string, Schema>;
+    properties.password = { ...properties.password, description: 'Current login password, re-verified before the key is created. Missing: 403 reauth_required; wrong: 403 reauth_failed; 5 failures per 15 minutes: 429.' };
+    properties.allowedMailboxIds = { ...properties.allowedMailboxIds, description: `${keyRestriction.allowedMailboxIds.description} Every id must be a mailbox the caller currently owns, otherwise 400.` };
+    properties.allowedDomains = { ...properties.allowedDomains, description: keyRestriction.allowedDomains.description };
+    return schema;
+  })(),
   UpdateApiKeyRequest: fromZod(updateApiKeyRequestSchema), CreateInviteRequest: fromZod(createInviteRequestSchema), ReplaceMailboxSharesRequest: fromZod(replaceMailboxSharesRequestSchema),
   BatchShareMailboxesRequest: fromZod(batchShareMailboxesRequestSchema),
-  UpdateSettingsRequest: settingsUpdate, UpdateNotifyPrefsRequest: fromZod(updateNotifyPrefsRequestSchema),
+  UpdateSettingsRequest: settingsUpdate, UpdateNotifyPrefsRequest: (() => {
+    const schema = fromZod(updateNotifyPrefsRequestSchema);
+    const properties = schema.properties as Record<string, Schema>;
+    properties.password = { ...properties.password, description: 'Current login password. Required (403 reauth_required / reauth_failed) when forward adds an address not yet confirmed or turns forwarding on.' };
+    properties.forward = { ...properties.forward, description: 'Desired forwarding targets (web session only). Already confirmed addresses stay; new ones are not applied but receive a confirmation mail and appear in forwardPending until confirmed; pending addresses missing from the list are cancelled.' };
+    return schema;
+  })(),
   SingleUploadResult: object({ token: str, filename: str, size: int, mimeType: str }),
   MultipartInitResult: object({ token: str, uploadId: str, partBytes: positiveId, partCount: positiveId }),
   MultipartPartResult: object({ partNumber: positiveId, etag: str }), MultipartCompleteResult: object({ token: str, size: int }),
@@ -787,6 +814,7 @@ const NOT_FOUND_BY_RESOURCE: Record<string, ErrorExampleName> = {
   'mailbox-shares': 'NotFoundMailbox', grantees: 'NotFoundGrantee', 'hosted-domains': 'NotFoundHostedDomain', 'dns-records': 'NotFoundDnsRecord',
   'api-keys': 'NotFoundApiKey', users: 'NotFoundUser', invites: 'NotFoundInvite', uploads: 'NotFoundUpload', multipart: 'NotFoundUpload',
   avatar: 'NotFoundAvatar', jobs: 'NotFoundNotificationJob', suppressions: 'NotFoundSuppression', onboardings: 'NotFoundOnboarding',
+  webhooks: 'NotFoundWebhook', deliveries: 'NotFoundWebhook',
 };
 function notFoundExamples(path: string): string[] {
   const segments = path.split('/');
@@ -832,6 +860,14 @@ export function specificationOperation(): Operation {
       example: { openapi: '3.1.0', info: { title: 'HPC Mail Open API', version: SPEC_VERSION }, paths: {} } } } },
   } };
 }
+/** 分文件维护的路径（如 openapi-webhooks.ts）在模块加载时登记自己的组件 schema，避免都挤进上面的对象 */
+export function registerSchemas(extra: Record<string, Schema>): void {
+  for (const [name, schema] of Object.entries(extra)) {
+    if (name in schemas && schemas[name] !== schema) throw new Error(`OpenAPI schema ${name} 重复登记`);
+    schemas[name] = schema;
+  }
+}
+
 /** components.examples：只输出 paths 引用到的失败示例；fix/docs 缺省时按错误码套用中间件的默认建议，docs 按 origin 补成绝对 URL */
 export function usedExamples(paths: Paths, origin: string): Record<string, Schema> {
   const names = new Set<string>();

@@ -157,6 +157,20 @@
       "breakpoints": true
     },
     {
+      "idx": 22,
+      "version": "6",
+      "when": 1794913646111,
+      "tag": "0022_key_scopes_account_security",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1794913647111,
+      "tag": "0023_webhooks_v2",
+      "breakpoints": true
+    },
+    {
       "idx": 24,
       "version": "6",
       "when": 1795400000000,

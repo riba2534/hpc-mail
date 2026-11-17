@@ -10,6 +10,7 @@ import { signToken } from '../src/lib/jwt.js';
 import { DEFAULT_ERROR_HINTS, onError } from '../src/middleware/error.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 import type { AppContext } from '../src/types.js';
 import errorsDoc from '../../web/public/references/errors.md?raw';
 
@@ -28,11 +29,11 @@ async function keyWithScopes(username: string, scopes: string[]) {
     domains: { list: [{ domain: 'hpc.email', public: true, perUserLimit: 0 }] },
     api: { enabled: true }, security: { require2fa: false },
   });
-  const [user] = await createDb(env).insert(users).values({ username, role: 'user', passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await createDb(env).insert(users).values({ username, role: 'user', passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
   const response = await request('/api/api-keys', { method: 'POST', headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'k', scopes, rateLimit: 120 }) });
+    body: JSON.stringify({ name: 'k', scopes, rateLimit: 120, password: TEST_PASSWORD }) });
   return ((await response.json()) as { data: CreatedApiKey }).data.key;
 }
 

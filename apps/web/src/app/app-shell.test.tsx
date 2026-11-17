@@ -113,6 +113,25 @@ describe('AppShell', () => {
     second.client.clear();
   });
 
+  it('站点强制两步验证而账号未绑定时，任何路由都只渲染绑定引导，不请求未读数', async () => {
+    mocks.config.mockResolvedValue({ siteTitle: 'HPC Mail', registrationMode: 'closed', require2fa: true, hostedDomainsEnabled: false });
+    mocks.unread.mockClear();
+    const { client } = renderShell('/inbox');
+    expect(await screen.findByText('本站要求所有账户开启两步验证')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '启用两步验证' })).toBeInTheDocument();
+    expect(screen.queryByText('收件列表')).toBeNull();
+    expect(mocks.unread).not.toHaveBeenCalled();
+    client.clear();
+    cleanup();
+
+    // 已绑定的账号照常使用
+    const enabled = renderShell('/inbox', { ...user, twoFactorEnabled: true });
+    expect(await screen.findByText('收件列表')).toBeInTheDocument();
+    expect(screen.queryByText('本站要求所有账户开启两步验证')).toBeNull();
+    enabled.client.clear();
+    mocks.config.mockResolvedValue({ siteTitle: 'HPC Mail', registrationMode: 'closed', require2fa: false, hostedDomainsEnabled: false });
+  });
+
   it('? 打开快捷键帮助', async () => {
     const { client } = renderShell('/inbox');
     fireEvent.keyDown(document.body, { key: '?', shiftKey: true });

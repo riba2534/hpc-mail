@@ -16,6 +16,7 @@ import {
 import { bumpCounter, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 import type { Env } from '../src/types.js';
 
 /**
@@ -207,11 +208,14 @@ async function fixture() {
 
   /** 用户、JWT 与一把指定 scope 的 Key（经 /api/api-keys 创建，与真实流程一致） */
   async function actor(suffix: string, scopes: ApiScope[] = DOMAIN_SCOPES, role: 'admin' | 'user' = 'user') {
-    const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: 'test', authVersionMigrated: true }).returning().get())!;
+    const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: await testPasswordHash(), authVersionMigrated: true }).returning().get())!;
     const sid = await createSession(env, user.id);
     const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
-    const created = await data<CreatedApiKey>(await api('POST', '/api-keys', jwt, { name: `${suffix}-agent`, scopes, rateLimit: 600 }), 201);
-    expect(created.scopes).toEqual(scopes);
+    // admin scope 按存量管理员 Key 的形态补上（新建要求 IP 白名单，测试请求不带来源 IP）
+    const granted = scopes.filter((scope) => scope !== 'admin');
+    const created = await data<CreatedApiKey>(await api('POST', '/api-keys', jwt, { name: `${suffix}-agent`, scopes: granted, rateLimit: 600, password: TEST_PASSWORD }), 201);
+    expect(created.scopes).toEqual(granted);
+    if (role === 'admin' && scopes.includes('admin')) await grantLegacyAdminScope(env, created.id);
     return { id: user.id, username: user.username, jwt, key: created.key, keyId: created.id };
   }
   /** 直接落一行已生效的托管域名，并在假 Cloudflare 建好带邮箱记录的 zone */
@@ -342,7 +346,7 @@ describe('/v1 接入自有域名', () => {
     const owner = await f.actor('owner');
     const member = await f.actor('member');
     const stranger = await f.actor('stranger');
-    const admin = await f.actor('admin', DOMAIN_SCOPES, 'admin');
+    const admin = await f.actor('admin', [...DOMAIN_SCOPES, 'admin'], 'admin');
     const site = await f.hosted(cf, owner);
     await db.insert(hostedDomainMembers).values({ domainId: site.id, userId: member.id, grantedBy: owner.id });
 
@@ -373,7 +377,7 @@ describe('/v1 接入自有域名', () => {
     const cf = fakeCloudflare();
     const f = await fixture();
     const owner = await f.actor('owner');
-    const admin = await f.actor('admin', DOMAIN_SCOPES, 'admin');
+    const admin = await f.actor('admin', [...DOMAIN_SCOPES, 'admin'], 'admin');
     const other = await f.actor('other');
     const site = await f.hosted(cf, owner);
     await db.insert(hostedDomainMembers).values({ domainId: site.id, userId: other.id, grantedBy: owner.id });
@@ -496,7 +500,7 @@ describe('/v1 托管域名的额度、限流与开关与 /api 共用', () => {
     expect(cf.calls).toHaveLength(callsBefore);
 
     // 全站额度用尽：其他用户的 DNS 请求同样 429
-    const admin = await f.actor('admin', DOMAIN_SCOPES, 'admin');
+    const admin = await f.actor('admin', [...DOMAIN_SCOPES, 'admin'], 'admin');
     await bumpCounter(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', minuteWindow(1), MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - (await siteCalls()));
     expect(await errorOf(await v1('GET', `/hosted-domains/${site.id}/dns-records`, admin.key), 429))
       .toMatchObject({ code: 'rate_limited', message: '当前解析操作较多，请稍后再试' });

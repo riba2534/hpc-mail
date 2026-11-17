@@ -81,6 +81,10 @@ export const ERROR_CODES = [
   'recipient_suppressed',
   /** 回复/转发没给 from，而原信的收件地址不是调用者可用的发件身份（如共享给你的邮箱）：400，在 from 指定自己的地址 */
   'from_required',
+  /** 敏感操作（创建 API Key、新增转发目标、开关两步验证）需要在请求里带当前密码 password：403 */
+  'reauth_required',
+  /** 重新验证时当前密码错误：403（不是 401，网页会话不会因此被清掉）；15 分钟内失败 5 次后 429 */
+  'reauth_failed',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -108,5 +112,7 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   delivery_failed: 422,
   recipient_suppressed: 422,
   from_required: 400,
+  reauth_required: 403,
+  reauth_failed: 403,
   internal: 500,
 };

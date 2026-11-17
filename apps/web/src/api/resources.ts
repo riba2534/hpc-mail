@@ -15,8 +15,17 @@ import type {
   ClaimPlan,
   ClaimPlanStrategy,
   CompleteMultipartUploadRequest,
-  CreateApiKeyRequest,
+  ConfirmForwardResult,
+  CreateWebhookEndpointInput,
+  CreatedWebhookEndpoint,
+  UpdateWebhookEndpointRequest,
+  WebhookDelivery,
+  WebhookEndpoint,
+  WebhookTestResult,
+  CreateApiKeyInput,
   CreatedApiKey,
+  NotifyPrefsView,
+  TwoFactorDisabled,
   CreateInviteRequest,
   CreateUserRequest,
   DisableTwoFactorRequest,
@@ -56,7 +65,6 @@ import type {
   UpdateUserRequest,
   UploadAvatarRequest,
   UploadedPart,
-  UserNotifyPrefs,
   NotificationHealth,
   TwoFactorEnabled,
   TwoFactorSetup,
@@ -79,10 +87,11 @@ export const authApi = {
   uploadAvatar: (body: UploadAvatarRequest) =>
     api.post<SessionUser, UploadAvatarRequest>('/auth/avatar', body),
   deleteAvatar: () => api.delete<SessionUser>('/auth/avatar'),
-  setup2fa: () => api.post<TwoFactorSetup>('/auth/2fa/setup'),
+  setup2fa: (password: string) => api.post<TwoFactorSetup, { password: string }>('/auth/2fa/setup', { password }),
+  /** 启用与关闭都会让其他会话失效，返回的 token 要立即替换当前会话令牌 */
   enable2fa: (code: string) => api.post<TwoFactorEnabled, { code: string }>('/auth/2fa/enable', { code }),
   disable2fa: (body: DisableTwoFactorRequest) =>
-    api.post<{ success: boolean }, DisableTwoFactorRequest>('/auth/2fa/disable', body),
+    api.post<TwoFactorDisabled, DisableTwoFactorRequest>('/auth/2fa/disable', body),
 };
 
 // ---- 公开配置 ----
@@ -97,9 +106,12 @@ export const domainApi = {
 
 // ---- 个人转发与通知偏好 ----
 export const notifyPrefsApi = {
-  get: () => api.get<UserNotifyPrefs>('/me/notify-prefs'),
+  get: () => api.get<NotifyPrefsView>('/me/notify-prefs'),
   update: (body: UpdateNotifyPrefsRequest) =>
-    api.put<UserNotifyPrefs, UpdateNotifyPrefsRequest>('/me/notify-prefs', body),
+    api.put<NotifyPrefsView, UpdateNotifyPrefsRequest>('/me/notify-prefs', body),
+  /** 目标邮箱的主人确认接收转发（公开，凭确认信里的 token） */
+  confirmForward: (token: string) =>
+    api.post<ConfirmForwardResult, { token: string }>('/forward-confirmations/confirm', { token }, { token: null }),
   testFeishu: () => api.post<{ ok: boolean }>('/me/notify-prefs/feishu-test'),
   testPushdeer: () => api.post<{ ok: boolean }>('/me/notify-prefs/pushdeer-test'),
   health: () => api.get<NotificationHealth>('/me/notify-prefs/health'),
@@ -227,10 +239,23 @@ export const uploadsApi = {
   remove: (token: string) => api.delete<{ success: boolean }>(`/uploads/${token}`),
 };
 
+// ---- Webhook v2 端点 ----
+export const webhookApi = {
+  list: () => api.get<WebhookEndpoint[]>('/webhooks'),
+  create: (body: CreateWebhookEndpointInput) => api.post<CreatedWebhookEndpoint, CreateWebhookEndpointInput>('/webhooks', body),
+  update: (id: number, body: UpdateWebhookEndpointRequest) =>
+    api.put<WebhookEndpoint, UpdateWebhookEndpointRequest>(`/webhooks/${id}`, body),
+  remove: (id: number) => api.delete<{ success: boolean }>(`/webhooks/${id}`),
+  rotateSecret: (id: number) => api.post<CreatedWebhookEndpoint>(`/webhooks/${id}/rotate-secret`),
+  test: (id: number) => api.post<WebhookTestResult>(`/webhooks/${id}/test`),
+  deliveries: (id: number) => api.get<Page<WebhookDelivery>>(`/webhooks/${id}/deliveries`, { query: { limit: 20 } }),
+  retry: (id: number, deliveryId: number) => api.post<WebhookDelivery>(`/webhooks/${id}/deliveries/${deliveryId}/retry`),
+};
+
 // ---- API Keys（自助） ----
 export const apiKeyApi = {
   list: () => api.get<ApiKeySummary[]>('/api-keys'),
-  create: (body: CreateApiKeyRequest) => api.post<CreatedApiKey, CreateApiKeyRequest>('/api-keys', body),
+  create: (body: CreateApiKeyInput) => api.post<CreatedApiKey, CreateApiKeyInput>('/api-keys', body),
   update: (id: number, body: UpdateApiKeyRequest) =>
     api.put<ApiKeySummary, UpdateApiKeyRequest>(`/api-keys/${id}`, body),
   remove: (id: number) => api.delete<void>(`/api-keys/${id}`),

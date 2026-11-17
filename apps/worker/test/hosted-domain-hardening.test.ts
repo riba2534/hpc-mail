@@ -16,6 +16,7 @@ import { handleInbound } from '../src/services/inbound.js';
 import { minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 import type { Env } from '../src/types.js';
 
 const app = createApp();
@@ -154,7 +155,7 @@ async function fixture() {
     hosted_domains: { enabled: true, maxPerUser: 5, maxPendingPerUser: 3, maxPendingTotal: 20, pendingDays: 7, autoClaimLimit: 0 },
   });
   async function actor(suffix: string, role: 'admin' | 'user' = 'user') {
-    const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: 'test', authVersionMigrated: true }).returning().get())!;
+    const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: await testPasswordHash(), authVersionMigrated: true }).returning().get())!;
     const sid = await createSession(env, user.id);
     return { ...user, jwt: await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 }) };
   }
@@ -595,7 +596,7 @@ describe('重新接入（R15）', () => {
     await updateSettings(env, { api: { enabled: true }, security: { require2fa: false } });
     const owner = await f.actor('owner');
     const key = async (scopes: string[]) => (await data<CreatedApiKey>(await call('POST', '/api-keys', owner.jwt,
-      { name: `reconnect-${scopes.join('-')}`, scopes, rateLimit: 600 }), 201));
+      { name: `reconnect-${scopes.join('-')}`, scopes, rateLimit: 600, password: TEST_PASSWORD }), 201));
     const reader = await key(['domain.read']);
     const writer = await key(['domain.read', 'domain.write']);
     const domain = f.domain();

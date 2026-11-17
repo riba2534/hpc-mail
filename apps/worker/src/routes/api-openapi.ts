@@ -4,6 +4,8 @@ import {
   mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref,
   scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedExamples, usedSchemas, type Paths,
 } from './openapi-common.js';
+import { accountSessionPaths } from './openapi-account.js';
+import { webhookPaths } from './openapi-webhooks.js';
 
 /** Complete JWT-session contract; API keys are never accepted for these operations. */
 export function buildSessionOpenApiSpec(origin: string) {
@@ -14,7 +16,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/config': { get: operation('getPublicConfig', 'Read public site configuration', ref('PublicConfig'), { errors: ['Internal'], public: true }) },
     '/avatar/{userId}': { get: operation('downloadAvatar', 'Download a public avatar', str, { public: true, binary: 'application/octet-stream', parameters: [query('v', str, 'Avatar version from avatarUrl; cache-busting value.') ] }) },
     '/auth/login': { post: operation('createSession', 'Sign in and create a JWT session', ref('LoginResponse'), { errors: ['BadCredentials', 'TotpRequired', 'UserDisabled', 'LoginRateLimited'], public: true, request: 'LoginRequest',
-      description: 'If enabled, supply a six-digit TOTP or a recovery code in totp. A 401 error.code=totp_required means retry login with that code. The session token is different from an hpcm_ API key. New sessions are guarded against concurrent password/2FA changes.' }) },
+      description: 'If enabled, supply a six-digit TOTP or a recovery code in totp. Each TOTP code is accepted once; reusing it (or an older one) returns bad_credentials. A 401 error.code=totp_required means retry login with that code. The session token is different from an hpcm_ API key. New sessions are guarded against concurrent password/2FA changes.' }) },
     '/auth/register': { post: operation('registerUser', 'Register a user and create a session', ref('LoginResponse'), { errors: ['RegistrationClosed', 'InviteInvalid', 'UsernameTaken', 'RegisterRateLimited'], public: true, request: 'RegisterRequest', status: 201,
       description: 'Subject to closed/invite/open registration policy and IP limits. Invite mode requires inviteCode.' }) },
     '/auth/me': { get: operation('getCurrentUser', 'Read the current session user', ref('SessionUser')) },
@@ -25,11 +27,14 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/auth/password': { put: operation('changePassword', 'Change password and replace the session', ref('ChangePasswordResponse'), { errors: ['WrongPassword'], request: 'ChangePasswordRequest',
       description: 'Supply the current password. Changes password and credential epoch atomically, invalidates previous user JWTs, and returns a replacement JWT. Use the new token for subsequent calls. revokeApiKeys defaults to true and revokes every unrevoked API key of the user in the same change; revokedApiKeys reports how many. Revoked keys then return 401 on /v1.' }) },
     '/auth/2fa/setup': { post: operation('startTwoFactorSetup', 'Begin TOTP enrollment', object({ secret: str, otpauthUri: str }),
-      { errors: ['TwoFactorAlreadyEnabled'], example: { secret: 'JBSWY3DPEHPK3PXP', otpauthUri: 'otpauth://totp/HPC%20Mail:alice?secret=JBSWY3DPEHPK3PXP&issuer=HPC%20Mail' }, description: 'Returns a sensitive enrollment secret and QR-compatible otpauth URI; this does not enable TOTP until /auth/2fa/enable succeeds.' }) },
-    '/auth/2fa/enable': { post: operation('enableTwoFactor', 'Verify TOTP and enable two-factor authentication', object({ recoveryCodes: array(str) }), { errors: ['WrongTotp', 'TwoFactorAlreadyEnabled'], example: { recoveryCodes: ['k3j9-x8m2-p4q7', 'z1n5-w6r8-t2y4'] }, request: 'EnableTwoFactorRequest', status: 201,
-      description: 'Supply the six-digit code for the current enrollment secret. Recovery codes are returned once; store securely. This route is available when totp_setup_required restricts other actions.' }) },
-    '/auth/2fa/disable': { post: operation('disableTwoFactor', 'Disable two-factor authentication', success, { errors: ['WrongTotp'], request: 'DisableTwoFactorRequest',
-      description: 'An enrolled account must supply its current password or a valid TOTP code.' }) },
+      { errors: ['TwoFactorAlreadyEnabled', 'ReauthRequired', 'ReauthFailed', 'ReauthRateLimited'], request: 'SetupTwoFactorRequest', example: { secret: 'JBSWY3DPEHPK3PXP', otpauthUri: 'otpauth://totp/HPC%20Mail:alice?secret=JBSWY3DPEHPK3PXP&issuer=HPC%20Mail' },
+        description: 'Requires the current password (403 reauth_required when missing, 403 reauth_failed when wrong, 429 after 5 failures in 15 minutes). Returns a sensitive enrollment secret and QR-compatible otpauth URI; this does not enable TOTP until /auth/2fa/enable succeeds.' }) },
+    '/auth/2fa/enable': { post: operation('enableTwoFactor', 'Verify TOTP and enable two-factor authentication', object({ recoveryCodes: array(str), token: str }),
+      { errors: ['WrongTotpCode', 'TwoFactorAlreadyEnabled'], example: { recoveryCodes: ['k3j9-x8m2-p4q7', 'z1n5-w6r8-t2y4'], token: 'eyJhbGciOiJIUzI1NiJ9.e30.c2ln' }, request: 'EnableTwoFactorRequest', status: 201,
+        description: 'Supply the six-digit code for the current enrollment secret; a wrong code returns 400 validation_failed. Recovery codes are returned once; store securely. Enabling invalidates every other session of the user; token replaces the current JWT and must be used for subsequent calls. The code used here cannot be reused to log in. This route is available when totp_setup_required restricts other actions.' }) },
+    '/auth/2fa/disable': { post: operation('disableTwoFactor', 'Disable two-factor authentication', object({ success: { const: true, type: 'boolean' }, token: str }),
+      { errors: ['ReauthRequired', 'ReauthFailed', 'ReauthRateLimited'], example: { success: true, token: 'eyJhbGciOiJIUzI1NiJ9.e30.c2ln' }, request: 'DisableTwoFactorRequest',
+        description: 'Requires the current password; TOTP or recovery codes cannot disable 2FA. Disabling an enabled 2FA invalidates every other session; token replaces the current JWT.' }) },
     '/auth/logout': { post: operation('revokeSession', 'Revoke the current session', success) },
     '/domains': { get: operation('listDomains', 'List configured domains visible to this user', array(str), { example: ['example.org', 'alice.dev'], description: 'Returns data as an array, unlike /v1/domains data.domains. Ordinary users see public domains or the domains allowed by their dedicated mailboxPolicy. Dedicated policies replace public visibility and quotas; explicitly granted private domains are allowed. Active hosted domains follow the system domains: those the caller owns or was granted, or every active hosted domain for administrators, who may claim addresses on any user’s hosted domain. Adding/managing system domains requires administrator settings; users host their own domains with /hosted-domains; claiming an address is a separate operation.' }) },
     '/identities': { get: operation('listSenderIdentities', 'List sender identities', ref('SendIdentities'), { description: identitiesDescription }) },
@@ -69,7 +74,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       parameters: [query('q', { type: 'string', minLength: 1, maxLength: 32 }, 'Required username substring; trimmed and case-insensitive.', true),
         query('excludeUserId', { type: 'integer', minimum: 1 }, 'Exclude the mailbox owner.'),
         query('limit', { type: 'integer', minimum: 1, maximum: 20, default: 20 })],
-      description: 'JWT only. Returns only id, username and role for active candidates; no account details or mailbox lists. hasMore means refine the search.'
+      description: 'JWT only. Returns only id and username for active candidates (no role, so the search cannot be used to locate administrators); no account details or mailbox lists. hasMore means refine the search.'
     }) },
     ...mailboxBatchPaths(),
     '/mailboxes/availability': { get: operation('checkMailboxAvailability', 'Check mailbox availability', ref('MailboxAvailability'), { parameters: [query('localPart', str, undefined, true), query('domain', str, undefined, true), query('strategy', claimStrategy)],
@@ -113,8 +118,8 @@ export function buildSessionOpenApiSpec(origin: string) {
     ...uploadPaths(),
     '/me/notify-prefs': {
       get: operation('getNotifyPrefs', 'Read masked personal notification and forwarding preferences', ref('NotifyPrefs')),
-      put: operation('updateNotifyPrefs', 'Update personal notification and forwarding preferences', ref('NotifyPrefs'), { errors: ['PushKeyReentryRequired'], request: 'UpdateNotifyPrefsRequest',
-        description: 'At least one channel. ****** preserves stored secrets; explicit empty strings clear them. A ****** pushkey with a PushDeer endpoint whose origin or path changed (a trailing slash is ignored; empty means the official endpoint) returns 400 validation_failed until the pushkey is entered again. Enabled channels require complete valid configuration. Webhook is HPC Mail JSON ({event:"mail.received",message:{id,address,fromAddress,fromName,subject,verificationCode,verificationLink,preview,createdAt}}), not a native Bark/ntfy request. Email forwarding includes rate limits; shared readers never receive owner notifications.' }),
+      put: operation('updateNotifyPrefs', 'Update personal notification and forwarding preferences', ref('NotifyPrefs'), { errors: ['PushKeyReentryRequired', 'ReauthRequired', 'ReauthFailed', 'ForwardConfirmLimit'], request: 'UpdateNotifyPrefsRequest',
+        description: 'At least one channel. Forwarding targets: addresses already confirmed stay; each new address receives a confirmation mail (valid 72 hours, at most 20 such mails per user per day, 429 beyond) and is listed in forwardPending until its owner confirms, only then does forwarding to it start. Adding an address or enabling forwarding requires the current password in password (403 reauth_required / reauth_failed). ****** preserves stored secrets; explicit empty strings clear them. A ****** pushkey with a PushDeer endpoint whose origin or path changed (a trailing slash is ignored; empty means the official endpoint) returns 400 validation_failed until the pushkey is entered again. Enabled channels require complete valid configuration. Webhook is HPC Mail JSON ({event:"mail.received",message:{id,address,fromAddress,fromName,subject,verificationCode,verificationLink,preview,createdAt}}), not a native Bark/ntfy request. Email forwarding includes rate limits; shared readers never receive owner notifications.' }),
     },
     '/me/notify-prefs/health': { get: operation('getNotifyHealth', 'Read personal recent delivery health and forwarding quotas', ref('NotificationHealth'),
       { description: 'Current user only. pending/processing are queued; unknown means a result was not confirmed and must be checked before manual retry. Forward counts are attempts, and reset at UTC midnight. No message bodies or raw endpoint secrets are returned.' }) },
@@ -124,12 +129,13 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/me/notify-prefs/pushdeer-test': { post: operation('testPushDeerNotification', 'Send a real PushDeer test with saved settings', okResult, { errors: ['PushKeyMissing'], description: 'Performs an external notification and validates HTTP and provider JSON success. This is not a dry run.' }) },
     '/api-keys': {
       get: operation('listApiKeys', 'List own API keys without plaintext secrets', array(ref('ApiKeySummary'))),
-      post: operation('createApiKey', 'Create an API key', ref('CreatedApiKey'), { errors: ['ApiKeyLimit'], request: 'CreateApiKeyRequest', status: 201,
-        description: 'The full key is returned only once. Scopes limit /v1 operations, never grant administrator/JWT-only permissions, and are additionally bounded by the owner role and mailbox visibility.' }),
+      post: operation('createApiKey', 'Create an API key', ref('CreatedApiKey'), { errors: ['ApiKeyLimit', 'ReauthRequired', 'ReauthFailed', 'AdminScopeForbidden', 'AdminScopeRules'], request: 'CreateApiKeyRequest', status: 201,
+        description: 'Requires the current password (password); missing returns 403 reauth_required, wrong returns 403 reauth_failed. The full key is returned only once. Scopes limit /v1 operations and never grant JWT-only functions (account settings, mail forwarding targets, 2FA, key management, administration). allowedMailboxIds/allowedDomains restrict the key to those mailboxes or domains; ids must be mailboxes the caller owns. The admin scope can only be granted by administrators and requires allowedIps plus an expiresAt at most 90 days ahead (400 otherwise; 403 for non-administrators); only with it does an administrator key act as administrator.' }),
     },
     '/api-keys/{id}': {
       get: operation('getApiKey', 'Read own API key metadata', ref('ApiKeySummary')),
-      put: operation('updateApiKey', 'Update own API key limits/scopes/status', ref('ApiKeySummary'), { request: 'UpdateApiKeyRequest' }),
+      put: operation('updateApiKey', 'Update own API key limits/scopes/status', ref('ApiKeySummary'), { errors: ['AdminScopeForbidden', 'AdminScopeRules'], request: 'UpdateApiKeyRequest',
+        description: 'Only supplied fields change; allowedMailboxIds/allowedDomains replace the whole list. When scopes, allowedIps or expiresAt change, the resulting key is validated against the admin scope rules (allowlist and at most 90 days); renaming or disabling an existing key is not.' }),
       delete: operation('revokeApiKey', 'Revoke own API key', success),
     },
     '/api-keys/{id}/logs': { get: operation('listApiKeyLogs', 'Read own API key audit logs', page(ref('ApiRequestLog')), { parameters: pageQuery,
@@ -248,6 +254,8 @@ export function buildSessionOpenApiSpec(origin: string) {
     },
     '/admin/api-keys/{id}/logs': { get: operation('listApiKeyLogsAsAdmin', 'Read any API key audit logs', page(ref('ApiRequestLog')), { ...admin, parameters: pageQuery }) },
     '/admin/audit-logs': { get: operation('listAuditLogs', 'Read administrator audit logs', page(ref('AdminAuditLog')), { ...admin, parameters: pageQuery }) },
+    ...webhookPaths('api'),
+    ...accountSessionPaths(),
   };
   const described = describePaths(paths, { security: [{ sessionToken: [] }], errors: ['UnauthorizedSession', 'RateLimitedSession'] });
   return { openapi: '3.1.0', info: specInfo('HPC Mail Session and Administration API',

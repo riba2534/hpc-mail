@@ -9,6 +9,7 @@ import { hostedDomainMembers, hostedDomains, mailboxes, users } from '../src/db/
 import { signToken } from '../src/lib/jwt.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -38,11 +39,11 @@ async function actor(username: string) {
     security: { require2fa: false },
     api: { enabled: true },
   });
-  const [user] = await db.insert(users).values({ username, role: 'user', passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+  const [user] = await db.insert(users).values({ username, role: 'user', passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
   const scopes: ApiScope[] = [...API_SCOPES];
-  const key = (await result<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: 'k', scopes, rateLimit: 600 })), 201)).key;
+  const key = (await result<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: 'k', scopes: scopes.filter((scope) => scope !== 'admin'), rateLimit: 600, password: TEST_PASSWORD })), 201)).key;
   return { id: user!.id, jwt, key };
 }
 

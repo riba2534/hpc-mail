@@ -39,7 +39,7 @@ const mailbox = {
 const sessionUser = { id: 3, username: 'alice', role: 'user', createdAt: AT, avatarUrl: null, twoFactorEnabled: false };
 const apiKey = {
   id: 5, name: 'ci-bot', keyPrefix: 'hpcm_3f9a', keySuffix: 'c2d1', scopes: ['mail.read', 'mail.send'], rateLimit: 60,
-  allowedIps: [], status: 'active', expiresAt: null, lastUsedAt: LATER, createdAt: AT, ownerUsername: 'alice',
+  allowedIps: [], status: 'active', expiresAt: null, lastUsedAt: LATER, createdAt: AT, allowedMailboxIds: [], allowedDomains: [], ownerUsername: 'alice',
 };
 const hostedDomain = {
   id: 8, domain: 'alice.dev', status: 'active', role: 'owner', ownerUserId: 3, ownerUsername: 'alice',
@@ -88,7 +88,7 @@ export const SCHEMA_EXAMPLES: Record<string, unknown> = {
     claimed: [mailbox], taken: [{ localPart: 'bob', domain: 'example.org' }], notAttempted: [], stoppedBy: null,
   },
   ClaimPlan: { strategy: 'uniform', items: [{ domain: 'example.org', suspended: 0 }, { domain: 'example.net', suspended: 0 }], pool: ['example.org', 'example.net'], shortfall: 0, reason: null },
-  UserSearchResults: { items: [{ id: 4, username: 'bob', role: 'user' }], hasMore: false },
+  UserSearchResults: { items: [{ id: 4, username: 'bob' }], hasMore: false },
   SendIdentities: {
     identities: [
       { kind: 'owned', mailboxId: 12, address: 'alice@example.org', domain: 'example.org', displayName: 'Alice', canSend: true, reason: null },
@@ -97,7 +97,8 @@ export const SCHEMA_EXAMPLES: Record<string, unknown> = {
     domains: [],
   },
   ApiKeySelf: {
-    key: { id: 5, name: 'ci-bot', keyPrefix: 'hpcm_3f9a', keySuffix: 'c2d1', scopes: ['mail.read', 'mail.send'], rateLimit: 60, allowedIps: [], expiresAt: null, createdAt: AT },
+    key: { id: 5, name: 'ci-bot', keyPrefix: 'hpcm_3f9a', keySuffix: 'c2d1', scopes: ['mail.read', 'mail.send'], rateLimit: 60, allowedIps: [], expiresAt: null, createdAt: AT,
+      allowedMailboxIds: [12], allowedDomains: [], effectiveRole: 'user' },
     user: { id: 3, username: 'alice', role: 'user' },
     limits: { userRequestsPerMinute: 120, waitPollsPerMinute: 120 },
     outbound: { sent: 4, recipients: 6, dailyLimit: 100, dailyRecipientLimit: 300, exempt: false, resetsAt: '2026-11-18T00:00:00.000Z' },
@@ -125,6 +126,7 @@ export const SCHEMA_EXAMPLES: Record<string, unknown> = {
     webhook: { enabled: true, url: 'https://hooks.example.net/hpc-mail', secret: '******' },
     forward: { enabled: true, addresses: ['me@example.net'] },
     pushdeer: { enabled: false, endpoint: '', pushkey: '' },
+    forwardPending: [{ address: 'new@example.net', expiresAt: '2026-11-20T00:00:00.000Z' }],
   },
   DomainStatus: { domain: 'example.org', inList: true, mxReady: true, spfReady: true, mxRecords: ['route1.mx.cloudflare.net'], resolved: true },
   DomainClaudeStats: { domain: 'example.org', accounts: 12, suspended: 0, paid: 3, paidSuspended: 0, pending: 2, recent: 1, risk: null },
@@ -285,6 +287,25 @@ export const ERROR_EXAMPLES = {
   DnsRecordLimit: { code: 'forbidden', message: `每个域名最多 ${MAX_HOSTED_DNS_RECORDS} 条解析记录` },
   DnsRecordMailConflict: { code: 'validation_failed', message: '根域的 MX 记录用于本站收件，由系统维护' },
   DnsRecordLocked: { code: 'forbidden', message: '根域的 SPF 记录用于本站收发，由系统维护' },
+  ReauthRequired: { code: 'reauth_required', message: '该操作需要输入当前密码', fix: '在请求体里带上当前登录密码 password 后重试',
+    docs: '/references/errors.md#reauth_required' },
+  ReauthFailed: { code: 'reauth_failed', message: '当前密码错误', docs: '/references/errors.md#reauth_failed' },
+  ReauthRateLimited: { code: 'rate_limited', message: '密码验证失败次数过多，请 15 分钟后再试' },
+  WrongTotpCode: { code: 'validation_failed', message: '验证码错误，请重试' },
+  AdminScopeForbidden: { code: 'forbidden', message: '只有管理员可以授予 admin scope' },
+  AdminScopeRules: { code: 'validation_failed', message: '带 admin scope 的 Key 必须设置 IP 白名单' },
+  KeyRestricted: { code: 'forbidden', message: '这把 API Key 限定了可用的邮箱或域名，不能访问 bob@example.org',
+    fix: 'GET /v1/me 查看 key.allowedMailboxIds 与 key.allowedDomains；换用覆盖它的 Key，或请用户在网页「API Key」页面调整范围',
+    docs: '/references/errors.md#key-restricted' },
+  ForwardSessionOnly: { code: 'forbidden', message: '邮箱转发目标只能在网页会话里修改',
+    fix: '去掉请求里的 forward；需要改转发目标时请用户登录网页「个人设置 - 转发与通知」修改（新目标要邮件确认）', docs: '/references/notifications.md' },
+  ForwardConfirmLimit: { code: 'rate_limited', message: '每天最多发送 20 封转发确认邮件，请明天再试' },
+  ForwardConfirmInvalid: { code: 'not_found', message: '确认链接无效或已过期' },
+  ForwardTargetLimit: { code: 'conflict', message: '转发目标已达 5 个上限' },
+  NotFoundWebhook: { code: 'not_found', message: 'Webhook 端点不存在' },
+  WebhookEndpointLimit: { code: 'forbidden', message: '每个用户最多 10 个 Webhook 端点' },
+  WebhookUrlInvalid: { code: 'validation_failed', message: 'Webhook 地址不能指向本站' },
+  WebhookNotRetryable: { code: 'conflict', message: '只有投递失败的记录可以重试' },
 } satisfies Record<string, ErrorExample>;
 export type ErrorExampleName = keyof typeof ERROR_EXAMPLES;
 

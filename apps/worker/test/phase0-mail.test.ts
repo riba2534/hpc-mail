@@ -13,6 +13,7 @@ import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { deleteMessages, findNextMessage, getMessageDetail } from '../src/services/message.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 afterEach(() => { vi.restoreAllMocks(); });
@@ -58,10 +59,13 @@ async function baseSettings(patch: Partial<Settings> = {}) {
 async function account(prefix: string, role: 'admin' | 'user' = 'user', scopes: ApiScope[] = [...API_SCOPES]) {
   const username = `${prefix}-${rand()}`;
   const [user] = await createDb(env).insert(users)
-    .values({ username, role, passwordHash: 'x', status: 'active', authVersionMigrated: true }).returning();
+    .values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`, scopes, rateLimit: 120 })), 201);
+  const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-key`,
+    scopes: scopes.filter((scope) => scope !== 'admin'), rateLimit: 120, password: TEST_PASSWORD })), 201);
+  // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope）
+  if (role === 'admin' && scopes.includes('admin')) await grantLegacyAdminScope(env, key.id);
   const localPart = username.toLowerCase();
   const address = `${localPart}@hpc.email`;
   const [box] = await createDb(env).insert(mailboxes).values({ address, domain: 'hpc.email', userId: user!.id }).returning({ id: mailboxes.id });

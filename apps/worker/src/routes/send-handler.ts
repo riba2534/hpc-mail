@@ -12,7 +12,8 @@ import {
 } from '@hpc-mail/shared';
 import type { Context } from 'hono';
 import { AppError } from '../lib/errors.js';
-import { ok, parseBody } from '../lib/http.js';
+import { execCtx, ok, parseBody } from '../lib/http.js';
+import { assertKeyCanUseAddress, assertKeyCanUseSender } from '../middleware/api-key-auth.js';
 import { beginIdempotentSend, failIdempotentSend, type IdempotencyActor } from '../services/idempotency.js';
 import {
   decodeInlineAttachments,
@@ -24,6 +25,7 @@ import {
 } from '../services/outbound.js';
 import { composeForward, composeReply, fromRequiredError } from '../services/reply-forward.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
+import { emitSendResult } from '../services/webhooks.js';
 import type { AppContext } from '../types.js';
 
 /** 首次响应与同 Key 重放共用：全部收件人被明确拒收为 422，其余（含部分失败、结果未确认的 unknown）为 201 */
@@ -86,6 +88,8 @@ async function runSend(
     await Promise.all([failIdempotentSend(c.env, idem.handle, error), releaseDeliveryLeases(c.env, leaseToken)]);
     throw error;
   }
+  // Webhook v2 的 mail.sent / mail.failed：放进 waitUntil，按发件行最终状态发，去重键保证同一封只发一次
+  await emitSendResult(c.env, sender.userId, summary.id, execCtx(c));
   // 全部失败不回收草稿：同一 token 修正后可以再发。其余结果下邮件可能已发出，草稿回收失败不能翻转请求结果
   // （前端会提示重发，token 又还在，收件人就收到两封），留给 24h 的草稿清理兜底
   if (summary.status !== 'failed' && tokens.length) {
@@ -103,11 +107,11 @@ export async function handleSend(
   c: Context<AppContext>,
   actor: IdempotencyActor,
   sender: Sender,
-  authorize?: (req: InternalSendMailRequest) => void,
+  authorize?: (req: InternalSendMailRequest) => void | Promise<void>,
 ): Promise<Response> {
   assertRequestSize(c);
   const req = await parseBody(c, internalSendMailSchema);
-  authorize?.(req);
+  await authorize?.(req);
   return runSend(c, actor, sender, sendRequestFingerprint(req), async () => ({
     req, attachments: { inline: req.attachments, tokens: req.attachmentTokens },
   }));
@@ -129,7 +133,9 @@ export async function handleCompose(
     const req = await parseBody(c, replyMessageRequestSchema);
     return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () => {
       const composed = await composeReply(c.env, sender, sourceId, req);
-      // TODO(PR4a): assertKeyCanUseAddress(c, composed.sourceAddress) 与解析出的发件地址
+      // 限定了范围的 API Key：原信与发件地址都要在范围内（网页会话不受限）
+      await assertKeyCanUseAddress(c, composed.sourceAddress);
+      await assertKeyCanUseSender(c, composed.req.from);
       return {
         req: composed.req,
         attachments: { inline: req.attachments, tokens: req.attachmentTokens },
@@ -140,7 +146,8 @@ export async function handleCompose(
   const req = await parseBody(c, forwardMessageRequestSchema);
   return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () => {
     const composed = await composeForward(c.env, sender, sourceId, req);
-    // TODO(PR4a): assertKeyCanUseAddress(c, composed.sourceAddress) 与解析出的发件地址
+    await assertKeyCanUseAddress(c, composed.sourceAddress);
+    await assertKeyCanUseSender(c, composed.req.from);
     return {
       req: composed.req,
       attachments: { inline: [], tokens: [] },

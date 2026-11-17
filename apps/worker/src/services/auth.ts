@@ -17,7 +17,7 @@ import {
 } from './rate-counter.js';
 import { signToken } from '../lib/jwt.js';
 import { hashPassword, verifyPassword } from '../lib/password.js';
-import { hashRecoveryCode, verifyTotp } from '../lib/totp.js';
+import { hashRecoveryCode, matchTotpStep } from '../lib/totp.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { revokeAllApiKeysQuery } from './api-key.js';
 import { avatarUrl } from './avatar.js';
@@ -180,7 +180,12 @@ async function verifyLoginTwoFactor(
   if (!user.totpEnabledAt) return;
   if (!totp) throw new AppError('totp_required', '需要两步验证码');
   const cleaned = totp.replace(/\s/g, '');
-  if (user.totpSecret && (await verifyTotp(user.totpSecret, cleaned))) return;
+  const step = user.totpSecret ? await matchTotpStep(user.totpSecret, cleaned) : null;
+  if (step !== null) {
+    // 防重放：同一时间步（及更早）的码只能用一次；条件写入保证并发的两次登录只有一个成功
+    if (await consumeTotpStep(env, user.id, step)) return;
+    throw new AppError('bad_credentials', '该验证码已使用过，请等待下一个验证码');
+  }
   // 尝试恢复码（用后从列表移除）
   const codes = user.totpRecoveryCodes ?? [];
   if (codes.length) {
@@ -199,10 +204,23 @@ async function verifyLoginTwoFactor(
   throw new AppError('bad_credentials', '两步验证码错误');
 }
 
+/** 记录已用的 TOTP 时间步；时间步不大于已记录值（重放）时返回 false */
+export async function consumeTotpStep(env: Env, userId: number, step: number): Promise<boolean> {
+  const result = await env.db.prepare(`UPDATE users SET totp_last_step = ?
+    WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)`).bind(step, userId, step).run();
+  return (result.meta.changes ?? 0) === 1;
+}
+
 /** 签发会话令牌：先写 D1 会话行（条件复核凭据），再签 JWT */
-async function issueToken(env: Env, user: typeof users.$inferSelect): Promise<string> {
+export async function issueToken(env: Env, user: typeof users.$inferSelect): Promise<string> {
   const sid = await createSession(env, user.id, user);
   return signToken(env.jwt_secret, { sub: user.id, sid, uepoch: user.authVersion });
+}
+
+let dummyHash: Promise<string> | undefined;
+/** 与真实密码同参数的随机哈希，每个 isolate 生成一次 */
+function dummyPasswordHash(): Promise<string> {
+  return (dummyHash ??= hashPassword(crypto.randomUUID()));
 }
 
 export async function login(
@@ -218,7 +236,8 @@ export async function login(
   let issuing = false;
   try {
     user = await db.select().from(users).where(eq(users.username, req.username)).get();
-    const valid = user ? await verifyPassword(req.password, user.passwordHash) : false;
+    // 用户不存在时也做一次同等耗时的哈希比较，响应时间不泄露用户名是否存在
+    const valid = user ? await verifyPassword(req.password, user.passwordHash) : await verifyPassword(req.password, await dummyPasswordHash()) && false;
     if (!user || !valid) throw new AppError('bad_credentials', '用户名或密码错误');
     if (user.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
     await verifyLoginTwoFactor(env, user, req.totp);
@@ -286,16 +305,22 @@ export async function register(env: Env, req: RegisterRequest, ip: string): Prom
   const mode = settings.register_mode;
   if (mode === 'closed') throw new AppError('registration_closed', '注册已关闭');
 
+  const db = createDb(env);
+  // 邀请模式先校验邀请码再查重名：没有有效邀请码的人不能借注册接口探测用户名是否存在
+  if (mode === 'invite') {
+    if (!req.inviteCode) throw new AppError('invite_invalid', '需要邀请码');
+    const invite = await env.db.prepare(`SELECT 1 AS ok FROM invites WHERE code = ? AND status = 'active' AND used_count < max_uses
+      AND (expires_at IS NULL OR expires_at > ?)`).bind(req.inviteCode, Date.now()).first<{ ok: number }>();
+    if (!invite) throw new AppError('invite_invalid', '邀请码无效或已用尽');
+  }
   // 保留用户名按「已存在」处理，不额外暴露保留名单
   if (RESERVED_USERNAMES.includes(req.username)) throw new AppError('conflict', '用户名已存在');
-  const db = createDb(env);
   const existing = await db.select({ id: users.id }).from(users).where(eq(users.username, req.username)).get();
   if (existing) throw new AppError('conflict', '用户名已存在');
 
   const passwordHash = await hashPassword(req.password);
   let row: typeof users.$inferSelect | undefined;
   if (mode === 'invite') {
-    if (!req.inviteCode) throw new AppError('invite_invalid', '需要邀请码');
     try {
       // INSERT ... SELECT 与迁移中的 AFTER INSERT trigger 处于同一 SQLite 写事务：
       // 只有仍可用的邀请码能建户，建户失败也不会消耗次数。

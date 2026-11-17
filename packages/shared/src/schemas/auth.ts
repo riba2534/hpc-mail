@@ -36,12 +36,17 @@ export const enableTwoFactorRequestSchema = z.object({
 });
 export type EnableTwoFactorRequest = z.infer<typeof enableTwoFactorRequestSchema>;
 
+/** 关闭两步验证：必须重新输入当前密码（只凭 TOTP 码不能关闭） */
 export const disableTwoFactorRequestSchema = z.object({
-  /** 当前密码或有效 TOTP 码任一 */
-  password: z.string().max(PASSWORD_MAX_LENGTH).optional(),
-  code: z.string().trim().max(32).optional(),
+  password: z.string().min(1, '请输入当前密码').max(PASSWORD_MAX_LENGTH),
 });
 export type DisableTwoFactorRequest = z.infer<typeof disableTwoFactorRequestSchema>;
+
+/** 开始登记两步验证：必须重新输入当前密码 */
+export const setupTwoFactorRequestSchema = z.object({
+  password: z.string().min(1, '请输入当前密码').max(PASSWORD_MAX_LENGTH),
+});
+export type SetupTwoFactorRequest = z.infer<typeof setupTwoFactorRequestSchema>;
 
 /** 开始登记：返回密钥与 otpauth URI（尚未启用，需 verify） */
 export interface TwoFactorSetup {
@@ -49,9 +54,19 @@ export interface TwoFactorSetup {
   otpauthUri: string;
 }
 
-/** 启用成功：一次性返回恢复码 */
+/**
+ * 启用成功：一次性返回恢复码。开启会递增鉴权版本让其他会话失效，
+ * token 是替换当前会话的新令牌，后续请求要改用它。
+ */
 export interface TwoFactorEnabled {
   recoveryCodes: string[];
+  token: string;
+}
+
+/** 关闭成功：同样让其他会话失效，token 替换当前会话令牌 */
+export interface TwoFactorDisabled {
+  success: true;
+  token: string;
 }
 
 export const registerRequestSchema = z.object({
@@ -115,7 +130,8 @@ export type SearchUsersQuery = z.infer<typeof searchUsersQuerySchema>;
 export interface UserSearchResult {
   id: number;
   username: string;
-  role: Role;
+  /** 只有管理员的用户搜索返回角色；共享与成员候选搜索不返回，避免普通用户枚举管理员 */
+  role?: Role;
 }
 
 export interface UserSearchResults {

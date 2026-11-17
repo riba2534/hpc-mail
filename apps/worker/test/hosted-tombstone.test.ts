@@ -10,7 +10,6 @@ import { HOSTED_TOMBSTONE_RETENTION_DAYS, purgeHostedTombstones, tombstoneStatem
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import type { Env } from '../src/types.js';
-// @ts-expect-error vite 的 ?raw 导入：直接执行迁移里的回填语句
 import migration0024 from '../migrations/0024_hosted_domain_hardening.sql?raw';
 
 const app = createApp();

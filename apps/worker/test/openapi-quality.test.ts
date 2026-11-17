@@ -168,7 +168,8 @@ describe('OpenAPI 质量约束：operationId、security 与示例', () => {
       else if (label !== 'GET /api/attachments/{id}') expect(op.security, label).toEqual([{ [scheme]: [] }]);
     }
     expect(open.sort()).toEqual(namespace === 'api'
-      ? ['GET /api/avatar/{userId}', 'GET /api/config', 'GET /api/openapi.json', 'POST /api/auth/login', 'POST /api/auth/register']
+      ? ['GET /api/avatar/{userId}', 'GET /api/config', 'GET /api/openapi.json', 'POST /api/auth/login', 'POST /api/auth/register',
+        'POST /api/forward-confirmations/confirm']
       : ['GET /v1/openapi.json']);
     expect(opAt('api', '/attachments/{id}', 'get').security).toEqual([{ sessionToken: [] }, { attachmentSignature: [], attachmentExpiry: [] }]);
   });

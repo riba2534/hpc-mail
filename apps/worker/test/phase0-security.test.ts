@@ -282,9 +282,9 @@ describe('API Key 管理的并发守卫', () => {
   });
 
   it('网页创建 Key 带令牌鉴权版本，正常会话照常创建', async () => {
-    const user = await seedUser('p0-create-http');
+    const user = await seedUser('p0-create-http', { password: 'p0-create-http-pass' });
     const response = await call('/api/api-keys', await jwtFor(user.id),
-      jsonInit('POST', { name: 'web', scopes: ['mail.read'], rateLimit: 60 }));
+      jsonInit('POST', { name: 'web', scopes: ['mail.read'], rateLimit: 60, password: 'p0-create-http-pass' }));
     expect(response.status).toBe(201);
   });
 });

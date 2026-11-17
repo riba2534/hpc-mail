@@ -9,6 +9,7 @@ import { createApiKey } from '../src/services/api-key.js';
 import { MAIL_READ_USER_ACTION, userMailReadAuditStatement } from '../src/services/audit.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { grantLegacyAdminScope } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -23,6 +24,8 @@ async function fixture() {
     const sid = await createSession(env, user.id);
     const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
     const created = await createApiKey(env, user.id, { name, scopes: ['mail.read', 'mail.write', 'mailbox.read', 'mailbox.write'], rateLimit: 1000, allowedIps: [] });
+    // 管理员沿用存量 Key 的形态（迁移 0022 自动加上 admin scope），审计用例要它的跨用户能力
+    if (role === 'admin') await grantLegacyAdminScope(env, created.id);
     return { ...user, jwt, key: created.key, keyId: created.id };
   }
   const admin = await actor('admin', 'admin');

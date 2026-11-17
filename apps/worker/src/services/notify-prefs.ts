@@ -172,11 +172,16 @@ export function notifyOwnersFromRows(
   return out;
 }
 
-/** 写个人偏好：逐块合并 + secret 掩码保留旧值 + 落库 */
+/**
+ * 写个人偏好：逐块合并 + secret 掩码保留旧值 + 落库。forward 原样写入（服务层直调与测试用）；
+ * 网页会话的转发修改走 forward-confirm.ts，新增目标在确认前不写进这里。
+ * allowEmptyForward：转发已开启、目标都在等确认时允许暂存「开启且没有已确认目标」。
+ */
 export async function updateUserNotifyPrefs(
   env: Env,
   userId: number,
   patch: UpdateNotifyPrefsRequest,
+  opts: { allowEmptyForward?: boolean } = {},
 ): Promise<UserNotifyPrefs> {
   const current = await getUserNotifyPrefs(env, userId);
   const next = clone(current);
@@ -216,7 +221,7 @@ export async function updateUserNotifyPrefs(
   if (patch.webhook && next.webhook.enabled && !validateNotifyWebhookUrl(next.webhook.url)) {
     throw new AppError('validation_failed', '开启通用 Webhook 需要有效的 HTTPS 公网地址');
   }
-  if (patch.forward && next.forward.enabled && next.forward.addresses.length === 0) {
+  if (patch.forward && next.forward.enabled && next.forward.addresses.length === 0 && !opts.allowEmptyForward) {
     throw new AppError('validation_failed', '开启邮箱转发需要至少一个目标地址');
   }
 

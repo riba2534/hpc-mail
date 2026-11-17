@@ -69,6 +69,18 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 请求频率或每日外发配额超限（HTTP 429）。按 `X-RateLimit-Reset` 或错误信息稍后重试，设总期限，不要换 Key 绕过账户级限制；`GET /v1/me` 查看速率上限与今日外发用量（`outbound.resetsAt` 是配额重置时间）。
 
+## key-restricted
+
+这把 Key 限定了可用的邮箱或域名（HTTP 403 `forbidden`），请求涉及的地址、邮箱或域名不在范围内。`GET /v1/me` 的 `key.allowedMailboxIds`、`key.allowedDomains` 列出范围；只限定了邮箱的 Key 不能认领新地址。列表、等待、未读数等读取只返回范围内的邮件，不会报这个错。换用覆盖该地址的 Key，或请用户在网页「API Key」页面调整范围。
+
+## reauth_required
+
+网页会话（JWT）的敏感操作需要在请求体里带当前登录密码 `password`（HTTP 403）：创建 API Key、新增或启用邮箱转发目标、开启或关闭两步验证。向用户索取当前密码后带上重试；不要把密码写进日志或报告。
+
+## reauth_failed
+
+`password` 与当前登录密码不符（HTTP 403，网页会话不会因此失效）。同一账户 15 分钟内失败 5 次后返回 429 `rate_limited`，等窗口结束再试。
+
 ## 其他错误码
 
 | HTTP / code | 含义与处理 |
