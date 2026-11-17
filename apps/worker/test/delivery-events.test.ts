@@ -197,7 +197,7 @@ describe('外发回执回写与抑制名单', () => {
     expect(sent.map((item) => item.to)).toEqual([other, blocked]);
   });
 
-  it('API 返回 422 recipient_suppressed 错误信封，过期的抑制不再拦截', async () => {
+  it('API 返回 422 recipient_suppressed 错误信封并释放 Idempotency-Key，过期的抑制不再拦截', async () => {
     const f = await fixture();
     const target = f.ext('expired');
     await env.db.prepare(`INSERT INTO email_suppressions (address, sending_domain, reason, detail, expires_at, updated_at)
@@ -207,7 +207,8 @@ describe('外发回执回写与抑制名单', () => {
     const { runtime } = mailEnv();
     const request = async () => {
       const ctx = createExecutionContext();
-      const response = await app.request('/api/messages/send', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      const response = await app.request('/api/messages/send', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json',
+        'Idempotency-Key': `${f.prefix}-suppressed-key` },
         body: JSON.stringify({ from: { localPart: `${f.prefix}-owner`, domain: 'hpc.email' }, to: [target], subject: `${f.prefix}-api`, text: 'x' }) }, runtime, ctx);
       await waitOnExecutionContext(ctx);
       return response;
@@ -218,6 +219,7 @@ describe('外发回执回写与抑制名单', () => {
     expect(body.error.code).toBe('recipient_suppressed');
     expect(body.error.fix).toContain('管理员');
     expect(body.error.details.suppressed).toHaveLength(1);
+    // 没有发出也没有发件记录：同一个 Idempotency-Key 已释放，条目过期后可以直接复用
     await env.db.prepare('UPDATE email_suppressions SET expires_at = ? WHERE address = ?').bind(Date.now() - 1, target).run();
     expect((await request()).status).toBe(201);
   });
