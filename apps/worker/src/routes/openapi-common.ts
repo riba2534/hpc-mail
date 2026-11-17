@@ -6,7 +6,7 @@ import {
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
   createUserRequestSchema, updateUserRequestSchema, userMailboxPolicySchema, createApiKeyRequestSchema, updateApiKeyRequestSchema,
   createInviteRequestSchema, replaceMailboxSharesRequestSchema, batchShareMailboxesRequestSchema, updateSettingsRequestSchema,
-  updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
+  updateNotifyPrefsRequestSchema, userNotifyPrefsSchema, setupTwoFactorRequestSchema, translateMessageRequestSchema, aiModelTestRequestSchema,
   HOSTED_DOMAIN_STATUSES, createHostedDomainRequestSchema, updateHostedDomainRequestSchema, replaceHostedDomainMembersRequestSchema,
   transferHostedDomainRequestSchema, HOSTED_DNS_CAA_TAGS, HOSTED_DNS_TTL_AUTO, hostedDnsRecordInputSchema,
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
@@ -204,7 +204,8 @@ export const schemas: Record<string, Schema> = {
     taken: { ...array(ref('ClaimMailboxRequest')), description: 'Skipped because the address is already claimed; request order.' },
     notAttempted: { ...array(ref('ClaimMailboxRequest')), description: 'Not attempted after stoppedBy, including the item that stopped the batch; request order.' },
     stoppedBy: nullable(object({ code: { type: 'string', enum: ERROR_CODES }, message: str })) }),
-  UserSearchResults: object({ items: array(object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] } })), hasMore: bool }),
+  UserSearchResults: object({ items: array(object({ id: positiveId, username: str,
+    role: { type: 'string', enum: ['admin', 'user'], description: 'Only in the administrator user search.' } }, ['role'])), hasMore: bool }),
   MailboxTransferResult: object({ mailbox: ref('Mailbox'), previousUserId: positiveId, transferred: bool, revokedShares: int }),
   SharedMailbox: object({ mailboxId: positiveId, address: str, domain: str, displayName: str, ownerUsername: str }),
   SendIdentities: object({
@@ -372,6 +373,7 @@ export const schemas: Record<string, Schema> = {
     return schema;
   })(),
   UploadAvatarRequest: fromZod(uploadAvatarRequestSchema), EnableTwoFactorRequest: fromZod(enableTwoFactorRequestSchema), DisableTwoFactorRequest: fromZod(disableTwoFactorRequestSchema),
+  SetupTwoFactorRequest: fromZod(setupTwoFactorRequestSchema),
   CreateUserRequest: fromZod(createUserRequestSchema), UpdateUserRequest: {
     ...fromZod(updateUserRequestSchema), dependentRequired: { mailboxPolicy: ['expectedMailboxPolicyRevision'] },
   }, CreateApiKeyRequest: (() => {

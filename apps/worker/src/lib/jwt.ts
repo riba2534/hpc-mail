@@ -1,3 +1,5 @@
+import { deriveSubkey } from './crypto.js';
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -47,7 +49,8 @@ export async function signToken(
   const headerStr = base64url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
   const payloadStr = base64url(encoder.encode(JSON.stringify(fullPayload)));
   const data = `${headerStr}.${payloadStr}`;
-  const key = await importKey(secret, ['sign']);
+  // 用 jwt_secret 派生的会话子密钥签名，不与附件链接、中转防环头共用同一把密钥
+  const key = await importKey(await deriveSubkey(secret, 'jwt'), ['sign']);
   const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
   return `${data}.${base64url(signature)}`;
 }
@@ -57,13 +60,11 @@ export async function verifyToken(secret: string, token: string): Promise<JwtCla
     const [headerB64, payloadB64, signatureB64] = token.split('.');
     if (!headerB64 || !payloadB64 || !signatureB64) return null;
     const data = `${headerB64}.${payloadB64}`;
-    const key = await importKey(secret, ['verify']);
-    const valid = await crypto.subtle.verify(
-      'HMAC',
-      key,
-      base64urlDecode(signatureB64),
-      encoder.encode(data),
-    );
+    const signature = base64urlDecode(signatureB64);
+    const verifyWith = async (raw: string) =>
+      crypto.subtle.verify('HMAC', await importKey(raw, ['verify']), signature, encoder.encode(data));
+    // 过渡期：改用子密钥之前签发的令牌（最长 7 天）仍按 jwt_secret 本身校验，本版本上线 7 天后删除这一分支
+    const valid = await verifyWith(await deriveSubkey(secret, 'jwt')) || await verifyWith(secret);
     if (!valid) return null;
     const payload = JSON.parse(decoder.decode(base64urlDecode(payloadB64))) as JwtClaims;
     const now = Math.floor(Date.now() / 1000);

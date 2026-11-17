@@ -48,7 +48,7 @@ hpc '/auth/me'
 
 成功返回 `{data:{token,user}}`，`user` 含 `id,username,role,createdAt,avatarUrl,twoFactorEnabled`。JWT 默认有效期 7 天，也可能提前因登出、密码变更、账户禁用/删除或会话撤销失效；没有 refresh-token 接口。401 时重新登录需有效凭证，不无限尝试密码。
 
-启用 2FA 的用户需在登录 JSON 的 `totp` 提供当前 6 位码或一次性恢复码。`totp_required` 表示需要追加码；恢复码成功使用后即消耗。不要替用户生成/猜测验证码。
+启用 2FA 的用户需在登录 JSON 的 `totp` 提供当前 6 位码或一次性恢复码。`totp_required` 表示需要追加码；恢复码成功使用后即消耗。同一个 6 位码只能用一次（登录或启用用过之后，再用同一个或更早的码返回 `bad_credentials`），连续两次登录要等下一个码。不要替用户生成/猜测验证码。
 
 `totp_setup_required` 是 403：登录已成功，但站点要求未绑定用户先启用 2FA；保留 JWT，可经 API 完成绑定。此时只放行 `/auth/me`、`/auth/logout`、`/auth/2fa/*` 与公开配置。绑定是账户安全变更，需适用的用户授权。
 
@@ -61,9 +61,9 @@ hpc '/auth/me'
 | `POST /auth/avatar` | `{contentType,image}`；`image` 为无 `data:` 前缀的 base64，PNG/JPEG/WebP，解码最多 2 MiB；返回更新后的用户 |
 | `DELETE /auth/avatar` | 返回用户，`avatarUrl:null` |
 | `GET /avatar/:userId` | 公开二进制头像；优先用用户返回的带版本 URL |
-| `POST /auth/2fa/setup` | 无正文；返回 `{secret,otpauthUri}`，只登记，尚未启用；重复 setup 会替换待绑定密钥 |
-| `POST /auth/2fa/enable` | `{code:"123456"}`；用 setup 密钥的有效 TOTP 校验，201 返回 `{recoveryCodes:[...]}`，仅这次能获得明文恢复码 |
-| `POST /auth/2fa/disable` | `{password}` 或 `{code}`（当前 TOTP）；返回 `{success:true}`，恢复码不能用于此操作 |
+| `POST /auth/2fa/setup` | `{password}`（当前密码，缺少或错误返回 403 `reauth_required`/`reauth_failed`）；返回 `{secret,otpauthUri}`，只登记，尚未启用；重复 setup 会替换待绑定密钥 |
+| `POST /auth/2fa/enable` | `{code:"123456"}`；用 setup 密钥的有效 TOTP 校验（错误 400），201 返回 `{recoveryCodes:[...],token}`，仅这次能获得明文恢复码；其他会话全部失效，`token` 立即替换当前 JWT |
+| `POST /auth/2fa/disable` | `{password}`（只接受当前密码，TOTP 码与恢复码都不能关闭）；返回 `{success:true,token}`，其他会话全部失效，`token` 替换当前 JWT |
 
 用户名为 3–32 位小写字母/数字/`_`/`-`，以字母或数字开始；创建/注册/新密码 8–128 位。在用户私有渠道保存 TOTP 密钥与恢复码，勿写入公开报告。站点强制 2FA 时关闭后会重新触发绑定要求，不应把此路径当绕过策略的方法。
 
