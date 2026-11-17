@@ -1,6 +1,6 @@
 import { DELIVERY_EVENT_TYPES, type DeliveryEventType, type RecipientOutcome } from '@hpc-mail/shared';
 import { getEmailDomain } from '../lib/email-address.js';
-import type { Env, ExecCtx } from '../types.js';
+import type { Env } from '../types.js';
 import { stripBrackets } from './delivery-refs.js';
 import { overallResult } from './outbound.js';
 import { bounceSuppression, upsertSuppressionStatement } from './suppression.js';
@@ -87,22 +87,11 @@ interface RefRow {
 
 interface MessageRow {
   id: number;
-  address: string;
   status: string;
   recipient_outcomes: string;
 }
 
 export type DeliveryEventResult = 'applied' | 'unchanged' | 'ignored' | 'unmatched' | 'retry';
-
-/** 投递结果事件推给发件人（Webhook v2）；processDeliveryEvent 只收集，由消费者统一发出 */
-export interface DeliveryUserEvent {
-  userId: number;
-  event: 'mail.delivered' | 'mail.bounced';
-  data: {
-    messageId: number; address: string; recipient: string; status: RecipientOutcome['status'];
-    deliveryEvent: DeliveryEventType; smtpStatus: string; error: string; occurredAt: string;
-  };
-}
 
 /** 事件早于发件结果落库（还在 pending）或对应关系还没写入时的重试：只在事件很新时等，最多 4 次 */
 const MATCH_GRACE_MS = 15 * 60_000;
@@ -150,16 +139,10 @@ const resolveRef = (env: Env, id: number, at: number) =>
   env.db.prepare('UPDATE email_delivery_refs SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL').bind(at, id);
 
 /** 回写一个发件行；并发写入用旧值做条件，冲突时重读重试 */
-async function applyToMessage(env: Env, ref: RefRow, event: DeliveryEvent, attempts: number,
-  userEvents: DeliveryUserEvent[]): Promise<DeliveryEventResult> {
+async function applyToMessage(env: Env, ref: RefRow, event: DeliveryEvent, attempts: number): Promise<DeliveryEventResult> {
   for (let round = 0; round < 3; round++) {
-    const [messageResult, ownerResult] = await env.db.batch([
-      env.db.prepare(`SELECT id, address, status, recipient_outcomes FROM messages
-        WHERE id = ? AND direction = 'outbound'`).bind(ref.message_id),
-      env.db.prepare(`SELECT user_id FROM mailboxes WHERE address = (SELECT address FROM messages WHERE id = ?)`)
-        .bind(ref.message_id),
-    ]);
-    const message = (messageResult!.results as MessageRow[])[0];
+    const message = await env.db.prepare(`SELECT id, status, recipient_outcomes FROM messages
+      WHERE id = ? AND direction = 'outbound'`).bind(ref.message_id).first<MessageRow>();
     if (!message) {
       await resolveRef(env, ref.id, event.at).run();
       return 'ignored';
@@ -185,14 +168,6 @@ async function applyToMessage(env: Env, ref: RefRow, event: DeliveryEvent, attem
       resolveRef(env, ref.id, event.at),
     ]);
     if (!write!.meta.changes) continue;
-    const ownerId = (ownerResult!.results as { user_id: number }[])[0]?.user_id;
-    if (ownerId && event.type !== 'complained') {
-      userEvents.push({
-        userId: Number(ownerId), event: event.type === 'delivered' ? 'mail.delivered' : 'mail.bounced',
-        data: { messageId: message.id, address: message.address, recipient: ref.recipient, status: updated.status,
-          deliveryEvent: event.type, smtpStatus: event.smtpStatus, error: event.error, occurredAt: updated.eventAt! },
-      });
-    }
     return 'applied';
   }
   return 'retry';
@@ -221,7 +196,7 @@ async function applyToForward(env: Env, ref: RefRow, event: DeliveryEvent): Prom
  * 返回 retry 时由调用方延迟重投；其他结果都确认消息。
  */
 export async function processDeliveryEvent(env: Env, body: unknown,
-  options: { attempts?: number; now?: number; userEvents?: DeliveryUserEvent[] } = {}): Promise<DeliveryEventResult> {
+  options: { attempts?: number; now?: number } = {}): Promise<DeliveryEventResult> {
   const now = options.now ?? Date.now();
   const event = parseDeliveryEvent(body, now);
   if (!event) return 'ignored';
@@ -242,24 +217,15 @@ export async function processDeliveryEvent(env: Env, body: unknown,
     return now - event.at < MATCH_GRACE_MS && attempts < MAX_MATCH_ATTEMPTS ? 'retry' : 'unmatched';
   }
   if (ref.kind === 'forward') return applyToForward(env, ref, event);
-  return applyToMessage(env, ref, event, attempts, options.userEvents ?? []);
-}
-
-/**
- * Webhook v2 的接入点：PR4a 的 emitUserEvent(env, userId, event, ctx) 合入后在这里调用。
- * TODO(PR4a)：for (const item of events) await emitUserEvent(env, item.userId, { type: item.event, data: item.data }, ctx);
- */
-export async function emitDeliveryUserEvents(_env: Env, _ctx: ExecCtx, _events: DeliveryUserEvent[]): Promise<void> {
-  // PR4a 合入前不推送
+  return applyToMessage(env, ref, event, attempts);
 }
 
 /** Queue consumer：逐条处理，数据库故障或需要等待时延迟重投，其余确认；每批输出一行汇总日志 */
-export async function handleDeliveryEventBatch(batch: MessageBatch<unknown>, env: Env, ctx: ExecCtx): Promise<void> {
+export async function handleDeliveryEventBatch(batch: MessageBatch<unknown>, env: Env): Promise<void> {
   const counts: Record<DeliveryEventResult | 'error', number> = { applied: 0, unchanged: 0, ignored: 0, unmatched: 0, retry: 0, error: 0 };
-  const userEvents: DeliveryUserEvent[] = [];
   for (const message of batch.messages) {
     try {
-      const result = await processDeliveryEvent(env, message.body, { attempts: message.attempts, userEvents });
+      const result = await processDeliveryEvent(env, message.body, { attempts: message.attempts });
       counts[result]++;
       if (result === 'retry') message.retry({ delaySeconds: 60 });
       else message.ack();
@@ -268,9 +234,6 @@ export async function handleDeliveryEventBatch(batch: MessageBatch<unknown>, env
       console.error('投递事件处理失败，稍后重试:', error);
       message.retry({ delaySeconds: 30 });
     }
-  }
-  if (userEvents.length) {
-    ctx.waitUntil(emitDeliveryUserEvents(env, ctx, userEvents).catch((error) => console.error('投递结果事件推送失败:', error)));
   }
   console.log(JSON.stringify({ event: 'delivery_events', queue: batch.queue, size: batch.messages.length, ...counts }));
 }

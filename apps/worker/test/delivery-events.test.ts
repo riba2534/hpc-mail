@@ -7,7 +7,7 @@ import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, emailDeliveryRefs, emailSuppressions, mailboxes, messages, notificationJobs, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import {
-  handleDeliveryEventBatch, parseDeliveryEvent, processDeliveryEvent, type DeliveryUserEvent,
+  handleDeliveryEventBatch, parseDeliveryEvent, processDeliveryEvent,
 } from '../src/services/delivery-events.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { getNotificationHealth } from '../src/services/notification-jobs.js';
@@ -128,26 +128,22 @@ describe('外发回执回写与抑制名单', () => {
     ].sort());
     expect(refs.every((ref) => ref.rfcMessageId && !ref.rfcMessageId.startsWith('<') && ref.sender === f.address)).toBe(true);
 
-    const userEvents: DeliveryUserEvent[] = [];
     const delivered = event('delivered', { messageId: `cf-1-${a}`, sender: f.address, recipient: a, smtp: ['250', '2.0.0', '250 OK'] });
-    expect(await processDeliveryEvent(env, delivered, { userEvents })).toBe('applied');
+    expect(await processDeliveryEvent(env, delivered)).toBe('applied');
     let row = await outbound(summary.id);
     expect(outcomeOf(row, a)).toMatchObject({ status: 'delivered', event: 'delivered', smtpStatus: '250 2.0.0' });
     expect(outcomeOf(row, a).error).toBeUndefined();
     expect(row!.status).toBe('sent');
-    // 重复投递的同一事件不改动、不重复推送
-    expect(await processDeliveryEvent(env, delivered, { userEvents })).toBe('unchanged');
+    // 重复投递的同一事件不改动
+    expect(await processDeliveryEvent(env, delivered)).toBe('unchanged');
 
     const bounced = event('bounced', { messageId: `cf-2-${b}`, sender: f.address, recipient: b,
       smtp: ['550', '5.1.1', '550 5.1.1 User unknown'], bounceType: 'hard' });
-    expect(await processDeliveryEvent(env, bounced, { userEvents })).toBe('applied');
+    expect(await processDeliveryEvent(env, bounced)).toBe('applied');
     row = await outbound(summary.id);
     expect(outcomeOf(row, b)).toMatchObject({ status: 'bounced', event: 'bounced', smtpStatus: '550 5.1.1', error: '550 5.1.1 User unknown' });
     expect(row!.status).toBe('delivered');
     expect(row!.errorDetail).toBe(`部分收件人失败: ${b}: 550 5.1.1 User unknown`);
-    expect(userEvents.map((item) => [item.event, item.userId, item.data.recipient, item.data.messageId])).toEqual([
-      ['mail.delivered', f.user.id, a, summary.id], ['mail.bounced', f.user.id, b, summary.id],
-    ]);
     const suppression = await db.select().from(emailSuppressions).where(eq(emailSuppressions.address, b)).get();
     expect(suppression).toMatchObject({ sendingDomain: 'hpc.email', reason: 'hard_bounce', expiresAt: null });
     expect((await db.select().from(emailDeliveryRefs).where(eq(emailDeliveryRefs.messageId, summary.id)).all())
@@ -344,13 +340,12 @@ describe('Queue consumer 与管理接口', () => {
     const waiting = message(event('delivered', { messageId: `${f.prefix}-none`, sender: f.address, recipient: f.ext('w') }));
     const broken = message(event('delivered', { messageId: `${f.prefix}-none`, sender: f.address, recipient: f.ext('w') }));
     const brokenEnv = { ...env, db: { ...env.db, batch: async () => { throw new Error('D1 unavailable'); }, prepare: env.db.prepare.bind(env.db) } } as unknown as Env;
-    const waitUntil = vi.fn();
     await handleDeliveryEventBatch({ queue: 'hpc-mail-email-events', messages: [ignored, waiting], metadata: {} as MessageBatchMetadata,
-      retryAll: vi.fn(), ackAll: vi.fn() } as unknown as MessageBatch<unknown>, env, { waitUntil });
+      retryAll: vi.fn(), ackAll: vi.fn() } as unknown as MessageBatch<unknown>, env);
     expect(ignored.ack).toHaveBeenCalledOnce();
     expect(waiting.retry).toHaveBeenCalledWith({ delaySeconds: 60 });
     await handleDeliveryEventBatch({ queue: 'hpc-mail-email-events', messages: [broken], metadata: {} as MessageBatchMetadata,
-      retryAll: vi.fn(), ackAll: vi.fn() } as unknown as MessageBatch<unknown>, brokenEnv, { waitUntil });
+      retryAll: vi.fn(), ackAll: vi.fn() } as unknown as MessageBatch<unknown>, brokenEnv);
     expect(broken.retry).toHaveBeenCalledWith({ delaySeconds: 30 });
     expect(broken.ack).not.toHaveBeenCalled();
   });
