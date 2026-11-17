@@ -3,7 +3,7 @@ import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../src/db/client.js';
 import { attachments, mailboxes, messages, notificationJobs, storageCleanupJobs, users } from '../src/db/schema.js';
-import { htmlToText } from '../src/lib/text.js';
+import { HTML_TO_TEXT_MAX_CHARS, htmlToText } from '../src/lib/text.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { purgeMatchingMessages } from '../src/services/message-lifecycle.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
@@ -307,17 +307,17 @@ describe('收件链路 Ack 前往返', () => {
       + '<a href="https://example.net/verify?t=abcdefghijklmnopqrstuvwxyz">Verify</a></body></html>';
     const raw = ['From: Example <no-reply@example.net>', `To: ${owner.address}`, 'Subject: Verify your sign-in', 'Message-ID: <rt-html@example.net>',
       'MIME-Version: 1.0', 'Content-Type: text/html; charset=utf-8', '', html, ''].join('\r\n');
-    const scriptStrip = /^<\(script\|style\|head\|template\)/;
-    const replace = vi.spyOn(String.prototype, 'replace');
+    const slice = vi.spyOn(String.prototype, 'slice');
     const ctx = createExecutionContext();
     await handleInbound(incoming(owner.address, raw), env, ctx);
     await waitOnExecutionContext(ctx);
-    // htmlToText 的第一步对入参整体做脚本/样式剥离；只数作用于整份正文（含标记、非链接提取标记文本）的那一次
-    const fullConversions = replace.mock.calls.filter(([pattern], index) => {
-      const subject = String(replace.mock.contexts[index]);
-      return pattern instanceof RegExp && scriptStrip.test(pattern.source) && subject.includes(token) && !subject.includes('\u0001');
+    // htmlToText 入口对入参整体截取 (0, HTML_TO_TEXT_MAX_CHARS)；只数作用于整份正文（含标记、非链接提取标记文本）的那一次
+    const fullConversions = slice.mock.calls.filter((args, index) => {
+      const subject = String(slice.mock.contexts[index]);
+      return args.length === 2 && args[0] === 0 && args[1] === HTML_TO_TEXT_MAX_CHARS
+        && subject.includes(token) && !subject.includes('\u0001');
     }).length;
-    replace.mockRestore();
+    slice.mockRestore();
     expect(fullConversions).toBe(1);
 
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/chat/completions'))).toBe(true);

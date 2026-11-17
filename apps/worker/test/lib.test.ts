@@ -13,7 +13,7 @@ import {
   extractCodeByRegex,
   resolveVerificationCode,
 } from '../src/services/code-extract.js';
-import { htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
+import { HTML_TO_TEXT_MAX_CHARS, htmlToText, makePreview, PREVIEW_LIMIT } from '../src/lib/text.js';
 import { injectAttachmentLinks } from '../src/services/outbound.js';
 import { ipInAllowList } from '../src/lib/ip-allowlist.js';
 import {
@@ -267,6 +267,34 @@ describe('htmlToText', () => {
     expect(htmlToText('<head><style>.x{color:red}</style></head><body><p>hi</p></body>')).toBe('hi');
     expect(htmlToText('<p>a &lt;b&gt; &quot;c&quot; &amp; d</p>')).toBe('a <b> "c" & d');
     expect(htmlToText('<p>line1<br>line2</p>')).toBe('line1\nline2');
+  });
+
+  it('剥离整段时大小写不敏感、取第一个闭标签；没有闭标签的开标签按普通标签处理', () => {
+    expect(htmlToText('<STYLE x>a</Style >b')).toBe('b');
+    expect(htmlToText('<style>a<style>b</style>c</style>d')).toBe('c d');
+    expect(htmlToText('x<style>never closed<p>hi</p>')).toBe('x never closed hi');
+    expect(htmlToText('<script>a</script>b<script>c')).toBe('b c');
+    // <header>、<scripts> 不是要整段丢弃的元素
+    expect(htmlToText('<header>Brand</header><p>hi</p></head>')).toBe('Brand hi');
+    expect(htmlToText('<scripts>a</script>b')).toBe('a b');
+    expect(htmlToText('<a <a <br>')).toBe('<a <a');
+  });
+
+  it('只处理开头 512KB，超长输入的结尾不参与转换', () => {
+    const text = htmlToText(`<p>${'a '.repeat(HTML_TO_TEXT_MAX_CHARS)}TAIL</p>`);
+    expect(text.length).toBeLessThanOrEqual(HTML_TO_TEXT_MAX_CHARS);
+    expect(text).not.toContain('TAIL');
+  });
+
+  it('病态 HTML 耗时线性：没有 > 的长串、没闭合的 <style>、大量 <header> 不再平方退化', () => {
+    // 修复前每种在 256KB 上耗时 1～12 秒（收件解析在 SMTP Ack 前同步执行，会耗尽 CPU）
+    const size = 256 * 1024;
+    const started = Date.now();
+    for (const unit of ['<a ', '<b ', '<style>', '<style ', '<header>x', '</style  ']) {
+      htmlToText(unit.repeat(Math.ceil(size / unit.length)));
+      htmlToText(`${unit.repeat(Math.ceil(size / unit.length))}<br>`);
+    }
+    expect(Date.now() - started).toBeLessThan(1500);
   });
 });
 
