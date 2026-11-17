@@ -112,6 +112,15 @@ jobs:
       - name: 部署脚本自测（冒烟、金丝雀、心跳）
         run: node scripts/check-deploy-scripts.mjs
 
+      # 两份 OpenAPI 导出后按仓库根 .spectral.yaml 检查。Spectral 是 npx 现装的第三方包（固定版本、不跑安装脚本），
+      # 用 env -i 只给 PATH/HOME：前面写进 GITHUB_ENV 的账户、D1、KV 标识不进入它的环境
+      - name: OpenAPI 规范检查（Spectral）
+        run: |
+          node apps/worker/scripts/export-openapi.mjs "$RUNNER_TEMP/openapi"
+          env -i PATH="$PATH" HOME="$HOME" npm_config_ignore_scripts=true \
+            npx --yes @stoplight/spectral-cli@6.17.1 lint "$RUNNER_TEMP/openapi/api.json" "$RUNNER_TEMP/openapi/v1.json" \
+            --ruleset .spectral.yaml --fail-severity=error
+
       - name: 依赖安全审计
         run: pnpm audit --prod --audit-level high
 

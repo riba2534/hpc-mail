@@ -1,5 +1,6 @@
 import { createApp, isApiPath } from './app.js';
 import { routeLabel } from './lib/http.js';
+import { SECURITY_HEADERS } from './lib/security-headers.js';
 import { handleDeliveryEventBatch } from './services/delivery-events.js';
 import { handleInbound } from './services/inbound.js';
 import { runScheduled } from './services/scheduled.js';
@@ -7,30 +8,10 @@ import type { Env } from './types.js';
 
 const app = createApp();
 
-/**
- * 给前端资产响应加安全头。邮件正文已在 Shadow DOM 内消毒并按用户意愿放行远程图片，
- * 故 img-src 放开 https:；样式含 React 内联 style，需 'unsafe-inline'。
- * frame-ancestors 'none' 防点击劫持；HSTS 强制 HTTPS。
- */
-const CSP = [
-  "default-src 'self'",
-  "script-src 'self'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: https:",
-  "font-src 'self' data:",
-  "connect-src 'self'",
-  "frame-ancestors 'none'",
-  "base-uri 'self'",
-  "form-action 'self'",
-].join('; ');
-
+/** 给经过 Worker 的前端资产响应加安全头；头的取值与资产层 _headers 共用 lib/security-headers.ts */
 function withSecurityHeaders(res: Response, extra?: Record<string, string>): Response {
   const headers = new Headers(res.headers);
-  headers.set('Content-Security-Policy', CSP);
-  headers.set('X-Frame-Options', 'DENY');
-  headers.set('X-Content-Type-Options', 'nosniff');
-  headers.set('Referrer-Policy', 'no-referrer');
-  headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) headers.set(k, v);
   if (extra) for (const [k, v] of Object.entries(extra)) headers.set(k, v);
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }

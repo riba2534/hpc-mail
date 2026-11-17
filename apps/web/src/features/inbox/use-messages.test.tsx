@@ -34,7 +34,7 @@ const wrapperOf = (client: QueryClient) =>
   };
 const renderList = (client: QueryClient) => renderHook(() => useMessagesQuery(query), { wrapper: wrapperOf(client) });
 
-// 接管轮询定时器（列表 sync 的 20 秒周期与首轮等待、未读数自身的 refetchInterval），由 tick() 手动推进
+// 接管轮询定时器（列表 sync 的 20 秒周期与首轮等待、搜索视图的 60 秒周期、未读数自身的 refetchInterval），由 tick() 手动推进
 const pollTimers = new Map<number, { callback: () => void; delay: number; once: boolean }>();
 let nextTimerId = -1;
 /** 走到下一个轮询点：到期的一次性定时器触发后移除，周期定时器保留 */
@@ -59,7 +59,7 @@ beforeEach(() => {
   const realSetInterval = globalThis.setInterval;
   const realClearInterval = globalThis.clearInterval;
   vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, delay?: number, ...args: unknown[]) => {
-    if (delay !== 20_000) return realSetInterval(callback, delay, ...args);
+    if (delay !== 20_000 && delay !== 60_000) return realSetInterval(callback, delay, ...args);
     const id = nextTimerId--;
     pollTimers.set(id, { callback, delay, once: false });
     return id;
@@ -72,7 +72,7 @@ beforeEach(() => {
   vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay?: number, ...args: unknown[]) => {
     const id = nextTimerId--;
     if (delay === 2_500) retryTimers.set(id, callback);
-    else if (delay !== undefined && delay > 2_500 && delay <= 20_000) pollTimers.set(id, { callback, delay, once: true });
+    else if (delay !== undefined && ((delay > 2_500 && delay <= 20_000) || delay === 60_000)) pollTimers.set(id, { callback, delay, once: true });
     else return realSetTimeout(callback, delay, ...args);
     return id;
   }) as typeof setTimeout);
@@ -422,5 +422,57 @@ describe('first round after a list view mounts', () => {
     const unread = renderHook(() => useUnreadCount(), { wrapper: wrapperOf(fresh) });
     await waitFor(() => expect(unread.result.current.data).toEqual({ unread: 1 }));
     expect(nextUnreadRefreshDelay(fresh)).toBeLessThan(20_000);
+  });
+});
+
+describe('switching filters and searching', () => {
+  it('keeps showing the previous results instead of a loading state until the new ones arrive', async () => {
+    let resolveSearch: (value: MessageListPage) => void = () => {};
+    api.list
+      .mockResolvedValueOnce(page([3, 2], null, 'h1'))
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveSearch = resolve)));
+    const client = createClient();
+    const { result, rerender } = renderHook(
+      ({ q }: { q?: string }) => useMessagesQuery({ direction: 'inbound', q }),
+      { initialProps: {} as { q?: string }, wrapper: wrapperOf(client) },
+    );
+    await waitFor(() => expect(ids(result.current.data)).toEqual([[3, 2]]));
+    expect(result.current.isPlaceholderData).toBe(false);
+
+    rerender({ q: 'invoice' });
+    await waitFor(() => expect(api.list).toHaveBeenCalledTimes(2));
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.isPlaceholderData).toBe(true);
+    expect(ids(result.current.data)).toEqual([[3, 2]]);
+
+    await act(async () => resolveSearch(page([9], null, 'h9')));
+    await waitFor(() => expect(ids(result.current.data)).toEqual([[9]]));
+    expect(result.current.isPlaceholderData).toBe(false);
+  });
+
+  it('probes a search view every 60 seconds and leaves the unread count polling by itself', async () => {
+    api.list.mockResolvedValue(page([3], null, 'h1'));
+    api.sync.mockResolvedValue({ unread: 0, head: 'h1' });
+    api.unreadCount.mockResolvedValue({ unread: 0 });
+    const client = createClient();
+    // 非搜索视图此时会立即 sync（见上一组用例）；搜索词刚整体拉取过，等满 60 秒
+    markUnreadRefreshed(client, Date.now() - 25_000);
+    const search = { direction: 'inbound' as const, q: 'invoice' };
+    const { result } = renderHook(() => {
+      useUnreadCount();
+      return useMessagesQuery(search);
+    }, { wrapper: wrapperOf(client) });
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    await settle();
+    expect(api.sync).not.toHaveBeenCalled();
+    // 负载高时未读数查询的过期通知定时器也可能落进 20 秒以内被接管，只断言列表首轮
+    expect(pendingFirstRounds()).toContain(60_000);
+
+    await tick();
+    await waitFor(() => expect(api.sync).toHaveBeenCalledTimes(1));
+    expect(api.sync).toHaveBeenCalledWith(search, expect.any(AbortSignal));
+    // 列表按 60 秒探测首页；未读数没有被暂停，仍按自己的 20 秒刷新
+    const intervals = [...pollTimers.values()].filter((timer) => !timer.once).map((timer) => timer.delay);
+    expect(intervals.sort((a, b) => a - b)).toEqual([20_000, 60_000]);
   });
 });

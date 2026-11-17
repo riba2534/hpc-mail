@@ -5,6 +5,7 @@
 - [用户与邮件审阅](#用户与邮件审阅)：用户管理、审阅他人邮件
 - [用户专属邮箱权限](#用户专属邮箱权限)：按用户限定可认领域名与额度
 - [强制过户邮箱](#强制过户邮箱)：把邮箱连同历史转给另一个用户
+- [批量邮箱操作](#批量邮箱操作)：批量认领、释放、过户、共享与取消共享
 - [邀请码](#邀请码)
 - [系统设置与域名](#系统设置与域名)：设置项、外发与中转配额、系统域名
 - [投递回执与抑制名单](#投递回执与抑制名单)：回执订阅状态、抑制名单的查看与解除
@@ -79,6 +80,31 @@ hpc '/messages' --get --data-urlencode 'scope=unclaimed' --data-urlencode 'direc
 ```
 
 详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。要查看某个已认领邮箱自己的收件或发件，用 `scope=user&userId=<归属人>&address=<完整地址>`，再以 `direction=inbound|outbound` 区分。全站地址管理用 `GET /mailboxes?all=1`（带 `limit`/`cursor` 分页、`q`/`domain` 筛选，见[邮箱列表](mailboxes-and-domains.md#发现域名与邮箱)），编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
+
+## 批量邮箱操作
+
+运维批量处理邮箱用下面的接口，**只接受管理员 JWT**（API Key 返回 401），不要直写数据库。每次最多 100 项，items 里的地址不能重复（按小写比较），否则整批 400。
+
+| 方法与 `/api` 路径 | body | 作用 |
+|---|---|---|
+| `POST /admin/mailboxes/batch/claim` | `{userId,items:[{localPart,domain,strategy?}]}` | 为该用户认领，按**该用户自己**的认领规则（域名授权、保留前缀、额度；托管域名须已生效且他是所有者或成员）。返回同 `POST /mailboxes/batch`：`{claimed,taken,notAttempted,stoppedBy}` |
+| `POST /admin/mailboxes/batch/release` | `{items:[{address,expectedOwnerId?}],deleteHistory?}` | 释放并撤销共享；`deleteHistory:true` 同时永久删除这些地址的全部历史邮件（整批一个事务，地址历史很多时减小每批数量） |
+| `POST /admin/mailboxes/batch/transfer` | `{userId,items:[{address,expectedOwnerId}]}` | 过户给同一用户，规则同[强制过户](#强制过户邮箱)：保留历史、撤销旧共享；目标为专属配置的普通用户时按其额度逐项累计 |
+| `POST /admin/mailboxes/batch/share` | `{userIds,items:[{address,expectedOwnerId?}]}` | 把这批用户追加进每个邮箱的名单，不移除已有成员，不加入所有者，每只邮箱最多 100 人 |
+| `POST /admin/mailboxes/batch/unshare` | 同 share | 从每个邮箱的名单里移除这批用户 |
+
+除 claim 外返回 `{results,done,unchanged,failed}`，results 与 items 同序，每项 `{address,status,mailboxId,ownerId,error}`，另按操作带 `deletedMessages`、`revokedShares`（释放与过户撤销的共享数，取消共享移除的人数）或 `addedShares`。status 为 `done`、`unchanged`（已归目标用户，或成员都已在/都不在名单里）或 `failed`；failed 时 `error:{code,message}`：`not_found` 邮箱不存在，`conflict` 当前所有者与 expectedOwnerId 不符，`forbidden`/`validation_failed` 不符合目标用户的权限或名单已满。
+
+**事务语义是逐项结果**：读取后逐项校验，失败项不影响其他项；其余项在同一个事务里一起提交，提交时复核读取时的所有者、目标用户与被分享人状态、额度，有任何变化则**整批不做**并返回 409 `conflict`，重新执行即可。超时后重试同一请求时，上次已完成的项会报 `unchanged`（过户、共享、取消共享）或 `not_found`（释放）。认领例外，沿用批量认领语义：按顺序认领，被占用的跳过，首个业务错误停止，之前认领的保留。整批错误：400 参数、被分享人不存在或已禁用、目标用户已禁用；404 目标用户不存在；409 提交前状态已变。
+
+```bash
+# 释放并删除历史，只处理仍归 $HPC_OWNER_ID 的地址
+jq -n --argjson owner "$HPC_OWNER_ID" \
+  '{deleteHistory:true,items:[{address:"a@example.com",expectedOwnerId:$owner},{address:"b@example.com",expectedOwnerId:$owner}]}' |
+  hpc '/admin/mailboxes/batch/release' -X POST -H 'Content-Type: application/json' --data-binary @-
+```
+
+每项写一行管理审计，action 与单个操作相同：`mailbox.claim`、`mailbox.release`、`mailbox.transfer`、`mailbox.share`、`mailbox.unshare`；target 为地址，detail 末尾带 `批量请求 <请求 id>`（即响应头 `X-Request-ID`），可据此找出同一批的全部记录。
 
 ## 邀请码
 
@@ -187,4 +213,6 @@ jq --arg zone "$HPC_ZONE_ID" '{mode:"existing_zone",zoneId:$zone,fingerprint:.da
 | `DELETE /admin/api-keys/:id` | 吊销目标 Key，`{success:true}` |
 | `GET /admin/audit-logs?cursor=…&limit=30` | 管理操作审计分页 |
 
-管理员全站 Key 接口没有 PUT；自己 Key 的创建/更新仍用 `/api/api-keys`，不能把 admin metadata 查询当明文找回。审计默认页大小 30、最大 100，倒序读到 nextCursor=null；管理日志含 `id,actorName,action,target,detail,ip,createdAt`；`settings.update` 的 target 只列实际变化的设置键（不含 `expectedDomainsRevision`），detail 为变更摘要，如域名新增/移除、公开性与每人上限变化、`mailbox_policy.perUserLimit: 50→20`；`ai_model.apiKey` 只记「已更新/已清除」，不记录值，Key 日志字段见鉴权参考，保留约 90 天。只根据已看到的审计区间报告结果，不声称此接口是全部应用运行日志或队列监控。生产部署、Cloudflare DNS/Routing、数据库/R2 运维不是这些管理接口提供的能力。
+管理员全站 Key 接口没有 PUT；自己 Key 的创建/更新仍用 `/api/api-keys`，不能把 admin metadata 查询当明文找回。审计默认页大小 30、最大 100，倒序读到 nextCursor=null；管理日志含 `id,actorName,action,target,detail,ip,createdAt`；`settings.update` 的 target 只列实际变化的设置键（不含 `expectedDomainsRevision`），detail 为变更摘要，如域名新增/移除、公开性与每人上限变化、`mailbox_policy.perUserLimit: 50→20`；`ai_model.apiKey` 只记「已更新/已清除」，不记录值，Key 日志字段见鉴权参考，保留约 90 天。
+
+管理员对他人邮箱与邮件的操作也会留痕：释放他人邮箱记 `mailbox.release`（原所有者、保留或永久删除历史及条数），改他人邮箱发件名记 `mailbox.update`（前后值），`scope=unclaimed` 的永久删除记 `mail.purge_unclaimed`（条数与请求的 id），`scope=user` 读取他人邮件（列表、同步、详情、线程、原始邮件、附件等）记 `mail.read_user`，target 为 `user#目标用户ID`，每个管理员对每个用户每 UTC 日只记一条。经 `/v1` 的操作以 Key 所属用户为操作者，detail 末尾标注 `（API Key #id）`。只根据已看到的审计区间报告结果，不声称此接口是全部应用运行日志或队列监控。生产部署、Cloudflare DNS/Routing、数据库/R2 运维不是这些管理接口提供的能力。

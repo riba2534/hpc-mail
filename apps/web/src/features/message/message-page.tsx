@@ -50,6 +50,7 @@ import { attachmentIcon } from './attachment-icon';
 import { countRemoteImages } from './count-remote-images';
 import { downloadWithAuth, openOrDownloadWithAuth } from './download';
 import { EmailHtml } from '@/lib/email-html';
+import { EmailBodyBoundary } from '@/lib/email-html/body-error-boundary';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
 import { extractOtp } from '@/lib/otp';
@@ -224,6 +225,8 @@ export function MessagePage() {
       // 只同步这一封的已读状态与未读数；列表只标记过期，回到列表时由首页探测/单页重拉对齐
       if (result.changed > 0) syncReadState(queryClient, [id], isRead, result.unread);
     },
+    // 打开未读邮件时自动标已读也走这里：失败由全局 mutationCache 提示原因，否则列表一直显示未读却不知为何
+    meta: { errorTitle: '已读状态更新失败' },
   });
 
   useEffect(() => {
@@ -581,16 +584,23 @@ export function MessagePage() {
             </div>
           )}
 
-          {message.bodyHtml ? (
-            <EmailHtml
-              html={message.bodyHtml}
-              allowRemoteImages={showRemoteImages}
-              trustedImageOrigins={[globalThis.location.origin]}
-              onContentChange={setHtmlRoot}
-            />
-          ) : (
-            <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
-          )}
+          <EmailBodyBoundary
+            resetKey={message.id}
+            text={message.bodyText}
+            html={message.bodyHtml}
+            onDownloadRaw={message.hasRaw ? () => void downloadEml() : undefined}
+          >
+            {message.bodyHtml ? (
+              <EmailHtml
+                html={message.bodyHtml}
+                allowRemoteImages={showRemoteImages}
+                trustedImageOrigins={[globalThis.location.origin]}
+                onContentChange={setHtmlRoot}
+              />
+            ) : (
+              <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
+            )}
+          </EmailBodyBoundary>
 
           {listedAttachments.length > 0 && (
             <div className="border-t border-line pt-4">

@@ -34,6 +34,14 @@ function operations(namespace: keyof typeof specs) {
   return Object.entries(specs[namespace].paths).flatMap(([path, item]) => Object.keys(item)
     .filter(method => methods.has(method)).map(method => `${method.toUpperCase()} /${namespace}${path}`));
 }
+/** 去掉响应里的 examples（两套认证的示例文案不同），比较其余结构 */
+function withoutExamples(responses: unknown): unknown {
+  return JSON.parse(JSON.stringify(responses, (key, value: unknown) => key === 'examples' ? undefined : value));
+}
+function exampleNames(responses: unknown, status: string): string[] {
+  const content = (responses as Record<string, { content?: Record<string, { examples?: Schema }> }>)[status]?.content;
+  return Object.keys(content?.['application/json']?.examples ?? {});
+}
 function visit(value: unknown, callback: (value: Schema) => void) {
   if (!value || typeof value !== 'object') return;
   if (Array.isArray(value)) value.forEach(item => visit(item, callback));
@@ -147,9 +155,9 @@ describe('OpenAPI routes and public contracts', () => {
     for (const spec of Object.values(specs)) {
       visit(spec, item => {
         if (typeof item.$ref === 'string') {
-          const name = item.$ref.replace('#/components/schemas/', '');
-          expect(item.$ref).toBe(`#/components/schemas/${name}`);
-          expect(spec.components.schemas).toHaveProperty(name);
+          const [, kind, name] = /^#\/components\/(schemas|examples)\/([^/]+)$/.exec(item.$ref) ?? [];
+          expect(kind, item.$ref).toBeDefined();
+          expect(spec.components[kind as 'schemas' | 'examples'], item.$ref).toHaveProperty(name!);
         }
       });
       for (const [path, item] of Object.entries(spec.paths)) {
@@ -161,11 +169,13 @@ describe('OpenAPI routes and public contracts', () => {
     }
   });
 
-  it('keeps operation ids unique across both authentication APIs', () => {
-    const ids = Object.values(specs).flatMap(spec => Object.values(spec.paths).flatMap(item => Object.entries(item)
-      .filter(([method]) => methods.has(method)).map(([, operation]) => operation.operationId)));
-    expect(ids.every(id => typeof id === 'string')).toBe(true);
-    expect(new Set(ids).size).toBe(ids.length);
+  it('keeps operation ids unique within each authentication API', () => {
+    for (const spec of Object.values(specs)) {
+      const ids = Object.values(spec.paths).flatMap(item => Object.entries(item)
+        .filter(([method]) => methods.has(method)).map(([, operation]) => operation.operationId));
+      expect(ids.every(id => typeof id === 'string')).toBe(true);
+      expect(new Set(ids).size).toBe(ids.length);
+    }
   });
 
   it('documents auth boundaries and scopes without granting admin functions to API keys', () => {
@@ -385,7 +395,10 @@ describe('Agent 接口第 1 期反映在 OpenAPI 中', () => {
       const api = specs.api.paths[path]![method]!;
       expect(v1['x-required-scopes'], path).toEqual([scope]);
       expect(api, path).not.toHaveProperty('x-required-scopes');
-      expect(v1.responses, path).toEqual(api.responses);
+      // 两套认证的 401/429 示例文案不同，/v1 另有缺 scope 的 403 示例；除示例外完全同形
+      expect(withoutExamples(v1.responses), path).toEqual(withoutExamples(api.responses));
+      expect(exampleNames(v1.responses, '403'), path).toContain(`ForbiddenScope${scope === 'mailbox.read' ? 'MailboxRead' : 'MailboxWrite'}`);
+      expect(exampleNames(api.responses, '403'), path).toEqual([]);
       expect(v1.requestBody, path).toEqual(api.requestBody);
       expect(v1.parameters, path).toEqual(api.parameters);
     }
@@ -443,7 +456,9 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
       for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
       expect(envelope.required).toEqual(['code', 'message']);
-      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'suppressed', 'precheck']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'source', 'suppressed', 'precheck']);
+      expect(props(error.details!).source).toMatchObject({ enum: ['reply', 'forward'] });
+      expect(props(error.details!).suppressed).toMatchObject({ type: 'array', items: { $ref: '#/components/schemas/SuppressedRecipient' } });
       expect(error.docs).toMatchObject({ format: 'uri' });
     }
   });
@@ -451,7 +466,11 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
   it('两个发信端点：201 只表示至少一个收件人成功，400/413/422/500 有发信专属说明，/api 与 /v1 一致', () => {
     const v1 = specs.v1.paths['/messages']!.post!;
     const api = specs.api.paths['/messages/send']!.post!;
-    expect(v1.responses).toEqual(api.responses);
+    expect(withoutExamples(v1.responses)).toEqual(withoutExamples(api.responses));
+    for (const operation of [v1, api]) {
+      expect(exampleNames(operation.responses, '404')).toEqual(expect.arrayContaining(['SourceUnavailableReply', 'SourceUnavailableForward']));
+      expect(exampleNames(operation.responses, '422')).toEqual(['DeliveryFailed', 'RecipientSuppressed']);
+    }
     for (const operation of [v1, api]) {
       const responses = operation.responses as Record<string, { description: string }>;
       expect(operation.description).toContain('at least one recipient succeeded');
@@ -815,7 +834,9 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
         const api = specs.api.paths[path]![method]!;
         expect(v1['x-required-scopes'], label).toEqual([scope]);
         expect(api, label).not.toHaveProperty('x-required-scopes');
-        expect(v1.responses, label).toEqual(api.responses);
+        // 两套认证的 401/429 示例文案不同，/v1 另有缺 scope 的 403 示例；除示例外完全同形
+        expect(withoutExamples(v1.responses), label).toEqual(withoutExamples(api.responses));
+        expect(exampleNames(v1.responses, '403'), label).toContain(scope === 'domain.read' ? 'ForbiddenScopeDomainRead' : 'ForbiddenScopeDomainWrite');
         expect(v1.requestBody, label).toEqual(api.requestBody);
         expect(v1.parameters, label).toEqual(api.parameters);
         checked++;

@@ -366,7 +366,7 @@ async function loadForwardedAttachments(
   verified?: VerifiedSource,
 ): Promise<StoredAttachment[]> {
   const unavailable = '转发的原邮件不存在或不可见';
-  if (verified?.id !== sourceMessageId) await loadSourceMessage(env, sender, sourceMessageId, unavailable);
+  if (verified?.id !== sourceMessageId) await loadSourceMessage(env, sender, sourceMessageId, unavailable, 'forward');
   const ofSource = eq(attachmentsTable.messageId, sourceMessageId);
   const [, rows, source] = await db.batch([
     db.insert(deliveryObjectLeases)
@@ -376,7 +376,7 @@ async function loadForwardedAttachments(
     // 与读附件行同一事务复核原邮件仍在：永久删除时附件行与邮件同批删除，不会只带走一半附件
     db.select({ id: messages.id }).from(messages).where(eq(messages.id, sourceMessageId)),
   ]);
-  if (!source.length) throw new AppError('source_unavailable', unavailable);
+  if (!source.length) throw new AppError('source_unavailable', unavailable, { details: { source: 'forward' } });
   if (alreadyCount + rows.length > MAX_ATTACHMENTS) {
     throw new AppError('validation_failed', `原邮件附件与新增附件合计最多 ${MAX_ATTACHMENTS} 个，请先移除部分附件`);
   }
@@ -385,7 +385,7 @@ async function loadForwardedAttachments(
   }
   const heads = await Promise.all(rows.map((row) => env.r2.head(row.r2Key)));
   const missing = rows.find((_, index) => !heads[index]);
-  if (missing) throw new AppError('source_unavailable', `附件「${missing.filename}」已丢失，无法完整转发`);
+  if (missing) throw new AppError('source_unavailable', `附件「${missing.filename}」已丢失，无法完整转发`, { details: { source: 'forward' } });
   // 保留原始 contentId/disposition：此前硬编码成 ''/attachment，转发一封带内嵌图片的
   // 富文本邮件时，HTML 里的 <img src="cid:xxx"> 在 MIME 里再也找不到对应 part，
   // 收件端图片全裂、还平白多出一堆附件
@@ -580,7 +580,7 @@ async function resolveReply(
 ): Promise<{ reply: ReplyContext | null; inReplyTo: string | null; references: string }> {
   if (!replyToMessageId) return { reply: null, inReplyTo: null, references: '' };
   const orig = verified?.id === replyToMessageId
-    ? verified : await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见');
+    ? verified : await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见', 'reply');
   if (!orig.messageId) return { reply: null, inReplyTo: null, references: '' };
   const references = [...new Set([orig.references, orig.inReplyTo, orig.messageId]
     .filter(Boolean).flatMap(value => value!.match(/<[^<>\s]+>/g) ?? []))].join(' ');

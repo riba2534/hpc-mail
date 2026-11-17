@@ -1,9 +1,10 @@
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { type FormEvent, useState } from 'react';
 import { changePasswordRequestSchema } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
+import { queryKeys } from '@/api/query-keys';
 import { authApi } from '@/api/resources';
-import { setAuthToken } from '@/lib/auth-token';
+import { getAuthRevision, setAuthToken } from '@/lib/auth-token';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
@@ -18,12 +19,15 @@ export function ChangePasswordDialog({ open, onOpenChange }: { open: boolean; on
   // 默认一并吊销：账号可能已泄露时，改密之外还要收回别人可能留下的 API Key
   const [revokeApiKeys, setRevokeApiKeys] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
 
   const mutation = useMutation({
     mutationFn: () => authApi.changePassword({ oldPassword, newPassword, revokeApiKeys }),
     onSuccess: (res) => {
-      // 改密会踢掉全部旧会话，服务端返回的新 token 需立即替换，当前会话才不掉线
+      // 改密会踢掉全部旧会话，服务端返回的新 token 需立即替换，当前会话才不掉线。
+      // 同一账户换发 token 不清查询缓存；预填新一代会话，外壳与当前页面不重挂、不闪全屏加载
       setAuthToken(res.token);
+      queryClient.setQueryData(queryKeys.sessionForRevision(getAuthRevision()), res.user);
       toast({
         title: '密码已修改',
         description: res.revokedApiKeys > 0 ? `已吊销 ${res.revokedApiKeys} 个 API Key，用到它们的脚本需要换用新 Key` : undefined,

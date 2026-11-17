@@ -2,8 +2,17 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
+// web 包不装 @types/node，只声明这里用到的部分
+declare const process: { env: Record<string, string | undefined> };
+
+/** 构建号：CI 用提交 SHA（GitHub Actions 自带 GITHUB_SHA），本地构建为 local；前端与 /api/config 的 X-HPC-Build 比对 */
+const BUILD_ID = process.env.BUILD_SHA || process.env.GITHUB_SHA || 'local';
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  define: {
+    __HPC_BUILD__: JSON.stringify(BUILD_ID),
+  },
   resolve: {
     alias: {
       '@': new URL('./src', import.meta.url).pathname,

@@ -10,13 +10,8 @@ import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { execCtx, routeLabel } from '../lib/http.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
+import { writeApiRequestLog } from '../services/api-request-log.js';
 import { getSettings, settingsQuery } from '../services/setting.js';
-import {
-  API_REJECT_SCOPE,
-  counterStatement,
-  counterWithinGuard,
-  minuteWindow,
-} from '../services/rate-counter.js';
 import { limitApiKeyRequest } from '../services/rate-limit.js';
 import type { AppContext, Env } from '../types.js';
 
@@ -134,7 +129,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     throw err;
   } finally {
     // 审计日志不阻塞响应；无 ExecutionContext（单测直调）时同步写入
-    const audit = writeAudit(c.env, admitted, {
+    const audit = writeApiRequestLog(c.env, admitted, {
       apiKeyId: row.id,
       requestId: c.get('requestId') ?? '',
       method: c.req.method,
@@ -163,36 +158,6 @@ async function touchLastUsed(c: Context<AppContext>, record: ApiKeyRecord, ip: s
   const ctx = execCtx(c);
   if (ctx) ctx.waitUntil(write);
   else await write;
-}
-
-interface AuditEntry {
-  apiKeyId: number;
-  requestId: string;
-  method: string;
-  path: string;
-  statusCode: number;
-  ip: string;
-  durationMs: number;
-}
-
-/**
- * 放行的请求逐条记录；中间件拒绝的请求先累加本 Key 本分钟的拒绝计数，同一事务里只有
- * 第一次拒绝写明细。
- */
-async function writeAudit(env: Env, admitted: boolean, entry: AuditEntry): Promise<void> {
-  const values = [entry.apiKeyId, entry.requestId, entry.method, entry.path, entry.statusCode, entry.ip, entry.durationMs];
-  const columns = 'INSERT INTO api_request_logs (api_key_id, request_id, method, path, status_code, ip, duration_ms)';
-  if (admitted) {
-    await env.db.prepare(`${columns} VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(...values).run();
-    return;
-  }
-  const subject = String(entry.apiKeyId);
-  const minute = minuteWindow(1);
-  const firstReject = counterWithinGuard(API_REJECT_SCOPE, subject, minute, 1);
-  await env.db.batch([
-    counterStatement(env, API_REJECT_SCOPE, subject, minute),
-    env.db.prepare(`${columns} SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${firstReject.sql}`).bind(...values, ...firstReject.params),
-  ]);
 }
 
 /** 校验 scope（v1 路由内调用） */

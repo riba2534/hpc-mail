@@ -96,7 +96,7 @@ flowchart LR
     subgraph CF [Cloudflare]
         W["Worker<br/>(fetch / email / scheduled)"]
         D1[(D1 业务数据)]
-        KV[(KV 配置缓存/回滚兼容)]
+        KV[(KV 过渡期回滚兼容)]
         R2[(R2 附件/大正文)]
         W --- D1
         W --- KV
@@ -111,7 +111,7 @@ flowchart LR
     W -->|OpenAI 兼容接口| LLM[大模型 如 DeepSeek<br/>验证码兜底 / 翻译]
 ```
 
-单个 Worker 同时承载三个入口：`fetch`（`/api` 内部接口 + `/v1` 开放接口 + 前端静态资源）、`email`（Email Routing catch-all 收件）、`scheduled`（每日清理）。前端构建产物打进 Worker Assets **同源部署**，`/api` 请求零跨域。
+单个 Worker 同时承载三个入口：`fetch`（`/api` 内部接口 + `/v1` 开放接口 + 前端静态资源）、`email`（Email Routing catch-all 收件）、`scheduled`（每 5 分钟处理通知队列、存储清理与托管域名同步；每日一次执行保留策略、回收站与日志清理）。前端构建产物打进 Worker Assets **同源部署**，`/api` 请求零跨域。
 
 前后端靠 `packages/shared` 的 zod schema 共享契约：worker 用它校验输入，web 用它做表单前置校验并导入响应类型，改接口只改一处。
 
@@ -122,7 +122,7 @@ flowchart LR
 | 后端 | Cloudflare Workers · Hono 4 · Drizzle ORM（D1/SQLite 增量迁移）· PostalMime |
 | 前端 | React 19 · Vite · Tailwind CSS 4 · TanStack Query 5 · React Router 7 · Radix Primitives |
 | 契约 | pnpm workspace monorepo，`packages/shared` 提供前后端共享的 zod schema 与类型 |
-| 存储 | D1（业务数据）· KV（会话/配置缓存）· R2（附件与超大正文） |
+| 存储 | D1（业务数据、会话与配置的唯一真源；正文只留 4KB 搜索文本）· KV（仅升级/回滚过渡期镜像会话）· R2（附件、邮件全文与原始 .eml） |
 | CI/CD | GitHub Actions：测试门控 → 构建 → 资源注入 → 迁移与完整性校验 → 部署 → 线上冒烟 → 收件金丝雀（可选）→ cron 心跳 → 失败自动回滚 |
 
 ## 快速开始
@@ -281,7 +281,7 @@ curl -s -X POST "$BASE/v1/messages" \
   -d '{"from":{"localPart":"noreply","domain":"your-domain.example"},"to":["someone@example.org"],"subject":"Hello","text":"来自 HPC Mail 的邮件"}'
 ```
 
-全部端点：`GET /v1/status` · `GET /v1/domains` · `GET|POST /v1/mailboxes` · `GET|POST /v1/messages` · `GET /v1/messages/:id` · `GET /v1/messages/:id/attachments/:attId` · `GET /v1/openapi.json`。scope 粒度：`mail.read` / `mail.write` / `mail.send` / `mailbox.read` / `mailbox.write`。
+常用端点：`GET /v1/me` · `GET /v1/identities` · `GET|POST /v1/mailboxes` · `GET|POST /v1/messages` · `GET /v1/messages/wait` · `GET /v1/messages/:id` · `GET /v1/messages/:id/attachments/:attId` · `POST /v1/uploads`。完整列表与字段见 `GET /v1/openapi.json`（公开可读）和 [`/skill.md`](apps/web/public/skill.md)。scope 粒度：`mail.read` / `mail.write` / `mail.send` / `mailbox.read` / `mailbox.write`。
 
 ## 设置模型：系统级 vs 个人级
 
@@ -311,8 +311,8 @@ git fetch upstream && git merge upstream/main && git push          # push 即触
 以下 wrangler 命令在 `apps/worker` 目录用 `pnpm exec wrangler` 执行（仓库锁定版本）。D1 命令加 `--cwd "$(mktemp -d)"`：`wrangler.toml` 里的 D1 id 是占位符，不加会解析到占位符而失败；此时相对路径也按那个临时目录解析，输出文件请写绝对路径。
 
 - **D1（核心数据，必备）**：`pnpm exec wrangler d1 export hpc-cloud-mail-db --remote --output "$PWD/backup.sql" --cwd "$(mktemp -d)"`；同账号内倒回某个时间点优先用 Time Travel（见上方手册）
-- **R2（附件与超大正文）**：用 `wrangler r2 object get` 或 rclone 按需同步
-- **KV**：只存会话与缓存，无需备份（丢失只是全员重新登录）
+- **R2（附件、邮件全文与原始 .eml，必备）**：用 `wrangler r2 object get` 或 rclone 按需同步；D1 只留正文前 4KB，完整正文只在 R2
+- **KV**：只在升级/回滚过渡期镜像会话与鉴权版本，会话与配置都以 D1 为准，无需备份
 - **换 Cloudflare 账号搬迁**：新账号照部署步骤建资源 → 更新 GitHub Variables 里的账户/资源 ID → `pnpm exec wrangler d1 execute hpc-cloud-mail-db --remote --file "$PWD/backup.sql" --cwd "$(mktemp -d)"` 导入 → 部署后在管理后台把域名列表写回
 
 ## FAQ

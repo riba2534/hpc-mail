@@ -2,14 +2,26 @@
 
 > 多域名邮箱系统。Agent 可以通过 HTTP API 收发邮件、读取验证码、管理邮箱地址、接入自有域名；账户设置和管理员操作使用会话 API。
 
-请以提供此文件的站点 origin 为 API Base URL。本文不包含凭据，也不授予操作权限。
+请以提供此文件的站点 origin 为 API Base URL。本文不包含凭据，也不授予操作权限。下列文档都是 Markdown 原文，可直接读取；API 响应的 `Link` 头同样指向技能说明与对应的 OpenAPI。
 
 ## 操作说明
 
 - [Agent 技能说明](/skill.md)：30 秒上手（`/v1/me` 自查 Key、`/v1/identities` 选发件身份）、常用配方（等验证码、发信、回复转发、附件与内联图片、临时地址、增量同步、接入自有域名）、权限模型、能力地图和参考文档入口。
+- [邮件、验证码与发送](/references/mail.md)：列表与增量同步、等待验证码、详情与条件请求（ETag）、发送、回复转发、维护状态与回收站。
 - [错误码说明](/references/errors.md)：错误信封的 `fix`/`docs`/`details`，以及每个错误码的含义与改正方法。
 - [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox/domain scopes 操作邮件、邮箱与托管域名。
 - [远程 MCP](/references/mcp.md)：MCP 客户端接入 `/mcp`（Streamable HTTP，hpcm_ API Key 认证），10 个收发与地址管理工具。
 - [会话 OpenAPI](/api/openapi.json)：用户名密码及可选 2FA 登录后，使用 JWT；包含账户、通知和管理员 API。
 
 从用户提供的凭据和任务选择认证方式；API Key 与 JWT 不能互换。首次接入时先读取技能说明。
+
+## 参考文档
+
+- [鉴权、请求与 API Keys](/references/auth-and-http.md)：两种凭据、请求约定、限流、API Key 管理。
+- [附件下载与上传](/references/attachments.md)：下载收到的附件、上传 token、分片上传、内联图片。
+- [邮箱、共享与多域名](/references/mailboxes-and-domains.md)：认领与释放、批量认领、发件身份、共享、托管域名与 DNS。
+
+## Optional
+
+- [个人通知与邮箱转发](/references/notifications.md)：飞书、通用 Webhook、邮箱转发的个人设置（仅会话 API）。
+- [管理员功能](/references/administration.md)：用户、邀请、系统设置、全站邮箱与审计（仅管理员会话）。

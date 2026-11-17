@@ -175,7 +175,7 @@ export async function composeReply(
   sourceId: number,
   req: ReplyMessageRequest,
 ): Promise<ComposedSend> {
-  const source = await loadSourceContent(env, sender, sourceId, '回复的原邮件不存在或不可见');
+  const source = await loadSourceContent(env, sender, sourceId, '回复的原邮件不存在或不可见', 'reply');
   const recipients = source.recipients ?? { to: [], cc: [], bcc: [] };
   const inbound = source.direction === 'inbound';
   const primary: MailAddress[] = inbound
@@ -219,7 +219,7 @@ export async function composeForward(
   sourceId: number,
   req: ForwardMessageRequest,
 ): Promise<ComposedSend> {
-  const source = await loadSourceContent(env, sender, sourceId, '转发的原邮件不存在或不可见');
+  const source = await loadSourceContent(env, sender, sourceId, '转发的原邮件不存在或不可见', 'forward');
   const owners = await ownersOf(env, [source.address], req.from?.mailboxId);
   const chosen = chooseFrom(sender, source, req.from, owners);
   const note = req.note ?? '';

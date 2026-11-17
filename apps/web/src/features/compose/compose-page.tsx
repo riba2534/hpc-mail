@@ -745,9 +745,10 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   };
 
   const attachmentTotal = attachments.reduce((sum, item) => sum + item.size, 0);
+  // 去掉了与原邮件的回复关联（原邮件已不存在）就是一封新邮件
   const title =
     initial.mode === 'reply'
-      ? '回复邮件'
+      ? replyToMessageId ? '回复邮件' : '写邮件'
       : initial.mode === 'forward'
         ? '转发邮件'
         : initial.mode === 'resend'

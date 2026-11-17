@@ -1,6 +1,7 @@
 import {
   API_SCOPES, ERROR_CODES, MAX_BATCH_CLAIM, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
   SETTING_SCHEMAS, batchMailboxRequestSchema, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
+  adminBatchClaimRequestSchema, adminBatchReleaseRequestSchema, adminBatchTransferRequestSchema, adminBatchShareRequestSchema,
   internalSendMailSchema, apiMarkReadRequestSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
   initMultipartUploadSchema, completeMultipartUploadSchema, loginRequestSchema, registerRequestSchema,
   changePasswordRequestSchema, uploadAvatarRequestSchema, enableTwoFactorRequestSchema, disableTwoFactorRequestSchema,
@@ -13,7 +14,7 @@ import {
   ALLOWED_CUSTOM_HEADERS, MAX_CUSTOM_HEADER_VALUE_BYTES, MAX_CUSTOM_NON_X_HEADERS, MAX_CUSTOM_HEADERS_TOTAL_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_SEND_REQUEST_BYTES, MAX_REPLY_TO, MAX_DISPLAY_NAME_LENGTH,
   EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE,
-  MAIL_AUTH_RESULTS, PROMPT_INJECTION_REASONS,
+  MAIL_AUTH_RESULTS, PROMPT_INJECTION_REASONS, ERROR_STATUS,
   MAX_HOSTED_DOMAIN_BATCH, batchCreateHostedDomainsRequestSchema, batchCheckHostedDomainsRequestSchema,
   DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, SUPPRESSION_REASONS,
   LIST_PAGE_DEFAULT_LIMIT, LIST_PAGE_MAX_LIMIT,
@@ -22,14 +23,31 @@ import {
   SYSTEM_DOMAIN_ZONE_CATEGORIES, SYSTEM_DOMAIN_ZONE_ORIGINS, cancelSystemDomainOnboardingRequestSchema, confirmSystemDomainOnboardingRequestSchema,
   createSystemDomainOnboardingRequestSchema, updateSystemDomainHiddenZonesRequestSchema,
 } from '@hpc-mail/shared';
-import { REQUEST_ID_PATTERN } from '../middleware/error.js';
+import { DEFAULT_ERROR_HINTS, REQUEST_ID_PATTERN } from '../middleware/error.js';
 import {
   MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE, RECONNECT_CF_CALLS,
 } from '../services/hosted-domain.js';
+import {
+  BINARY_EXAMPLES, EXAMPLE_REQUEST_ID, SCHEMA_EXAMPLES, errorExample, forwardedMessageExample, scopeExampleName, sentMessageExample,
+  type ErrorExampleName, type ScopeExampleName,
+} from './openapi-examples.js';
 
 export type Schema = Record<string, unknown>;
 export type Operation = Record<string, unknown>;
 export type Paths = Record<string, Record<string, Operation>>;
+
+/**
+ * operationId 的动词表：每个 operation 的 operationId 写成「动词+名词」的 camelCase（listMessages、getMessage、claimMailbox），
+ * 单份规范内唯一；/api 与 /v1 的同一操作用同一个名字。动词不够用时在这里追加，并同步仓库根 .spectral.yaml 的同名规则。
+ */
+export const OPERATION_VERBS = [
+  'list', 'get', 'create', 'update', 'delete', 'replace', 'send', 'claim', 'release', 'transfer', 'check', 'search', 'sync', 'count', 'wait',
+  'mark', 'star', 'restore', 'purge', 'share', 'unshare', 'revoke', 'remove', 'upload', 'download', 'complete', 'register', 'start', 'enable', 'disable',
+  'change', 'retry', 'test', 'translate', 'suspend', 'resume', 'reply', 'forward', 'confirm', 'cancel', 'reconnect',
+] as const;
+export type OperationId = `${(typeof OPERATION_VERBS)[number]}${Capitalize<string>}`;
+export const OPERATION_ID_PATTERN = new RegExp(`^(?:${OPERATION_VERBS.join('|')})[A-Z][A-Za-z0-9]*$`);
+
 export const str: Schema = { type: 'string' };
 export const int: Schema = { type: 'integer', minimum: 0 };
 export const positiveId: Schema = { type: 'integer', minimum: 1 };
@@ -37,8 +55,9 @@ export const bool: Schema = { type: 'boolean' };
 export const date: Schema = { type: 'string', format: 'date-time' };
 export const domainName: Schema = { type: 'string', minLength: 1, maxLength: 253,
   pattern: '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$',
-  description: 'Normalized lowercase DNS name. Each label is 1–63 characters and cannot start/end with a hyphen.' };
-export const dnsRecordId: Schema = { type: 'string', pattern: '^[0-9a-f]{32}$', description: 'Cloudflare DNS record id: 32 lowercase hex characters.' };
+  description: 'Normalized lowercase DNS name. Each label is 1–63 characters and cannot start/end with a hyphen.', examples: ['example.org'] };
+export const dnsRecordId: Schema = { type: 'string', pattern: '^[0-9a-f]{32}$', description: 'Cloudflare DNS record id: 32 lowercase hex characters.',
+  examples: ['023e105f4ecef8ad9ca31a8372d0c353'] };
 export const ref = (name: string): Schema => ({ $ref: `#/components/schemas/${name}` });
 export const array = (items: Schema): Schema => ({ type: 'array', items });
 export const nullable = (schema: Schema): Schema => ({ anyOf: [schema, { type: 'null' }] });
@@ -319,7 +338,7 @@ function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
 }
 export const schemas: Record<string, Schema> = {
   Error: object({ error: object({ code: { type: 'string', enum: ERROR_CODES,
-    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; remove the reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. recipient_suppressed (422): every recipient is on this site’s suppression list for the sender’s domain after an earlier bounce or spam complaint; nothing was sent, no outbound message was recorded, no quota was used and the Idempotency-Key is released; details.suppressed lists each address with its reason and expiry.' },
+    description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; details.source says which (reply or forward), so remove only that reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. recipient_suppressed (422): every recipient is on this site’s suppression list for the sender’s domain after an earlier bounce or spam complaint; nothing was sent, no outbound message was recorded, no quota was used and the Idempotency-Key is released; details.suppressed lists each address with its reason and expiry.' },
     message: { ...str, description: 'Human-readable Chinese explanation; wording may change.' },
     fix: { ...str, description: 'Optional: one actionable correction, e.g. which scope to add or which endpoint to call first.' },
     docs: { type: 'string', format: 'uri', description: 'Optional: absolute URL of the matching section in /references/errors.md on this site.' },
@@ -327,9 +346,11 @@ export const schemas: Record<string, Schema> = {
       headers: { ...array(str), description: 'header_not_allowed and header value errors: offending header names as written in the request.' },
       messageId: { ...positiveId, description: 'delivery_failed: id of the recorded outbound message (visible in direction=outbound lists).' },
       recipientOutcomes: { ...array(recipientOutcome), description: 'delivery_failed: per-recipient results, all failed.' },
+      source: { type: 'string', enum: ['reply', 'forward'],
+        description: 'source_unavailable only: which reference is unavailable. reply: replyToMessageId; forward: forwardAttachmentsFrom or one of its attachments. When a request has both, drop only this one. Older servers omit it.' },
       suppressed: { ...array(ref('SuppressedRecipient')), description: 'recipient_suppressed: every recipient with its suppression entry.' },
       precheck: { type: 'object', description: 'Session API system-domain onboarding 409 only: the latest precheck (SystemDomainPrecheck in /api/openapi.json) with confirmation items, blockers and fingerprint; confirm with its fingerprint and accept, then retry.' },
-    }, ['headers', 'messageId', 'recipientOutcomes', 'suppressed', 'precheck']), description: 'Optional structured data, present only on the codes above.' },
+    }, ['headers', 'messageId', 'recipientOutcomes', 'source', 'suppressed', 'precheck']), description: 'Optional structured data, present only on the codes above.' },
   }, ['fix', 'docs', 'details']),
     requestId: { ...str, description: `Same value as the X-Request-ID response header, which every response carries; ${clientRequestIdRule}, anything else is replaced by a server-generated UUID.` } }),
   MessageSummary: messageSummary,
@@ -352,6 +373,19 @@ export const schemas: Record<string, Schema> = {
     stoppedBy: nullable(object({ code: { type: 'string', enum: ERROR_CODES }, message: str })) }),
   UserSearchResults: object({ items: array(object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] } })), hasMore: bool }),
   MailboxTransferResult: object({ mailbox: ref('Mailbox'), previousUserId: positiveId, transferred: bool, revokedShares: int }),
+  AdminBatchClaimRequest: fromZod(adminBatchClaimRequestSchema), AdminBatchReleaseRequest: fromZod(adminBatchReleaseRequestSchema),
+  AdminBatchTransferRequest: fromZod(adminBatchTransferRequestSchema), AdminBatchShareRequest: fromZod(adminBatchShareRequestSchema),
+  AdminMailboxBatchResult: object({
+    results: { ...array(object({ address: str,
+      status: { type: 'string', enum: ['done', 'unchanged', 'failed'], description: 'done: applied; unchanged: already in the requested state (already owned by the target user, or every user already in or already absent from the list); failed: not applied, see error.' },
+      mailboxId: nullable(positiveId), ownerId: { ...nullable(positiveId), description: 'Owner before this request; null when the mailbox does not exist.' },
+      error: { ...nullable(object({ code: { type: 'string', enum: ERROR_CODES }, message: str })),
+        description: 'Only for failed: not_found (no such claimed mailbox), conflict (the owner differs from expectedOwnerId), forbidden or validation_failed (not allowed for the target user, or the share list is full).' },
+      deletedMessages: { ...int, description: 'release: history messages deleted (0 unless deleteHistory).' },
+      revokedShares: { ...int, description: 'release and transfer: shares revoked; unshare: users removed.' },
+      addedShares: { ...int, description: 'share: users added.' } }, ['deletedMessages', 'revokedShares', 'addedShares'])),
+      description: 'One result per request item, in request order.' },
+    done: int, unchanged: int, failed: int }),
   SharedMailbox: object({ mailboxId: positiveId, address: str, domain: str, displayName: str, ownerUsername: str }),
   SendIdentities: object({
     identities: { ...array(object({
@@ -413,8 +447,10 @@ export const schemas: Record<string, Schema> = {
   CreatedApiKey: object({ ...(apiKey.properties as Record<string, Schema>), key: { ...str, description: 'Full hpcm_ key, returned only once at creation. Save securely.' } }, ['ownerUsername']),
   ApiRequestLog: { ...object({ id: positiveId, requestId: str, method: str,
     path: { ...str, maxLength: 256, description: 'Normalized route: numeric id segments become :id; at most 256 characters.' },
-    statusCode: int, ip: str, durationMs: int, createdAt: date }),
-    description: 'One row per accepted request. Rejected requests (disabled or expired key, IP not allowed, disabled user, rate limited) are recorded at most once per key per minute; revoked keys are treated as unknown and never logged.' },
+    statusCode: int, ip: str,
+    durationMs: { ...int, description: 'Milliseconds; for an aggregated row the sum over its requests, so the average is durationMs / count.' },
+    count: { ...positiveId, description: 'Requests this row stands for: 1 for rows logged one by one, more for an aggregated row.' }, createdAt: date }),
+    description: 'Successful reads (GET or HEAD answered 2xx or 304, such as polling message detail with If-None-Match) are aggregated into one row per key, method, route, status code and minute; requestId, ip and createdAt are those of the first request in that minute. Writes and failed requests are logged one row each (count 1). Rejected requests (disabled or expired key, IP not allowed, disabled user, rate limited) are recorded at most once per key per minute; revoked keys are treated as unknown and never logged.' },
   AdminAuditLog: object({ id: positiveId, actorName: str, action: str, target: str, detail: str, ip: str, createdAt: date }),
   SuppressedRecipient: suppressedRecipient,
   EmailSuppression: { ...object({ ...(suppressedRecipient.properties as Record<string, Schema>), id: positiveId,
@@ -570,82 +606,250 @@ export const idempotencyHeader = { name: 'Idempotency-Key', in: 'header', requir
 export const success = object({ success: { const: true, type: 'boolean' } });
 export const changed = object({ changed: int });
 export const okResult = object({ ok: { const: true, type: 'boolean' } });
-export function operation(summary: string, data: Schema, options: {
-  request?: string; requestRequired?: boolean; status?: number; parameters?: Schema[]; description?: string; public?: boolean; role?: 'admin'; scope?: string; binary?: string; security?: Schema[];
-} = {}): Operation {
+const EXAMPLE_TIME = '2026-11-17T08:30:00.000Z';
+const STRING_FORMAT_EXAMPLES: Record<string, string> = {
+  'date-time': EXAMPLE_TIME, uri: 'https://mail.example/', ipv4: '203.0.113.10', ipv6: '2001:db8::10', binary: '<binary content>',
+};
+/** 带 pattern 的字符串依次试这些取值，取第一个能匹配的 */
+const PATTERN_CANDIDATES = ['example', 'example.org', 'alice@example.org', 'https://example.org/hook', 'hpcm_', '1'];
+/**
+ * 按 schema 拼一个能通过校验的示例：引用的组件取 SCHEMA_EXAMPLES，其余依次用 schema 自带的
+ * examples / const / default / enum，再按类型补最小合法值（对象只填 required 字段）。
+ */
+export function exampleOf(schema: Schema): unknown {
+  if (typeof schema.$ref === 'string') {
+    const name = schema.$ref.slice('#/components/schemas/'.length);
+    return name in SCHEMA_EXAMPLES ? SCHEMA_EXAMPLES[name] : exampleOf(schemas[name]!);
+  }
+  if (Array.isArray(schema.examples) && schema.examples.length) return schema.examples[0];
+  if ('const' in schema) return schema.const;
+  if ('default' in schema) return schema.default;
+  if (Array.isArray(schema.enum)) return schema.enum[0];
+  const properties = schema.properties as Record<string, Schema> | undefined;
+  const variants = (schema.oneOf ?? schema.anyOf) as Schema[] | undefined;
+  if (variants && !properties) return exampleOf(variants.find(variant => variant.type !== 'null') ?? variants[0]!);
+  switch (schema.type) {
+    case 'object':
+      return Object.fromEntries(((schema.required as string[] | undefined) ?? []).map(key => [key, exampleOf(properties?.[key] ?? {})]));
+    case 'array':
+      return Array.from({ length: Math.max(1, Number(schema.minItems ?? 1)) }, () => exampleOf((schema.items as Schema | undefined) ?? {}));
+    case 'integer':
+    case 'number': {
+      const minimum = typeof schema.minimum === 'number' ? schema.minimum
+        : typeof schema.exclusiveMinimum === 'number' ? schema.exclusiveMinimum + 1 : 1;
+      return Math.min(Math.max(1, minimum), typeof schema.maximum === 'number' ? schema.maximum : Number.MAX_SAFE_INTEGER);
+    }
+    case 'boolean': return true;
+    case 'null': return null;
+    case 'string': {
+      const pattern = typeof schema.pattern === 'string' ? new RegExp(schema.pattern, 'u') : null;
+      const value = STRING_FORMAT_EXAMPLES[schema.format as string]
+        ?? (pattern ? PATTERN_CANDIDATES.find(candidate => pattern.test(candidate)) : undefined) ?? 'example';
+      const padded = value.padEnd(Number(schema.minLength ?? 0), 'x');
+      return typeof schema.maxLength === 'number' ? padded.slice(0, schema.maxLength) : padded;
+    }
+    default: return {};
+  }
+}
+const exampleRef = (name: string): Schema => ({ $ref: `#/components/examples/${name}` });
+/** 把失败示例挂到它的错误码对应的状态码上（状态码由 ERROR_STATUS 决定，响应里没有该状态时补一个） */
+function addErrorExamples(responses: Record<string, Schema>, names: readonly string[]): Record<string, Schema> {
+  const result = { ...responses };
+  for (const name of names) {
+    const example = errorExample(name);
+    if (!example) throw new Error(`OpenAPI: unknown error example ${name}`);
+    const status = String(ERROR_STATUS[example.code]);
+    const response = result[status] ?? { description: example.code, content: { 'application/json': { schema: ref('Error') } } };
+    const content = response.content as Record<string, Schema>;
+    const json = content['application/json']!;
+    result[status] = { ...response, content: { ...content,
+      'application/json': { ...json, examples: { ...(json.examples as Schema | undefined), [name]: exampleRef(name) } } } };
+  }
+  return result;
+}
+const ERROR_DESCRIPTIONS: Record<number, string> = { 400: 'Invalid request', 401: 'Missing/invalid credentials; login may return totp_required',
+  403: 'Permission denied or totp_setup_required', 404: 'Resource not found or not visible',
+  409: 'Conflict or stale revision; for sends idempotency_mismatch or send_in_progress', 413: 'Payload exceeds limits',
+  429: 'Rate limit or quota exceeded', 500: 'Server or notification-delivery error' };
+export interface OperationOptions {
+  request?: string; requestRequired?: boolean; status?: number; parameters?: Schema[]; description?: string; public?: boolean;
+  role?: 'admin'; scope?: string; binary?: string; security?: Schema[];
+  /** 成功响应 data 的示例；省略时由 exampleOf(data) 按组件示例拼出 */
+  example?: unknown;
+  /**
+   * 这个接口特有的失败示例（openapi-examples.ts 中 ERROR_EXAMPLES 的键名）。以下示例自动补上，不用重复写：
+   * 请求体或查询参数不合法的 400、管理员接口与缺 scope 的 403、需要认证时的 401 与 429、路径带 {id} 时该资源的 404。
+   */
+  errors?: Array<ErrorExampleName | ScopeExampleName>;
+  /** 改写某个错误状态的说明；不在默认状态里的（如 422）会补上 */
+  errorDescriptions?: Record<number, string>;
+}
+/** 会被服务端校验的查询参数：必填，或有枚举、长度、范围、格式等约束 */
+const CONSTRAINT_KEYWORDS = ['enum', 'const', 'pattern', 'format', 'minLength', 'maxLength', 'minimum', 'maximum'];
+function validatedQuery(param: { in: string; required?: boolean; schema?: Schema }): boolean {
+  return param.in === 'query' && (param.required === true || param.schema?.type === 'integer'
+    || CONSTRAINT_KEYWORDS.some(keyword => param.schema !== undefined && keyword in param.schema));
+}
+/** 由接口形态推出的失败示例：请求体/查询参数 → 400，管理员 → 403，scope → 403 */
+function derivedErrors(options: OperationOptions): string[] {
+  const parameters = (options.parameters ?? []) as Array<{ name: string; in: string; required?: boolean; schema?: Schema }>;
+  const names: string[] = [];
+  if (options.request) names.push(options.requestRequired === false ? 'ValidationFailed' : 'InvalidJson');
+  else if (parameters.some(param => param.name === 'userId' && param.in === 'query')) names.push('MissingUserId');
+  else if (parameters.some(param => param.name === 'cursor')) names.push('InvalidCursor');
+  else if (parameters.some(validatedQuery)) names.push('ValidationFailed');
+  if (options.role === 'admin') names.push('ForbiddenAdmin');
+  if (options.scope) names.push(scopeExampleName(options.scope));
+  return names;
+}
+/**
+ * 描述一个接口。operationId 必须是「动词+名词」（见 OPERATION_VERBS），单份规范内唯一。
+ * 成功示例按 data 的 schema 自动生成（可用 options.example 覆盖），失败示例见 options.errors。
+ */
+export function operation(operationId: OperationId, summary: string, data: Schema, options: OperationOptions = {}): Operation {
   const responseSchema = options.binary ? { type: 'string', format: 'binary' } : object({ data });
-  const errors = Object.fromEntries([400, 401, 403, 404, 409, 413, 429, 500].map(code => [code, {
-    description: ({ 400: 'Invalid request', 401: 'Missing/invalid credentials; login may return totp_required', 403: 'Permission denied or totp_setup_required',
-      404: 'Resource not found or not visible', 409: 'Conflict or stale revision; for sends idempotency_mismatch or send_in_progress', 413: 'Payload exceeds limits', 429: 'Rate limit or quota exceeded', 500: 'Server or notification-delivery error' } as Record<number, string>)[code],
-    content: { 'application/json': { schema: ref('Error') } },
+  const errors: Record<string, Schema> = Object.fromEntries([400, 401, 403, 404, 409, 413, 429, 500].map(code => [code, {
+    description: options.errorDescriptions?.[code] ?? ERROR_DESCRIPTIONS[code], content: { 'application/json': { schema: ref('Error') } },
   }]));
-  return { summary, description: options.description || summary, tags: [options.role ? 'Administration' : 'Mail'],
+  for (const [code, description] of Object.entries(options.errorDescriptions ?? {})) {
+    errors[code] ??= { description, content: { 'application/json': { schema: ref('Error') } } };
+  }
+  const media = options.binary ? [options.binary, ...(options.binary === 'application/octet-stream' ? ['*/*'] : [])] : ['application/json'];
+  const example = (type: string) => options.binary ? BINARY_EXAMPLES[type] ?? BINARY_EXAMPLES['*/*'] : { data: options.example ?? exampleOf(data) };
+  return { operationId, summary, description: options.description || summary, tags: [options.role ? 'Administration' : 'Mail'],
     ...(options.role ? { 'x-required-role': options.role } : {}), ...(options.scope ? { 'x-required-scopes': [options.scope] } : {}),
     ...(options.public ? { security: [] } : options.security ? { security: options.security } : {}),
     ...(options.parameters?.length ? { parameters: options.parameters } : {}),
     ...(options.request ? { requestBody: { required: options.requestRequired ?? true, content: { 'application/json': { schema: ref(options.request) } } } } : {}),
-    responses: { ...errors, [options.status ?? 200]: { description: options.status === 201 ? 'Created' : 'Success',
-      content: { [options.binary || 'application/json']: { schema: responseSchema },
-        ...(options.binary === 'application/octet-stream' ? { '*/*': { schema: responseSchema } } : {}) } } },
+    responses: addErrorExamples({ ...errors, [options.status ?? 200]: { description: options.status === 201 ? 'Created' : 'Success',
+      content: Object.fromEntries(media.map(type => [type, { schema: responseSchema, example: example(type) }])) } },
+    [...derivedErrors(options), ...(options.errors ?? [])]),
   };
 }
+/** 发信各错误状态的说明；/v1 的回复与转发接口在此基础上改写 400/403/404 */
+const SEND_ERROR_DESCRIPTIONS: Record<number, string> = {
+  400: 'validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, or a hosted-domain sender whose sending is not ready.',
+  403: 'forbidden: the API key lacks a scope (fix names it), or the sender identity is not allowed (fix points to GET /identities); shared mailboxes never send.',
+  404: 'source_unavailable: replyToMessageId or forwardAttachmentsFrom is missing or invisible, or a forwarded attachment is lost; details.source is reply or forward. not_found: the sender mailboxId does not exist.',
+  413: `payload_too_large: request body over ${MAX_SEND_REQUEST_BYTES / 1024 / 1024} MiB (rejected before parsing), base64 attachments over ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB combined, or all attachments over ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB. Upload large files and use attachmentTokens.`,
+  422: 'delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key. recipient_suppressed: every recipient is on this site’s suppression list for the sender’s domain (an earlier bounce or spam complaint), so nothing was sent, no outbound message was recorded and no quota was used; details.suppressed lists address, reason, sendingDomain, since and expiresAt (null: until an administrator removes it), and the Idempotency-Key is released for reuse. When only some recipients are suppressed the others are sent (201) and each suppressed recipient has status failed with code recipient_suppressed; if every other recipient fails too, the response is 422 delivery_failed whose recipientOutcomes include the suppressed ones.',
+  429: 'rate_limited: request rate, or the daily outbound mail/recipient quota (GET /v1/me shows usage).',
+  500: 'internal: the server failed before every recipient was attempted. Retry the identical request with the same Idempotency-Key to fetch the result: it may be 201, or 422 delivery_failed whose recipientOutcomes show recipients that were never attempted.',
+};
 /** 发信：/api/messages/send 与 /v1/messages 同一份请求、结果与错误说明；/v1 另声明 scope */
 export function sendMailOperation(scope?: string): Operation {
   const keyScopes = scope
     ? ` API keys need ${scope}; replyToMessageId or forwardAttachmentsFrom additionally require mail.read (403 without it).` : '';
-  const base = operation('Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope, status: 201, parameters: [idempotencyHeader],
-    description: `HTTP 201 means at least one recipient succeeded (status sent or delivered), or none succeeded but at least one result is uncertain (status unknown: provider timeout or network error, possibly delivered; also an interrupted send replayed after an hour). Only a definite provider rejection (destination not verified, sending domain not ready, invalid address, limit exceeded and the like) counts as failed; anything else is unknown. Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; confirm unknown recipients before resending; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient definitely failed (or the server failed before delivery started) the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery; on deployments with delivery receipts enabled, Cloudflare receipts later update recipientOutcomes (delivered, bounced, failed, complained) and status, so read the message again to confirm delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. ${scope ? 'To let the server fill in recipients, subject and quote, use POST /messages/{id}/reply or /forward instead. Here' : 'There is no separate reply or forward endpoint (POST /messages/{id} does not exist):'} set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable, and removing the reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` });
-  const error = (description: string) => ({ description, content: { 'application/json': { schema: ref('Error') } } });
-  return { ...base,
-    responses: { ...(base.responses as Record<string, unknown>),
-      400: error('validation_failed (the message names the first invalid field; header value problems add details.headers), header_not_allowed (details.headers lists every rejected name), replyToMessageId combined with headers In-Reply-To/References, or a hosted-domain sender whose sending is not ready.'),
-      403: error('forbidden: the API key lacks a scope (fix names it), or the sender identity is not allowed (fix points to GET /identities); shared mailboxes never send.'),
-      413: error(`payload_too_large: request body over ${MAX_SEND_REQUEST_BYTES / 1024 / 1024} MiB (rejected before parsing), base64 attachments over ${MAX_INLINE_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB combined, or all attachments over ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MiB. Upload large files and use attachmentTokens.`),
-      422: error('delivery_failed: every recipient was attempted and rejected, nothing was delivered. details.messageId is the recorded outbound message, details.recipientOutcomes the per-recipient errors. The same Idempotency-Key replays this 422; fix the recipients and send with a new key. recipient_suppressed: every recipient is on this site’s suppression list for the sender’s domain (an earlier bounce or spam complaint), so nothing was sent, no outbound message was recorded and no quota was used; details.suppressed lists address, reason, sendingDomain, since and expiresAt (null: until an administrator removes it), and the Idempotency-Key is released for reuse. When only some recipients are suppressed the others are sent (201) and each suppressed recipient has status failed with code recipient_suppressed; if every other recipient fails too, the response is 422 delivery_failed whose recipientOutcomes include the suppressed ones.'),
-      429: error('rate_limited: request rate, or the daily outbound mail/recipient quota (GET /v1/me shows usage).'),
-      500: error('internal: the server failed before every recipient was attempted. Retry the identical request with the same Idempotency-Key to fetch the result: it may be 201, or 422 delivery_failed whose recipientOutcomes show recipients that were never attempted.'),
-    },
+  return { ...operation('sendMessage', 'Send, reply, resend or forward mail', ref('MessageSummary'), { request: 'SendMailRequest', scope, status: 201, parameters: [idempotencyHeader],
+    example: sentMessageExample,
+    errors: ['HeaderNotAllowed', 'ForbiddenSender', 'SourceUnavailableReply', 'SourceUnavailableForward', 'IdempotencyMismatch', 'SendInProgress',
+      'SendPayloadTooLarge', 'DeliveryFailed', 'RecipientSuppressed', 'OutboundQuota'],
+    errorDescriptions: SEND_ERROR_DESCRIPTIONS,
+    description: `HTTP 201 means at least one recipient succeeded (status sent or delivered), or none succeeded but at least one result is uncertain (status unknown: provider timeout or network error, possibly delivered; also an interrupted send replayed after an hour). Only a definite provider rejection (destination not verified, sending domain not ready, invalid address, limit exceeded and the like) counts as failed; anything else is unknown. Partial failure is still 201, so always inspect errorDetail and recipientOutcomes, and retry only the failed recipients with a new key, keeping to/cc/bcc groups; confirm unknown recipients before resending; use forwardAttachmentsFrom=<this id> for the attachments. When every recipient definitely failed (or the server failed before delivery started) the response is 422 delivery_failed with error.details.messageId and error.details.recipientOutcomes, and replaying the same Idempotency-Key returns the same 422. Provider-accepted sent is not proof of recipient inbox delivery; on deployments with delivery receipts enabled, Cloudflare receipts later update recipientOutcomes (delivered, bounced, failed, complained) and status, so read the message again to confirm delivery. Choose from with GET /identities. Recipients accept display names, replyTo sets Reply-To, headers adds X-* and allowlisted headers, and attachments or attachmentTokens with contentId embed inline images. Draft attachmentTokens come from /uploads; base64 attachments are also supported. Large external attachments become signed links valid for 90 days independently of sent-mail deletion. ${scope ? 'To let the server fill in recipients, subject and quote, use POST /messages/{id}/reply or /forward instead. Here' : 'There is no separate reply or forward endpoint (POST /messages/{id} does not exist):'} set replyToMessageId (or headers In-Reply-To/References for mail from outside this site) or forwardAttachmentsFrom here; a missing or invisible source message, or a lost forwarded attachment, returns 404 source_unavailable with error.details.source (reply or forward), and removing that reference sends a new message. Idempotency conflicts return 409 idempotency_mismatch or send_in_progress, see the Idempotency-Key header.${keyScopes} Errors carry fix and docs hints.` }),
     ...(scope ? { 'x-conditional-scopes': [{ scope: 'mail.read', when: 'replyToMessageId or forwardAttachmentsFrom is present' }] } : {}) };
+}
+/** GET /messages/{id} 的条件读取：弱 ETag 与 Cache-Control，If-None-Match 命中时 304 无正文；bucket 写附件签名的时间桶 */
+export function conditionalDetail(base: Operation, bucket: string, extra = ''): Operation {
+  const responses = base.responses as Record<string, Schema>;
+  const headers = {
+    ETag: { description: 'Weak validator of this detail as seen by this caller and scope. Send it back in If-None-Match.', schema: { type: 'string', pattern: '^W/".+"$' } },
+    'Cache-Control': { description: 'The detail may be stored privately but must be revalidated; shared caches must not store it.', schema: { type: 'string', const: 'private, no-cache' } },
+  };
+  return { ...base,
+    description: `${base.description} Conditional reads: every 200 carries a weak ETag (W/"…") and Cache-Control: private, no-cache. Send the last ETag in If-None-Match and an unchanged message returns 304 Not Modified with no body. The ETag covers everything except the body text (status, read state, star, verification code, attachments, the caller and scope, and the site version); when the message has attachments it also changes with the attachment signing time bucket (${bucket}), so a reused detail never carries an expired URL.${extra}`,
+    parameters: [...((base.parameters as Schema[] | undefined) ?? []), { name: 'If-None-Match', in: 'header', required: false, schema: { type: 'string' },
+      description: 'ETag from an earlier 200 of this message (several may be comma-separated; * matches any). A match returns 304.' }],
+    responses: { ...responses, 200: { ...responses['200'], headers },
+      304: { description: 'Not Modified: the ETag in If-None-Match still matches. No body; keep using the cached detail.', headers } },
+  };
 }
 /** POST /v1/messages/{id}/reply 与 /forward：结果、幂等与错误同发信，另有 from_required */
 export function composeOperation(op: 'reply' | 'forward'): Operation {
-  const send = sendMailOperation('mail.send');
-  const base = operation(op === 'reply' ? 'Reply to a message' : 'Forward a message with its attachments', ref('MessageSummary'), {
-    request: op === 'reply' ? 'ReplyMessageRequest' : 'ForwardMessageRequest', status: 201, parameters: [idempotencyHeader],
-    description: `${op === 'reply'
+  const reply = op === 'reply';
+  const base = operation(reply ? 'replyToMessage' : 'forwardMessage', reply ? 'Reply to a message' : 'Forward a message with its attachments', ref('MessageSummary'), {
+    request: reply ? 'ReplyMessageRequest' : 'ForwardMessageRequest', status: 201, parameters: [idempotencyHeader], scope: 'mail.send',
+    example: reply ? sentMessageExample : forwardedMessageExample,
+    errors: ['FromRequired', 'HeaderNotAllowed', 'ForbiddenSender', scopeExampleName('mail.read'), reply ? 'SourceUnavailableReply' : 'SourceUnavailableForward',
+      'IdempotencyMismatch', 'SendInProgress', 'DeliveryFailed', 'RecipientSuppressed', 'OutboundQuota'],
+    errorDescriptions: { ...SEND_ERROR_DESCRIPTIONS,
+      400: 'validation_failed (unknown fields, empty body, invalid recipients, In-Reply-To/References in reply headers, or no recipient left to reply to), header_not_allowed, or from_required: the default sender (the address the source was received at) is not one you can send from, so give from.',
+      403: 'forbidden: the API key lacks mail.send or mail.read, or the explicit from is not allowed (fix points to GET /identities).',
+      404: `source_unavailable (details.source is ${op}): the source message does not exist or is not visible to you${reply ? '' : ', or one of its attachments is gone'}.`,
+    },
+    description: `${reply
       ? 'Replies to the visible message {id}: the server picks the recipients, adds Re: to the subject, sets In-Reply-To/References and by default quotes the original below your text.'
       : 'Forwards the visible message {id}: subject gets Fwd:, your note comes first, the original header and body follow (includeOriginal), and every original attachment is attached.'} The source must be visible to the key owner like GET /messages/{id} (claimed addresses, non-deleted inbound mail shared with you, and for administrators unclaimed addresses); otherwise 404 source_unavailable. from defaults to the address the source was received at; mail in a mailbox shared with you needs an explicit from (400 from_required otherwise). Results, partial failure, 422 delivery_failed and the Idempotency-Key behave exactly like POST /messages; a replay returns the original result even if the source was deleted since. Needs both mail.send and mail.read.` });
-  const error = (description: string) => ({ description, content: { 'application/json': { schema: ref('Error') } } });
-  return { ...base, 'x-required-scopes': ['mail.send', 'mail.read'],
-    responses: { ...(send.responses as Record<string, unknown>),
-      201: (base.responses as Record<string, unknown>)[201],
-      400: error('validation_failed (unknown fields, empty body, invalid recipients, In-Reply-To/References in reply headers, or no recipient left to reply to), header_not_allowed, or from_required: the default sender (the address the source was received at) is not one you can send from, so give from.'),
-      403: error('forbidden: the API key lacks mail.send or mail.read, or the explicit from is not allowed (fix points to GET /identities).'),
-      404: error('source_unavailable: the source message does not exist or is not visible to you, or (forward) one of its attachments is gone.'),
-    } };
+  return { ...base, 'x-required-scopes': ['mail.send', 'mail.read'] };
 }
-export function describePaths(paths: Paths, namespace = ''): Paths {
-  return Object.fromEntries(Object.entries(paths).map(([path, methods]) => [path, {
-    ...methods,
-    ...(Array.from(path.matchAll(/\{([^}]+)\}/g)).length ? { parameters: Array.from(path.matchAll(/\{([^}]+)\}/g), match => ({
-      name: match[1], in: 'path', required: true,
-      schema: match[1] === 'token' ? { type: 'string', minLength: 1 } : match[1] === 'recordId' ? dnsRecordId : positiveId,
-    })) } : {}),
-    ...Object.fromEntries(Object.entries(methods).map(([method, value]) => [method, {
-      ...value, operationId: `${namespace}${method}_${path.replace(/[^a-zA-Z0-9]+/g, '_')}`,
-    }])),
-  }])) as Paths;
+/** 路径参数前一段对应的资源：带 {id} 的接口自动带上该资源的 404 示例。新增带参数的路径时在这里登记首个参数的资源。 */
+const NOT_FOUND_BY_RESOURCE: Record<string, ErrorExampleName> = {
+  messages: 'NotFoundMessage', attachments: 'NotFoundAttachment', mailboxes: 'NotFoundMailbox', shares: 'NotFoundMailbox',
+  'mailbox-shares': 'NotFoundMailbox', grantees: 'NotFoundGrantee', 'hosted-domains': 'NotFoundHostedDomain', 'dns-records': 'NotFoundDnsRecord',
+  'api-keys': 'NotFoundApiKey', users: 'NotFoundUser', invites: 'NotFoundInvite', uploads: 'NotFoundUpload', multipart: 'NotFoundUpload',
+  avatar: 'NotFoundAvatar', jobs: 'NotFoundNotificationJob', suppressions: 'NotFoundSuppression', onboardings: 'NotFoundOnboarding',
+};
+function notFoundExamples(path: string): string[] {
+  const segments = path.split('/');
+  const resources = segments.flatMap((segment, index) => segment.startsWith('{') ? [segments[index - 1]!] : []);
+  if (!resources.length) return [];
+  const first = NOT_FOUND_BY_RESOURCE[resources[0]!];
+  if (!first) throw new Error(`OpenAPI: register a 404 example for /${resources[0]}/{…} in NOT_FOUND_BY_RESOURCE (${path})`);
+  const last = NOT_FOUND_BY_RESOURCE[resources.at(-1)!];
+  return [...new Set([first, ...(last ? [last] : [])])];
 }
+export interface PathDefaults {
+  /** 没有声明 security 的接口使用的认证方案（/api 为 sessionToken，/v1 为 apiKey）；公开接口在 operation 里写 public: true */
+  security: Schema[];
+  /** 需要认证的接口都可能返回的失败示例（401 与 429，两套认证的文案不同） */
+  errors: ErrorExampleName[];
+}
+/** 补路径参数，给每个接口写明 security，挂上认证失败与资源不存在的示例 */
+export function describePaths(paths: Paths, defaults: PathDefaults): Paths {
+  return Object.fromEntries(Object.entries(paths).map(([path, methods]) => {
+    const names = Array.from(path.matchAll(/\{([^}]+)\}/g), match => match[1]!);
+    const notFound = notFoundExamples(path);
+    return [path, {
+      ...Object.fromEntries(Object.entries(methods).map(([method, value]) => {
+        const security = (value.security as Schema[] | undefined) ?? defaults.security;
+        return [method, { ...value, security,
+          responses: addErrorExamples(value.responses as Record<string, Schema>, [...(security.length ? defaults.errors : []), ...notFound]) }];
+      })),
+      ...(names.length ? { parameters: names.map(name => ({ name, in: 'path', required: true,
+        schema: name === 'token' ? { type: 'string', minLength: 1 } : name === 'recordId' ? dnsRecordId : positiveId })) } : {}),
+    }];
+  })) as Paths;
+}
+const SPEC_VERSION = '1.6.0';
 export function specInfo(title: string, description: string) {
-  return { title, description, version: '1.6.0', license: { name: 'MIT', identifier: 'MIT' },
+  return { title, description, version: SPEC_VERSION, license: { name: 'MIT', identifier: 'MIT' },
     contact: { name: 'HPC Mail', url: 'https://github.com/riba2534/hpc-mail' } };
 }
 export function specificationOperation(): Operation {
   const document = object({ openapi: str, info: object({ title: str, version: str }), paths: { type: 'object' } });
-  const base = operation('Read this OpenAPI specification', document, { public: true });
+  const base = operation('getOpenApiSpec', 'Read this OpenAPI specification', document, { public: true, errors: ['Internal'] });
   return { ...base, responses: { ...(base.responses as Record<string, unknown>),
-    200: { description: 'Raw OpenAPI 3.1 document, without a data envelope', content: { 'application/json': { schema: document } } },
+    200: { description: 'Raw OpenAPI 3.1 document, without a data envelope', content: { 'application/json': { schema: document,
+      example: { openapi: '3.1.0', info: { title: 'HPC Mail Open API', version: SPEC_VERSION }, paths: {} } } } },
   } };
+}
+/** components.examples：只输出 paths 引用到的失败示例；fix/docs 缺省时按错误码套用中间件的默认建议，docs 按 origin 补成绝对 URL */
+export function usedExamples(paths: Paths, origin: string): Record<string, Schema> {
+  const names = new Set<string>();
+  JSON.stringify(paths, (key, value: unknown) => {
+    if (key === '$ref' && typeof value === 'string' && value.startsWith('#/components/examples/')) names.add(value.slice('#/components/examples/'.length));
+    return value;
+  });
+  return Object.fromEntries([...names].sort().map(name => {
+    const example = errorExample(name)!;
+    const hints = DEFAULT_ERROR_HINTS[example.code] ?? {};
+    const fix = example.fix ?? hints.fix;
+    const docs = example.docs ?? hints.docs;
+    return [name, { summary: `${example.code}: ${example.message}`, value: {
+      error: { code: example.code, message: example.message, ...(fix ? { fix } : {}), ...(docs ? { docs: new URL(docs, origin).toString() } : {}),
+        ...(example.details ? { details: example.details } : {}) },
+      requestId: EXAMPLE_REQUEST_ID,
+    } }];
+  }));
 }
 /** Emit only schemas actually reachable from these routes, so imported tool contracts stay focused. */
 export function usedSchemas(paths: Paths): Record<string, Schema> {
@@ -667,11 +871,11 @@ export const identitiesDescription = 'Which addresses the caller can send from. 
 /** 批量认领、批量可用性与随机后缀方案：会话与 API Key 两套接口同形，API Key 另需 scope */
 export function mailboxBatchPaths(scopes?: { read: string; write: string }): Paths {
   return {
-    '/mailboxes/batch': { post: operation('Claim several addresses in order', ref('BatchClaimMailboxResult'), { request: 'BatchMailboxRequest', scope: scopes?.write,
+    '/mailboxes/batch': { post: operation('claimMailboxes', 'Claim several addresses in order', ref('BatchClaimMailboxResult'), { request: 'BatchMailboxRequest', scope: scopes?.write,
       description: 'Same rules as POST /mailboxes, applied to each item in request order. Each item accepts optional strategy; claude rechecks current suspension facts inside the write transaction and stops with forbidden when a domain has any historical suspension. An already-claimed address is skipped into taken and the batch continues; any other error stops the batch, keeps the addresses already claimed and reports stoppedBy with the remaining items in notAttempted.' }) },
-    '/mailboxes/availability/batch': { post: operation('Check availability of several addresses', array(ref('MailboxAvailability')), { request: 'BatchMailboxRequest', scope: scopes?.read,
+    '/mailboxes/availability/batch': { post: operation('checkMailboxesAvailability', 'Check availability of several addresses', array(ref('MailboxAvailability')), { request: 'BatchMailboxRequest', scope: scopes?.read,
       description: 'Advisory only, same rules as GET /mailboxes/availability. Results follow request order.' }) },
-    '/mailboxes/random-plan': { get: operation('Allocate random suffixes for a batch claim', ref('ClaimPlan'), { scope: scopes?.read,
+    '/mailboxes/random-plan': { get: operation('getRandomClaimPlan', 'Allocate random suffixes for a batch claim', ref('ClaimPlan'), { scope: scopes?.read,
       parameters: [query('count', { type: 'integer', minimum: 1, maximum: MAX_BATCH_CLAIM }, 'Number of addresses to allocate.', true),
         query('strategy', { type: 'string', enum: ['uniform', 'claude'] }, 'uniform: equal chance among eligible domains; claude: only zero-suspension domains, balanced by Claude accounts plus pending claims.', true)],
       description: 'Read-only: allocates domains, does not claim or reserve. Candidates are the domains the caller may claim with domains.list[].random true, trimmed by per-domain and per-user remaining quota. The claude strategy excludes every domain with any historical Claude suspension from both items and pool, regardless of paid status or deprecated thresholds. It balances accounts plus recent pending claims and stops at claim_random.dailyLimit or claim quotas without spilling over to suspended domains. Generate prefixes, then pass strategy=claude on each item for availability and actual claims, including after manual suffix changes. Claims atomically recheck suspension facts; a plan does not reserve eligibility.' }) },
@@ -685,33 +889,33 @@ export function hostedDomainPaths(scopes?: { read: string; write: string }): Pat
   const audit = scopes ? ' The administration audit log records the actor as “username（API Key #id）”.' : '';
   return {
     '/hosted-domains': {
-      get: operation('List hosted domains the caller owns or was granted', array(ref('HostedDomain')), { scope: scopes?.read,
+      get: operation('listHostedDomains', 'List hosted domains the caller owns or was granted', array(ref('HostedDomain')), { scope: scopes?.read,
         description: scopes
           ? 'Users can host their own registered domains on this site. Each item has role owner or member. Administrator keys also see only their own here; the site-wide list is only in the JWT API GET /api/admin/hosted-domains.'
           : 'Users can host their own domains on this site. Each item has role owner or member; administrators also see only their own here and use /admin/hosted-domains for all.' }),
-      post: operation('Host a domain', ref('HostedDomain'), { request: 'CreateHostedDomainRequest', scope: scopes?.write, status: 201,
+      post: operation('createHostedDomain', 'Host a domain', ref('HostedDomain'), { errors: ['HostingDisabled', 'HostedDomainTaken', 'HostedCreateRateLimited'], request: 'CreateHostedDomainRequest', scope: scopes?.write, status: 201,
         description: `${scopes
           ? 'Returns 403 forbidden while hosted domains are disabled or the site has no Cloudflare credentials; the public GET /api/config reports hostedDomainsEnabled.'
           : 'Requires /config hostedDomainsEnabled.'} Enter a registered root domain (not a subdomain). The site creates a Cloudflare zone and returns status pending with the two nameServers to set at the registrar; existing DNS records at the old nameservers are not migrated automatically; recreate common records (website, verification and so on) with /hosted-domains/{id}/dns-records, preferably before changing the nameservers. Disable DNSSEC at the registrar first. After the nameservers take effect, receiving (Email Routing catch-all) and sending (Email Sending) are configured automatically; poll GET /hosted-domains/{id}. Mail to any unclaimed address on an active hosted domain is claimed for the owner on arrival. Ordinary users obey hosted_domains.maxPerUser and pending limits; domains already used on this site, system domains and zones already in the site account are rejected with 409. Before reserving, ordinary users’ requests check the domain’s public delegation (RDAP, else DNS): nameservers still pointing at ones this site assigned (typically left behind after another user deleted the domain) return 409 conflict, as does an undeterminable delegation for a domain another user hosted within the last 90 days; the previous owner and administrators are exempt. More than ${MAX_HOSTED_CREATES_PER_MINUTE} attempts per user per minute (including attempts Cloudflare rejected; administrators included) return 429 rate_limited. The site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} Cloudflare calls per minute, shared with checks, deletions and DNS records, is charged with the real calls: 2 when the domain is reserved (an exhausted budget returns 429 rate_limited, as does Cloudflare rate limiting) and 5 more for the background preconfiguration.${audit}` }),
     },
     '/hosted-domains/{id}': {
-      get: operation('Read a hosted domain and its setup progress', ref('HostedDomain'), { scope: scopes?.read,
+      get: operation('getHostedDomain', 'Read a hosted domain and its setup progress', ref('HostedDomain'), { scope: scopes?.read,
         description: `Owner, member or administrator; otherwise 404.${scopes ? ' Poll it at low frequency while setting up; the scheduled task advances setup about every 5 minutes. Deleting the domain, memberLimit, members and transfer are JWT-only.' : ''}` }),
     },
-    '/hosted-domains/{id}/check': { post: operation('Check the nameservers and continue setup now', ref('HostedDomain'), { scope: scopes?.write,
+    '/hosted-domains/{id}/check': { post: operation('checkHostedDomain', 'Check the nameservers and continue setup now', ref('HostedDomain'), { errors: ['HostedOwnerOnly', 'CloudflareBusy'], scope: scopes?.write,
       description: `Owner or administrator. Asks Cloudflare to re-check nameservers while pending, then advances setup. Calls within 15 seconds of the last check return the current state. More than ${MAX_HOSTED_CHECKS_PER_MINUTE} requests per user per minute (including throttled or forbidden ones) return 429 rate_limited. A check that reaches Cloudflare costs 4 calls of the shared site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} calls per minute; an exhausted budget also returns 429 rate_limited. Nothing is charged while hosted domains are disabled or the Worker has no Cloudflare credentials.` }) },
-    '/hosted-domains/{id}/reconnect': { post: operation('Reconnect a domain whose nameservers moved away', ref('HostedDomain'), { scope: scopes?.write,
+    '/hosted-domains/{id}/reconnect': { post: operation('reconnectHostedDomain', 'Reconnect a domain whose nameservers moved away', ref('HostedDomain'), { errors: ['HostedOwnerOnly', 'HostedNotMoved', 'CloudflareBusy'], scope: scopes?.write,
       description: `Owner or administrator (members get 403); requires hosted domains enabled and the Worker's Cloudflare credentials (403 otherwise). Only status moved is accepted; any other status returns 409 conflict. If the Cloudflare zone still exists, Cloudflare is asked to re-check the nameservers and the domain is checked once; the response shows the latest status (still moved until the nameservers point back). If Cloudflare already deleted the zone (it usually does about 7 days after the nameservers move away), a new zone is created and the domain returns to pending with new nameServers to set at the registrar; activatedAt, addresses, mail history and members are kept, and the pending deadline does not apply. A same-name zone in the site account that this site did not create for the reconnect is never taken over (409 conflict). An uncertain Cloudflare result returns 500 internal; try again later and the zone created meanwhile is adopted. While the domain is being checked by another request the current state is returned without calling Cloudflare. Shares the per-user limit of ${MAX_HOSTED_CREATES_PER_MINUTE} attempts per minute with domain additions and costs ${RECONNECT_CF_CALLS} calls of the site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} calls per minute (5 more for background preconfiguration after a new zone); either limit returns 429 rate_limited.${audit}` }) },
     '/hosted-domains/{id}/dns-records': {
-      get: operation('List DNS records of a hosted domain', array(ref('HostedDnsRecord')), { scope: scopes?.read,
+      get: operation('listDnsRecords', 'List DNS records of a hosted domain', array(ref('HostedDnsRecord')), { errors: ['HostedOwnerOnly', 'CloudflareBusy'], scope: scopes?.read,
         description: `Owner or administrator; members get 403, other users 404. Reads the domain’s Cloudflare zone directly and needs only the Worker’s Cloudflare credentials, not hosted_domains.enabled (403 without them). Works while pending, so records can be added before changing the nameservers, and while suspended. Deleting domains return 409, as do domains still being created. Sorted by name (@ first), type and content, including kind=mail records used for receiving and sending and kind=readonly records this site cannot edit. All four DNS endpoints share a limit of ${MAX_HOSTED_DNS_REQUESTS_PER_MINUTE} requests per user per minute, administrators included. Because every hosted domain uses the site’s Cloudflare token, user actions share a site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} Cloudflare calls per minute with hosted-domain additions (2 when reserved plus 5 for background preconfiguration), immediate checks (4) and deletions (2, counted but never refused): listing records costs 1, adding, updating and deleting records cost 2 each, and only requests that can reach Cloudflare count (not those over the per-user limit, or rejected for permission or domain status). Either limit returns 429 rate_limited.` }),
-      post: operation('Add a DNS record to a hosted domain', ref('HostedDnsRecord'), { request: 'HostedDnsRecordInput', scope: scopes?.write, status: 201,
+      post: operation('createDnsRecord', 'Add a DNS record to a hosted domain', ref('HostedDnsRecord'), { errors: ['DnsRecordMailConflict', 'DnsRecordLimit', 'CloudflareBusy'], request: 'HostedDnsRecordInput', scope: scopes?.write, status: 201,
         description: `Owner or administrator; on suspended domains only administrators may write (403). DNS only: A, AAAA and CNAME are created with proxied=false. Records that would conflict with mail are rejected with 400 before Cloudflare is called: root MX, root SPF TXT, any record at _dmarc, _domainkey, *._domainkey, cf-bounce or *.cf-bounce, and a CNAME at the root. At most ${MAX_HOSTED_DNS_RECORDS} non-mail records per domain (403). Cloudflare rejecting the value returns 400; an existing record that cannot coexist with the same name returns 409.${audit}` }),
     },
     '/hosted-domains/{id}/dns-records/{recordId}': {
-      put: operation('Update a DNS record of a hosted domain', ref('HostedDnsRecord'), { request: 'HostedDnsRecordInput', scope: scopes?.write,
+      put: operation('updateDnsRecord', 'Update a DNS record of a hosted domain', ref('HostedDnsRecord'), { errors: ['DnsRecordLocked', 'DnsRecordMailConflict'], request: 'HostedDnsRecordInput', scope: scopes?.write,
         description: `Owner or administrator, same domain status rules as adding. Only kind=user records can be changed; mail and readonly records return 403 with their lockedReason. type must equal the existing record type (400; delete and re-add instead). The new name and value follow the same mail-conflict rules as adding. An unknown or malformed recordId returns 404.${audit}` }),
-      delete: operation('Delete a DNS record of a hosted domain', success, { scope: scopes?.write,
+      delete: operation('deleteDnsRecord', 'Delete a DNS record of a hosted domain', success, { errors: ['DnsRecordLocked'], scope: scopes?.write,
         description: `Owner or administrator, same domain status rules as adding. Only kind=user records can be deleted; mail and readonly records return 403. An unknown or malformed recordId returns 404.${audit}` }),
     },
   };
@@ -720,9 +924,9 @@ export function hostedDomainPaths(scopes?: { read: string; write: string }): Pat
 export function hostedDomainBatchPaths(scope?: string): Paths {
   const budget = `Items are processed one by one in request order with exactly the rules of the single endpoint, and each gets its own result; the HTTP status is 200 even when items fail. Before processing, the current minute’s per-user count and the site-wide Cloudflare budget (${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} calls per minute) are read: items beyond what they allow are not attempted, not counted and never reach Cloudflare, and fail with rate_limited and a message starting with 未处理; retry only those items after about a minute.`;
   return {
-    '/hosted-domains/batch': { post: operation('Host several domains in order', ref('HostedDomainBatchCreateResult'), { request: 'BatchCreateHostedDomainsRequest', scope,
+    '/hosted-domains/batch': { post: operation('createHostedDomains', 'Host several domains in order', ref('HostedDomainBatchCreateResult'), { request: 'BatchCreateHostedDomainsRequest', scope,
       description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domains, same rules as POST /hosted-domains for each. ${budget} Each attempted item counts toward the ${MAX_HOSTED_CREATES_PER_MINUTE} additions per user per minute and costs 2 site-wide calls when reserved (plus 5 for background preconfiguration). A rate_limited, forbidden (per-user hosted or pending limit) or user_disabled failure stops the batch: the remaining items fail with the same code without being attempted. Other failures, such as 409 for a domain already used, affect only that item. Ordinary users may keep only hosted_domains.maxPendingPerUser domains pending at once. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
-    '/hosted-domains/batch-check': { post: operation('Check several hosted domains now', ref('HostedDomainBatchCheckResult'), { request: 'BatchCheckHostedDomainsRequest', scope,
+    '/hosted-domains/batch-check': { post: operation('checkHostedDomains', 'Check several hosted domains now', ref('HostedDomainBatchCheckResult'), { request: 'BatchCheckHostedDomainsRequest', scope,
       description: `1–${MAX_HOSTED_DOMAIN_BATCH} distinct domain ids, same rules as POST /hosted-domains/{id}/check for each (owner or administrator; members get forbidden and other users not_found for that item only). ${budget} Each attempted item counts toward the ${MAX_HOSTED_CHECKS_PER_MINUTE} checks per user per minute; a check that reaches Cloudflare costs 4 site-wide calls. rate_limited or user_disabled stops the batch. Hosted domains disabled or no Cloudflare credentials returns 403 for the whole request.` }) },
   };
 }
@@ -731,17 +935,17 @@ export function uploadPaths(scope?: string): Paths {
   const lengthHeader = (maximum: number): Schema => ({ name: 'Content-Length', in: 'header', required: true,
     schema: { type: 'integer', minimum: 1, maximum }, description: 'Actual byte count of the raw binary request body.' });
   return {
-    '/uploads': { post: { ...operation('Upload a small draft attachment', ref('SingleUploadResult'), { status: 201, scope,
+    '/uploads': { post: { ...operation('uploadAttachment', 'Upload a small draft attachment', ref('SingleUploadResult'), { status: 201, scope, errors: ['UploadSizeMismatch', 'DraftQuota'],
       description: 'Raw binary upload up to 10 MiB. Pass returned token in SendMailRequest.attachmentTokens. Drafts expire after 24 hours; the combined attachment limit also applies at send time.',
       parameters: [query('filename', { type: 'string', minLength: 1, maxLength: 255 }, 'No path separators or ..', true),
         query('mimeType', { type: 'string', maxLength: 128, default: 'application/octet-stream' }), lengthHeader(SINGLE_UPLOAD_THRESHOLD_BYTES)] }), requestBody: binaryBody } },
-    '/uploads/multipart': { post: operation('Initialize a large draft attachment', ref('MultipartInitResult'), { request: 'InitMultipartUploadRequest', status: 201, scope,
+    '/uploads/multipart': { post: operation('createMultipartUpload', 'Initialize a large draft attachment', ref('MultipartInitResult'), { request: 'InitMultipartUploadRequest', status: 201, scope, errors: ['DraftQuota'],
       description: 'Use returned token for parts/complete, and returned partBytes to split the file. Upload parts sequentially; the last part uses the remaining byte count. Maximum single file 50 MiB.' }) },
-    '/uploads/multipart/{token}/parts/{partNumber}': { put: { ...operation('Upload a numbered binary part', ref('MultipartPartResult'), { scope,
+    '/uploads/multipart/{token}/parts/{partNumber}': { put: { ...operation('uploadMultipartPart', 'Upload a numbered binary part', ref('MultipartPartResult'), { scope, errors: ['PartSizeMismatch'],
       description: 'partNumber starts at 1 and cannot exceed partCount. Content-Length must equal partBytes, except the final remainder. Save each returned etag for completion.', parameters: [lengthHeader(MULTIPART_PART_BYTES)] }), requestBody: binaryBody } },
-    '/uploads/multipart/{token}/complete': { post: operation('Complete the multipart draft', ref('MultipartCompleteResult'), { request: 'CompleteMultipartUploadRequest', scope,
+    '/uploads/multipart/{token}/complete': { post: operation('completeMultipartUpload', 'Complete the multipart draft', ref('MultipartCompleteResult'), { request: 'CompleteMultipartUploadRequest', scope,
       description: 'Submit every partNumber/etag in parts. The server checks the actual final object size. Only completed tokens may be attached to a message.' }) },
-    '/uploads/{token}': { delete: operation('Cancel or delete a draft attachment', success, { scope,
+    '/uploads/{token}': { delete: operation('deleteUpload', 'Cancel or delete a draft attachment', success, { scope,
       description: 'Own draft only. Aborts unfinished multipart uploads or deletes the completed draft object. R2 failure keeps the durable reference for cleanup.' }) },
   };
 }

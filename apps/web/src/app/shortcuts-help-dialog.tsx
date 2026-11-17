@@ -35,6 +35,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: one('x'), label: '选中 / 取消选中' },
       { keys: one('s'), label: '星标' },
       { keys: one('e', '#'), label: '删除' },
+      { keys: one('z'), label: '撤销最近一次删除' },
       { keys: one('Shift+I'), label: '标为已读' },
       { keys: one('Shift+U'), label: '标为未读' },
     ],

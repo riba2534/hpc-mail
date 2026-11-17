@@ -47,7 +47,7 @@ function EditMailboxDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onCl
       void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.root });
       onClose();
     },
-    onError: () => toast({ title: '更新失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '备注更新失败' },
   });
 
   const handleSubmit = (event: FormEvent) => {
@@ -116,7 +116,7 @@ function ReleaseDialog({
       onReleased();
       onClose();
     },
-    onError: () => toast({ title: '释放失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '释放失败' },
   });
 
   return (

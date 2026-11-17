@@ -14,6 +14,8 @@ export interface ApiErrorDetails {
   /** delivery_failed：已记录的发件行 id（可在已发送里查看）与逐收件人结果 */
   messageId?: number;
   recipientOutcomes?: RecipientOutcome[];
+  /** source_unavailable：不可用的是哪一个引用（reply = replyToMessageId，forward = forwardAttachmentsFrom 或其附件） */
+  source?: 'reply' | 'forward';
   /** recipient_suppressed：命中抑制名单的收件人（全部收件人都在名单里，没有创建发件记录） */
   suppressed?: SuppressedRecipient[];
   /** 系统域名接入 409：最新预检（需确认项、阻断项与指纹），确认后带 fingerprint 与 accept 重试 */

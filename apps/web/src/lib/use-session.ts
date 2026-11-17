@@ -4,6 +4,7 @@ import type { SessionUser } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { authApi } from '@/api/resources';
 import { getAuthRevision, getAuthToken } from './auth-token';
+import { readTokenClaims } from './token-claims';
 import { subscribeAuthCache } from './auth-cache';
 
 /** 订阅 localStorage token 变化（登录/登出/跨标签页同步） */
@@ -26,7 +27,13 @@ export function sessionQueryOptions(revision: number) {
 /** ['session'] 查询：有 token 时拉取当前用户 */
 export function useSessionQuery() {
   const token = useAuthToken();
-  return useQuery({ ...sessionQueryOptions(getAuthRevision()), enabled: Boolean(token) });
+  const sub = readTokenClaims(token)?.sub;
+  return useQuery({
+    ...sessionQueryOptions(getAuthRevision()),
+    enabled: Boolean(token),
+    // 同一账户换发 token（如在其他标签页改密）：后台校验期间沿用上一代的用户，外壳不闪全屏加载
+    placeholderData: (previous) => (previous?.id === sub ? previous : undefined),
+  });
 }
 
 /** 已认证外壳内向下传递已解析的当前用户，避免重复请求 */

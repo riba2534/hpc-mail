@@ -16,6 +16,8 @@ export interface ToastInput {
   variant?: ToastVariant;
   /** 单个操作按钮（如「撤销」）；点击后执行并关闭通知 */
   action?: ToastAction;
+  /** 失败请求的 ID：小字附在说明下方，点一下即可整段选中复制，便于反馈排障 */
+  requestId?: string;
 }
 
 interface ToastItem extends ToastInput {
@@ -79,6 +81,11 @@ function ToastCard({ item, onDismiss }: { item: ToastItem; onDismiss: (id: numbe
       <div className="min-w-0">
         <p className="text-sm font-semibold text-ink">{item.title}</p>
         {item.description && <p className="mt-0.5 text-sm text-ink-secondary">{item.description}</p>}
+        {item.requestId && (
+          <p className="mt-1 break-all text-xs text-ink-tertiary">
+            请求 ID：<span className="select-all font-mono">{item.requestId}</span>
+          </p>
+        )}
       </div>
       <div className="flex items-center gap-1">
         {item.action && (

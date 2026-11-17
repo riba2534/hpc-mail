@@ -1,5 +1,6 @@
 import { DRAFT_ATTACHMENT_TTL_HOURS } from '@hpc-mail/shared';
 import type { ComposeInitial } from './compose-init';
+import { DRAFT_KEY_PREFIX } from './draft-retention';
 
 export interface SavedAttachment {
   key: string;
@@ -29,8 +30,8 @@ export interface ComposeDraft extends ComposeInitial {
 export type DraftScene = 'new' | `reply:${number}` | `forward:${number}` | `resend:${number}`;
 
 /** 旧版单 key（同一用户所有场景共用一份）；读取一次迁移到 new 后删除 */
-export const legacyDraftKeyForUser = (userId: number) => `hpc-compose-draft:${userId}`;
-export const draftKeyForUser = (userId: number, scene: DraftScene = 'new') => `hpc-compose-draft:${userId}:${scene}`;
+export const legacyDraftKeyForUser = (userId: number) => `${DRAFT_KEY_PREFIX}${userId}`;
+export const draftKeyForUser = (userId: number, scene: DraftScene = 'new') => `${DRAFT_KEY_PREFIX}${userId}:${scene}`;
 export const identityKeyForUser = (userId: number) => `hpc-default-identity:${userId}`;
 export const lastIdentityKeyForUser = (userId: number) => `hpc-last-identity:${userId}`;
 

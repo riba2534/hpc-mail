@@ -104,6 +104,12 @@ export interface ApiRequestLogEntry {
   path: string;
   statusCode: number;
   ip: string;
+  /** 聚合行为同分钟内各请求耗时之和；平均耗时 = durationMs / count */
   durationMs: number;
+  /**
+   * 本行代表的请求数。成功的 GET（2xx 与 304）按 Key、路由、状态码、分钟聚合成一行，
+   * requestId/ip/createdAt 取该分钟第一次请求；写操作与失败请求逐条记录，恒为 1。
+   */
+  count: number;
   createdAt: string;
 }
