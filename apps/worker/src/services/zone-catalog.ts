@@ -57,6 +57,11 @@ export function requireCredentials(env: Env): CloudflareCredentials {
 export const SYSTEM_DOMAIN_CF_SCOPE = 'system_domain_cf';
 export const SYSTEM_DOMAIN_CF_WINDOW_MINUTES = 5;
 export const MAX_SYSTEM_DOMAIN_CF_CALLS = 120;
+/**
+ * 可接入列表的就绪摘要只用本窗口的前 100 次：列表页开着时的轮询每分钟都会让摘要缓存过期，
+ * 至少留出一次配置（预检 + 写入）的额度给接入任务与管理员的显式操作；超出的摘要显示为 unchecked
+ */
+export const READINESS_CF_CALLS_CEILING = 100;
 /** 全局退避（settings 行 cf_backoff，{"until": 毫秒}，不进 SETTING_SCHEMAS）：收到 429 后至少停 5 分钟 */
 const MIN_BACKOFF_SECONDS = 300;
 const BACKOFF_UNTIL_SQL = "COALESCE((SELECT json_extract(value, '$.until') FROM settings WHERE key = 'cf_backoff'), 0)";
@@ -64,20 +69,21 @@ const BACKOFF_UNTIL_SQL = "COALESCE((SELECT json_extract(value, '$.until') FROM 
 export const cfWindow = (now = Date.now()): number => minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES, now);
 
 /** 守卫：本窗口已用 + calls 不超过上限，且不在 429 退避期内（匿名 ? 绑定，可直接作为 counterStatement 的 guard） */
-export function cfBudgetGuard(calls: number, now = Date.now()): CounterGuard {
+export function cfBudgetGuard(calls: number, now = Date.now(), ceiling = MAX_SYSTEM_DOMAIN_CF_CALLS): CounterGuard {
   return {
     sql: `COALESCE((SELECT count FROM rate_counters WHERE scope = ? AND subject = 'all' AND "window" = ?), 0) + ? <= ?
       AND ${BACKOFF_UNTIL_SQL} <= ?`,
-    params: [SYSTEM_DOMAIN_CF_SCOPE, cfWindow(now), calls, MAX_SYSTEM_DOMAIN_CF_CALLS, now],
+    params: [SYSTEM_DOMAIN_CF_SCOPE, cfWindow(now), calls, ceiling, now],
   };
 }
 
 export const cfBusyError = (): AppError => new AppError('rate_limited', 'Cloudflare 接口繁忙，请稍后再试');
 
 /** 预占 calls 次调用额度（与退避检查同一条语句）；不够或在退避期内返回 false */
-export async function reserveCfCalls(env: Env, calls: number): Promise<boolean> {
+export async function reserveCfCalls(env: Env, calls: number, ceiling = MAX_SYSTEM_DOMAIN_CF_CALLS): Promise<boolean> {
   if (calls <= 0) return true;
-  const result = await counterStatement(env, SYSTEM_DOMAIN_CF_SCOPE, 'all', cfWindow(), calls, 0, cfBudgetGuard(calls)).all();
+  const now = Date.now();
+  const result = await counterStatement(env, SYSTEM_DOMAIN_CF_SCOPE, 'all', cfWindow(now), calls, 0, cfBudgetGuard(calls, now, ceiling)).all();
   return counterResult(result) !== null;
 }
 
@@ -433,7 +439,7 @@ function readinessOf(precheck: SystemDomainPrecheck): SystemDomainZoneReadiness 
   };
 }
 
-/** 为未缓存的 available zone 逐批预检（含 RDAP），每个先预占额度；额度不足时其余保持 unchecked，不报错 */
+/** 为未缓存的 available zone 逐批预检（含 RDAP），每个先预占额度（不超过摘要的额度上限）；额度不足时其余保持 unchecked，不报错 */
 async function fillReadiness(env: Env, creds: CloudflareCredentials, zones: CfZone[], facts: OccupancyFacts): Promise<void> {
   const now = Date.now();
   const due = zones.filter((zone) => (readinessCache.get(zone.id)?.at ?? 0) <= now - READINESS_CACHE_MS).slice(0, READINESS_PER_REQUEST);
@@ -441,7 +447,7 @@ async function fillReadiness(env: Env, creds: CloudflareCredentials, zones: CfZo
   for (let i = 0; i < due.length && !exhausted; i += READINESS_CONCURRENCY) {
     await Promise.all(due.slice(i, i + READINESS_CONCURRENCY).map(async (zone) => {
       // 未激活的 zone 只读 zone 本身（列表里已有），不调用 Cloudflare
-      if (exhausted || !(await reserveCfCalls(env, zone.status === 'active' ? INSPECT_CF_CALLS : 0))) {
+      if (exhausted || !(await reserveCfCalls(env, zone.status === 'active' ? INSPECT_CF_CALLS : 0, READINESS_CF_CALLS_CEILING))) {
         exhausted = true;
         return;
       }

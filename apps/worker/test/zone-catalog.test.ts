@@ -18,6 +18,7 @@ afterEach(() => {
 
 const zones = async (token: string, query = '') => data<SystemDomainZonesView>(await call('GET', `${BASE}/zones${query}`, token));
 const byName = (list: SystemDomainZone[], name: string) => list.find((zone) => zone.name === name)!;
+const checked = (view: SystemDomainZonesView) => view.zones.filter((zone) => zone.readiness?.verdict !== 'unchecked').length;
 const listCalls = (fake: FakeCloudflare) => fake.requests.filter((r) => r.method === 'GET' && r.path === '/zones' && !r.query.get('name'));
 
 describe('zone 分类', () => {
@@ -86,30 +87,48 @@ describe('zone 分类', () => {
     expect(onlyHidden.others).toHaveLength(4);
   });
 
-  it('列表分页拉全并缓存 60 秒（refresh=1 跳过）；就绪摘要每次最多预检 10 个、按 zone 缓存，额度不足时其余为 unchecked 而不报错', async () => {
+  it('列表缓存 60 秒（refresh=1 跳过）；就绪摘要每次最多预检 10 个、按 zone 缓存', async () => {
+    const f = await resetSystemDomains();
+    // 未激活的 zone 预检不调用 Cloudflare，只受每次 10 个的上限约束
+    cf = fakeCloudflare({ zones: Array.from({ length: 30 }, (_, i) => ({ name: f.domain(`z${String(i).padStart(2, '0')}`), status: 'pending' as const })) });
+    const admin = await actor('zc-admin');
+    const first = await zones(admin.jwt);
+    expect(first.counts.available).toBe(30);
+    expect(listCalls(cf)).toHaveLength(1);
+    expect(checked(first)).toBe(10);
+    expect(first.zones.slice(0, 10).every((zone) => zone.readiness?.verdict === 'pending')).toBe(true);
+    expect(first.zones[10]!.readiness).toEqual({ verdict: 'unchecked', confirmCount: 0, reasons: [], registrar: null, checkedAt: null });
+    const second = await zones(admin.jwt);
+    expect(listCalls(cf)).toHaveLength(1);
+    expect(checked(second)).toBe(20);
+    await zones(admin.jwt, '?refresh=1');
+    expect(listCalls(cf)).toHaveLength(2);
+  });
+
+  it('就绪摘要只用额度的前 100 次，其余为 unchecked 而不报错；留给显式操作的额度仍可用', async () => {
     // 额度按 5 分钟窗口计：离窗口边界太近时等到下一个窗口，用例内的额度不被清零
     const windowMs = SYSTEM_DOMAIN_CF_WINDOW_MINUTES * 60_000;
     const toEdge = windowMs - (Date.now() % windowMs);
     if (toEdge < 3000) await new Promise((resolve) => setTimeout(resolve, toEdge + 50));
     const f = await resetSystemDomains();
-    cf = fakeCloudflare({ zones: Array.from({ length: 120 }, (_, i) => ({ name: f.domain(`z${String(i).padStart(3, '0')}`) })) });
+    cf = fakeCloudflare({ zones: Array.from({ length: 12 }, (_, i) => ({ name: f.domain(`a${String(i).padStart(2, '0')}`) })) });
     const admin = await actor('zc-admin');
-    const first = await zones(admin.jwt);
-    expect(first.counts.available).toBe(120);
-    expect(first.complete).toBe(true);
-    expect(listCalls(cf)).toHaveLength(3);
-    const checked = (view: SystemDomainZonesView) => view.zones.filter((zone) => zone.readiness?.verdict !== 'unchecked').length;
-    expect(checked(first)).toBe(10);
-    expect(first.zones.slice(0, 10).every((zone) => zone.readiness?.verdict === 'ready')).toBe(true);
+    // 列表 1 页 + 每个 zone 预占 10 次：第 10 个会超过 100
+    const view = await zones(admin.jwt);
+    expect(checked(view)).toBe(9);
+    expect(view.zones.slice(0, 9).every((zone) => zone.readiness?.verdict === 'ready')).toBe(true);
+    const precheck = await call('GET', `${BASE}/precheck?mode=existing_zone&zoneId=${cf.zoneByName(f.domain('a11'))!.id}`, admin.jwt);
+    expect(precheck.status).toBe(200);
+  });
 
-    // 第二次：列表走缓存；前 10 个的摘要走缓存，再预检后面的，直到额度用完（已用 3 页 + 10×10，只够再预检 1 个）
-    const second = await zones(admin.jwt);
+  it('120 个 zone 分 3 页拉全', async () => {
+    const f = await resetSystemDomains();
+    cf = fakeCloudflare({ zones: Array.from({ length: 120 }, (_, i) => ({ name: f.domain(`p${String(i).padStart(3, '0')}`), status: 'pending' as const })) });
+    const admin = await actor('zc-admin');
+    const view = await zones(admin.jwt);
+    expect(view.counts.available).toBe(120);
+    expect(view.complete).toBe(true);
     expect(listCalls(cf)).toHaveLength(3);
-    expect(checked(second)).toBe(11);
-    // refresh=1 重新拉列表；剩余额度不够预检时摘要保持 unchecked，接口照常返回
-    const refreshed = await zones(admin.jwt, '?refresh=1');
-    expect(listCalls(cf)).toHaveLength(6);
-    expect(checked(refreshed)).toBe(11);
   });
 
   it('读取 Cloudflare 列表失败：500；429 时同样 429 并设置全局退避', async () => {
