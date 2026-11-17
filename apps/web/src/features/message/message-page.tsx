@@ -59,6 +59,7 @@ import { OtpBanner } from './otp-banner';
 import { SenderAuthBanner, senderAuthFailed } from './sender-auth-banner';
 import { TranslationBar } from './translation/translation-bar';
 import { useMessageTranslation } from './translation/use-message-translation';
+import { isFailedOutcome } from './delivery-outcomes';
 import { inspectVerificationLink } from './verification-link';
 import { useDocumentTitle } from '@/lib/use-document-title';
 import { useCurrentUser } from '@/lib/use-session';
@@ -362,7 +363,7 @@ export function MessagePage() {
   const deliveryUnknown = outbound && message.status === 'unknown';
   const sendIssue = outbound && !deliveryPending && (deliveryUnknown || message.errorDetail || message.status === 'failed');
   // 投递回执的退信与发送时被拒一样列为失败；投诉表示已送达但被标记为垃圾邮件
-  const failedRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'failed' || outcome.status === 'bounced') ?? [];
+  const failedRecipients = message.recipientOutcomes?.filter(isFailedOutcome) ?? [];
   const unknownRecipients = message.recipientOutcomes?.filter((outcome) => outcome.status === 'unknown') ?? [];
   const complainedRecipients = outbound ? message.recipientOutcomes?.filter((outcome) => outcome.status === 'complained') ?? [] : [];
   // 正文里已经就地显示的内联图不再在附件区重复列出

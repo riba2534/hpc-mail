@@ -1,4 +1,5 @@
 import type { MessageDetail } from '@hpc-mail/shared';
+import { isFailedOutcome } from '@/features/message/delivery-outcomes';
 import { formatDateTime } from '@/lib/format';
 
 /** 通过 router location.state 传给写邮件页的预填数据 */
@@ -123,7 +124,7 @@ export function buildForward(message: MessageDetail): ComposeInitial {
 export function buildResend(message: MessageDetail, failedOnly = false): ComposeInitial {
   const outcomes = message.recipientOutcomes ?? [];
   // 投递回执的退信与发送时被拒一样算失败（对方已恢复时可直接重试；仍在抑制名单里会得到明确错误）
-  const failures = new Set(outcomes.filter((outcome) => outcome.status === 'failed' || outcome.status === 'bounced')
+  const failures = new Set(outcomes.filter(isFailedOutcome)
     .map((outcome) => outcome.address.toLowerCase()));
   const unconfirmed = failedOnly ? outcomes.filter((outcome) => outcome.status === 'unknown').map((outcome) => outcome.address) : [];
   const recipients = (addresses: string[]) => failedOnly ? addresses.filter((address) => failures.has(address.toLowerCase())) : addresses;
