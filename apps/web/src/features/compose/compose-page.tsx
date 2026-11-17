@@ -21,7 +21,7 @@ import {
   type UploadedPart,
   internalSendMailSchema,
 } from '@hpc-mail/shared';
-import { ApiError, isUncertainSendError } from '@/api/errors';
+import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi, uploadsApi } from '@/api/resources';
 import { Progress } from '@/components/ui/progress';
@@ -61,7 +61,7 @@ import {
 import { exceedsExternalLimit, hasExternalRecipient } from './compose-attachments';
 import { IdentityPicker } from './identity-picker';
 import { RecipientInput } from './recipient-input';
-import { clearSendAttempt, hashSendPayload, persistSendAttempt, readSendAttempt } from './send-attempt';
+import { classifySendError, clearSendAttempt, hashSendPayload, persistSendAttempt, readSendAttempt } from './send-attempt';
 
 interface AttachmentUpload {
   key: string;
@@ -258,7 +258,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
     for (const attachment of attachmentRefs.current) attachment.abort?.abort();
   }, []);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
-  const [sendError, setSendError] = useState<{ message: string; uncertain: boolean } | null>(null);
+  const [sendError, setSendError] = useState<{ message: string; kind: 'uncertain' | 'in_progress' | 'error' } | null>(null);
   const [dragging, setDragging] = useState(false);
   const replyToMessageId = initial.replyToMessageId;
 
@@ -430,17 +430,20 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       navigate(result.errorDetail || result.status === 'failed' || result.recipientOutcomes?.some((outcome) => outcome.status === 'failed') ? `/mail/${result.id}` : '/sent');
     },
     onError: (err) => {
-      // 网络/超时可能发生在服务端已经发送之后，保留同一个 key 可安全查询/重放结果；
-      // 明确的业务错误则允许用户修正后使用新 key。
-      const unresolved = isUncertainSendError(err);
-      if (!unresolved) {
+      // 网络/超时可能发生在服务端已经发送之后、服务端也可能仍在处理：保留同一个 key，再次发送只会查询/重放原结果。
+      // 明确的业务错误，或 key 已绑定其他内容（当前内容一定没用它发出）：换新 key，由用户修正或确认后再发。
+      const failure = classifySendError(err);
+      if (failure === 'rejected' || failure === 'key_mismatch') {
         clearSendAttempt(user.id, sendIdempotencyKeyRef.current);
         setRecoveredSendPending(false);
         sendIdempotencyKeyRef.current = null;
         sendPayloadHashRef.current = null;
       }
       const sessionChanged = err instanceof ApiError && err.code === 'session_changed';
-      setSendError({ message: err instanceof ApiError ? err.message : '发送失败，请重试', uncertain: unresolved && !sessionChanged });
+      const message = failure === 'key_mismatch'
+        ? '发送凭据已用于其他内容，已为这封邮件更换新凭据。请先到已发送确认没有重复，再点击发送。'
+        : err instanceof ApiError ? err.message : '发送失败，请重试';
+      setSendError({ message, kind: failure === 'in_progress' ? 'in_progress' : failure === 'uncertain' && !sessionChanged ? 'uncertain' : 'error' });
     },
   });
 
@@ -626,7 +629,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         setFieldErrors(issueErrors);
         focusField(issueErrors);
       } else {
-        setSendError({ message: parsed.error.issues[0]?.message ?? '请检查输入', uncertain: false });
+        setSendError({ message: parsed.error.issues[0]?.message ?? '请检查输入', kind: 'error' });
       }
       return;
     }
@@ -893,7 +896,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         </div>
 
         {sendError && (
-          sendError.uncertain ? (
+          sendError.kind === 'uncertain' ? (
             <div role="alert" className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
               <p className="font-medium text-caution">发送结果不确定：{sendError.message}</p>
               <p className="mt-1">
@@ -904,6 +907,16 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
               <Button type="submit" size="sm" variant="secondary" className="mt-2" loading={sendMutation.isPending}>
                 重试发送
               </Button>
+            </div>
+          ) : sendError.kind === 'in_progress' ? (
+            // 服务端仍在处理或结果待确认：不提供重试按钮，避免反复提交；先去已发送核对
+            <div role="alert" className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
+              <p className="font-medium text-caution">发送结果待确认</p>
+              <p className="mt-1">
+                服务器仍在处理这封邮件，或上次发送的结果尚未确认。请到
+                <Link to="/sent" className="mx-0.5 font-medium text-accent hover:underline">已发送</Link>
+                查看是否已经发出；内容不变时再次点击发送只会查询原结果，不会重复投递，修改内容则会作为一封新邮件发送。
+              </p>
             </div>
           ) : (
             <p role="alert" className="text-sm text-critical">{sendError.message}</p>

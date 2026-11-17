@@ -332,3 +332,50 @@ describe('send errors, shortcuts and field validation', () => {
     client.clear();
   });
 });
+
+describe('idempotency error codes', () => {
+  const initial = { fromAddress: 'first@one.example', to: ['to@example.com'], subject: 'pending?', body: 'body' };
+  const savedKey = () => JSON.parse(localStorage.getItem(sendAttemptKeyForUser(1)) ?? 'null')?.key as string | undefined;
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('send_in_progress keeps the key, never retries on its own and points to Sent', async () => {
+    mocks.send.mockRejectedValue(new ApiError('该发信请求正在处理或结果待确认，请勿重复提交', { code: 'send_in_progress', httpStatus: 409 }));
+    const client = show(initial);
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('发送结果待确认');
+    expect(screen.getByRole('link', { name: '已发送' })).toHaveAttribute('href', '/sent');
+    expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
+    const key = mocks.send.mock.calls[0]![1];
+    expect(savedKey()).toBe(key);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mocks.send).toHaveBeenCalledOnce();
+    // 用户手动再次点击：同一内容沿用原 key，只会查询原结果
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![1]).toBe(key);
+    client.clear();
+  });
+
+  it('idempotency_mismatch drops the key so the next send uses a fresh one', async () => {
+    mocks.send
+      .mockRejectedValueOnce(new ApiError('相同 Idempotency-Key 不能用于不同的发信内容', { code: 'idempotency_mismatch', httpStatus: 409 }))
+      .mockResolvedValueOnce({ id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show(initial);
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('已为这封邮件更换新凭据');
+    expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
+    expect(savedKey()).toBeUndefined();
+    const oldKey = mocks.send.mock.calls[0]![1];
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![0]).toEqual(mocks.send.mock.calls[0]![0]);
+    expect(mocks.send.mock.calls[1]![1]).toBeTruthy();
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
+    await screen.findByText('sent page');
+    client.clear();
+  });
+});
