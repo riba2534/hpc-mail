@@ -351,4 +351,28 @@ describe('限定范围的 Key 与托管域名接口', () => {
     expect((await errorOf(await request('/v1/hosted-domains', json(key, { domain: 'brand-new.test' })), 403)).docs).toContain('#key-restricted');
     expect((await errorOf(await request('/v1/hosted-domains/batch-check', json(key, { ids: [mine.id, other.id] })), 403)).docs).toContain('#key-restricted');
   });
+
+  it('按 id 访问别人的托管域名与不存在一样 404，范围外的报错只带 id 不带域名（A2）', async () => {
+    const user = await account('hosted-enum');
+    const victim = await account('hosted-victim');
+    const theirs = (await db.insert(hostedDomains).values({ domain: `ks-victim-${seq}.test`, userId: victim.id, status: 'active', zoneId: `z-victim-${seq}` }).returning().get())!;
+    const mine = (await db.insert(hostedDomains).values({ domain: `ks-enum-mine-${seq}.test`, userId: user.id, status: 'active', zoneId: `z-enum-${seq}` }).returning().get())!;
+    const key = (await keyFor(user.jwt, { scopes: ['domain.read', 'domain.write'], allowedDomains: ['anything.example'] })).key;
+    for (const [path, init] of [
+      [`/v1/hosted-domains/${theirs.id}`, { headers: auth(key) }],
+      [`/v1/hosted-domains/${theirs.id}/check`, json(key, {})],
+    ] as const) {
+      const response = await request(path, init);
+      expect(response.status, path).toBe(404);
+      expect(await response.text(), path).not.toContain(theirs.domain);
+    }
+    // DNS 接口与不限范围的 Key 同一口径（本测试环境没有 CF 凭据），都不带出域名
+    expect(await (await request(`/v1/hosted-domains/${theirs.id}/dns-records`, { headers: auth(key) })).text()).not.toContain(theirs.domain);
+    const batch = await request('/v1/hosted-domains/batch-check', json(key, { ids: [theirs.id] }));
+    expect(await batch.text()).not.toContain(theirs.domain);
+    // 自己的托管域名在范围外：403，只带 id
+    const own = await errorOf(await request(`/v1/hosted-domains/${mine.id}`, { headers: auth(key) }), 403);
+    expect(own.message).toContain(`#${mine.id}`);
+    expect(own.message).not.toContain(mine.domain);
+  });
 });

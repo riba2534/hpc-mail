@@ -6,11 +6,12 @@ import { AppError } from '../lib/errors.js';
 import { generateRecoveryCodes, generateTotpSecret, matchTotpStep, otpauthUri } from '../lib/totp.js';
 import type { Env } from '../types.js';
 import { issueToken } from './auth.js';
-import { verifyReauthPassword } from './reauth.js';
+import { verifyReauthPassword, type ReauthActor } from './reauth.js';
 
 /** 开始登记：先重新验证密码（拿到会话令牌的人不能给账号绑上自己的验证器），再生成密钥（未启用） */
-export async function setupTwoFactor(env: Env, userId: number, password: string): Promise<TwoFactorSetup> {
-  const user = await verifyReauthPassword(env, userId, password);
+export async function setupTwoFactor(env: Env, actor: ReauthActor, password: string): Promise<TwoFactorSetup> {
+  const { userId } = actor;
+  const user = await verifyReauthPassword(env, actor, password);
   if (user.totpEnabled) throw new AppError('conflict', '两步验证已启用');
   const secret = generateTotpSecret();
   await createDb(env)
@@ -49,8 +50,9 @@ export async function enableTwoFactor(env: Env, userId: number, code: string): P
  * 关闭两步验证：必须重新验证当前密码（只凭 TOTP 码不能关闭）。已启用时递增鉴权版本让其他会话失效；
  * 只是取消未完成的登记时不影响其他会话。返回的 token 替换当前会话。
  */
-export async function disableTwoFactor(env: Env, userId: number, password: string): Promise<TwoFactorDisabled> {
-  const { totpEnabled: enabled } = await verifyReauthPassword(env, userId, password);
+export async function disableTwoFactor(env: Env, actor: ReauthActor, password: string): Promise<TwoFactorDisabled> {
+  const { userId } = actor;
+  const { totpEnabled: enabled } = await verifyReauthPassword(env, actor, password);
   const updated = await createDb(env)
     .update(users)
     .set({ totpSecret: null, totpEnabledAt: null, totpRecoveryCodes: null, totpLastStep: null,

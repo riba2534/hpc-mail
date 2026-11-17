@@ -69,7 +69,7 @@ app.delete('/avatar', requireAuth, async (c) => {
 app.put('/password', requireAuth, async (c) => {
   const user = c.get('user')!;
   const req = await parseBody(c, changePasswordRequestSchema);
-  const result = await changePassword(c.env, user, req);
+  const result = await changePassword(c.env, user, req, c.get('sessionId')!);
   if (result.revokedApiKeys) {
     await logAdminAction(c.env, user, 'apikey.revoke_all', user.username, `修改密码时吊销 ${result.revokedApiKeys} 个 API Key`, clientIp(c));
   }
@@ -79,7 +79,7 @@ app.put('/password', requireAuth, async (c) => {
 /** 两步验证：开始登记（需当前密码；返回密钥+otpauth URI） */
 app.post('/2fa/setup', requireAuth, async (c) => {
   const req = await parseBody(c, setupTwoFactorRequestSchema);
-  return ok(c, await setupTwoFactor(c.env, c.get('user')!.id, req.password));
+  return ok(c, await setupTwoFactor(c.env, { userId: c.get('user')!.id, sessionId: c.get('sessionId')! }, req.password));
 });
 
 /** 两步验证：校验一次性码并启用（返回一次性恢复码与替换当前会话的新令牌，其他会话失效） */
@@ -91,7 +91,7 @@ app.post('/2fa/enable', requireAuth, async (c) => {
 /** 两步验证：关闭（需当前密码；返回替换当前会话的新令牌，其他会话失效） */
 app.post('/2fa/disable', requireAuth, async (c) => {
   const req = await parseBody(c, disableTwoFactorRequestSchema);
-  return ok(c, await disableTwoFactor(c.env, c.get('user')!.id, req.password));
+  return ok(c, await disableTwoFactor(c.env, { userId: c.get('user')!.id, sessionId: c.get('sessionId')! }, req.password));
 });
 
 app.post('/logout', requireAuth, async (c) => {

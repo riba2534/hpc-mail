@@ -675,7 +675,7 @@ export const schemas: Record<string, Schema> = {
   }, CreateApiKeyRequest: (() => {
     const schema = fromZod(createApiKeyRequestSchema);
     const properties = schema.properties as Record<string, Schema>;
-    properties.password = { ...properties.password, description: 'Current login password, re-verified before the key is created. Missing: 403 reauth_required; wrong: 403 reauth_failed; 5 failures per 15 minutes: 429.' };
+    properties.password = { ...properties.password, description: 'Current login password, re-verified before the key is created. Missing: 403 reauth_required; wrong: 403 reauth_failed; 5 failures per session in 15 minutes: 429.' };
     properties.allowedMailboxIds = { ...properties.allowedMailboxIds, description: `${keyRestriction.allowedMailboxIds.description} Every id must be a mailbox the caller currently owns, otherwise 400.` };
     properties.allowedDomains = { ...properties.allowedDomains, description: keyRestriction.allowedDomains.description };
     return schema;

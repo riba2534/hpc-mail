@@ -52,6 +52,8 @@ export async function updatePrefsWithForwardConfirmation(
   user: { id: number; username: string },
   patch: UpdateNotifyPrefsRequest,
   origin: string,
+  /** 发起修改的会话：重新验证密码的失败按会话计数 */
+  sessionId: string,
 ): Promise<{ prefs: UserNotifyPrefs; pending: ForwardPendingTarget[] }> {
   if (!patch.forward) {
     const [prefs, pending] = await Promise.all([updateUserNotifyPrefs(env, user.id, patch), listPendingForwards(env, user.id)]);
@@ -70,7 +72,7 @@ export async function updatePrefsWithForwardConfirmation(
   const toSend = added.filter((address) => !stillPending.has(address));
   // 要发新确认信，或把转发从关改为开时重新验证密码；只是保留已在等待确认的地址不需要
   if (toSend.length || (patch.forward.enabled && !current.forward.enabled)) {
-    await verifyReauthPassword(env, user.id, patch.password);
+    await verifyReauthPassword(env, { userId: user.id, sessionId }, patch.password);
   }
   if (toSend.length) {
     // 加上本次不超过每日上限才计数，超限的请求不推高计数

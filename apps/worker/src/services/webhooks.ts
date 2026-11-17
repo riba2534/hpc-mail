@@ -51,6 +51,7 @@ const PROCESSING_LEASE_MS = 2 * 60_000;
 const SOURCE_GONE = '源邮件已永久删除，不再投递';
 const ENDPOINT_GONE = '端点已停用或删除，不再投递';
 const OWNER_DISABLED = '端点所属用户已停用，不再投递';
+const ENDPOINT_CHANGED = '端点地址或订阅已修改，之前的投递不再发送';
 const USER_AGENT = 'HPC-Mail-Webhooks/1.0';
 
 interface EndpointRow {
@@ -194,7 +195,8 @@ export async function updateWebhookEndpoint(
   const sets: string[] = [];
   const values: unknown[] = [];
   const set = (column: string, value: unknown) => { sets.push(`${column} = ?`); values.push(value); };
-  if (req.url !== undefined) set('url', await validateWebhookEndpointUrl(env, req.url, writer.requestOrigin));
+  const url = req.url === undefined ? undefined : await validateWebhookEndpointUrl(env, req.url, writer.requestOrigin);
+  if (url !== undefined) set('url', url);
   if (req.description !== undefined) set('description', req.description);
   if (req.events !== undefined) set('events', JSON.stringify(req.events));
   if (req.addresses !== undefined) set('addresses', JSON.stringify(req.addresses));
@@ -206,9 +208,24 @@ export async function updateWebhookEndpoint(
     set('status', 'disabled'); set('disabled_reason', '');
   }
   set('access_role', writer.accessRole);
-  set('updated_at', Date.now());
-  const row = await env.db.prepare(`UPDATE webhook_endpoints SET ${sets.join(', ')} WHERE id = ? AND user_id = ? RETURNING *`)
-    .bind(...values, current.id, userId).first<EndpointRow>();
+  const now = Date.now();
+  set('updated_at', now);
+  const update = env.db.prepare(`UPDATE webhook_endpoints SET ${sets.join(', ')} WHERE id = ? AND user_id = ? RETURNING *`)
+    .bind(...values, current.id, userId);
+  // 地址或订阅变了：已入队、未成功的投递（含待重试与可手动重试的失败）可能带着按旧订阅构造的邮件内容，
+  // 同一事务里作废并清空载荷，不会发往新地址；原样提交同样的值不算修改
+  const currentEvents = JSON.parse(current.events) as string[];
+  const eventsChanged = req.events !== undefined
+    && (req.events.length !== currentEvents.length || req.events.some((event) => !currentEvents.includes(event)));
+  if ((url !== undefined && url !== current.url) || eventsChanged) {
+    const [updated] = await env.db.batch([update, env.db.prepare(`UPDATE webhook_deliveries
+      SET status = 'failed', payload = '', last_error = ?, updated_at = ?
+      WHERE endpoint_id = ? AND status IN ('pending', 'processing', 'failed')`).bind(ENDPOINT_CHANGED, now, current.id)]);
+    const row = updated?.results?.[0] as EndpointRow | undefined;
+    if (!row) throw new AppError('not_found', 'Webhook 端点不存在');
+    return toEndpoint(row);
+  }
+  const row = await update.first<EndpointRow>();
   if (!row) throw new AppError('not_found', 'Webhook 端点不存在');
   return toEndpoint(row);
 }
@@ -267,11 +284,11 @@ export async function retryWebhookDelivery(env: Env, userId: number, endpointId:
   const endpoint = await loadEndpoint(env, userId, endpointId);
   if (endpoint.status !== 'active') throw new AppError('conflict', '端点已停用，先重新启用再重试');
   const row = await env.db.prepare(`UPDATE webhook_deliveries SET status = 'pending', next_attempt_at = ?, updated_at = ?
-    WHERE id = ? AND endpoint_id = ? AND status = 'failed' AND last_error <> ?
+    WHERE id = ? AND endpoint_id = ? AND status = 'failed' AND last_error NOT IN (?, ?)
       AND (event_type NOT IN ${MAIL_EVENT_TYPES_SQL} OR EXISTS (SELECT 1 FROM messages AS source
         WHERE source.id = ${eventMessageIdSql('webhook_deliveries.event_key')} AND source.deleted_at IS NULL))
     RETURNING *`)
-    .bind(Date.now(), Date.now(), deliveryId, endpointId, SOURCE_GONE).first<DeliveryRow>();
+    .bind(Date.now(), Date.now(), deliveryId, endpointId, SOURCE_GONE, ENDPOINT_CHANGED).first<DeliveryRow>();
   if (!row) throw new AppError('conflict', '只有投递失败、且源邮件未删除的记录可以重试');
   runDetached(ctx, processWebhookDeliveries(env, { ids: [Number(row.id)] }));
   return toDelivery(row);

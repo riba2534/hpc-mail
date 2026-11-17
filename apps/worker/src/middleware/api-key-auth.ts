@@ -214,7 +214,8 @@ export function keyRestriction(c: Context<AppContext>): KeyRestriction | null {
   return { mailboxIds: key.allowedMailboxIds, domains: key.allowedDomains };
 }
 
-function restrictedError(what: string): AppError {
+/** Key 限定范围的 403（docs: /references/errors.md#key-restricted）；what 只写调用方自己给出的值或 id，不带出范围外对象的名称 */
+export function restrictedError(what: string): AppError {
   return new AppError('forbidden', `这把 API Key 限定了可用的邮箱或域名，不能访问${what}`, {
     fix: 'GET /v1/me 查看 key.allowedMailboxIds 与 key.allowedDomains；换用覆盖它的 Key，或请用户在网页「API Key」页面调整范围',
     docs: '/references/errors.md#key-restricted',

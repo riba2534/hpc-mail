@@ -27,7 +27,7 @@ app.post('/', async (c) => {
   const user = c.get('user')!;
   const { password, ...req } = await parseBody(c, createApiKeyRequestSchema);
   // 先重新验证密码：拿到会话令牌的人不能静默创建一把改密前就存在、之后也收不回的 Key
-  await verifyReauthPassword(c.env, user.id, password);
+  await verifyReauthPassword(c.env, { userId: user.id, sessionId: c.get('sessionId')! }, password);
   // 带上令牌的鉴权版本：改密后仍在途的旧令牌请求不能再插入新 Key
   return ok(c, await createApiKey(c.env, user.id, req, c.get('authEpoch'), user.role), 201);
 });

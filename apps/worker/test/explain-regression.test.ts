@@ -452,6 +452,37 @@ describe('执行计划回归：wait 的地址与域名过滤', () => {
   });
 });
 
+describe('执行计划回归：限定范围的 Key 等待新信', () => {
+  it('逐地址取数只探测范围内的地址，范围外地址的新信不被反复读取（A1）', async () => {
+    const db = createDb(env);
+    const [user] = await db.insert(users).values({ username: 'wait-restrict', passwordHash: 'x', role: 'user', authVersionMigrated: true })
+      .returning({ id: users.id });
+    const [quiet] = await db.insert(mailboxes).values([
+      { address: 'quiet@waitrestrict.test', domain: 'waitrestrict.test', userId: user!.id },
+      { address: 'busy@waitrestrict-busy.test', domain: 'waitrestrict-busy.test', userId: user!.id },
+    ]).returning({ id: mailboxes.id });
+    const stale = (await env.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM messages').first<{ id: number }>())!.id;
+    // 范围外的地址在 afterId 之后有 600 封新信（同时让全站新信多于 50 封，走逐地址那条）
+    await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600)
+      INSERT INTO messages (direction, address, domain, from_address, subject, preview, status)
+      SELECT 'inbound', 'busy@waitrestrict-busy.test', 'waitrestrict-busy.test', 'f@example.net', 's', 'p', 'received' FROM n`).run();
+    const total = (plans: { rowsRead: number }[]) => plans.reduce((sum, p) => sum + p.rowsRead, 0);
+    for (const restrict of [{ mailboxIds: [quiet!.id], domains: [] }, { mailboxIds: [], domains: ['waitrestrict.test'] }]) {
+      let found: Awaited<ReturnType<typeof findNextMessage>> | undefined;
+      const plans = onMessages(await capturePlans(async (e) => {
+        found = await findNextMessage(e, { userId: user!.id, role: 'user', restrict }, { afterId: stale });
+      }));
+      const label = JSON.stringify(restrict);
+      expect(found, label).toEqual({ message: null, scannedThroughId: stale });
+      expect(plans[0]!.plan, label).toMatch(/idx_messages_visible \(address=\? AND deleted_at=\? AND direction=\? AND is_read=\? AND rowid>\?\)/);
+      expect(plans[0]!.plan, label).not.toContain('idx_mailboxes_domain');
+      expectNoFullScan(plans[0]!.plan, label);
+      // 分流判定最多读 51 行新信 + 范围内地址的空区间查找；范围只作剩余过滤时要读完范围外地址的 600 封
+      expect(total(plans), label).toBeLessThan(200);
+    }
+  });
+});
+
 describe('执行计划回归：通知归属', () => {
   it('resolveNotifyOwnerIds 未认领分支只扫启用管理员的部分索引，不扫 users 全表', async () => {
     const [owners] = await capturePlans((e) => resolveNotifyOwnerIds(e, 'nobody@explain.test'));

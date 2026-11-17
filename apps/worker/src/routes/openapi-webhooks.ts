@@ -61,7 +61,7 @@ export function webhookPaths(kind: 'api' | 'v1'): Paths {
       get: operation('getWebhookEndpoint', 'Read a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope }),
       put: { ...operation('updateWebhookEndpoint', 'Update a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope, request: 'UpdateWebhookEndpointRequest',
         errors: ['WebhookUrlInvalid', ...scopeErrors, ...keyErrors],
-        description: `Only supplied fields change; lists replace the whole list. enabled:true re-enables an endpoint (clearing disabledReason and the failure count); failed deliveries are not resent automatically, retry them explicitly.${range}${mailRead}${restricted}` }), ...conditional },
+        description: `Only supplied fields change; lists replace the whole list. enabled:true re-enables an endpoint (clearing disabledReason and the failure count); failed deliveries are not resent automatically, retry them explicitly. Changing url or events voids every unfinished or failed delivery of the endpoint (payload cleared, no longer sent or retryable), so queued content never goes to a new address.${range}${mailRead}${restricted}` }), ...conditional },
       delete: operation('deleteWebhookEndpoint', 'Delete a Webhook v2 endpoint and its delivery records', success, { scope }),
     },
     '/webhooks/{id}/rotate-secret': { post: operation('changeWebhookSecret', 'Rotate the signing secret', ref('CreatedWebhookEndpoint'), { scope,
