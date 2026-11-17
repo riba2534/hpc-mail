@@ -85,6 +85,11 @@ export const MAX_DRAFT_ATTACHMENT_BYTES_PER_USER = 100 * 1024 * 1024;
 
 /** 用户名：小写字母/数字开头，3-32 位，允许 - _ */
 export const USERNAME_REGEX = /^[a-z0-9][a-z0-9_-]{2,31}$/;
+/**
+ * 系统保留用户名：注册与管理员创建都不能使用。ci-smoke 由部署流水线的 seed 脚本维护（密码由 JWT_SECRET 派生），
+ * 若被他人抢先注册，seed 会重置其密码。
+ */
+export const RESERVED_USERNAMES: readonly string[] = ['ci-smoke'];
 
 /** 邮箱前缀（local part）：1-64 位，小写字母数字开头结尾，中间允许 . _ + - */
 export const LOCAL_PART_REGEX = /^[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?$/;

@@ -6,6 +6,7 @@ import type {
   RegisterRequest,
   SessionUser,
 } from '@hpc-mail/shared';
+import { RESERVED_USERNAMES } from '@hpc-mail/shared';
 import { and, eq, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { users } from '../db/schema.js';
@@ -231,6 +232,8 @@ export async function register(env: Env, req: RegisterRequest, ip: string, ctx?:
   const mode = settings.register_mode;
   if (mode === 'closed') throw new AppError('registration_closed', '注册已关闭');
 
+  // 保留用户名按「已存在」处理，不额外暴露保留名单
+  if (RESERVED_USERNAMES.includes(req.username.toLowerCase())) throw new AppError('conflict', '用户名已存在');
   const db = createDb(env);
   const existing = await db.select({ id: users.id }).from(users).where(eq(users.username, req.username)).get();
   if (existing) throw new AppError('conflict', '用户名已存在');

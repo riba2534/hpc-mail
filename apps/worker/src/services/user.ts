@@ -1,4 +1,4 @@
-import type { AdminUser, CreateUserRequest, SearchUsersQuery, UpdateUserRequest, UserSearchResults } from '@hpc-mail/shared';
+import { RESERVED_USERNAMES, type AdminUser, type CreateUserRequest, type SearchUsersQuery, type UpdateUserRequest, type UserSearchResults } from '@hpc-mail/shared';
 import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { mailboxes, users } from '../db/schema.js';
@@ -102,6 +102,7 @@ export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<User
 
 export async function createUser(env: Env, req: CreateUserRequest): Promise<AdminUser> {
   const db = createDb(env);
+  if (RESERVED_USERNAMES.includes(req.username.toLowerCase())) throw new AppError('conflict', '该用户名为系统保留，不能使用');
   const existing = await db.select().from(users).where(eq(users.username, req.username)).get();
   if (existing) throw new AppError('conflict', '用户名已存在');
   const passwordHash = await hashPassword(req.password);
