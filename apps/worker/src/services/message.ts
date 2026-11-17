@@ -37,7 +37,7 @@ import { ATTACHMENT_BUCKET_SECONDS, sha256Hex, signAttachment } from '../lib/cry
 import { etagMatches } from '../lib/etag.js';
 import { chunk, D1_ID_BATCH, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
-import { countsAsAttachment } from '../lib/attachment-rule.js';
+import { COUNTS_AS_ATTACHMENT, countsAsAttachment } from '../lib/attachment-rule.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
 import { detectPromptInjection, extractReplyText } from '../lib/agent-text.js';
 import { mailText, PREVIEW_LIMIT } from '../lib/text.js';
@@ -382,6 +382,20 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     size: row.size,
     createdAt: row.createdAt.toISOString(),
   };
+}
+
+/**
+ * 按 id 读一封邮件的摘要，不做可见性判断、星标按未加星：幂等记录恢复重放结果与草稿重放发送结果共用。
+ * 行与附件标记同一个 batch。
+ */
+export async function loadMessageSummary(env: Env, messageId: number): Promise<MessageSummary | null> {
+  const db = createDb(env);
+  const [rows, files] = await db.batch([
+    db.select().from(messages).where(eq(messages.id, messageId)),
+    db.select({ id: attachmentsTable.id }).from(attachmentsTable)
+      .where(and(eq(attachmentsTable.messageId, messageId), COUNTS_AS_ATTACHMENT)).limit(1),
+  ]);
+  return rows[0] ? summarize(rows[0], files.length > 0, false) : null;
 }
 
 /**

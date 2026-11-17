@@ -23,22 +23,21 @@ import {
 } from '@hpc-mail/shared';
 import { and, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { apiKeys, attachments as attachmentsTable, draftAttachments, drafts, idempotencyRecords, messages } from '../db/schema.js';
+import { apiKeys, draftAttachments, drafts, idempotencyRecords, messages } from '../db/schema.js';
+import { runLimited } from '../lib/concurrency.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { base64ToBytes } from '../lib/mime.js';
 import { decodeCursor, encodeCursor } from '../lib/pagination.js';
 import { makePreview } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
-import { beginIdempotentSend, failIdempotentSend, type IdempotencyActor } from './idempotency.js';
+import { normalizeIdempotencyKey, type IdempotencyActor } from './idempotency.js';
 import { readMailBody, storeMailBody } from './mail-body.js';
-import { summarize } from './message.js';
-import { attachmentDisposition, deliveryFailedError, releaseDeliveryLeases, sendMail, type Sender } from './outbound.js';
-import {
-  consumeDraftAttachments, draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment, resolveDraftAttachments,
-} from './upload.js';
+import { loadMessageSummary } from './message.js';
+import { attachmentDisposition, type Sender } from './outbound.js';
+import { deliverSend, planOf, settledResult, type SendEnvironment } from './send-flow.js';
+import { draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment } from './upload.js';
 import { fetchUrlAttachments, releaseUrlAttachments } from './url-attachment.js';
-import { emitSendResult } from './webhooks.js';
 
 type DraftRow = typeof drafts.$inferSelect;
 
@@ -68,10 +67,7 @@ export interface DraftActor {
 }
 
 /** 保存草稿时的请求环境：附件下载链接的 origin，URL 附件不能指向的本站主机 */
-export interface DraftRequestEnv {
-  origin: string;
-  selfHosts: string[];
-}
+export type DraftRequestEnv = Pick<SendEnvironment, 'origin' | 'selfHosts'>;
 
 /** 定时发送因 5xx 且确认未外发时最多尝试几次，之后标 failed */
 const MAX_SCHEDULED_ATTEMPTS = 3;
@@ -100,11 +96,6 @@ function conflictMessage(row: Pick<DraftRow, 'status' | 'version'>, action: '修
   if (row.status === 'sending') return `草稿正在发送，不能${action}`;
   if (row.status === 'sent') return `草稿已发送，不能${action}`;
   return `草稿已被修改（当前版本 ${row.version}），请读取最新内容后再改`;
-}
-
-/** 合并后内容是否引用来源邮件（Key 需另有 mail.read） */
-export function referencesSource(content: Pick<StoredDraftContent, 'replyToMessageId' | 'forwardAttachmentsFrom'>): boolean {
-  return Boolean(content.replyToMessageId || content.forwardAttachmentsFrom);
 }
 
 // ---------- 读取 ----------
@@ -373,13 +364,6 @@ function sendAtOf(input: DraftInput): Date | null | undefined {
   return new Date(input.sendAt);
 }
 
-function normalizeIdempotencyKey(value: string | undefined): string | null {
-  const key = value?.trim();
-  if (!key) return null;
-  if (key.length > 128 || !/^[\x21-\x7e]+$/.test(key)) throw new AppError('validation_failed', 'Idempotency-Key 必须是 1-128 位可见 ASCII 字符');
-  return key;
-}
-
 /** 同键已有草稿：同一请求体返回它（当前状态），不同请求体 409 */
 async function replayCreate(env: Env, userId: number, storedKey: string, requestHash: string): Promise<Draft | null> {
   const existing = await createDb(env).select({ id: drafts.id, requestHash: drafts.requestHash }).from(drafts)
@@ -531,16 +515,6 @@ export async function deleteDraft(env: Env, owner: DraftOwner, id: number): Prom
 
 // ---------- 发送 ----------
 
-async function messageSummaryOf(env: Env, messageId: number): Promise<MessageSummary | null> {
-  const db = createDb(env);
-  const [rows, files] = await db.batch([
-    db.select().from(messages).where(eq(messages.id, messageId)),
-    db.select({ id: attachmentsTable.id }).from(attachmentsTable).where(and(eq(attachmentsTable.messageId, messageId),
-      sql`NOT (${attachmentsTable.disposition} = 'inline' AND ${attachmentsTable.contentId} <> '')`)).limit(1),
-  ]);
-  return rows[0] ? summarize(rows[0], files.length > 0, false) : null;
-}
-
 type SendMode = 'now' | 'scheduled';
 
 interface SendOutcome {
@@ -587,14 +561,13 @@ async function settle(env: Env, row: Pick<DraftRow, 'id' | 'attempt'>, outcome: 
  * 立即发送把错误原样抛给调用方（与 POST /messages 一致）；定时发送只记到草稿上。
  */
 async function performSend(
-  env: Env,
-  ctx: ExecCtx,
+  se: SendEnvironment,
   row: DraftRow,
   sender: Sender,
-  origin: string,
   mode: SendMode,
   previous: DraftStatus,
 ): Promise<MessageSummary | null> {
+  const { env } = se;
   let summary: MessageSummary;
   try {
     const body = await readMailBody(env, row);
@@ -606,26 +579,9 @@ async function performSend(
       });
     }
     const req: InternalSendMailRequest = parsed.data;
-    const idem = await beginIdempotentSend(env, { type: 'draft', id: row.id }, String(row.attempt), sendRequestFingerprint(req));
-    if (idem.kind === 'replay') {
-      summary = idem.response;
-    } else {
-      const leaseToken = crypto.randomUUID();
-      try {
-        const files = await resolveDraftAttachments(env, row.userId, req.attachmentTokens, leaseToken, { draftId: row.id });
-        summary = await sendMail(env, ctx, sender, req, files, origin, idem.handle, leaseToken);
-      } catch (error) {
-        // 投递开始后 sendMail 不再抛错；这里是投递前的异常，幂等记录按错误类型删除或标 failed，租约随之释放
-        await Promise.all([failIdempotentSend(env, idem.handle, error), releaseDeliveryLeases(env, leaseToken)]);
-        throw error;
-      }
-      // Webhook v2 的 mail.sent / mail.failed：与直接发信一样按发件行最终状态发
-      await emitSendResult(env, row.userId, summary.id, ctx);
-      if (summary.status !== 'failed') {
-        await consumeDraftAttachments(env, row.userId, req.attachmentTokens.map((ref) => ref.token))
-          .catch((error) => console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', error));
-      }
-    }
+    // 附件在保存时已转存为上传附件（draftSendInput 的 attachments 恒为空），发送时没有 URL 要拉取
+    summary = await deliverSend(se, { type: 'draft', id: row.id }, sender, String(row.attempt),
+      sendRequestFingerprint(req), async () => ({ ...planOf(req), draftId: row.id }));
   } catch (error) {
     const outcome = await failureOutcome(env, row, error, mode, previous);
     await settle(env, row, outcome).catch((cause) => console.error('草稿发送结果写回失败:', cause));
@@ -636,9 +592,7 @@ async function performSend(
   const failed = summary.status === 'failed';
   await settle(env, row, { status: failed ? 'failed' : 'sent', messageId: summary.id, errorDetail: summary.errorDetail })
     .catch((error) => console.error('草稿发送结果写回失败（邮件已处理，租约到期后按发件记录恢复）:', error));
-  if (failed && mode === 'now') {
-    throw deliveryFailedError(summary.id, summary.recipientOutcomes ?? [], summary.errorDetail || '全部收件人投递失败');
-  }
+  if (mode === 'now') return settledResult(summary);
   return failed ? null : summary;
 }
 
@@ -647,15 +601,14 @@ async function performSend(
  * authorize 在认领前按草稿内容做 scope 检查（Key 引用来源邮件需 mail.read）；expectedVersion 是审阅时的版本，不一致 409。
  */
 export async function sendDraftNow(
-  env: Env,
-  ctx: ExecCtx,
+  se: SendEnvironment,
   sender: Sender,
   id: number,
-  origin: string,
   authorize?: (content: StoredDraftContent) => void | Promise<void>,
   expectedVersion?: number,
   restrictedKeyId?: number | null,
 ): Promise<MessageSummary> {
+  const { env } = se;
   const db = createDb(env);
   const row = await db.select().from(drafts).where(and(eq(drafts.id, id), ownedBy({ userId: sender.userId, keyId: restrictedKeyId }))).get();
   if (!row) throw notFound();
@@ -666,7 +619,7 @@ export async function sendDraftNow(
       });
     }
     if (current.status === 'sent' && current.messageId) {
-      const summary = await messageSummaryOf(env, current.messageId);
+      const summary = await loadMessageSummary(env, current.messageId);
       if (summary) return summary;
     }
     throw stateConflict(current, current.status === 'sent' ? '草稿已发送，发件记录已不存在' : '草稿状态已变化，请重新读取');
@@ -685,7 +638,7 @@ export async function sendDraftNow(
     if (!current) throw notFound();
     return settled(current);
   }
-  return (await performSend(env, ctx, claimed, sender, origin, 'now', row.status))!;
+  return (await performSend(se, claimed, sender, 'now', row.status))!;
 }
 
 // ---------- 定时派发与恢复 ----------
@@ -722,13 +675,6 @@ function scheduleRevoked(
     if (!allowed) return '安排定时发送的 API Key 已不再覆盖这个发件地址，定时发送已取消，请确认后重新安排';
   }
   return null;
-}
-
-async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    for (let i = next++; i < items.length; i = next++) await task(items[i]!);
-  }));
 }
 
 /**
@@ -809,7 +755,7 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
     status: String(key.status), expiresAt: key.expires_at === null ? null : new Date(Number(key.expires_at)),
     mailboxIds: json(key.allowed_mailbox_ids).map(Number), domains: json(key.allowed_domains).map(String),
   }]));
-  await runPool(due, DISPATCH_CONCURRENCY, async (row) => {
+  await runLimited(due, DISPATCH_CONCURRENCY, async (row) => {
     try {
       const owner = ownerById.get(row.userId);
       const revoked = scheduleRevoked(row, owner, row.scheduledByKeyId !== null ? keyById.get(row.scheduledByKeyId) : undefined, senderOf(row), now);
@@ -819,7 +765,7 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
         return;
       }
       const sender = { userId: row.userId, role: owner!.role };
-      const summary = await performSend(env, ctx, row, sender, env.site_origin ?? row.origin, 'scheduled', 'scheduled');
+      const summary = await performSend({ env, ctx, origin: env.site_origin ?? row.origin, selfHosts: [] }, row, sender, 'scheduled', 'scheduled');
       if (summary) report.sent++;
       else report.failed++;
     } catch (error) {

@@ -12,17 +12,17 @@ import {
   waitMessagesQuerySchema,
   type BatchSendItemResult,
   type BatchSendResult,
-  type InternalSendMailRequest,
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { buildSecureHeaders } from '../../lib/attachment-security.js';
 import { auditUnclaimedPurge, auditUserScopeRead, messageViewer, mutationViewer } from '../../lib/message-viewer.js';
+import { runLimited } from '../../lib/concurrency.js';
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
 import { conditionalDetailResponse } from '../../lib/etag.js';
 import { execCtx, ok, parseBody, parseId, parseQuery, parseValue } from '../../lib/http.js';
 import {
-  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, assertKeyCanUseSender, keyRestriction, requireScope,
+  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, keyRestriction, requireScope,
 } from '../../middleware/api-key-auth.js';
 import { errorObject } from '../../middleware/error.js';
 import {
@@ -39,11 +39,10 @@ import {
   getMessageDetailConditional,
   listMessages,
   loadAttachmentForViewer,
-  loadSourceMessage,
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import { assertRequestSize, handleCompose, handleSend, sendEnvironment, sendOne } from '../send-handler.js';
+import { assertRequestSize, authorizeSendContent, handleCompose, handleSend, sendEnvironment, sendOne } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -65,19 +64,8 @@ app.get('/', async (c) => {
 app.post('/', (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
-  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, (req) => authorizeSend(c, key, req));
+  return handleSend(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role });
 });
-
-/** 单发与批量的每一项共用：引用来源邮件另需 mail.read，限定范围的 Key 只能用范围内的发件地址与来源 */
-async function authorizeSend(
-  c: Context<AppContext>,
-  key: { userId: number; role: Viewer['role'] },
-  req: InternalSendMailRequest,
-): Promise<void> {
-  // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
-  if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
-  await assertSendWithinRestriction(c, key, req);
-}
 
 /** 批量发送并发上限：项与项之间互不等待，又不至于同时持有太多附件或占满出站连接 */
 const BATCH_SEND_CONCURRENCY = 4;
@@ -114,47 +102,23 @@ app.post('/batch', async (c) => {
   const se = sendEnvironment(c);
   const sender = { userId: key.userId, role: key.role };
   const results: BatchSendItemResult[] = [];
-  let next = 0;
-  const worker = async () => {
-    for (let i = next++; i < parsed.length; i = next++) {
-      const item = parsed[i]!;
-      const itemKey = 'itemKey' in item ? item.itemKey : undefined;
-      try {
-        if ('error' in item) throw item.error;
-        await authorizeSend(c, key, item.req);
-        const message = await sendOne(se, { type: 'api_key', id: key.id }, sender, item.req, itemKey);
-        results.push({ index: item.index, ok: true, httpStatus: 201, ...(itemKey ? { idempotencyKey: itemKey } : {}), message });
-      } catch (error) {
-        const { status, error: body } = errorObject(error, c);
-        results.push({ index: item.index, ok: false, httpStatus: status, ...(itemKey ? { idempotencyKey: itemKey } : {}), error: body });
-      }
+  await runLimited(parsed, BATCH_SEND_CONCURRENCY, async (item) => {
+    const itemKey = 'itemKey' in item ? item.itemKey : undefined;
+    try {
+      if ('error' in item) throw item.error;
+      await authorizeSendContent(c, item.req);
+      const message = await sendOne(se, { type: 'api_key', id: key.id }, sender, item.req, itemKey);
+      results.push({ index: item.index, ok: true, httpStatus: 201, ...(itemKey ? { idempotencyKey: itemKey } : {}), message });
+    } catch (error) {
+      const { status, error: body } = errorObject(error, c);
+      results.push({ index: item.index, ok: false, httpStatus: status, ...(itemKey ? { idempotencyKey: itemKey } : {}), error: body });
     }
-  };
-  await Promise.all(Array.from({ length: Math.min(BATCH_SEND_CONCURRENCY, parsed.length) }, worker));
+  });
   results.sort((a, b) => a.index - b.index);
   const succeeded = results.filter((result) => result.ok).length;
   const body: BatchSendResult = { items: results, succeeded, failed: results.length - succeeded };
   return ok(c, body);
 });
-
-/**
- * 限定了范围的 Key 发信：发件地址与回复、转发引用的来源邮件都要在范围内。
- * 发件邮箱或来源不存在、不可见时交给 sendMail 按原有口径报 404，这里只拦范围外的。
- */
-async function assertSendWithinRestriction(
-  c: Context<AppContext>,
-  key: { userId: number; role: Viewer['role'] },
-  req: InternalSendMailRequest,
-): Promise<void> {
-  if (!keyRestriction(c)) return;
-  await assertKeyCanUseSender(c, req.from);
-  const sources = [['reply', req.replyToMessageId], ['forward', req.forwardAttachmentsFrom]] as const;
-  for (const [source, id] of sources) {
-    if (id === undefined) continue;
-    const row = await loadSourceMessage(c.env, key, id, '引用的原邮件不存在或不可见', source);
-    await assertKeyCanUseAddress(c, row.address);
-  }
-}
 
 /**
  * 按域名收窄：域名在 allowedDomains 中，或只限定了邮箱时该域名下有允许的邮箱（列表照常只返回允许的邮箱），
