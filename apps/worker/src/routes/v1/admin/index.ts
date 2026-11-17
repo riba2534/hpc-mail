@@ -8,7 +8,8 @@ import adminMailboxes from './mailboxes.js';
 
 /**
  * /v1/admin：管理员 Key 的运维接口（管理员账户 + admin scope，即 Key 的有效角色为 admin）。
- * 写操作复用 /api/admin 的批量服务（同样的事务、审计与逐项结果），审计操作人记为「用户名（API Key #id）」。
+ * 写操作复用 /api/admin 的批量服务（同样的事务、审计与逐项结果）：审计操作人为 Key 所属的管理员用户名，
+ * detail 末尾带「批量请求 <请求 id>（API Key #id）」，与网页会话的批量操作同一写法。
  */
 const app = new Hono<AppContext>();
 app.use('*', apiKeyAuth);
