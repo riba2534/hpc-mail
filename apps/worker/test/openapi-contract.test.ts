@@ -544,7 +544,7 @@ describe('Agent docs reference only real endpoints and anchors', () => {
     expect(frontmatter).not.toBeNull();
     expect([...frontmatter![1]!].length).toBeLessThanOrEqual(1024);
     expect(frontmatter![1]).not.toMatch(/管理员|admin/i);
-    expect(skillDoc.split('\n').length).toBeLessThanOrEqual(170);
+    expect(skillDoc.split('\n').length).toBeLessThanOrEqual(200);
     for (const recipe of ['①', '②', '③', '④', '⑤', '⑥']) expect(skillDoc).toMatch(new RegExp(`^### ${recipe} `, 'm'));
     for (const field of ['scannedThroughId', 'recipientOutcomes', 'Idempotency-Key', 'send_in_progress', 'idempotency_mismatch', 'afterId', 'nextCursor']) {
       expect(skillDoc).toContain(field);
@@ -625,5 +625,20 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     expect(((data.properties as Record<string, Schema>).scopes!.items as Schema).enum).toEqual([...API_SCOPES]);
     expect(specs.v1.info.description).not.toContain('Users cannot create arbitrary domains');
     expect(specs.v1.info.description).toContain('domain.write');
+  });
+
+  it('Agent 文档写明配方⑦、两个新 scope 与只用 JWT 的边界', () => {
+    expect(skillDoc).toMatch(/^### ⑦ 接入自有域名$/m);
+    for (const text of ['POST /hosted-domains', 'POST /hosted-domains/:id/check', 'GET /hosted-domains/:id', 'POST /hosted-domains/:id/dns-records',
+      'nameServers', 'expiresAt', 'steps.sending', '`domain.read`', '`domain.write`']) {
+      expect(skillDoc, text).toContain(text);
+    }
+    // 每个 scope 在鉴权参考的 scope 表里都有一行
+    for (const scope of API_SCOPES) expect(authDoc, scope).toContain(`\n| \`${scope}\` |`);
+    expect(mailboxesDoc).toContain('\n### 用 API Key 接入\n');
+    for (const [name, doc] of Object.entries({ mailboxesDoc, authDoc, administrationDoc })) {
+      expect(doc, name).not.toMatch(/Key 无对应接口|五个 ?scopes?|上表五个/);
+    }
+    expect(llmsDoc).toContain('mail/mailbox/domain scopes');
   });
 });
