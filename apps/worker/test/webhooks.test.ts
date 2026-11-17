@@ -295,6 +295,35 @@ describe('Webhook v2 事件投递', () => {
     expect(deliveries).toHaveLength(2);
   });
 
+  it('改端点的 url 或 events 时作废未完成与失败的投递，已入队的邮件内容不会发往新地址（A5）', async () => {
+    const user = await account('repoint');
+    const endpoint = await data<CreatedWebhookEndpoint>(await create(user.jwt, { includeBody: true }), 201);
+    const hits = receiver(() => 503);
+    await receive(user.box.address, 'queued code');
+    await receive(user.box.address, 'failed code');
+    const rows = (await env.db.prepare('SELECT id FROM webhook_deliveries WHERE endpoint_id = ? ORDER BY id').bind(endpoint.id).all<{ id: number }>()).results;
+    const [pending, failed] = rows.map((row) => Number(row.id));
+    await env.db.prepare("UPDATE webhook_deliveries SET status = 'failed' WHERE id = ?").bind(failed).run();
+    // 只改描述、或原样提交同样的 url 与 events，不作废
+    await data(await request(`/api/webhooks/${endpoint.id}`, json(user.jwt, { description: 'same', url: 'https://hooks.example.com/hpc', events: ['mail.received'] }, 'PUT')));
+    expect((await env.db.prepare('SELECT status FROM webhook_deliveries WHERE id = ?').bind(pending).first<{ status: string }>())!.status).toBe('pending');
+    // 只有 webhook.write 的 Key 把端点改成不订阅收信、指向别处：修改后的状态不需要 mail.read，但积压的投递随之作废
+    const key = await user.key(['webhook.write']);
+    await data(await request(`/v1/webhooks/${endpoint.id}`, json(key, { url: 'https://attacker.example.com/h', events: ['mail.sent'], includeBody: false }, 'PUT')));
+    vi.unstubAllGlobals();
+    const after = receiver(() => 200);
+    await env.db.prepare('UPDATE webhook_deliveries SET next_attempt_at = 0 WHERE endpoint_id = ?').bind(endpoint.id).run();
+    await processWebhookDeliveries(env, { ids: [pending!, failed!] });
+    expect(after).toHaveLength(0);
+    for (const id of [pending, failed]) {
+      const row = await env.db.prepare('SELECT status, payload FROM webhook_deliveries WHERE id = ?').bind(id).first<{ status: string; payload: string }>();
+      expect(row).toMatchObject({ status: 'failed', payload: '' });
+      expect((await request(`/v1/webhooks/${endpoint.id}/deliveries/${id}/retry`, { method: 'POST', headers: auth(key) })).status).toBe(409);
+    }
+    expect(after).toHaveLength(0);
+    expect(hits.length).toBeGreaterThan(0);
+  });
+
   it('发信成功与失败分别发 mail.sent / mail.failed，同一封只发一次', async () => {
     const user = await account('sent');
     await data(await create(user.jwt, { events: ['mail.sent', 'mail.failed'] }), 201);
