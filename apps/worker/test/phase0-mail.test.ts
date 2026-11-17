@@ -9,7 +9,7 @@ import { createDb } from '../src/db/client.js';
 import { attachments, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import { handleInbound } from '../src/services/inbound.js';
-import { findNextMessage, getMessageDetail } from '../src/services/message.js';
+import { deleteMessages, findNextMessage, getMessageDetail, restoreMessages } from '../src/services/message.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 
@@ -30,10 +30,13 @@ async function data<T>(response: Response, status = 200): Promise<T> {
   expect(response.status, JSON.stringify(body)).toBe(status);
   return body.data;
 }
-async function errorOf(response: Response, status: number): Promise<string> {
-  const body = await response.json() as { error: { code: string } };
+async function failure(response: Response, status: number): Promise<{ code: string; message: string }> {
+  const body = await response.json() as { error: { code: string; message: string } };
   expect(response.status, JSON.stringify(body)).toBe(status);
-  return body.error.code;
+  return body.error;
+}
+async function errorOf(response: Response, status: number): Promise<string> {
+  return (await failure(response, status)).code;
 }
 const rand = () => crypto.randomUUID().slice(0, 8);
 
@@ -92,16 +95,25 @@ async function outboundCount(subject: string): Promise<number> {
 }
 
 describe('X01 已存验证码不被摘要重提覆盖', () => {
-  it('真码在第 160 字之后、摘要开头有年份和订单号：列表、wait、线程与详情都返回收件时存下的码', async () => {
-    await baseSettings();
-    const owner = await account('x01');
-    const base = await maxMessageId();
-    const body = [
+  it.each([
+    // 摘要里的年份、订单号离主题关键词更近，一度盖掉真码
+    ['摘要开头有年份和订单号', 'Your verification code', [
       'Order #20261117 was placed on November 17, 2026 and is waiting for you to sign in on a new device.',
       'We need to confirm it is really you before the checkout can continue, so please enter the code below within ten minutes.',
       'Your verification code is 482913.',
-    ].join('\r\n');
-    const raw = `From: Shop <security@shop.example>\r\nTo: ${owner.address}\r\nSubject: Your verification code\r\nMessage-ID: <x01-${rand()}@shop.example>\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${body}\r\n`;
+    ]],
+    // 摘要单看像 link-only，一度在读取时把已存的码清空
+    ['主题像登录、开头是 Click the button below', 'Confirm your sign-in', [
+      'Click the button below to finish signing in to your account. If the button does not work on this device,',
+      'you can also complete the sign-in from the app on your phone or computer.',
+      'Or enter this code: 482913',
+    ]],
+  ])('真码在第 160 字之后、%s：列表、wait、线程与详情都返回收件时存下的码', async (_name, subject, lines) => {
+    await baseSettings();
+    const owner = await account('x01');
+    const base = await maxMessageId();
+    const body = lines.join('\r\n');
+    const raw = `From: Shop <security@shop.example>\r\nTo: ${owner.address}\r\nSubject: ${subject}\r\nMessage-ID: <x01-${rand()}@shop.example>\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${body}\r\n`;
     const ctx = createExecutionContext();
     await handleInbound({ to: owner.address, from: 'security@shop.example', headers: new Headers(), raw: new Response(raw).body!,
       forward: async () => {}, setReject: () => {} } as unknown as ForwardableEmailMessage, env, ctx);
@@ -192,7 +204,7 @@ describe('R09 发信引用来源邮件需要读取权限与可见性', () => {
     expect(sent.status).toBe('delivered');
   });
 
-  it('来源按 mine 判定：本人与共享来的收件可转发；他人私有邮件与不存在的 id 同为 404', async () => {
+  it('来源按 mine 判定：本人与共享来的收件可转发；他人私有邮件与不存在的 id 同为 404 source_unavailable', async () => {
     await baseSettings();
     const owner = await account('r09-owner');
     const other = await account('r09-other');
@@ -206,13 +218,27 @@ describe('R09 发信引用来源邮件需要读取权限与可见性', () => {
     const forwarded = await data<MessageSummary>(await send(owner.key, owner.localPart, { subject: `r09-own-${rand()}`, forwardAttachmentsFrom: own, replyToMessageId: own }), 201);
     expect(forwarded.hasAttachments).toBe(true);
 
+    const unavailable = { forwardAttachmentsFrom: '转发的原邮件不存在或不可见', replyToMessageId: '回复的原邮件不存在或不可见' };
     for (const source of [privateSource, 999_999_999]) {
-      for (const field of ['forwardAttachmentsFrom', 'replyToMessageId']) {
+      for (const [field, message] of Object.entries(unavailable)) {
         const subject = `r09-hidden-${rand()}`;
-        expect(await errorOf(await send(owner.key, owner.localPart, { subject, [field]: source }), 404), `${field}=${source}`).toBe('not_found');
+        expect(await failure(await send(owner.key, owner.localPart, { subject, [field]: source }), 404), `${field}=${source}`)
+          .toEqual({ code: 'source_unavailable', message });
+        expect(await failure(await request('/api/messages/send', json(owner.jwt, {
+          from: { localPart: owner.localPart, domain: 'hpc.email' }, to: [`r09-sink-${rand()}@hpc.email`], text: 'body', subject, [field]: source,
+        })), 404), `/api ${field}=${source}`).toEqual({ code: 'source_unavailable', message });
         expect(await outboundCount(subject)).toBe(0);
       }
     }
+
+    // 原附件对象已丢失同样是来源不可用；发件邮箱不存在等其他 404 仍是 not_found
+    const broken = await mail(owner.address, { subject: 'Broken original' });
+    await createDb(env).insert(attachments).values({ messageId: broken, r2Key: `att/${broken}/gone`, filename: 'gone.txt', mimeType: 'text/plain', size: 4 });
+    expect(await failure(await send(owner.key, owner.localPart, { subject: `r09-broken-${rand()}`, forwardAttachmentsFrom: broken }), 404))
+      .toEqual({ code: 'source_unavailable', message: '附件「gone.txt」已丢失，无法完整转发' });
+    expect(await failure(await request('/v1/messages', json(owner.key, {
+      from: { mailboxId: 999_999_999 }, to: [`r09-sink-${rand()}@hpc.email`], subject: `r09-nobox-${rand()}`, text: 'body',
+    })), 404)).toEqual({ code: 'not_found', message: '发件邮箱不存在' });
 
     await createDb(env).insert(mailboxShares).values({ mailboxId: other.mailboxId, userId: owner.id, grantedBy: other.id });
     const viaShare = await data<MessageSummary>(await send(owner.key, owner.localPart, { subject: `r09-shared-${rand()}`, forwardAttachmentsFrom: sharedSource }), 201);
@@ -230,7 +256,7 @@ describe('R09 发信引用来源邮件需要读取权限与可见性', () => {
 
     for (const field of ['forwardAttachmentsFrom', 'replyToMessageId']) {
       const subject = `r09-admin-hidden-${rand()}`;
-      expect(await errorOf(await send(admin.key, admin.localPart, { subject, [field]: privateSource }), 404), field).toBe('not_found');
+      expect(await errorOf(await send(admin.key, admin.localPart, { subject, [field]: privateSource }), 404), field).toBe('source_unavailable');
       expect(await outboundCount(subject)).toBe(0);
     }
     const fromUnclaimed = await data<MessageSummary>(await send(admin.key, admin.localPart, {
@@ -264,6 +290,38 @@ describe('R05 站内详情签名 URL 与 JWT 附件下载', () => {
     const download = await request(url);
     expect(download.status).toBe(200);
     expect(new TextDecoder().decode(await download.arrayBuffer())).toBe('content of logo.png');
+  });
+
+  it('/v1 详情的签名 URL 仍是 5 分钟（另有带 Key 鉴权的附件端点），/api 详情按整点对齐', async () => {
+    await baseSettings();
+    const owner = await account('f7-ttl');
+    const id = await mail(owner.address, { subject: 'Inline picture', bodyHtml: '<img src="cid:logo-2">' });
+    await attach(id, 'logo.png', { contentId: 'logo-2', disposition: 'inline' });
+    const expOf = (url: string) => Number(new URL(url, 'https://hpc.email').searchParams.get('exp'));
+    const now = Math.floor(Date.now() / 1000);
+
+    const v1 = await data<MessageDetail>(await request(`/v1/messages/${id}`, auth(owner.key)));
+    expect(expOf(v1.attachments[0]!.url) - now).toBeGreaterThan(0);
+    expect(expOf(v1.attachments[0]!.url) - now).toBeLessThanOrEqual(5 * 60 + 1);
+    expect(v1.bodyHtml).toBe(`<img src="${v1.attachments[0]!.url}">`);
+
+    const api = await data<MessageDetail>(await request(`/api/messages/${id}`, auth(owner.jwt)));
+    expect(expOf(api.attachments[0]!.url) % 3600).toBe(0);
+    expect(expOf(api.attachments[0]!.url) - now).toBeGreaterThanOrEqual(3600 - 1);
+  });
+
+  it('邮件移入回收站后已签出的 URL 失效，恢复后在有效期内重新可用', async () => {
+    await baseSettings();
+    const owner = await account('f8-trash');
+    const viewer = { userId: owner.id, role: 'user' as const };
+    const id = await mail(owner.address, { subject: 'Signed attachment' });
+    await attach(id, 'signed.txt');
+    const url = (await getMessageDetail(env, viewer, id)).attachments[0]!.url;
+    expect((await request(url)).status).toBe(200);
+    expect(await deleteMessages(env, viewer, [id])).toBe(1);
+    expect(await errorOf(await request(url), 404)).toBe('not_found');
+    expect(await restoreMessages(env, viewer, [id])).toBe(1);
+    expect((await request(url)).status).toBe(200);
   });
 
   it('JWT 下载与详情同一可见范围：管理员带 scope=user 审计他人附件，普通用户不能用 scope=user，非法 scope 显式拒绝', async () => {

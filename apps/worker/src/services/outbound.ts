@@ -201,7 +201,7 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/** 转发时把原邮件的附件带入本次发送：校验可见性（同详情，不可见即 404）后从 R2 读回，转成 DecodedAttachment */
+/** 转发时把原邮件的附件带入本次发送：校验可见性（同详情）后从 R2 读回，转成 DecodedAttachment；来源或附件不可用为 source_unavailable */
 async function loadForwardedAttachments(
   env: Env,
   db: Db,
@@ -210,7 +210,7 @@ async function loadForwardedAttachments(
   alreadyCount: number,
   alreadyBytes: number,
 ): Promise<DecodedAttachment[]> {
-  await loadSourceMessage(env, sender, sourceMessageId);
+  await loadSourceMessage(env, sender, sourceMessageId, '转发的原邮件不存在或不可见');
   const rows = await db
     .select()
     .from(attachmentsTable)
@@ -225,7 +225,7 @@ async function loadForwardedAttachments(
   const out: DecodedAttachment[] = [];
   for (const a of rows) {
     const obj = await env.r2.get(a.r2Key);
-    if (!obj) throw new AppError('not_found', `附件「${a.filename}」已丢失，无法完整转发`);
+    if (!obj) throw new AppError('source_unavailable', `附件「${a.filename}」已丢失，无法完整转发`);
     const bytes = new Uint8Array(await obj.arrayBuffer());
     out.push({
       filename: a.filename,
@@ -399,14 +399,14 @@ function summarize(
   };
 }
 
-/** 校验并构造回复线程头（回复的原邮件须对发件人可见，同详情口径，不存在与不可见同为 404） */
+/** 校验并构造回复线程头（回复的原邮件须对发件人可见，同详情口径，不存在与不可见同为 source_unavailable） */
 async function resolveReply(
   env: Env,
   sender: Sender,
   replyToMessageId: number | undefined,
 ): Promise<{ reply: ReplyContext | null; inReplyTo: string | null; references: string }> {
   if (!replyToMessageId) return { reply: null, inReplyTo: null, references: '' };
-  const orig = await loadSourceMessage(env, sender, replyToMessageId);
+  const orig = await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见');
   if (!orig.messageId) return { reply: null, inReplyTo: null, references: '' };
   const references = [...new Set([orig.references, orig.inReplyTo, orig.messageId]
     .filter(Boolean).flatMap(value => value!.match(/<[^<>\s]+>/g) ?? []))].join(' ');
