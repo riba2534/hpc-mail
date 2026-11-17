@@ -70,7 +70,7 @@ for (const schema of [settingsResponse, settingsUpdate]) {
   const properties = schema.properties as Record<string, Schema>;
   properties.ai_model!.description = 'The single OpenAI-compatible Chat Completions model used by every AI feature: message translation and the inbound verification-code fallback. Configured means baseUrl, apiKey and model are all nonempty; baseUrl must be https and excludes /chat/completions. When translation is enabled, segments a user chooses to translate are sent to it; when code_extract.aiEnabled is on, the subject and first 6000 body characters of inbound mail that the regex could not resolve and that mentions a code-related keyword are sent to it. Unconfigured: translation is unavailable and code extraction uses regex only.';
   const aiFields = properties.ai_model!.properties as Record<string, Schema>;
-  aiFields.apiKey = { ...aiFields.apiKey, description: 'Write-only provider key. Responses return ****** when a key is stored (empty string when none). Submitting ****** keeps the stored key; an empty string clears it. Saving a baseUrl with a different origin than the stored one requires entering apiKey again: ****** then returns 400 validation_failed, so a stored key is never sent to a new host.' };
+  aiFields.apiKey = { ...aiFields.apiKey, description: 'Write-only provider key. Responses return ****** when a key is stored (empty string when none). Submitting ****** keeps the stored key; an empty string clears it. Keeping the stored key requires an unchanged baseUrl origin (scheme, host and port): ****** together with a baseUrl on another origin returns 400 validation_failed, so enter the apiKey again; clearing baseUrl may keep the stored key. The stored key is never sent to a new host.' };
   properties.claim_random!.description = 'Rules for the Claude zero-suspension random suffix strategy. Any historical suspension excludes a domain. paidSuspendedLimit and suspendedPercent are deprecated compatibility fields and never change eligibility, including when zero. pendingDays counts recently claimed mailboxes without Claude mail as load (0 disables). dailyLimit caps additions in the last 24 hours (Claude accounts first seen plus new claims without Claude mail), including this plan (0 disables); full zero-suspension domains never spill over to suspended domains. domains.list[].random controls participation.';
   const claimFields = properties.claim_random!.properties as Record<string, Schema>;
   for (const name of ['paidSuspendedLimit', 'suspendedPercent']) {
@@ -238,7 +238,7 @@ export const schemas: Record<string, Schema> = {
   }),
   AiModelTestRequest: (() => {
     const schema = fromZod(aiModelTestRequestSchema);
-    schema.description = 'All fields optional; the body may be omitted. Omitted or empty fields and apiKey ****** use the saved ai_model.';
+    schema.description = 'All fields optional; the body may be omitted. Omitted or empty fields and apiKey ****** use the saved ai_model. An omitted, empty or ****** apiKey with a baseUrl on a different origin than the saved one returns 400 validation_failed: the saved key is only sent to its own origin, so enter the apiKey to test a new host.';
     return schema;
   })(),
   AiModelTestResult: object({ ok: { const: true, type: 'boolean' }, latencyMs: int, sample: { ...str, description: 'Simplified Chinese translation of the fixed English sample.' } }),

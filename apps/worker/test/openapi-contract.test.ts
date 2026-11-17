@@ -5,6 +5,7 @@ import { createApp } from '../src/app.js';
 import { buildSessionOpenApiSpec } from '../src/routes/api-openapi.js';
 import { buildOpenApiSpec } from '../src/routes/v1/openapi.js';
 import type { Schema } from '../src/routes/openapi-common.js';
+import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../src/services/hosted-domain.js';
 import skillDoc from '../../web/public/skill.md?raw';
 import llmsDoc from '../../web/public/llms.txt?raw';
 import administrationDoc from '../../web/public/references/administration.md?raw';
@@ -280,8 +281,18 @@ describe('Phase-0 hardening is reflected in both OpenAPI documents', () => {
   });
 
   it('documents hosted-domain creation/check limits and scoped JWT attachment downloads', () => {
-    expect(specs.api.paths['/hosted-domains']!.post!.description).toContain('429 rate_limited');
-    expect(specs.api.paths['/hosted-domains/{id}/check']!.post!.description).toContain('429 rate_limited');
+    const create = specs.api.paths['/hosted-domains']!.post!.description as string;
+    const check = specs.api.paths['/hosted-domains/{id}/check']!.post!.description as string;
+    expect(create).toContain(`More than ${MAX_HOSTED_CREATES_PER_MINUTE} attempts per user per minute`);
+    expect(check).toContain(`More than ${MAX_HOSTED_CHECKS_PER_MINUTE} requests per user per minute`);
+    for (const text of [create, check, specs.api.paths['/hosted-domains/{id}/dns-records']!.get!.description as string]) {
+      expect(text).toContain('429 rate_limited');
+      expect(text).toContain(`${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE}`);
+    }
+    for (const description of [specs.api.paths['/admin/settings/ai-model-test']!.post!.description,
+      ((specs.api.components.schemas.UpdateSettingsRequest!.properties as Record<string, Schema>).ai_model!.properties as Record<string, Schema>).apiKey!.description]) {
+      expect(description).toContain('400 validation_failed');
+    }
     const params = (specs.api.paths['/attachments/{id}']!.get!.parameters as Array<{ name: string }>).map(param => param.name);
     expect(params).toEqual(['exp', 'sig', 'scope', 'userId']);
   });
