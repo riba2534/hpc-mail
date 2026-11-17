@@ -24,6 +24,7 @@ export const loadInboxPage = preloadable(() => import('@/features/inbox/inbox-pa
 export const loadMessagePage = preloadable(() => import('@/features/message/message-page'));
 export const loadComposePage = preloadable(() => import('@/features/compose/compose-page'));
 export const loadSentPage = preloadable(() => import('@/features/sent/sent-page'));
+export const loadDraftsPage = preloadable(() => import('@/features/drafts/drafts-page'));
 export const loadStarredPage = preloadable(() => import('@/features/starred/starred-page'));
 export const loadTrashPage = preloadable(() => import('@/features/trash/trash-page'));
 export const loadMailboxesPage = preloadable(() => import('@/features/mailboxes/mailboxes-page'));
@@ -39,6 +40,7 @@ const ROUTE_LOADERS: ReadonlyArray<readonly [RegExp, () => Promise<unknown>]> = 
   [/^\/mail\/\d+$/, loadMessagePage],
   [/^\/compose$/, loadComposePage],
   [/^\/sent$/, loadSentPage],
+  [/^\/drafts$/, loadDraftsPage],
   [/^\/starred$/, loadStarredPage],
   [/^\/trash$/, loadTrashPage],
   [/^\/mailboxes$/, loadMailboxesPage],

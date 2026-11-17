@@ -21,6 +21,8 @@ export interface ComposeInitial {
   sourceMessageId?: number;
   /** 只重试失败收件人时，投递结果未确认（unknown）的地址：可能已经送达，不自动加入收件人，只提示用户 */
   unconfirmed?: string[];
+  /** 从草稿箱进入：编辑这份服务端草稿（内容从服务器读取，不用本机草稿） */
+  serverDraftId?: number;
 }
 
 function withPrefix(subject: string, prefix: 'Re' | 'Fwd'): string {

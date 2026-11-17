@@ -10,6 +10,7 @@ import { RouteErrorPage } from './route-error-page';
 import {
   loadApiKeysPage,
   loadComposePage,
+  loadDraftsPage,
   loadHostedDomainDetailPage,
   loadHostedDomainsPage,
   loadInboxPage,
@@ -36,6 +37,7 @@ const InboxPage = page(loadInboxPage, (m) => m.InboxPage);
 const MessagePage = page(loadMessagePage, (m) => m.MessagePage);
 const ComposePage = page(loadComposePage, (m) => m.ComposePage);
 const SentPage = page(loadSentPage, (m) => m.SentPage);
+const DraftsPage = page(loadDraftsPage, (m) => m.DraftsPage);
 const StarredPage = page(loadStarredPage, (m) => m.StarredPage);
 const TrashPage = page(loadTrashPage, (m) => m.TrashPage);
 const MailboxesPage = page(loadMailboxesPage, (m) => m.MailboxesPage);
@@ -86,6 +88,7 @@ export const router = createBrowserRouter([
       { path: 'mail/:id', element: <MessagePage />, handle: title('邮件详情') },
       { path: 'compose', element: <ComposePage />, handle: title('写邮件') },
       { path: 'sent', element: <SentPage />, handle: title('已发送') },
+      { path: 'drafts', element: <DraftsPage />, handle: title('草稿箱') },
       { path: 'starred', element: <StarredPage />, handle: title('星标') },
       { path: 'trash', element: <TrashPage />, handle: title('回收站') },
       { path: 'mailboxes', element: <MailboxesPage />, handle: title('我的邮箱') },
