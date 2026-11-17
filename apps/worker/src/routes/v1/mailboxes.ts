@@ -1,7 +1,10 @@
-import { batchMailboxRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
+import {
+  batchMailboxRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, listMailboxesQuerySchema, updateMailboxRequestSchema,
+} from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../../lib/http.js';
 import { AppError } from '../../lib/errors.js';
+import { pageRequestOf } from '../../lib/pagination.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
 import { planRandomDomains } from '../../services/claim-plan.js';
 import {
@@ -24,8 +27,9 @@ app.get('/', async (c) => {
   const key = c.get('apiKey')!;
   const all = parseBooleanFlag(c.req.query('all'));
   if (all && key.role !== 'admin') throw new AppError('forbidden', '需要管理员权限');
-  const list = await listMailboxes(c.env, all ? { all: true } : { userId: key.userId });
-  return ok(c, list);
+  const query = parseQuery(c, listMailboxesQuerySchema);
+  const scope = all ? { all: true } : { userId: key.userId };
+  return ok(c, await listMailboxes(c.env, { ...scope, q: query.q, domain: query.domain }, pageRequestOf(query)));
 });
 
 app.get('/availability', async (c) => {

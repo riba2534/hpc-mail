@@ -12,7 +12,7 @@ import {
   MAX_TRANSLATE_BATCH_CHARS, MAX_TRANSLATE_SEGMENTS, MAX_TRANSLATE_SEGMENT_CHARS,
   ALLOWED_CUSTOM_HEADERS, MAX_CUSTOM_HEADER_VALUE_BYTES, MAX_CUSTOM_NON_X_HEADERS, MAX_CUSTOM_HEADERS_TOTAL_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_SEND_REQUEST_BYTES, MAX_REPLY_TO, MAX_DISPLAY_NAME_LENGTH,
-  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES,
+  EXTERNAL_MESSAGE_MAX_BYTES, OUTBOUND_STATUSES, LIST_PAGE_DEFAULT_LIMIT, LIST_PAGE_MAX_LIMIT,
 } from '@hpc-mail/shared';
 import { REQUEST_ID_PATTERN } from '../middleware/error.js';
 
@@ -497,3 +497,19 @@ export function uploadPaths(scope?: string): Paths {
       description: 'Own draft only. Aborts unfinished multipart uploads or deletes the completed draft object. R2 failure keeps the durable reference for cleanup.' }) },
   };
 }
+
+/** 可选分页的列表：出现 cursor 或 limit 即返回 Page，都不出现时返回旧版完整数组 */
+const pageSwitch = 'Presence of cursor or limit (even empty) switches the response from the full array to a page {items, nextCursor}.';
+export const optionalPageQuery = [
+  query('cursor', { type: 'string', maxLength: 128 }, `${pageSwitch} Pass the previous nextCursor unchanged; empty means the first page; null nextCursor means no next page. A cursor that is present but cannot be decoded returns 400 validation_failed.`),
+  query('limit', { type: 'integer', minimum: 1, maximum: LIST_PAGE_MAX_LIMIT, default: LIST_PAGE_DEFAULT_LIMIT }, `${pageSwitch} Items per page.`),
+];
+export const arrayOrPage = (items: Schema): Schema => ({ oneOf: [
+  { ...array(items), title: 'Full array (neither cursor nor limit present)' },
+  { ...page(items), title: 'Page (cursor or limit present)' },
+] });
+export const mailboxSearchQuery = [
+  query('q', { type: 'string', maxLength: 254 }, 'Case-insensitive literal substring of the address or the owner username (no wildcards).'),
+  query('domain', domainName, 'Exact domain.'),
+];
+export const mailboxListDescription = 'Ordered by mailbox id, newest first. q and domain filter in both response forms. Without cursor and limit the response stays the complete array, as before; scripts listing every mailbox with all=1 should page with limit and nextCursor instead.';

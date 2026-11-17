@@ -1,11 +1,12 @@
 import type {
   AdminHostedDomainsQuery, HostedDomain, HostedDomainMember, HostedDomainRole, HostedDomainSteps, HostedDomainStepState,
-  HostedDomainTransferResult, HostedDomainsHealth, Settings, TransferHostedDomainRequest,
+  HostedDomainTransferResult, HostedDomainsHealth, Page, Settings, TransferHostedDomainRequest,
 } from '@hpc-mail/shared';
-import { and, desc, eq, inArray, notInArray, or, sql, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
+import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
 import {
@@ -247,15 +248,22 @@ export async function listMyHostedDomains(env: Env, viewer: Viewer): Promise<Hos
   ));
 }
 
-export async function listAllHostedDomains(env: Env, viewer: Viewer, query: AdminHostedDomainsQuery): Promise<HostedDomain[]> {
+/** 全站托管域名，按 id 倒序：page 为 null 时返回数组（旧行为，最多 1000 条），否则返回一页 */
+export async function listAllHostedDomains(
+  env: Env, viewer: Viewer, query: Pick<AdminHostedDomainsQuery, 'status' | 'q'>, page: PageRequest | null = null,
+): Promise<HostedDomain[] | Page<HostedDomain>> {
   const conditions: (SQL | undefined)[] = [];
-  if (query.status) conditions.push(eq(hostedDomains.status, query.status));
+  // 分页按 id 倒序取够即停：status 索引不含 id，走它要先算完该状态全部行的计数子查询再排序，一元 + 让规划器不用它
+  if (query.status) conditions.push(page ? sql`+${hostedDomains.status} = ${query.status}` : eq(hostedDomains.status, query.status));
   if (query.q) {
     // instr 按字面匹配，% 和 _ 不当通配符
     conditions.push(or(sql`instr(${hostedDomains.domain}, ${query.q}) > 0`,
       sql`${hostedDomains.userId} IN (SELECT id FROM users WHERE instr(lower(username), ${query.q}) > 0)`));
   }
-  return loadViews(env, viewer, and(...conditions), 1000);
+  if (!page) return loadViews(env, viewer, and(...conditions), 1000);
+  if (page.cursorId) conditions.push(lt(hostedDomains.id, page.cursorId));
+  // 管理员对每个域名都有权限，loadViews 不会滤掉行，多取的一条照常用来判断下一页
+  return toPage(await loadViews(env, viewer, and(...conditions), fetchLimit(page)), page.limit, (view) => view.id);
 }
 
 // ---------------------------------------------------------------------------

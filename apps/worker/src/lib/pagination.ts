@@ -21,6 +21,30 @@ export function decodeCursor(cursor: string | undefined): number | null {
   return id;
 }
 
+/** 分页模式的请求：游标解出的 id（首页为 null）与每页条数 */
+export interface PageRequest {
+  cursorId: number | null;
+  limit: number;
+}
+
+/** 可选分页查询（shared withOptionalPage 的解析结果）：数组模式返回 null；无效游标 400 */
+export function pageRequestOf(query: { paged: boolean; cursor?: string; limit: number }): PageRequest | null {
+  return query.paged ? { cursorId: decodeCursor(query.cursor), limit: query.limit } : null;
+}
+
+/** 查询的 LIMIT：分页模式多取一条；数组模式为 -1 即不限（drizzle 不生成 LIMIT 子句，SQLite 的负数 LIMIT 也不设上限） */
+export const fetchLimit = (page: PageRequest | null): number => (page ? page.limit + 1 : -1);
+
+/**
+ * 按 id 倒序、多取一条（limit + 1）的结果切成一页：多出的那条只用来判断是否还有下一页，
+ * 下一页从本页最后一条的 id 之后继续。
+ */
+export function toPage<T>(items: T[], limit: number, idOf: (item: T) => number): Page<T> {
+  const hasMore = items.length > limit;
+  const page = hasMore ? items.slice(0, limit) : items;
+  return { items: page, nextCursor: hasMore ? encodeCursor(idOf(page[page.length - 1]!)) : null };
+}
+
 /**
  * 首页指纹：对首页序列化结果（条目 + nextCursor）取 SHA-256。
  * 条目里任何对用户可见的字段（已读、星标、验证码、状态等）或翻页游标变化都会改变它；

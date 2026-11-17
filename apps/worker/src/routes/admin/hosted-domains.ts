@@ -1,6 +1,7 @@
 import { adminHostedDomainsQuerySchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { clientIp, ok, parseId, parseQuery } from '../../lib/http.js';
+import { pageRequestOf } from '../../lib/pagination.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import {
   hostedDomainsHealth, listAllHostedDomains, resumeHostedDomain, suspendHostedDomain,
@@ -13,7 +14,7 @@ app.use('*', requireAuth, requireAdmin);
 
 app.get('/', async (c) => {
   const query = parseQuery(c, adminHostedDomainsQuerySchema);
-  return ok(c, await listAllHostedDomains(c.env, c.get('user')!, query));
+  return ok(c, await listAllHostedDomains(c.env, c.get('user')!, query, pageRequestOf(query)));
 });
 
 /** 凭据是否配置且有效、站长账户 zone 数量 */
