@@ -11,7 +11,7 @@ import { getSettings } from './setting.js';
  * 部署后探针：CI 发布后用它验证 fetch 以外的两个入口。
  * - 收件金丝雀：经 send_email 真实外发一封信到本站系统域名，走 MX → Email Routing → email handler，
  *   handler 认出签名后只记一条 KV，CI 轮询到即说明外发与收件链路都在新版本上可用。
- * - cron 心跳：每个 build 的 scheduled 首次运行后写一条 KV，表示「该 build 的 cron 已运行过」。
+ * - cron 心跳：scheduled 每次运行读一次 KV，build 变了才写，记录「最近一次写入它的 build 与时间」。
  * 运维令牌与信头签名都从 jwt_secret 派生，CI 用同一个 secret 计算，不另设密钥。
  */
 const CANARY_LABEL = 'hpc-canary-v1';
@@ -72,16 +72,19 @@ function canaryKey(nonce: string): string {
 }
 
 /**
- * 校验信头：收件人须是 canary@、未过期、签名与收件地址一致，有效时返回 nonce。
- * 只做本地计算；收件域是否为系统域名由 consumeCanaryMail 在签名通过后再查。
- * 途经 MTA 折行可能在值里留下空白，先去掉。
+ * 校验信头格式与签名（按实际收件地址计算），通过即证明是本站发出的金丝雀，返回 nonce 与过期时间；
+ * 是否过期、收件人是否合规由 consumeCanaryMail 判断。途经 MTA 折行可能在值里留下空白，先去掉。
  */
-export async function verifyCanaryHeader(env: Env, value: string | null, to: string): Promise<string | null> {
-  if (!value || !env.jwt_secret || getLocalPart(to) !== CANARY_LOCAL_PART) return null;
+export async function verifyCanaryHeader(
+  env: Env,
+  value: string | null,
+  to: string,
+): Promise<{ nonce: string; exp: number } | null> {
+  if (!value || !env.jwt_secret) return null;
   const [nonce = '', expText = '', signature = '', ...rest] = value.replace(/\s+/g, '').split('.');
+  if (rest.length || !isCanaryNonce(nonce) || !/^\d{1,12}$/.test(expText)) return null;
   const exp = Number(expText);
-  if (rest.length || !isCanaryNonce(nonce) || !/^\d{1,12}$/.test(expText) || exp * 1000 < Date.now()) return null;
-  return timingSafeEqualStr(await canarySignature(env, nonce, to, exp), signature) ? nonce : null;
+  return timingSafeEqualStr(await canarySignature(env, nonce, to, exp), signature) ? { nonce, exp } : null;
 }
 
 /**
@@ -124,15 +127,26 @@ export async function sendCanaryMail(env: Env, from: string, to: string, nonce: 
 }
 
 /**
- * 收件入口最先调用：签名有效、未过期、收件人是 canary@<系统域名> 的金丝雀只记一条 KV 并返回 true，
- * 调用方直接结束——不落库、不转发、不通知、不自动认领；任一条件不满足返回 false，照常按普通来信处理。
+ * 收件入口最先调用，返回 true 时调用方直接结束——不落库、不转发、不通知、不自动认领：
+ * - 签名不通过（没有头、伪造、或截获后改投其他地址）返回 false，照常按普通来信处理；
+ * - 签名通过但已过期（如 KV 写失败后 SMTP 重投超过 10 分钟）、收件人不是 canary@、收件域不在系统域名列表
+ *   （含读设置失败拿到空列表）时静默丢弃：只记一行日志，不写 KV——本站金丝雀不能落进 canary@ 邮箱去通知管理员；
+ * - 其余记一条 KV 回执供 CI 轮询。
  * 只读 Cloudflare 已解析的信头，不消费原文；没有该头的普通来信不做任何读取。签名通过后才读设置，
- * 与收件主流程随后的设置读取共用 isolate 内存缓存，不增加 D1 往返。KV 写失败向上抛出，交给 SMTP 重投。
+ * 与收件主流程的设置读取共用 isolate 内存缓存，不增加 D1 往返。KV 写失败向上抛出，交给 SMTP 重投。
  */
 export async function consumeCanaryMail(message: ForwardableEmailMessage, env: Env): Promise<boolean> {
   const to = normalizeEmail(message.to);
-  const nonce = await verifyCanaryHeader(env, message.headers.get(CANARY_HEADER), to);
-  if (!nonce || !(await getDomains(env, await getSettings(env))).includes(getEmailDomain(to))) return false;
+  const verified = await verifyCanaryHeader(env, message.headers.get(CANARY_HEADER), to);
+  if (!verified) return false;
+  const { nonce, exp } = verified;
+  const dropReason = exp * 1000 < Date.now() ? 'expired'
+    : getLocalPart(to) !== CANARY_LOCAL_PART ? 'not_canary_address'
+      : !(await getDomains(env, await getSettings(env))).includes(getEmailDomain(to)) ? 'not_system_domain' : '';
+  if (dropReason) {
+    console.warn(JSON.stringify({ event: 'canary_dropped', reason: dropReason, nonce, to }));
+    return true;
+  }
   const receipt: CanaryReceipt = { receivedAt: new Date().toISOString(), build: buildId(env), to };
   await env.kv.put(canaryKey(nonce), JSON.stringify(receipt), { expirationTtl: PROBE_TTL_SECONDS });
   return true;
@@ -147,29 +161,18 @@ export async function readCanaryReceipt(
   return receipt ? { received: true, receivedAt: receipt.receivedAt, build: receipt.build } : { received: false };
 }
 
-/** 本 isolate 已确认当前 build 的心跳在 KV 里（isolate 内 build 不变，确认一次即可） */
-let heartbeatConfirmed = false;
-
-/** 测试用：模拟新 isolate */
-export function resetCronHeartbeatMemory(): void {
-  heartbeatConfirmed = false;
-}
-
 /**
- * scheduled 每次运行结束调用，但心跳的语义是「该 build 的 cron 已运行过」，不是每 5 分钟刷新：
- * 本 isolate 确认过就不再读写；新 isolate 读一次 KV，已存心跳的 build 相同就不写（1 天过期后由下一个新 isolate 补写）。
- * KV 读比写便宜，热 isolate 则读写都没有。at/ok/failedSteps 因此是该 build 首次写入那次运行的结果。
- * 读写失败只记日志，不影响定时任务本身，下次运行重试。
+ * scheduled 每次运行结束调用。心跳的语义是「最近一次写入它的 build 与时间」，不是每 5 分钟刷新：
+ * 每次运行读一次 KV（读便宜），存的 build 与当前不同（或已过期消失）才写，at/ok/failedSteps 只在 build 变化时更新。
+ * 发布切换窗口里新旧 build 可能交替写入，旧 isolate 退场后由新 build 的下一次运行收敛到新 build，
+ * 所以不能用 isolate 内标记跳过读取。不访问 D1。读写失败只记日志，不影响定时任务本身，下次运行重试。
  */
 export async function writeCronHeartbeat(env: Env, cron: string, failedSteps: string[]): Promise<void> {
-  if (heartbeatConfirmed) return;
   const build = buildId(env);
   try {
-    if ((await readCronHeartbeat(env))?.build !== build) {
-      const heartbeat: CronHeartbeat = { at: new Date().toISOString(), build, cron, ok: failedSteps.length === 0, failedSteps };
-      await env.kv.put(CRON_HEARTBEAT_KEY, JSON.stringify(heartbeat), { expirationTtl: PROBE_TTL_SECONDS });
-    }
-    heartbeatConfirmed = true;
+    if ((await readCronHeartbeat(env))?.build === build) return;
+    const heartbeat: CronHeartbeat = { at: new Date().toISOString(), build, cron, ok: failedSteps.length === 0, failedSteps };
+    await env.kv.put(CRON_HEARTBEAT_KEY, JSON.stringify(heartbeat), { expirationTtl: PROBE_TTL_SECONDS });
   } catch (error) {
     console.error('cron 心跳写入失败:', error);
   }

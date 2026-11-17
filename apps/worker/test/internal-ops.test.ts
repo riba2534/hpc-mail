@@ -8,11 +8,11 @@ import { messages, users } from '../src/db/schema.js';
 import worker from '../src/index.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import {
-  CANARY_RATE_SCOPE, CRON_HEARTBEAT_KEY, canaryHeaderValue, pickCanaryDomains, resetCronHeartbeatMemory, verifyCanaryHeader,
+  CANARY_RATE_SCOPE, CRON_HEARTBEAT_KEY, canaryHeaderValue, pickCanaryDomains, verifyCanaryHeader,
 } from '../src/services/ops-probe.js';
 import { minuteWindow } from '../src/services/rate-counter.js';
 import { runScheduled } from '../src/services/scheduled.js';
-import { updateSettings } from '../src/services/setting.js';
+import { invalidateSettingsMemory, updateSettings } from '../src/services/setting.js';
 
 vi.mock('cloudflare:email', () => ({
   EmailMessage: class {
@@ -255,22 +255,49 @@ describe('email handler 识别金丝雀', () => {
     // FIXED_HEADER 签给 canary@mid.test，改投同为系统域名的 canary@zeta.test（先清掉前面用例的回执）
     await env.kv.delete(`canary:${FIXED_NONCE}`);
     await expectOrdinary('canary@zeta.test', FIXED_NONCE, FIXED_HEADER);
-    expect(await verifyCanaryHeader(env, FIXED_HEADER, 'canary@mid.test')).toBe(FIXED_NONCE);
+    expect(await verifyCanaryHeader(env, FIXED_HEADER, 'canary@mid.test')).toEqual({ nonce: FIXED_NONCE, exp: FIXED_EXP });
   });
 
-  it('过期、local part 不是 canary、收件域不是系统域名时按普通来信处理', async () => {
+  /** 签名通过但条件不满足：不落库、不转发、不写 KV，只记一行 canary_dropped 日志 */
+  async function expectDropped(address: string, nonce: string, header: string, reason: string, runtime: TestEnv = env) {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const before = await countRows('SELECT count(*) AS n FROM messages WHERE address = ?', address);
+    const message = inboundMail(address, header);
+    await deliver(message, runtime);
+    expect(await countRows('SELECT count(*) AS n FROM messages WHERE address = ?', address), address).toBe(before);
+    expect(await env.kv.get(`canary:${nonce}`), address).toBeNull();
+    expect(message.forward).not.toHaveBeenCalled();
+    expect(message.setReject).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map(args => JSON.parse(String(args[0])))).toEqual([{ event: 'canary_dropped', reason, nonce, to: address }]);
+    warn.mockRestore();
+  }
+
+  it('签名通过但过期、收件人不是 canary@、收件域不在系统域名列表时静默丢弃', async () => {
+    // 典型场景：KV 写失败后 SMTP 重投超过 10 分钟，不能落进 canary@ 邮箱去通知管理员
     const expired = Math.floor(Date.now() / 1000) - 1;
-    await expectOrdinary('canary@alpha.test', nonceOf(3), await canaryHeaderValue(env, nonceOf(3), 'canary@alpha.test', expired));
-    await expectOrdinary('probe@alpha.test', nonceOf(4), await canaryHeaderValue(env, nonceOf(4), 'probe@alpha.test', future()));
-    await expectOrdinary('canary@outside.test', nonceOf(5), await canaryHeaderValue(env, nonceOf(5), 'canary@outside.test', future()));
-    // 对照：同样构造、条件都满足时被认出
+    await expectDropped('canary@alpha.test', nonceOf(3), await canaryHeaderValue(env, nonceOf(3), 'canary@alpha.test', expired), 'expired');
+    await expectDropped('probe@alpha.test', nonceOf(4), await canaryHeaderValue(env, nonceOf(4), 'probe@alpha.test', future()), 'not_canary_address');
+    await expectDropped('canary@outside.test', nonceOf(5), await canaryHeaderValue(env, nonceOf(5), 'canary@outside.test', future()), 'not_system_domain');
+    // 对照：同样构造、条件都满足时记回执
     await deliver(inboundMail('canary@alpha.test', await canaryHeaderValue(env, nonceOf(6), 'canary@alpha.test', future())));
     expect(await env.kv.get(`canary:${nonceOf(6)}`, 'json')).toMatchObject({ to: 'canary@alpha.test' });
   });
 
+  it('读设置失败拿到空域名列表时金丝雀静默丢弃，不进普通收件', async () => {
+    invalidateSettingsMemory();
+    const broken = { ...env, db: new Proxy(env.db, {
+      get(target, property) {
+        if (property === 'prepare' || property === 'batch') return () => { throw new Error('d1 down'); };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) } as TestEnv;
+    await expectDropped('canary@alpha.test', nonceOf(7), await canaryHeaderValue(env, nonceOf(7), 'canary@alpha.test', future()), 'not_system_domain', broken);
+  });
+
   it('签名校验容忍折行空白；KV 写失败向上抛出交给 SMTP 重投', async () => {
     const folded = FIXED_HEADER.replace(/\.(?=[0-9a-f]{64}$)/, '.\r\n ');
-    expect(await verifyCanaryHeader(env, folded, 'canary@mid.test')).toBe(FIXED_NONCE);
+    expect(await verifyCanaryHeader(env, folded, 'canary@mid.test')).toEqual({ nonce: FIXED_NONCE, exp: FIXED_EXP });
     const failing = { ...env, kv: { put: async () => { throw new Error('kv down'); } } } as unknown as TestEnv;
     await expect(worker.email(inboundMail('canary@mid.test', FIXED_HEADER) as unknown as ForwardableEmailMessage,
       failing, createExecutionContext())).rejects.toThrow('kv down');
@@ -302,7 +329,6 @@ describe('cron 心跳', () => {
 
   beforeEach(() => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
-    resetCronHeartbeatMemory();
   });
 
   it('还没有心跳时 health 返回 cron: null', async () => {
@@ -322,28 +348,34 @@ describe('cron 心跳', () => {
     expect(health.data).toEqual({ build: 'sha-test', cron: heartbeat });
   });
 
-  it('同一 build 不重复写：本 isolate 再运行不读不写，新 isolate 只读一次，换 build 才写', async () => {
+  it('每次运行只读一次 KV，build 不变不写（at 不刷新），换 build 才写', async () => {
     await env.kv.delete(CRON_HEARTBEAT_KEY);
     const first = kvSpy({ ...env, build_sha: 'sha-one' } as TestEnv);
     await runCron('*/5 * * * *', first.runtime);
     expect(first.calls).toEqual({ get: 1, put: 1 });
     const written = await env.kv.get(CRON_HEARTBEAT_KEY, 'json');
 
-    const warm = kvSpy({ ...env, build_sha: 'sha-one' } as TestEnv);
-    await runCron('*/5 * * * *', warm.runtime);
-    expect(warm.calls).toEqual({ get: 0, put: 0 });
-
-    resetCronHeartbeatMemory();
-    const fresh = kvSpy({ ...env, build_sha: 'sha-one' } as TestEnv);
-    await runCron('*/5 * * * *', fresh.runtime);
-    expect(fresh.calls).toEqual({ get: 1, put: 0 });
+    for (let run = 0; run < 2; run++) {
+      const same = kvSpy({ ...env, build_sha: 'sha-one' } as TestEnv);
+      await runCron('*/5 * * * *', same.runtime);
+      expect(same.calls).toEqual({ get: 1, put: 0 });
+    }
     expect(await env.kv.get(CRON_HEARTBEAT_KEY, 'json')).toEqual(written);
 
-    resetCronHeartbeatMemory();
     const upgraded = kvSpy({ ...env, build_sha: 'sha-two' } as TestEnv);
     await runCron('*/5 * * * *', upgraded.runtime);
     expect(upgraded.calls).toEqual({ get: 1, put: 1 });
     expect(await env.kv.get(CRON_HEARTBEAT_KEY, 'json')).toMatchObject({ build: 'sha-two' });
+  });
+
+  it('发布切换窗口里旧 build 晚写入后，新 build 下一次运行收敛回新 build', async () => {
+    await env.kv.delete(CRON_HEARTBEAT_KEY);
+    const next = { ...env, build_sha: 'sha-new' } as TestEnv;
+    await runCron('*/5 * * * *', next);
+    await runCron('*/5 * * * *', { ...env, build_sha: 'sha-old' } as TestEnv);
+    expect(await env.kv.get(CRON_HEARTBEAT_KEY, 'json')).toMatchObject({ build: 'sha-old' });
+    await runCron('*/5 * * * *', next);
+    expect(await env.kv.get(CRON_HEARTBEAT_KEY, 'json')).toMatchObject({ build: 'sha-new' });
   });
 
   it('有步骤失败时心跳 ok=false 并列出失败步骤', async () => {
