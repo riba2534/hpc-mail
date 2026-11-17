@@ -1,4 +1,4 @@
-import { focusManager, onlineManager, useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
+import { focusManager, keepPreviousData, onlineManager, useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ListMessagesQuery } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
@@ -8,6 +8,8 @@ import { messageListQueryOptions } from './message-queries';
 import { markUnreadRefreshed, nextUnreadRefreshDelay, pauseUnreadCountPolling } from './use-unread-count';
 
 const POLL_INTERVAL_MS = 20_000;
+/** Search views: sync re-runs the unindexed full-text match, so the head is probed less often. */
+const SEARCH_POLL_INTERVAL_MS = 60_000;
 const RETRY_DELAY_MS = 2_500;
 type ListQuery = { state: { data?: MessageListData } };
 const singlePage = (query: ListQuery) => (query.state.data?.pages.length ?? 0) <= 1;
@@ -17,8 +19,11 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
   const queryClient = useQueryClient();
   // Once loaded, polling, focus and reconnect go through /messages/sync below and refetch only when the head changed.
   // Until the first page arrives (e.g. the initial load failed) the list keeps retrying as a whole.
-  const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } = useInfiniteQuery({
+  const { data, isLoading, isPlaceholderData, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage, refetch } = useInfiniteQuery({
     ...messageListQueryOptions(query),
+    // Switching filters or the search term keeps showing the previous results until the new ones arrive,
+    // instead of flashing the whole list back to a skeleton.
+    placeholderData: keepPreviousData,
     refetchInterval: (current) => (withoutData(current) ? POLL_INTERVAL_MS : false),
     refetchOnWindowFocus: withoutData,
     refetchOnReconnect: withoutData,
@@ -35,8 +40,11 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
     if (!hasData) return;
     const queryKey = queryKeys.messages.list(latestQuery.current);
     const controller = new AbortController();
+    const searching = Boolean(latestQuery.current.q);
+    const interval = searching ? SEARCH_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
     // sync carries the unread count every round, so the unread-count query stops polling on its own meanwhile.
-    const resumeUnreadPolling = pauseUnreadCountPolling(queryClient);
+    // Search views sync less often than the unread count refreshes, so there it keeps polling by itself.
+    const resumeUnreadPolling = searching ? () => {} : pauseUnreadCountPolling(queryClient);
     let pending = false;
     // Paging, refetching, an optimistic write or a pending mutation happened meanwhile: drop this round's result.
     const untouched = (since: number) => {
@@ -106,12 +114,12 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
       }
     };
     // The first round waits only for the rest of the interval since the last refresh: switching filters or pages
-    // neither postpones it nor sends an extra one within the interval.
+    // neither postpones it nor sends an extra one within the interval. A new search term was just fetched in full.
     let timer: ReturnType<typeof setInterval> | undefined;
     const firstTimer = globalThis.setTimeout(() => {
       void check();
-      timer = globalThis.setInterval(() => void check(), POLL_INTERVAL_MS);
-    }, nextUnreadRefreshDelay(queryClient));
+      timer = globalThis.setInterval(() => void check(), interval);
+    }, searching ? interval : nextUnreadRefreshDelay(queryClient));
     const unsubscribeFocus = focusManager.subscribe((focused) => {
       if (focused) void check();
     });
@@ -144,6 +152,8 @@ export function useMessagesQuery(query: Partial<ListMessagesQuery>) {
   return {
     data,
     isLoading,
+    /** Still showing the previous filter's results while the new ones load. */
+    isPlaceholderData,
     isError: isError || pollError !== null,
     error: error ?? pollError,
     fetchNextPage,
