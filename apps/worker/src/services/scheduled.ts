@@ -19,6 +19,7 @@ import { FORWARD_CONFIRM_SCOPE } from './forward-confirm.js';
 import { cleanupWebhookDeliveries, processWebhookDeliveries } from './webhooks.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
+import { backfillClaudeReceipts, harvestRecentClaudeReceipts } from './claude-receipts.js';
 import {
   HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
 } from './hosted-domain.js';
@@ -221,6 +222,9 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   // 投递中断（Worker 被回收、结果回填失败）超过 1 小时仍 pending 的外发标为 unknown，幂等重放才有终态
   await step(report, 'outbound.stale', () => markStaleOutbound(env));
   await step(report, 'claude_facts.harvest', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_WINDOW_MS));
+  // Anthropic 收据：先采最近 1 小时的新收据，再按 id 游标回填历史（追上后跟随新行，兜住定时任务中断的时段）
+  await step(report, 'claude_receipts.harvest', () => harvestRecentClaudeReceipts(env));
+  await step(report, 'claude_receipts.backfill', () => backfillClaudeReceipts(env));
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
   // 历史正文分批搬到 R2（放在清理之前：本轮没被引用的对象登记后同一轮就能回收）

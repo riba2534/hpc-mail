@@ -305,6 +305,32 @@ export const claudeAddressFacts = sqliteTable(
 );
 
 /**
+ * Anthropic 收据，由官方收据来信解析（services/claude-receipts.ts），信任口径同 claude_address_facts。
+ * 不随邮件删除：message_id 不加外键，永久删除后保留原值；同一封邮件只记一次。解析不到的金额、币种、卡尾号为 null。
+ */
+export const claudeReceipts = sqliteTable(
+  'claude_receipts',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    messageId: integer('message_id').notNull(),
+    address: text('address').notNull(),
+    domain: text('domain').notNull(),
+    receivedAt: integer('received_at', { mode: 'timestamp_ms' }).notNull(),
+    subject: text('subject').notNull(),
+    amountCents: integer('amount_cents'),
+    /** ISO 4217 代码，由金额符号推断（$ 为 USD） */
+    currency: text('currency'),
+    cardLast4: text('card_last4'),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    uniqueIndex('idx_claude_receipts_message').on(t.messageId),
+    index('idx_claude_receipts_address').on(t.address, t.receivedAt),
+    index('idx_claude_receipts_domain').on(t.domain),
+  ],
+);
+
+/**
  * 用户托管域名：zone 建在站长 Cloudflare 账户，用户把 NS 改过来后自动开通收发。
  * 只操作本表记录过的 zone_id，从不接管账户里已有的 zone。未认领地址的来信自动认领给 user_id。
  */

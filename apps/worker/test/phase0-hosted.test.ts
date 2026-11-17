@@ -31,14 +31,16 @@ describe('定时任务分工', () => {
     expect(daily).toEqual(expect.arrayContaining(['claude_facts.catchup', 'idempotency.cleanup', 'counters', 'retention', 'trash',
       'attachments.orphans', 'hosted_domains.tombstones']));
     for (const regular of ['inbound.repair', 'notification.repair', 'notification.process', 'purge.recover', 'outbound.stale', 'claude_facts.harvest',
-      'storage.leases', 'storage.links', 'bodies.offload', 'storage.cleanup', 'system_domains.onboarding', 'hosted_domains.sync', 'delivery_events.subscriptions',
+      'claude_receipts.harvest', 'claude_receipts.backfill', 'storage.leases', 'storage.links', 'bodies.offload', 'storage.cleanup',
+      'system_domains.onboarding', 'hosted_domains.sync', 'delivery_events.subscriptions',
       'webhooks.process']) {
       expect(daily).not.toContain(regular);
     }
 
     const every5 = await scheduledSteps(false);
     expect(every5).toEqual(['notification.repair', 'notification.process', 'purge.recover', 'outbound.stale', 'claude_facts.harvest',
-      'storage.leases', 'storage.links', 'bodies.offload', 'storage.cleanup', 'system_domains.onboarding', 'hosted_domains.sync', 'delivery_events.subscriptions',
+      'claude_receipts.harvest', 'claude_receipts.backfill', 'storage.leases', 'storage.links', 'bodies.offload', 'storage.cleanup',
+      'system_domains.onboarding', 'hosted_domains.sync', 'delivery_events.subscriptions',
       'webhooks.process']);
   });
 });
