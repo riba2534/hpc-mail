@@ -3,7 +3,9 @@ import {
 } from '@hpc-mail/shared';
 import { Hono, type Context } from 'hono';
 import { clientIp, execCtx, ok, parseBody, parseId, parseRecordId } from '../../lib/http.js';
-import { apiKeyAuth, assertKeyCanUseDomain, keyRestriction, requireScope } from '../../middleware/api-key-auth.js';
+import {
+  apiKeyAuth, assertKeyCanUseDomain, keyRestriction, requireScope, restrictedError, restrictionAllowsDomain,
+} from '../../middleware/api-key-auth.js';
 import { checkHostedDomain, createHostedDomain, getHostedDomain, listMyHostedDomains, reconnectHostedDomain } from '../../services/hosted-domain.js';
 import { checkHostedDomains, createHostedDomains } from '../../services/hosted-domain-batch.js';
 import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../../services/hosted-dns.js';
@@ -31,13 +33,19 @@ function keyActor(c: Context<AppContext>): Viewer {
 }
 
 /**
- * 限定了邮箱或域名的 Key 只能操作 allowedDomains 里的托管域名：按 id 访问时先查出域名再校验（不存在的交给服务层报 404）。
+ * 限定了邮箱或域名的 Key 只能操作 allowedDomains 里的托管域名。按 id 访问时只看调用者看得到的行（所有者、成员，
+ * 有效角色为管理员时全部）：看不到的与不存在一样交给服务层报 404；范围外的 403 只带 id，不带出域名，
+ * 否则限定范围的 Key 能按 id 枚举别人托管的域名。
  */
 async function assertHostedInKey(c: Context<AppContext>, ids: readonly number[]): Promise<void> {
-  if (!keyRestriction(c) || !ids.length) return;
-  const { results } = await c.env.db.prepare('SELECT domain FROM hosted_domains WHERE id IN (SELECT value FROM json_each(?))')
-    .bind(JSON.stringify(ids)).all<{ domain: string }>();
-  for (const row of results) assertKeyCanUseDomain(c, row.domain);
+  const restriction = keyRestriction(c);
+  if (!restriction || !ids.length) return;
+  const key = c.get('apiKey')!;
+  const { results } = await c.env.db.prepare(`SELECT id, domain FROM hosted_domains h WHERE id IN (SELECT value FROM json_each(?1))
+      AND (?3 = 'admin' OR h.user_id = ?2 OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?2))`)
+    .bind(JSON.stringify(ids), key.userId, key.role).all<{ id: number; domain: string }>();
+  const outside = results.find((row) => !restrictionAllowsDomain(restriction, row.domain));
+  if (outside) throw restrictedError(`托管域名 #${Number(outside.id)}`);
 }
 
 app.get('/', async (c) => {
