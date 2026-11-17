@@ -19,18 +19,6 @@ export function tombstoneStatement(env: Env, reason: 'expire' | 'delete', where:
     .bind(reason, Date.now(), ...params);
 }
 
-interface TombstoneRow { user_id: number; reason: string; transfer: string | null }
-
-/**
- * 墓碑记录的最后所有者：删除与过期写入的是删除当时的所有者；迁移 0024 回填的只有最后一次添加的人，
- * 之后若有过户（审计 detail 形如「旧名 (#旧id) → 新名 (#新id)；…」）以最近一次过户的目标为准，解析不出时谁都不免检（0）
- */
-function lastOwner(row: TombstoneRow): number {
-  if (row.reason !== 'backfill' || !row.transfer) return Number(row.user_id);
-  const target = /→ .*? \(#(\d+)\)/.exec(row.transfer);
-  return target ? Number(target[1]) : 0;
-}
-
 /**
  * 他人重新添加前的公开委派预检（R14）：同一 Cloudflare 账户重建 zone 会拿到相同的 NS，前所有者删除后没把 NS 改回时，
  * 别人加回来几分钟就能激活并收走全部来信。前所有者（90 天内墓碑）与管理员不受限；委派指向本账户分配过的 NS 一律拒绝；
@@ -40,19 +28,15 @@ export async function delegationBlock(env: Env, viewer: { id: number; role: Role
   if (viewer.role === 'admin') return null;
   const [[tombstone, known], delegation] = await Promise.all([
     env.db.batch([
-      // 回填墓碑只知道最后一次添加的人：一并取这次添加之后最近的过户审计，按过户目标认定最后的所有者
-      env.db.prepare(`SELECT t.user_id, t.reason,
-          (SELECT a.detail FROM admin_audit_logs a WHERE a.action = 'hosted_domain.transfer' AND a.target = t.domain
-            AND a.id > COALESCE((SELECT MAX(c.id) FROM admin_audit_logs c WHERE c.action = 'hosted_domain.create' AND c.target = t.domain), 0)
-            ORDER BY a.id DESC LIMIT 1) AS transfer
-        FROM hosted_domain_tombstones t WHERE t.domain = ? AND t.deleted_at >= ?`).bind(domain, Date.now() - RETENTION_MS),
+      // user_id 是最后的所有者：删除与过期写入删除当时的所有者，迁移 0024 回填时已按过户审计算出
+      env.db.prepare('SELECT user_id FROM hosted_domain_tombstones WHERE domain = ? AND deleted_at >= ?').bind(domain, Date.now() - RETENTION_MS),
       env.db.prepare(`SELECT lower(j.value) AS ns FROM hosted_domains h, json_each(h.name_servers) j
         UNION SELECT lower(j.value) FROM hosted_domain_tombstones t, json_each(t.name_servers) j`),
     ]),
     lookupDelegation(domain),
   ]);
-  const previous = tombstone?.results?.[0] as TombstoneRow | undefined;
-  if (previous && lastOwner(previous) === viewer.id) return null;
+  const previous = tombstone?.results?.[0] as { user_id: number } | undefined;
+  if (previous && Number(previous.user_id) === viewer.id) return null;
   if (delegation) {
     const ours = new Set(((known?.results ?? []) as { ns: string }[]).map((row) => row.ns.replace(/\.$/, '')));
     if (!delegation.some((ns) => ours.has(ns))) return null;
