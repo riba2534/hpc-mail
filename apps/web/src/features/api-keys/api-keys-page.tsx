@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { KeyRound, MoreHorizontal, Plus, Power, ScrollText, Trash2 } from 'lucide-react';
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import type { ApiKeyStatus, ApiKeySummary } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { apiKeyApi } from '@/api/resources';
@@ -85,10 +86,15 @@ export function ApiKeysPage() {
         title="API Keys"
         description="用于开放 API（/v1）的访问凭证，创建后仅展示一次完整密钥。"
         actions={
-          <Button onClick={() => setCreateOpen(true)}>
-            <Plus className="size-4" />
-            创建密钥
-          </Button>
+          <>
+            <Button asChild variant="secondary">
+              <Link to="/api-docs">查看 API 文档</Link>
+            </Button>
+            <Button onClick={() => setCreateOpen(true)}>
+              <Plus className="size-4" />
+              创建密钥
+            </Button>
+          </>
         }
       />
 
