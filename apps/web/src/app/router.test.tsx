@@ -81,6 +81,9 @@ describe('外壳内页面的错误边界', () => {
     const { client, router } = renderApp('/sent');
     expect(await screen.findByRole('heading', { name: '页面资源加载失败' })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: /星标/ }).length).toBeGreaterThan(0);
+    // 同一文档里重新 import 拿不到新版本：给整页刷新而不是原地重试
+    expect(screen.getByRole('button', { name: '刷新页面' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
     // 导航到其他页面照常可用
     pages.inboxFails = false;
     fireEvent.click(screen.getByRole('link', { name: '返回收件箱' }));
