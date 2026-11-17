@@ -3,6 +3,7 @@ import {
   internalSendMailSchema,
   sendRequestFingerprint,
   type InternalSendMailRequest,
+  type MessageSummary,
 } from '@hpc-mail/shared';
 import type { Context } from 'hono';
 import { AppError } from '../lib/errors.js';
@@ -42,7 +43,7 @@ export async function handleSend(
     }
     return ok(c, replay, 201);
   }
-  let summary;
+  let summary: MessageSummary;
   try {
     // 两种附件来源：base64 内联（AI/脚本）+ 上传 token（前端与大文件），合并后送 sendMail
     const attachments = [

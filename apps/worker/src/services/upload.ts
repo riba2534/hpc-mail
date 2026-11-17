@@ -69,8 +69,24 @@ export async function resolveDraftAttachments(
 }
 
 /**
- * 发送成功后回收草稿：只删 draft_attachments 行。对象已被发件行与站内副本的附件行直接引用，
- * 随邮件的删除进入清理台账，最后一个引用消失时才删除。
+ * 删除草稿行并在同一事务里登记清理台账。对象可能已被发出（包括全部失败而保留的）邮件的附件行直接引用，
+ * 由 processStorageCleanup 按引用判断是否真删；绑定参数不超过 90 个。
+ */
+function releaseDrafts(env: Env, where: string, params: unknown[]): D1PreparedStatement[] {
+  return [
+    env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM draft_attachments WHERE ${where}`).bind(...params),
+    env.db.prepare(`DELETE FROM draft_attachments WHERE ${where}`).bind(...params),
+  ];
+}
+
+/** 过期或手动删除的草稿（已完成上传，或从未开始分片） */
+export function releaseDraftStatements(env: Env, ids: number[]): D1PreparedStatement[] {
+  return releaseDrafts(env, `id IN (${ids.map(() => '?').join(', ')})`, ids);
+}
+
+/**
+ * 发送成功后回收草稿：只删草稿行，对象留给发件行与站内副本的附件行引用，随邮件删除进入清理；
+ * 发送途中发件记录已被永久删除的，靠这里登记的台账回收。
  */
 export async function consumeDraftAttachments(
   env: Env,
@@ -79,19 +95,5 @@ export async function consumeDraftAttachments(
 ): Promise<void> {
   const uniq = [...new Set(tokens)];
   if (uniq.length === 0) return;
-  await createDb(env)
-    .delete(draftAttachments)
-    .where(and(eq(draftAttachments.userId, userId), inArray(draftAttachments.token, uniq)));
-}
-
-/**
- * 释放已完成上传（或从未开始分片）的草稿：同一事务里删行并登记清理台账。对象可能已被发出
- * （包括全部失败而保留的）邮件附件引用，由 processStorageCleanup 按引用判断是否真删。ids 不超过 90 个。
- */
-export function releaseDraftStatements(env: Env, ids: number[]): D1PreparedStatement[] {
-  const marks = ids.map(() => '?').join(', ');
-  return [
-    env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) SELECT r2_key FROM draft_attachments WHERE id IN (${marks})`).bind(...ids),
-    env.db.prepare(`DELETE FROM draft_attachments WHERE id IN (${marks})`).bind(...ids),
-  ];
+  await env.db.batch(releaseDrafts(env, `user_id = ? AND token IN (${uniq.map(() => '?').join(', ')})`, [userId, ...uniq]));
 }

@@ -9,7 +9,7 @@ import {
   type Role,
   type SendFrom,
 } from '@hpc-mail/shared';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, notInArray, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { attachments as attachmentsTable, deliveryObjectLeases, mailboxes, messages, storageCleanupJobs } from '../db/schema.js';
 import {
@@ -773,6 +773,8 @@ export async function sendMail(
       }
     };
 
+    // 引用的已有对象（草稿、转发的原附件）由原持有方管理回收：草稿行不算清理引用，投递后在这里登记会在草稿还能重发时删掉对象
+    const borrowedKeys = [...new Set(attachments.flatMap(att => ('r2Key' in att ? [att.r2Key] : [])))];
     try {
       outboundAtts = await persistAttachments(env, db, sent.id, attachments, objectLeaseToken);
       await Promise.all([deliverExternal(), deliverInternal()]);
@@ -785,7 +787,8 @@ export async function sendMail(
           await db.batch([
             db.insert(storageCleanupJobs).select(db.select({ r2Key: deliveryObjectLeases.r2Key,
               createdAt: sql<Date>`${Date.now()}`.as('created_at'), lastError: sql<string>`''`.as('last_error') })
-              .from(deliveryObjectLeases).where(eq(deliveryObjectLeases.token, objectLeaseToken))).onConflictDoNothing(),
+              .from(deliveryObjectLeases).where(and(eq(deliveryObjectLeases.token, objectLeaseToken),
+                borrowedKeys.length ? notInArray(deliveryObjectLeases.r2Key, borrowedKeys) : undefined))).onConflictDoNothing(),
             db.delete(attachmentsTable).where(and(eq(attachmentsTable.messageId, sent.id),
               sql`not exists (select 1 from messages where id = ${sent.id})`)),
             db.delete(deliveryObjectLeases).where(eq(deliveryObjectLeases.token, objectLeaseToken)),

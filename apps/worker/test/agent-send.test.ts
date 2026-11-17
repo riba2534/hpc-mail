@@ -16,7 +16,7 @@ import { runDraftAttachmentCleanup, runScheduled } from '../src/services/schedul
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
-import { draftKey } from '../src/services/upload.js';
+import { consumeDraftAttachments, draftKey } from '../src/services/upload.js';
 import type { Env } from '../src/types.js';
 
 vi.mock('cloudflare:email', () => ({
@@ -240,6 +240,41 @@ describe('R39 大附件：引用草稿对象，按需读取', () => {
     expect(await purgeMessages(env, peer.sender, [copy.id])).toBe(1);
     await processStorageCleanup(env);
     expect(await env.r2.get(key)).toBeNull();
+  });
+
+  it('附件元数据写入失败时不登记草稿对象的清理：草稿还在、对象保留，用同一 token 重发成功', async () => {
+    const owner = await account('borrow-owner');
+    const { runtime, captured } = mailEnv();
+    const token = await upload(runtime, owner.key, 'keep.pdf', new TextEncoder().encode('keep me'));
+    const faulty = new Proxy(env.db, { get(target, property) {
+      if (property === 'prepare') return (query: string) => {
+        if (query.startsWith('insert into "attachments"')) throw new Error('D1 attachments unavailable');
+        return target.prepare(query);
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const body = { from: owner.address, to: ['keep@example.net'], subject: 'borrowed draft', text: 'x', attachmentTokens: [token.token] };
+    expect((await failure(await call({ ...runtime, db: faulty } as Env, '/v1/messages', json(owner.key, body)), 500)).code).toBe('internal');
+    await processStorageCleanup(env, 1000);
+    expect(await (await env.r2.get(draftKey(owner.id, token.token)))?.text()).toBe('keep me');
+    expect((await data<MessageSummary>(await call(runtime, '/v1/messages', json(owner.key, body)))).status).toBe('sent');
+    expect(new TextDecoder().decode(captured[0]!.mail.attachments[0]!.content as ArrayBuffer)).toBe('keep me');
+  });
+
+  it('回收草稿同时登记清理：仍被附件行引用的对象保留，发送途中失去引用的对象回收', async () => {
+    const owner = await account('consume-owner');
+    const { runtime } = mailEnv();
+    const kept = await upload(runtime, owner.key, 'kept.pdf', new TextEncoder().encode('kept'));
+    const orphan = await upload(runtime, owner.key, 'orphan.pdf', new TextEncoder().encode('orphan'));
+    const [message] = await db.insert(messages).values({ direction: 'outbound', address: owner.address, domain: 'hpc.email',
+      status: 'sent', subject: 'consume refs' }).returning();
+    await db.insert(attachments).values({ messageId: message!.id, r2Key: draftKey(owner.id, kept.token), filename: 'kept.pdf', size: 4 });
+    await consumeDraftAttachments(env, owner.id, [kept.token, orphan.token]);
+    expect(await db.select().from(draftAttachments).where(eq(draftAttachments.userId, owner.id)).all()).toHaveLength(0);
+    await processStorageCleanup(env, 1000);
+    expect(await (await env.r2.get(draftKey(owner.id, kept.token)))?.text()).toBe('kept');
+    expect(await env.r2.get(draftKey(owner.id, orphan.token))).toBeNull();
   });
 
   it('超过外发上限转下载链接时不读附件内容；内联进 MIME 时才读', async () => {
