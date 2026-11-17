@@ -37,13 +37,15 @@ import { ATTACHMENT_BUCKET_SECONDS, sha256Hex, signAttachment } from '../lib/cry
 import { etagMatches } from '../lib/etag.js';
 import { chunk, D1_ID_BATCH, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
+import { countsAsAttachment } from '../lib/attachment-rule.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
-import { PREVIEW_LIMIT } from '../lib/text.js';
+import { detectPromptInjection, extractReplyText } from '../lib/agent-text.js';
+import { mailText, PREVIEW_LIMIT } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { resolveVerificationCode } from './code-extract.js';
 import { getSettings } from './setting.js';
-import { getJson } from './storage.js';
+import { readMailBody } from './mail-body.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 
 export interface Viewer {
@@ -68,6 +70,7 @@ type MessageSummaryRow = Pick<
   | 'preview'
   | 'verificationCode'
   | 'verificationLink'
+  | 'auth'
   | 'status'
   | 'errorDetail'
   | 'recipientOutcomes'
@@ -88,6 +91,7 @@ const summarySelection = {
   preview: messages.preview,
   verificationCode: messages.verificationCode,
   verificationLink: messages.verificationLink,
+  auth: messages.auth,
   status: messages.status,
   errorDetail: messages.errorDetail,
   recipientOutcomes: messages.recipientOutcomes,
@@ -172,19 +176,19 @@ function ownedAddressQuery(db: Db, userId: number | SQL, domain?: string) {
 }
 
 /**
- * 分享给 userId、且认领人仍启用的地址。domain 写成一元 +：裸 domain = ? 时规划器会改从
- * idx_mailboxes_domain 扫整个域再回查分享表，系统域名下有上千个地址；分享通常只有几个，从分享表出发。
+* mailboxes 按共享关系收窄到某个域时写成一元 +domain，不让它参与选索引：规划器会改从 idx_mailboxes_domain
+ * 扫整个域再回查分享表，系统域名下有上千个地址；分享通常只有几个，从分享表出发。
  */
+const mailboxOnDomain = (domain: string | undefined) => (domain ? sql`+${mailboxes.domain} = ${domain}` : undefined);
+
+/** 分享给 userId、且认领人仍启用的地址；给了 domain 时只取该域的。userId 可以是 SQL，见 ownedAddressQuery */
 function sharedAddressQuery(db: Db, userId: number | SQL, domain?: string) {
   return db
     .select({ address: mailboxes.address })
     .from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
     .innerJoin(users, eq(users.id, mailboxes.userId))
-    .where(and(
-      eq(mailboxShares.userId, userId), eq(users.status, 'active'),
-      domain === undefined ? undefined : sql`+${mailboxes.domain} = ${domain}`,
-    ));
+    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active'), mailboxOnDomain(domain)));
 }
 
 /**
@@ -212,15 +216,17 @@ function scopeCondition(db: Db, scope: Scope, access: ScopeAccess = 'owned', dom
 }
 
 /**
- * 只用于已限定「inbound + 未删除」的查询：可见地址集合 = 认领 ∪ 分享，用 UNION 代替 OR。
+ * 只用于已限定「inbound + 未删除」的查询（wait）：可见地址集合 = 认领 ∪ 分享，用 UNION ALL 代替 OR。
  * 分享分支本身要求 inbound + 未删除，外层条件已覆盖，语义与 scopeCondition 一致；
- * 去掉 OR 后规划器才能按地址逐个走 idx_messages_visible，而不是扫全站未删除邮件。gate 见 gatedOwner。
+ * 去掉 OR 后地址集合是唯一的 IN 条件，INDEXED BY 才能逐个地址取数，而不是扫全站未删除邮件。
+ * 邮箱不能共享给自己的所有者，两支不相交，不需要 UNION 去重的临时 B 树（每个地址省一行读取）。
+ * domain 下推进地址子查询（见 ownedAddressQuery），gate 见 gatedOwner。
  */
 function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess, domain?: string, gate?: SQL): SQL {
   if (scope === 'unclaimed') return scopeCondition(db, scope, access, domain);
   const owner = gatedOwner(scope.ownerId, gate);
   if (access === 'owned') return inArray(messages.address, ownedAddressQuery(db, owner, domain));
-  return inArray(messages.address, union(ownedAddressQuery(db, owner, domain), sharedAddressQuery(db, owner, domain)));
+  return inArray(messages.address, unionAll(ownedAddressQuery(db, owner, domain), sharedAddressQuery(db, owner, domain)));
 }
 
 /**
@@ -344,6 +350,8 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     preview: row.preview,
     verificationCode,
     verificationLink: row.verificationLink ?? '',
+    // 收件才有认证结果；null 表示没有可信结果（历史邮件、站内互投），与「认证失败」不同
+    auth: row.direction === 'inbound' ? (row.auth ?? null) : undefined,
     status: row.status,
     errorDetail: row.errorDetail ?? '',
     recipientOutcomes: row.recipientOutcomes,
@@ -357,17 +365,10 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
 }
 
 /**
- * hasAttachments 的口径：带 Content-ID 的 inline 部件是正文里的内嵌图（logo、签名图），不算附件，
- * 否则带内嵌 logo 的通知邮件在列表里也显示回形针。JS 写法给详情，SQL 写法见 flagColumns，两处同一规则。
- */
-function countsAsAttachment(att: { disposition: string; contentId: string }): boolean {
-  return !(att.disposition === 'inline' && att.contentId !== '');
-}
-
-/**
  * 列表、sync、wait 行的附件与星标标记：相关子查询随行取回，不再取页后另查一次（少一次 D1 往返）。
- * 单表查询里 drizzle 把选择列中的列对象输出成不带表名的标识符，子查询里会被解析成内层表，
- * 所以外层写全限定名 "messages"."id"、内层用别名（同 visibilityColumns）。
+ * 附件口径同 lib/attachment-rule 的 COUNTS_AS_ATTACHMENT（内嵌图不算附件）。单表查询里 drizzle 把选择列中的
+ * 列对象输出成不带表名的标识符，子查询里会被解析成内层表，所以外层写全限定名 "messages"."id"、内层用别名
+ * （同 visibilityColumns），条件按同一规则手写。
  */
 function flagColumns(userId: number) {
   return {
@@ -378,7 +379,11 @@ function flagColumns(userId: number) {
   };
 }
 
-/** 列表搜索语义（主题/发件地址/发件名/文本正文/收件人子串）；全部已读按同一语义收窄 */
+/**
+ * 列表搜索语义（主题/发件地址/发件名/正文/收件人子串）；全部已读按同一语义收窄。
+ * 正文只搜 D1 的 body_text：正文前 BODY_PREVIEW_BYTES 的纯文本，只有 HTML 的邮件为 HTML 转出的文字（mail-body.ts）；
+ * 尚未回填的旧行仍是完整文本段。
+ */
 function searchCondition(q: string | undefined): SQL | undefined {
   if (!q) return undefined;
   const term = q.toLowerCase();
@@ -504,15 +509,15 @@ const waitColumns = asSqlColumns(summarySelection);
  * 遇到第一封可见的就停：游标跟得上时（每 2 秒轮询一次，最常见）只读一两行，逐地址取反而每个地址都要探一次
  * （本地 3 万封基准：505 个地址的用户没有新信时 1 → 3537 行）；但 afterId 落后很多（afterId=0 的空邮箱基线、
  * 中断后续等）且自己没有新信时，原计划每轮都要扫完 afterId 之后的全站邮件（空邮箱 afterId=0：28517 行）。
- * 所以只在 afterId 之后的全站新邮件多于 WAIT_SITE_SCAN_MAX 封、且可见地址不超过 ADDRESS_SCAN_MAX 个时逐地址取
- * （上例 179 行）；游标跟得上时分流判定只读到新邮件那几行（1 → 7 行），地址多的用户落后时多读约 200 行判定。
+ * 所以只在 afterId 之后的全站新邮件多于 WAIT_SITE_SCAN_MAX 封时逐地址取：读取量只随可见地址数与它们的新信增长，
+ * 与全站新信数量无关（上例 179 行）；游标跟得上时分流判定只读到新邮件那几行（1 → 7 行）。
  */
 const WAIT_SITE_SCAN_MAX = 50;
 
 /** afterId 之后的全站未删除邮件是否多于 max 封（LIMIT max+1 计数，沿 idx_messages_live 只读索引） */
 function newMailMoreThan(afterId: number, max: number): SQL {
-  return sql`(SELECT count(*) FROM (SELECT 1 FROM messages AS wait_new INDEXED BY idx_messages_live
-    WHERE wait_new.deleted_at IS NULL AND wait_new.id > ${afterId} LIMIT ${max + 1})) > ${max}`;
+  return sql`((SELECT count(*) FROM (SELECT 1 FROM messages AS wait_new INDEXED BY idx_messages_live
+    WHERE wait_new.deleted_at IS NULL AND wait_new.id > ${afterId} LIMIT ${max + 1})) > ${max})`;
 }
 /** AI 兜底提码在收件后异步写回；这段时间内无码的新邮件先不判为「不匹配」，避免被跳过 */
 const AI_CODE_GRACE_MS = 30_000;
@@ -528,7 +533,7 @@ const PENDING_ATTACHMENTS_GRACE_MS = 2 * 60_000;
  * 调用方超时后可从它继续。hasCode 与返回的 verificationCode 同一口径；AI 可能稍后补码的新邮件、
  * 附件尚未落库（pending）的新邮件都不计入已检查，下一次轮询再判定——游标推过去调用方就再也看不到它。
  * address（多个地址）与 domain 在 SQL 里收窄，不参与「跳过」；include=body 时命中项返回与详情相同的结构，
- * 可见性已由本查询的范围条件确定，整行与附件、星标合成一次 batch，不再走详情的可见性校验。
+ * 读整行时带上本查询的同一组范围条件复核，与附件、星标合成一次 batch，不再走详情的可见性校验。
  */
 export async function findNextMessage(
   env: Env,
@@ -546,19 +551,21 @@ export async function findNextMessage(
     .where(and(eq(messages.direction, 'inbound'), isNull(messages.deletedAt), ...conditions))
     .orderBy(asc(messages.id))
     .limit(limit);
+  // 可见范围（含 domain、指定地址）；include=body 读整行时用同一组条件复核
+  const visible = [inboxScopeCondition(db, scope, access, input.domain), input.address ? inArray(messages.address, input.address) : undefined];
   const after = gt(messages.id, input.afterId);
   let statements: [ReturnType<typeof scan>, ...ReturnType<typeof scan>[]];
   if (input.address) {
     // 指定地址时逐个地址按 id 取：多地址的 IN 会让规划器为省排序改沿 idx_messages_live 扫全站 afterId 之后的邮件
-    statements = [scan(MESSAGES_BY_ADDRESS, [inboxScopeCondition(db, scope, access, input.domain), inArray(messages.address, input.address), after])];
+    statements = [scan(MESSAGES_BY_ADDRESS, [...visible, after])];
   } else if (scope === 'unclaimed') {
-    statements = [scan(MESSAGES, [inboxScopeCondition(db, scope, access, input.domain), after])];
+    // 未认领的地址集合不可枚举：只给 domain 时规划器走 idx_messages_domain，什么都不给时按 id 扫全站新信
+    statements = [scan(MESSAGES, [...visible, after])];
   } else {
-    const gate = sql`(${newMailMoreThan(input.afterId, WAIT_SITE_SCAN_MAX)} AND ${addressCountAtMost(db, scope.ownerId, access, input.domain, ADDRESS_SCAN_MAX)})`;
+    const gate = newMailMoreThan(input.afterId, WAIT_SITE_SCAN_MAX);
     statements = [
       scan(MESSAGES_BY_VISIBLE, [inboxScopeCondition(db, scope, access, input.domain, gate), after, ...visiblePrefix({ direction: 'inbound' })]),
-      scan(MESSAGES, [inboxScopeCondition(db, scope, access, input.domain),
-        gt(messages.id, sql`(CASE WHEN ${gate} THEN ${Number.MAX_SAFE_INTEGER} ELSE ${input.afterId} END)`)]),
+      scan(MESSAGES, [...visible, gt(messages.id, sql`(CASE WHEN ${gate} THEN ${Number.MAX_SAFE_INTEGER} ELSE ${input.afterId} END)`)]),
     ];
   }
   const results = await db.batch(statements);
@@ -586,12 +593,15 @@ export async function findNextMessage(
       continue;
     }
     if (input.include === 'body') {
+      // 两次读取之间被删除、移入回收站或失去可见性（共享撤销、释放、过户）的不再以详情返回：
+      // 它已不在等待范围内，游标越过它继续往后找
       const [[full], attRows, starRows] = await db.batch([
-        db.select().from(messages).where(eq(messages.id, row.id)), ...detailExtras(db, viewer.userId, row.id),
+        db.select().from(messages).where(and(eq(messages.id, row.id), eq(messages.direction, 'inbound'), isNull(messages.deletedAt), ...visible)),
+        ...detailExtras(db, viewer.userId, row.id),
       ]);
-      // 两次读取之间被永久删除：等同不存在，继续往后找
       if (!full) { scannedThroughId = row.id; continue; }
-      return { message: await buildDetail(env, full, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
+      const body = await readMailBody(env, full);
+      return { message: await buildDetail(env, full, body, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
     }
     return { message: summary, scannedThroughId: row.id };
   }
@@ -861,7 +871,7 @@ export async function loadSourceMessage(
 }
 
 const messageColumns = getTableColumns(messages);
-/** 除正文外的全部列：ETag 由它们计算，带 If-None-Match 的详情先只读这些，304 时不读正文 */
+/** 除正文外的全部列，ETag 由它们计算（正文变化必然伴随 status、body_r2_key 等列变化） */
 const metaColumns = Object.fromEntries(
   Object.entries(messageColumns).filter(([key]) => key !== 'bodyText' && key !== 'bodyHtml'),
 ) as Omit<typeof messageColumns, 'bodyText' | 'bodyHtml'>;
@@ -926,13 +936,6 @@ function rewriteCidUrls(
   return { html: rewritten, inlined };
 }
 
-/** 完整正文：超过 D1 上限的正文在 R2，D1 里只有截断预览 */
-async function fullBody(env: Env, row: Pick<MessageRow, 'bodyText' | 'bodyHtml' | 'bodyR2Key'>) {
-  if (!row.bodyR2Key) return { bodyText: row.bodyText, bodyHtml: row.bodyHtml };
-  const full = await getJson<{ text?: string; html?: string }>(env, row.bodyR2Key);
-  return { bodyText: full?.text ?? row.bodyText, bodyHtml: full?.html ?? row.bodyHtml };
-}
-
 /** 主题与完整正文（可见性同详情），供翻译等只需要文字内容的读取 */
 export async function getMessageContent(
   env: Env,
@@ -940,7 +943,7 @@ export async function getMessageContent(
   id: number,
 ): Promise<{ subject: string; bodyText: string; bodyHtml: string }> {
   const row = await loadVisible(env, viewer, id);
-  return { subject: row.subject, ...(await fullBody(env, row)) };
+  return { subject: row.subject, ...(await readMailBody(env, row)) };
 }
 
 /** 详情所需的附件全行与当前用户星标，调用方放进同一次 batch */
@@ -951,22 +954,22 @@ function detailExtras(db: Db, userId: number, id: number) {
   ] as const;
 }
 
-/** 由已确认可见的整行组装详情：完整正文、附件签名 URL、CID 内联图替换 */
+/** 由已确认可见的整行与完整正文（readMailBody）组装详情：附件签名 URL、CID 内联图替换 */
 async function buildDetail(
   env: Env,
   row: MessageRow,
+  body: { bodyText: string; bodyHtml: string },
   attRows: (typeof attachmentsTable.$inferSelect)[],
   starred: boolean,
   attachmentTtlSeconds?: number,
 ): Promise<MessageDetail> {
-  const [body, signed] = await Promise.all([
-    fullBody(env, row),
-    Promise.all(attRows.map(async (a) => {
-      const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
-      return { ...a, url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}` };
-    })),
-  ]);
+  const signed = await Promise.all(attRows.map(async (a) => {
+    const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
+    return { ...a, url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}` };
+  }));
   const { html, inlined } = rewriteCidUrls(body.bodyHtml, signed);
+  // 给 Agent 的收件预处理在读取时惰性计算，不占收件链路的 CPU；HTML-only 邮件才需要转换
+  const plain = row.direction === 'inbound' ? mailText(body.bodyText, body.bodyHtml).plain : '';
   return {
     // 验证码与列表、wait、线程同一口径（summarize）：已存值优先，详情不再按正文另算一份
     ...summarize(row, attRows.some(countsAsAttachment), starred),
@@ -985,6 +988,9 @@ async function buildDetail(
       url: a.url,
     })),
     hasRaw: !!row.rawR2Key,
+    ...(row.direction === 'inbound'
+      ? { extractedText: extractReplyText(plain), risk: detectPromptInjection(row.subject, plain) }
+      : {}),
   };
 }
 
@@ -1019,10 +1025,10 @@ async function detailEtag(
 export type ConditionalDetail = { etag: string; notModified: true } | { etag: string; notModified: false; detail: MessageDetail };
 
 /**
- * 邮件详情（一次往返：整行、可见性、星标一条语句，附件一条，同一 batch）。
+ * 邮件详情：整行、可见性、星标一条语句，附件一条，同一个 D1 batch；完整正文再从 R2 读（readMailBody）。
  * attachmentTtlSeconds 不传时附件与 CID 内联图的签名按整点对齐（站内页面，1–2 小时）；
  * /v1 传短 TTL，签名 URL 不能比 Key 本身的有效期拖得更久。
- * 带 If-None-Match 时先不读正文：ETag 一致返回 notModified（仍是一次往返），不一致再补读正文。
+ * 带 If-None-Match 且 ETag 一致时返回 notModified：只有这一次 D1 往返，不读 R2 正文。
  */
 export async function getMessageDetailConditional(
   env: Env,
@@ -1032,30 +1038,16 @@ export async function getMessageDetailConditional(
 ): Promise<ConditionalDetail> {
   const db = createDb(env);
   const scope = resolveScope(viewer);
-  const withBody = !options.ifNoneMatch;
-  // CASE 的条件在执行时才求值，withBody=0 时正文列不会被读出
-  const bodyColumn = (column: Column) => sql<string | null>`CASE WHEN ${withBody ? 1 : 0} = 1 THEN ${column} END`;
   const [[row], attRows] = await db.batch([
-    db.select({
-      ...metaColumns,
-      bodyText: bodyColumn(messages.bodyText),
-      bodyHtml: bodyColumn(messages.bodyHtml),
-      ...visibilityColumns(viewer, scope),
-      isStarred: starredColumn(viewer.userId),
-    }).from(messages).where(eq(messages.id, id)),
+    db.select({ ...messageColumns, ...visibilityColumns(viewer, scope), isStarred: starredColumn(viewer.userId) })
+      .from(messages).where(eq(messages.id, id)),
     db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).orderBy(asc(attachmentsTable.id)),
   ]);
   if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
   const etag = await detailEtag(env, viewer, row, attRows, row.isStarred, options.attachmentTtlSeconds);
   if (etagMatches(options.ifNoneMatch, etag)) return { etag, notModified: true };
-  let body = { bodyText: row.bodyText ?? '', bodyHtml: row.bodyHtml ?? '' };
-  if (!withBody) {
-    const fetched = await db.select({ bodyText: messages.bodyText, bodyHtml: messages.bodyHtml }).from(messages).where(eq(messages.id, id)).get();
-    // 两次读取之间被永久删除：与不存在一样
-    if (!fetched) throw new AppError('not_found', '邮件不存在');
-    body = fetched;
-  }
-  const detail = await buildDetail(env, { ...row, ...body }, attRows, row.isStarred, options.attachmentTtlSeconds);
+  const body = await readMailBody(env, row);
+  const detail = await buildDetail(env, row, body, attRows, row.isStarred, options.attachmentTtlSeconds);
   return { etag, notModified: false, detail };
 }
 

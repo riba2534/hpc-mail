@@ -3,9 +3,12 @@ import type { Env } from '../types.js';
 /**
  * 由官方来信归纳每个收件地址的 Claude 账号事实（claude_address_facts），供随机后缀按封号风险分配。
  *
- * 口径：只认官方发件人；欢迎信、收据、订阅确认、封号信或任意 Claude 产品邮件算账号，只有登录魔法链接的不算。
- * 归纳幂等且单调：标志只会由否变是、时间取最早，cron 窗口重叠或永久删除前补归纳都可以重复执行。
- * 依据是 MIME From 与主题，没有校验 DKIM，界面上写作「根据历史来信判定」。
+ * 口径：只认通过认证的官方来信（见 AUTHENTIC）；欢迎信、收据、订阅确认、封号信或任意 Claude 产品邮件算账号，
+ * 只有登录魔法链接的不算。归纳幂等且单调：标志只会由否变是、时间取最早，cron 窗口重叠或永久删除前补归纳都可以重复执行。
+ * 界面上写作「根据历史来信判定」。
+ *
+ * 2026-11 起要求 DKIM：此前按 MIME From 与主题归纳的事实保持原样，不回溯推翻；没有认证结果（auth 为 NULL）的
+ * 历史邮件此后不再参与归纳（它们在收到后一小时内已被 cron 归纳过，永久删除前的补归纳不会再改变什么）。
  *
  * migrations/0019_claude_address_facts.sql 的一次性回填是当时口径的快照（已执行，不再修改）。
  */
@@ -23,6 +26,15 @@ const CLAUDE_OFFICIAL_SENDER_DOMAINS = [
 const SENDER_DOMAIN = `lower(substr(from_address, instr(from_address, '@') + 1))`;
 const OFFICIAL = `${SENDER_DOMAIN} IN (${CLAUDE_OFFICIAL_SENDER_DOMAINS.map((domain) => `'${domain}'`).join(', ')})`;
 const SUSPENDED = `subject LIKE 'Your account has been suspended%'`;
+/**
+ * 认证口径：Cloudflare 的 DKIM 通过、签名域与发件域相同或为其父域、From/To/Subject 头各只有一个（auth.aligned），
+ * 且收件地址出现在 To 头里——正版的官方邮件被原样重投到别的地址时 DKIM 照样通过，To 头却还是原来的收件人。
+ */
+const DKIM_DOMAIN = `json_extract(auth, '$.dkimDomain')`;
+const AUTHENTIC = `json_extract(auth, '$.dkim') = 'pass' AND json_extract(auth, '$.aligned') = 1
+    AND instr(${DKIM_DOMAIN}, '.') > 0
+    AND (${SENDER_DOMAIN} = ${DKIM_DOMAIN} OR substr(${SENDER_DOMAIN}, -length(${DKIM_DOMAIN}) - 1) = '.' || ${DKIM_DOMAIN})
+    AND EXISTS (SELECT 1 FROM json_each(recipients, '$.to') WHERE value = address)`;
 const PAID = `(subject LIKE 'Your receipt from Anthropic%' OR subject LIKE '%subscription is confirmed%')`;
 const ACCOUNT = `(${SUSPENDED} OR ${PAID} OR subject LIKE 'Welcome to Claude%' OR ${SENDER_DOMAIN} = 'email.claude.com')`;
 
@@ -34,7 +46,7 @@ export function harvestSql(scope: string, index: 'idx_messages_created_id' | 'id
   return `INSERT INTO claude_address_facts (address, domain, paid, suspended, first_seen_at, suspended_at)
   SELECT address, domain, MAX(${PAID}), MAX(${SUSPENDED}), MIN(created_at), MIN(CASE WHEN ${SUSPENDED} THEN created_at END)
   FROM messages INDEXED BY ${index}
-  WHERE ${scope} AND direction = 'inbound' AND send_channel <> 'internal' AND ${OFFICIAL}
+  WHERE ${scope} AND direction = 'inbound' AND send_channel <> 'internal' AND ${OFFICIAL} AND ${AUTHENTIC}
   GROUP BY address HAVING MAX(${ACCOUNT}) = 1
   ON CONFLICT(address) DO UPDATE SET
     paid = MAX(claude_address_facts.paid, excluded.paid),

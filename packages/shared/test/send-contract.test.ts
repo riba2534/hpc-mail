@@ -60,17 +60,33 @@ describe('地址写法', () => {
     expect(parseMailAddress('Alice Smith <alice@example.com>')).toEqual({ address: 'alice@example.com', name: 'Alice Smith' });
     expect(parseMailAddress('"Doe, John \\"JD\\"" <j@example.com>')).toEqual({ address: 'j@example.com', name: 'Doe, John "JD"' });
     expect(parseMailAddress('<j@example.com>')).toEqual({ address: 'j@example.com', name: '' });
-    expect(parseMailAddress('张三 <z@例子.com>')).toBeNull();
+    // 与上线前的地址校验口径一致：IDN 域名与 UTF-8 本地部分照常接受
+    expect(parseMailAddress('张三 <z@例子.com>')).toEqual({ address: 'z@例子.com', name: '张三' });
+    expect(parseMailAddress('用户@例子.中国')).toEqual({ address: '用户@例子.中国', name: '' });
+    expect(parseMailAddress('Ünïcødé <JÖRG@Bücher.DE>')).toEqual({ address: 'jörg@bücher.de', name: 'Ünïcødé' });
     expect(parseMailAddress('张三 <z@xn--fsqu00a.com>')).toEqual({ address: 'z@xn--fsqu00a.com', name: '张三' });
     expect(parseMailAddress({ address: 'B@x.io', name: ' Bob ' })).toEqual({ address: 'b@x.io', name: 'Bob' });
   });
   it('畸形地址不再当作地址放行', () => {
-    for (const bad of ['alice<a@b.com', 'a@b.com>', 'a b@c.com', 'a@b', 'a@-b.com', 'a..b@c.com', '.a@c.com', 'a@b.c',
-      '"x"@b.com', 'a@b.com, c@d.com', 'x <a@b.com> y', 'Evil\r\nBcc: x@y.com <a@b.com>', 'a@[127.0.0.1]']) {
+    for (const bad of ['alice<a@b.com', 'a@b.com>', 'a b@c.com', 'a@b', 'a@b..com', 'a@b.c',
+      '"x"@b.com', 'a@b.com, c@d.com', 'a;b@c.com', 'a(b)@c.com', 'a\\b@c.com', 'a:b@c.com', 'x <a@b.com> y',
+      'Evil\r\nBcc: x@y.com <a@b.com>', 'a@[127.0.0.1]', 'Bob "B" <a@b.com>', '"unterminated <a@b.com>', 'a\u0000b@c.com',
+      'a@b\u200b.com\n']) {
       expect(parseMailAddress(bad), bad).toBeNull();
     }
     expect(isValidMailAddress('a+tag@sub.example.co')).toBe(true);
     expect(isValidMailAddress(`${'a'.repeat(65)}@b.com`)).toBe(false);
+  });
+  it('超长与病态输入线性拒绝，不放大成平方耗时', () => {
+    const started = Date.now();
+    for (const input of ['a' + ' '.repeat(40000) + 'b', '"'.repeat(40000), '<'.repeat(40000) + '>', 'x'.repeat(399) + '<a@b.com>',
+      'a' + ' '.repeat(392) + '<a@b.com>']) {
+      expect(parseMailAddress(input)).toBeNull();
+    }
+    expect(parseMailAddress({ address: 'a@b.com', name: ' '.repeat(5000) })).toBeNull();
+    const schemaInput = { from: { mailboxId: 3 }, to: Array.from({ length: 100 }, () => 'a' + ' '.repeat(40000) + 'b'), subject: 's', text: 't' };
+    expect(internalSendMailSchema.safeParse(schemaInput).success).toBe(false);
+    expect(Date.now() - started).toBeLessThan(200);
   });
   it('收件人数组接受三种写法并输出 {address, name}', () => {
     const parsed = internalSendMailSchema.parse({ ...base, to: ['a@x.io', 'Bob <b@x.io>', { address: 'c@x.io', name: 'Carl' }], cc: [{ address: 'd@x.io' }] });
@@ -124,6 +140,12 @@ describe('自定义邮件头', () => {
       [{ References: '<a@x> b@x' }, 'message-id'],
       [{ 'List-Id': '列表 <l.x.io>' }, 'ASCII'],
     ];
+    // 原型链上的同名属性不能当成白名单或专用字段
+    for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      const result = checkCustomHeaders(JSON.parse(`{"${name}":"x"}`) as Record<string, string>);
+      expect(result).toMatchObject({ ok: false, code: 'header_not_allowed' });
+      expect(result.ok ? '' : result.message).not.toContain('function');
+    }
     for (const [headers, fragment] of cases) {
       const result = checkCustomHeaders(headers);
       expect(result.ok, JSON.stringify(headers)).toBe(false);
@@ -166,6 +188,7 @@ describe('内联附件与体积', () => {
     expect(firstIssue({ ...base, attachments: [{ ...att, disposition: 'inline' }] }).message).toContain('需要 contentId');
     expect(firstIssue({ ...base, attachments: [{ ...att, contentId: 'a' }], attachmentTokens: [{ token: 't', contentId: 'A' }] }).message).toContain('重复');
     expect(internalSendMailSchema.safeParse({ ...base, attachments: [{ ...att, contentId: 'a b' }] }).success).toBe(false);
+    expect(firstIssue({ ...base, attachmentTokens: ['t1', { token: 't1', contentId: 'c' }] }).message).toContain('token 重复');
     expect(internalSendMailSchema.parse({ ...base, attachmentTokens: ['t1', { token: 't2', contentId: 'c', disposition: 'inline' }] }).attachmentTokens)
       .toEqual([{ token: 't1' }, { token: 't2', contentId: 'c', disposition: 'inline' }]);
   });
@@ -193,6 +216,6 @@ describe('wait 参数', () => {
 
 describe('转发中转配额设置', () => {
   it('旧配置缺新字段时取缺省值', () => {
-    expect(quotaSettingSchema.parse({ dailyOutbound: 1, dailyRecipients: 2 })).toEqual({ dailyOutbound: 1, dailyRecipients: 2, relayDaily: 300, relayPerUserDaily: 50 });
+    expect(quotaSettingSchema.parse({ dailyOutbound: 1, dailyRecipients: 2 })).toEqual({ dailyOutbound: 1, dailyRecipients: 2, relayDaily: 300, relayPerUserDaily: 50, relayUnclaimedDaily: 50 });
   });
 });

@@ -2,7 +2,7 @@ import { clearAuthToken, getAuthToken } from '@/lib/auth-token';
 import { ApiError, toApiError } from './errors';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const API_BASE = '/api';
+export const API_BASE = '/api';
 
 export type QueryValue = string | number | boolean | null | undefined;
 export type QueryParams = Record<string, QueryValue | readonly QueryValue[]>;

@@ -48,7 +48,7 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 - **完整收发** — 回复线程化（In-Reply-To/References）、转发、CC/BCC、附件；外发走 Cloudflare `send_email`，在 Workers Paid 计划下可发送任意外部地址
 - **转发与通知到你常用的地方** — 每个用户独立配置：转发到任意外部邮箱（原生转发失败自动降级中转重发，带防环路守卫）、推送飞书卡片、回调通用 Webhook（Bark / ntfy / 自建）
 - **AI Agent 原生** — `/skill.md` 是一份部署在站点上的 Agent 操作说明书，`/v1/openapi.json` 提供 OpenAPI 3.1 描述
-- **push 即部署** — 一条 GitHub Actions 流水线：测试门控 → 构建 → 数据库迁移 → 部署 → 迁移完整性校验 → 线上冒烟
+- **push 即部署** — 一条 GitHub Actions 流水线：测试门控 → 构建 → 数据库迁移 → 部署 → 线上冒烟 → cron 心跳（可选收件金丝雀），任一失败自动回滚
 
 ## 功能总览
 
@@ -96,7 +96,7 @@ flowchart LR
     subgraph CF [Cloudflare]
         W["Worker<br/>(fetch / email / scheduled)"]
         D1[(D1 业务数据)]
-        KV[(KV 配置缓存/回滚兼容)]
+        KV[(KV 过渡期回滚兼容)]
         R2[(R2 附件/大正文)]
         W --- D1
         W --- KV
@@ -111,7 +111,7 @@ flowchart LR
     W -->|OpenAI 兼容接口| LLM[大模型 如 DeepSeek<br/>验证码兜底 / 翻译]
 ```
 
-单个 Worker 同时承载三个入口：`fetch`（`/api` 内部接口 + `/v1` 开放接口 + 前端静态资源）、`email`（Email Routing catch-all 收件）、`scheduled`（每日清理）。前端构建产物打进 Worker Assets **同源部署**，`/api` 请求零跨域。
+单个 Worker 同时承载三个入口：`fetch`（`/api` 内部接口 + `/v1` 开放接口 + 前端静态资源）、`email`（Email Routing catch-all 收件）、`scheduled`（每 5 分钟处理通知队列、存储清理与托管域名同步；每日一次执行保留策略、回收站与日志清理）。前端构建产物打进 Worker Assets **同源部署**，`/api` 请求零跨域。
 
 前后端靠 `packages/shared` 的 zod schema 共享契约：worker 用它校验输入，web 用它做表单前置校验并导入响应类型，改接口只改一处。
 
@@ -122,8 +122,8 @@ flowchart LR
 | 后端 | Cloudflare Workers · Hono 4 · Drizzle ORM（D1/SQLite 增量迁移）· PostalMime |
 | 前端 | React 19 · Vite · Tailwind CSS 4 · TanStack Query 5 · React Router 7 · Radix Primitives |
 | 契约 | pnpm workspace monorepo，`packages/shared` 提供前后端共享的 zod schema 与类型 |
-| 存储 | D1（业务数据）· KV（会话/配置缓存）· R2（附件与超大正文） |
-| CI/CD | GitHub Actions：测试门控 → 构建 → 资源注入 → 迁移 → 部署 → 完整性校验 → 线上冒烟 |
+| 存储 | D1（业务数据、会话与配置的唯一真源；正文只留 4KB 搜索文本）· KV（仅升级/回滚过渡期镜像会话）· R2（附件、邮件全文与原始 .eml） |
+| CI/CD | GitHub Actions：测试门控 → 构建 → 资源注入 → 迁移与完整性校验 → 部署 → 线上冒烟 → 收件金丝雀（可选）→ cron 心跳 → 失败自动回滚 |
 
 ## 快速开始
 
@@ -179,10 +179,9 @@ Cloudflare 账号，走 GitHub Actions 持续部署。逐步执行，每步验�
    wrangler whoami 查、D1_DATABASE_ID / KV_NAMESPACE_ID 用第 4 步的输出、
    CUSTOM_DOMAIN / ADMIN_USERNAME 用第 5 步收集的值）。
 8. 启用 fork 仓库的 Actions（gh workflow enable deploy.yml，不行就引导我在仓库
-   Actions 页点启用），然后 gh workflow run "Deploy HPC Mail" 触发首次部署
-   （全新数据库不要开 reset_database）。
+   Actions 页点启用），然后 gh workflow run "Deploy HPC Mail" 触发首次部署。
 9. gh run watch 盯到全部步骤通过。若「线上冒烟」超时，多半是 custom domain 证书
-   还在签发，等一分钟重跑（不要勾 reset_database）。
+   还在签发，等一分钟重跑。
 10. 部署成功后：指导我在 Cloudflare 控制台给收件域名开 Email Routing 并把 catch-all
     指向 hpc-cloud-mail Worker；然后让我登录 https://<CUSTOM_DOMAIN>，用管理员账号
     进「管理后台 → 域名」添加域名；最后往任意前缀@该域名发一封测试邮件，确认收件箱
@@ -239,15 +238,20 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 | Variable | `CUSTOM_DOMAIN` | 站点域名（Worker custom domain，不含 `https://`） |
 | Variable | `ADMIN_USERNAME` | 管理员用户名（3–32 位小写字母/数字/`-`/`_`） |
 | Secret（可选） | `CF_HOSTED_DOMAINS_TOKEN` | 开启「托管域名」：用户添加自己的域名时，Worker 用它在你的 Cloudflare 账户建 zone 并开通收发。不设置则该功能隐藏。权限见下方说明 |
+| Variable（可选） | `CANARY_FROM_DOMAIN` / `CANARY_TO_DOMAIN` | 两个都设置即启用部署后的**收件金丝雀**：经 `send_email` 从发件域外发一封信到收件域，确认新版本的收件链路可用（两个域名须在系统域名列表内，收件域已配好 catch-all）。默认不启用；Workers Free 计划只能发往已验证地址，不要启用 |
+| Variable（可选） | `DEPLOY_CANARY` | `on`：启用金丝雀并由服务端取系统域名按字母序的前两个；`off`：一律跳过 |
+| Secret（可选） | `ADMIN_TOTP_SECRET` | 管理员 TOTP 种子（base32）。管理员开了两步验证后，部署冒烟用它算验证码登录，保住管理员检查；不设则跳过管理员检查 |
 | Variable（可选） | `PLACEMENT_REGION` | Worker 放置区域，填 D1 主库附近的云区域（如主库在美西填 `aws:us-west-1`，在新加坡填 `aws:ap-southeast-1`）。设置后 API 请求在数据库附近执行，每个请求只跨一次远程；不设则在离用户最近的节点执行。D1 主库位置在建库时用 `wrangler d1 create --location <wnam/enam/weur/apac…>` 指定，应选在多数访问的入口节点附近（Cloudflare 日志里的 colo） |
 
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
 >
 > **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。
 
-**3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 **不需要**勾 `reset_database`，迁移会自动从零建表；只有复用了含旧表的数据库才勾它（危险：会清空数据）。此后每次 push 到 `main` 自动部署。
+> 仓库公开时 Actions 日志也公开。`CLOUDFLARE_ACCOUNT_ID`、`D1_DATABASE_ID`、`KV_NAMESPACE_ID` 与 6 位及以上的 `ADMIN_USERNAME` 在工作流第一步就被屏蔽，之后的日志里显示为 `***`（更短的用户名如 `admin` 不屏蔽，否则日志里所有同样的词都会被打码）。第一步的环境变量回显仍是明文；想让它们完全不出现在日志里，把这四项改配成同名 **Secret**（工作流优先读 Secret，读不到才用 Variable）。
 
-> 首次部署若在「线上冒烟」步骤超时，通常是 custom domain 边缘证书还在签发——等一分钟重跑 workflow 即可（各步骤幂等；重跑时不要勾 `reset_database`）。
+**3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 由迁移从零建表。此后每次 push 到 `main` 自动部署：部署前记录当前线上版本，冒烟、cron 心跳或（启用时的）收件金丝雀任一失败就自动回滚 Worker（数据库迁移不回滚），详见 [发布与回滚手册](docs/ROLLBACK.md)。部署还会自动创建一个普通用户 `ci-smoke`（系统保留用户名）供冒烟登录，不要删除、禁用它或给它认领邮箱；管理员账号因此可以放心开启两步验证（想保留管理员检查就配置 `ADMIN_TOTP_SECRET`）。
+
+> 首次部署若在「线上冒烟」步骤超时，通常是 custom domain 边缘证书还在签发——等一分钟重跑 workflow 即可（各步骤幂等）。
 
 **4. 接入收件域名**：对每个要收件的域名（与 `CUSTOM_DOMAIN` 可同可不同——后者是站点入口，前者只管收信）：
 
@@ -274,7 +278,7 @@ curl -s -X POST "$BASE/v1/messages" \
   -d '{"from":{"localPart":"noreply","domain":"your-domain.example"},"to":["someone@example.org"],"subject":"Hello","text":"来自 HPC Mail 的邮件"}'
 ```
 
-全部端点：`GET /v1/status` · `GET /v1/domains` · `GET|POST /v1/mailboxes` · `GET|POST /v1/messages` · `GET /v1/messages/:id` · `GET /v1/messages/:id/attachments/:attId` · `GET /v1/openapi.json`。scope 粒度：`mail.read` / `mail.write` / `mail.send` / `mailbox.read` / `mailbox.write`。
+常用端点：`GET /v1/me` · `GET /v1/identities` · `GET|POST /v1/mailboxes` · `GET|POST /v1/messages` · `GET /v1/messages/wait` · `GET /v1/messages/:id` · `GET /v1/messages/:id/attachments/:attId` · `POST /v1/uploads`。完整列表与字段见 `GET /v1/openapi.json`（公开可读）和 [`/skill.md`](apps/web/public/skill.md)。scope 粒度：`mail.read` / `mail.write` / `mail.send` / `mailbox.read` / `mailbox.write`。
 
 ## 设置模型：系统级 vs 个人级
 
@@ -295,12 +299,18 @@ git fetch upstream && git merge upstream/main && git push          # push 即触
 
 数据库迁移随部署自动执行（增量、幂等），历史数据保留。
 
+### 发布与回滚
+
+部署失败时的自动回滚、手动回滚 Worker、D1 Time Travel 恢复，以及迁移为什么只做加法，见 [发布与回滚手册](docs/ROLLBACK.md)。
+
 ### 备份与恢复
 
-- **D1（核心数据，必备）**：`wrangler d1 export hpc-cloud-mail-db --remote --output backup.sql`
-- **R2（附件与超大正文）**：用 `wrangler r2 object get` 或 rclone 按需同步
-- **KV**：只存会话与缓存，无需备份（丢失只是全员重新登录）
-- **换 Cloudflare 账号搬迁**：新账号照部署步骤建资源 → 更新 GitHub Variables 里的账户/资源 ID → `wrangler d1 execute hpc-cloud-mail-db --remote --file backup.sql` 导入 → 部署后在管理后台把域名列表写回
+以下 wrangler 命令在 `apps/worker` 目录用 `pnpm exec wrangler` 执行（仓库锁定版本）。D1 命令加 `--cwd "$(mktemp -d)"`：`wrangler.toml` 里的 D1 id 是占位符，不加会解析到占位符而失败；此时相对路径也按那个临时目录解析，输出文件请写绝对路径。
+
+- **D1（核心数据，必备）**：`pnpm exec wrangler d1 export hpc-cloud-mail-db --remote --output "$PWD/backup.sql" --cwd "$(mktemp -d)"`；同账号内倒回某个时间点优先用 Time Travel（见上方手册）
+- **R2（附件、邮件全文与原始 .eml，必备）**：用 `wrangler r2 object get` 或 rclone 按需同步；D1 只留正文前 4KB，完整正文只在 R2
+- **KV**：只在升级/回滚过渡期镜像会话与鉴权版本，会话与配置都以 D1 为准，无需备份
+- **换 Cloudflare 账号搬迁**：新账号照部署步骤建资源 → 更新 GitHub Variables 里的账户/资源 ID → `pnpm exec wrangler d1 execute hpc-cloud-mail-db --remote --file "$PWD/backup.sql" --cwd "$(mktemp -d)"` 导入 → 部署后在管理后台把域名列表写回
 
 ## FAQ
 

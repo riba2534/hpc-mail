@@ -102,39 +102,55 @@ export async function expireExternalAttachmentLinks(env: Env): Promise<number> {
 }
 
 /**
- * 指向已不存在邮件的附件行，按 id 从游标往后取一批（导出供 EXPLAIN 回归）。?1 游标 id、?2 当前时间、?3 批量。
+ * 指向已不存在邮件的附件行，在 id 区间 (?1, ?2] 里按 id 取一批（导出供 EXPLAIN 回归）。?3 当前时间、?4 批量。
  * 对象仍在有效投递租约里的跳过：发送流程收尾时自己删孤儿行并登记清理。
  */
 export const ORPHAN_ATTACHMENTS_SQL = `SELECT id FROM attachments
-  WHERE id > ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = attachments.message_id)
+  WHERE id > ?1 AND id <= ?2 AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = attachments.message_id)
     AND NOT EXISTS (SELECT 1 FROM delivery_object_leases WHERE delivery_object_leases.r2_key = attachments.r2_key
-      AND delivery_object_leases.expires_at >= ?2)
-  ORDER BY id LIMIT ?3`;
+      AND delivery_object_leases.expires_at >= ?3)
+  ORDER BY id LIMIT ?4`;
 
 const ORPHAN_ATTACHMENT_BATCH = 200;
 const ORPHAN_ATTACHMENT_MAX_BATCHES = 10;
+/** 孤儿扫描的检查点：上次扫到的附件 id（KV，每天读写一次，最终一致足够） */
+export const ORPHAN_SCAN_CURSOR_KEY = 'orphan-attachments:cursor';
+/** 每天只扫检查点之后这么多个 id，扫到表尾回到开头：整表一轮分摊到多天，不再每天全表扫两遍 */
+export const ORPHAN_SCAN_IDS = 20_000;
 
 /**
  * 每日维护：回收孤儿附件行（邮件在附件写入前被永久删除、或旧版本没有兜底时留下的）。
  * 对象 key 写进清理台账与删行在同一事务里，对象是否真删由 processStorageCleanup 按引用复核。
- * 每批沿 id 推进，单次最多 ORPHAN_ATTACHMENT_MAX_BATCHES 批；邮件 id 不复用，孤儿行不会重新有主。
+ * 每次从检查点扫 ORPHAN_SCAN_IDS 个 id 的区间，区间内每批沿 id 推进、最多 ORPHAN_ATTACHMENT_MAX_BATCHES 批；
+ * 批数用尽时下次从删到的位置接着扫。邮件 id 不复用，孤儿行不会重新有主，晚几天回收无妨。
  */
 export async function purgeOrphanAttachments(env: Env): Promise<number> {
-  let cursor = 0;
+  const start = Number(await env.kv.get(ORPHAN_SCAN_CURSOR_KEY)) || 0;
+  const end = start + ORPHAN_SCAN_IDS;
+  let cursor = start;
   let removed = 0;
+  let maxId = 0;
+  let rangeDone = false;
   for (let batch = 0; batch < ORPHAN_ATTACHMENT_MAX_BATCHES; batch++) {
     const now = Date.now();
-    const [, deleted] = await env.db.batch<{ id: number }>([
+    const [, deleted, last] = await env.db.batch<{ id: number | null }>([
       env.db.prepare(`INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key)
-        SELECT r2_key FROM attachments WHERE id IN (${ORPHAN_ATTACHMENTS_SQL})`).bind(cursor, now, ORPHAN_ATTACHMENT_BATCH),
+        SELECT r2_key FROM attachments WHERE id IN (${ORPHAN_ATTACHMENTS_SQL})`).bind(cursor, end, now, ORPHAN_ATTACHMENT_BATCH),
       env.db.prepare(`DELETE FROM attachments WHERE id IN (${ORPHAN_ATTACHMENTS_SQL}) RETURNING id`)
-        .bind(cursor, now, ORPHAN_ATTACHMENT_BATCH),
+        .bind(cursor, end, now, ORPHAN_ATTACHMENT_BATCH),
+      env.db.prepare('SELECT MAX(id) AS id FROM attachments'),
     ]);
+    maxId = Number(last?.results[0]?.id ?? 0);
     const ids = (deleted?.results ?? []).map((row) => Number(row.id));
     removed += ids.length;
-    if (ids.length < ORPHAN_ATTACHMENT_BATCH) break;
+    if (ids.length < ORPHAN_ATTACHMENT_BATCH) {
+      rangeDone = true;
+      break;
+    }
     cursor = Math.max(...ids);
   }
+  const next = !rangeDone ? cursor : end >= maxId ? 0 : end;
+  await env.kv.put(ORPHAN_SCAN_CURSOR_KEY, String(next));
   return removed;
 }
 

@@ -1,7 +1,5 @@
 import {
   API_KEY_PREFIX,
-  MAX_API_GLOBAL_REQUESTS_PER_MINUTE,
-  MAX_API_USER_REQUESTS_PER_MINUTE,
   type ApiScope,
   type Role,
   type Settings,
@@ -14,13 +12,7 @@ import { execCtx, routeLabel } from '../lib/http.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { writeApiRequestLog } from '../services/api-request-log.js';
 import { getSettings, settingsQuery } from '../services/setting.js';
-import {
-  andGuards,
-  counterResult,
-  counterStatement,
-  counterWithinGuard,
-  minuteWindow,
-} from '../services/rate-counter.js';
+import { limitApiKeyRequest } from '../services/rate-limit.js';
 import type { AppContext, Env } from '../types.js';
 
 const KEY_PATTERN = new RegExp(`^${API_KEY_PREFIX}[a-f0-9]{64}$`);
@@ -41,6 +33,7 @@ interface ApiKeyRecord {
   rate_limit: number;
   status: 'active' | 'disabled' | 'revoked';
   expires_at: number | null;
+  last_used_at: number | null;
   user_status: UserStatus | null;
   role: Role | null;
 }
@@ -53,7 +46,7 @@ interface ApiKeyRecord {
 async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ settings: Settings; record: ApiKeyRecord | null }> {
   if (!keyHash) return { settings: await getSettings(env), record: null };
   const keyStatement = env.db.prepare(`SELECT k.id, k.user_id, k.scopes, k.allowed_ips, k.rate_limit, k.status, k.expires_at,
-      u.status AS user_status, u.role
+      k.last_used_at, u.status AS user_status, u.role
     FROM api_keys k LEFT JOIN users u ON u.id = k.user_id WHERE k.key_hash = ? AND k.status <> 'revoked'`).bind(keyHash);
   const query = settingsQuery(env);
   if ('cached' in query) return { settings: query.cached, record: await keyStatement.first<ApiKeyRecord>() };
@@ -65,7 +58,7 @@ async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ s
 }
 
 /**
- * /v1 鉴权：设置 + hash 查 key → 状态/过期/IP → 滑窗限流 → finally 审计。
+ * /v1 鉴权：设置 + hash 查 key（唯一一次 D1 往返）→ 状态/过期/IP → 限流（Rate Limiting binding）→ finally 审计。
  * 中间件自身拒绝的请求（Key 禁用/过期、IP 白名单、用户停用、限流）每 Key 每分钟只写 1 行明细，
  * 其余只在 rate_counters 累加，拒绝请求再多也只是一行计数，写不满审计表。
  */
@@ -115,50 +108,18 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
       scopes: row.scopes,
     });
 
-    // 查到 key 之后的四次写合进一个 batch：Key 级窗口计数、用户级与实例级总桶、last_used。
-    // 后三条带守卫，保持原先的短路语义：Key 级超限时不计入总桶、任一超限时不刷新 last_used；
-    // 实例级总桶另要求用户级未超限，单个用户的超限请求不会把全站额度打满。
+    // 限流不写 D1：Key 档位 → 用户总桶 → 全站总桶依次短路（services/rate-limit.ts）。
+    // Key 级超限不占用户额度，用户级超限不计入全站，避免创建多个 Key 横向放大额度，也让单个用户打不满全站。
+    // 三种超限分开提示，调用方能区分是这把 Key、自己账户还是全站繁忙
     const now = Date.now();
-    const windowStart = Math.floor(now / 60000);
-    const minute = minuteWindow(1, now);
-    const keyWithinLimit = {
-      sql: `(SELECT request_count FROM api_rate_limits WHERE api_key_id = ? AND window_start = ?) <= ?`,
-      params: [row.id, windowStart, row.rateLimit],
-    };
-    const userSubject = String(row.userId);
-    const userWithinLimit = counterWithinGuard('api-user', userSubject, minute, MAX_API_USER_REQUESTS_PER_MINUTE);
-    const lastUsedGuard = andGuards(keyWithinLimit, userWithinLimit,
-      counterWithinGuard('api-global', 'instance', minute, MAX_API_GLOBAL_REQUESTS_PER_MINUTE));
-    const results = await c.env.db.batch([
-      // 已超限的窗口不再递增：计数停在上限 + 1，不返回行即视为超限
-      c.env.db.prepare(`INSERT INTO api_rate_limits (api_key_id, window_start, request_count) VALUES (?, ?, 1)
-        ON CONFLICT(api_key_id, window_start) DO UPDATE SET request_count = request_count + 1 WHERE request_count <= ?
-        RETURNING request_count`).bind(row.id, windowStart, row.rateLimit),
-      counterStatement(c.env, 'api-user', userSubject, minute, 1, 0, keyWithinLimit),
-      counterStatement(c.env, 'api-global', 'instance', minute, 1, 0, andGuards(keyWithinLimit, userWithinLimit)),
-      // last_used 最多 60 秒写一次，避免每个请求都写同一行
-      c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
-        WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?) AND ${lastUsedGuard.sql}`)
-        .bind(now, ip, row.id, now - LAST_USED_THROTTLE_MS, ...lastUsedGuard.params),
-    ]);
-    const counted = (results[0]?.results?.[0] as { request_count?: number } | undefined)?.request_count;
-    const requestCount = counted === undefined ? row.rateLimit + 1 : Number(counted);
+    const rate = await limitApiKeyRequest(c.env, { id: row.id, userId: row.userId, rateLimit: row.rateLimit }, now);
     c.header('X-RateLimit-Limit', String(row.rateLimit));
-    c.header('X-RateLimit-Remaining', String(Math.max(0, row.rateLimit - requestCount)));
-    c.header('X-RateLimit-Reset', String((windowStart + 1) * 60));
-    if (requestCount > row.rateLimit) throw new AppError('rate_limited', 'API 调用频率超限');
-
-    // Key 级限制之外再加用户级与实例级总桶，避免创建多个 Key 横向放大额度。
-    // 用户桶与 Key 级计数同一事务，Key 未超限时必有返回；实例桶的守卫包含 Key 级与用户级未超限，
-    // 无返回即用户桶已超限、未计入。两种超限分开提示，调用方能区分是自己账户超额还是全站繁忙
-    const userRate = counterResult(results[1]);
-    if (!userRate || userRate.count > MAX_API_USER_REQUESTS_PER_MINUTE) {
-      throw new AppError('rate_limited', 'API 调用频率超限（账户级），请稍后重试');
-    }
-    const globalRate = counterResult(results[2]);
-    if (!globalRate || globalRate.count > MAX_API_GLOBAL_REQUESTS_PER_MINUTE) {
-      throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
-    }
+    c.header('X-RateLimit-Remaining', String(rate.remaining));
+    c.header('X-RateLimit-Reset', String(rate.reset));
+    if (rate.rejectedBy === 'key') throw new AppError('rate_limited', 'API 调用频率超限');
+    if (rate.rejectedBy === 'user') throw new AppError('rate_limited', 'API 调用频率超限（账户级），请稍后重试');
+    if (rate.rejectedBy === 'global') throw new AppError('rate_limited', 'API 总调用频率超限，请稍后重试');
+    await touchLastUsed(c, record, ip, now);
 
     admitted = true;
     await next();
@@ -183,6 +144,21 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     else await audit;
   }
 };
+
+/**
+ * last_used 每把 Key 最多 60 秒写一次：查 key 时已读出旧值，未到期不发语句；写入走 waitUntil，不阻塞响应。
+ * 条件更新防止多个 isolate 同时写；无 ExecutionContext（单测直调）时同步写入。
+ */
+async function touchLastUsed(c: Context<AppContext>, record: ApiKeyRecord, ip: string, now: number): Promise<void> {
+  if (record.last_used_at !== null && Number(record.last_used_at) >= now - LAST_USED_THROTTLE_MS) return;
+  const write = c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
+    WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`)
+    .bind(now, ip, record.id, now - LAST_USED_THROTTLE_MS).run()
+    .then(() => undefined, (e: unknown) => console.error('api key last_used update failed:', e));
+  const ctx = execCtx(c);
+  if (ctx) ctx.waitUntil(write);
+  else await write;
+}
 
 /** 校验 scope（v1 路由内调用） */
 export function requireScope(c: Context<AppContext>, scope: ApiScope): void {

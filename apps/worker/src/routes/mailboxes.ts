@@ -20,6 +20,7 @@ import {
   listMailboxShares, listSharedMailboxes, replaceMailboxShares, revokeMailboxShare, shareMailboxes,
 } from '../services/mailbox-share.js';
 import { searchUsers } from '../services/user.js';
+import { auditActorOf } from '../services/audit.js';
 import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
@@ -101,14 +102,14 @@ app.put('/:id', async (c) => {
   const user = c.get('user')!;
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, updateMailboxRequestSchema);
-  return ok(c, await updateMailbox(c.env, user.id, id, req.displayName, user.role === 'admin'));
+  return ok(c, await updateMailbox(c.env, user.id, id, req.displayName, user.role === 'admin', auditActorOf(c)));
 });
 
 app.delete('/:id', async (c) => {
   const user = c.get('user')!;
   const id = parseId(c.req.param('id'));
   const deleteHistory = parseBooleanFlag(c.req.query('deleteHistory'));
-  const result = await releaseMailbox(c.env, user.id, id, user.role === 'admin', deleteHistory, execCtx(c));
+  const result = await releaseMailbox(c.env, user.id, id, user.role === 'admin', deleteHistory, execCtx(c), auditActorOf(c));
   return ok(c, { success: true, ...result });
 });
 
