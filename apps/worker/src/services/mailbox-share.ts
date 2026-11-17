@@ -21,8 +21,8 @@ function assertManageableMailbox<T extends { userId: number }>(
 
 const owners = alias(users, 'owners');
 
-/** 被分享人复核：存在、不是系统保留账号（共享给 CI 冒烟用户会干扰部署流水线）、已启用 */
-function assertShareTargets(targets: readonly { username: string; status: string }[], expected: number): void {
+/** 被分享人复核：存在、不是系统保留账号（共享给 CI 冒烟用户会干扰部署流水线）、已启用；共享、批量共享与管理员批量共享共用 */
+export function assertShareTargets(targets: readonly { username: string; status: string }[], expected: number): void {
   if (targets.length !== expected) {
     throw new AppError('validation_failed', '包含不存在的用户');
   }

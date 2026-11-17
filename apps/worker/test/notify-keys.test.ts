@@ -111,6 +111,27 @@ it('没有 admin scope 的管理员 Key 不能改通知配置：管理员的配�
 });
 
 describe('共享管理开放给 mailbox.share', () => {
+  it('未匹配的 /v1/mailboxes/shares 路径只鉴权一次并返回 404，不落进 /mailboxes/:id', async () => {
+    const owner = await account('share-unmatched');
+    const key = await owner.key(['mailbox.share', 'mailbox.write']);
+    const lookups: string[] = [];
+    const db = new Proxy(runtime.db, { get(target, property) {
+      if (property === 'prepare') return (query: string) => { if (/FROM api_keys k/.test(query)) lookups.push(query); return target.prepare(query); };
+      if (property === 'batch') return (statements: D1PreparedStatement[]) => target.batch(statements);
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    for (const [method, path] of [['DELETE', '/v1/mailboxes/shares'], ['GET', '/v1/mailboxes/shares/unknown'], ['PUT', '/v1/mailboxes/shares/1']] as const) {
+      lookups.length = 0;
+      const ctx = createExecutionContext();
+      const response = await app.request(path, { method, headers: auth(key) }, { ...runtime, db }, ctx);
+      await waitOnExecutionContext(ctx);
+      expect(response.status, `${method} ${path}`).toBe(404);
+      expect(((await response.json()) as { error: { code: string } }).error.code).toBe('not_found');
+      expect(lookups, `${method} ${path}`).toHaveLength(1);
+    }
+  });
+
   it('按 userId 共享、列出、批量追加、撤销；限定范围的 Key 只能管理范围内的邮箱', async () => {
     const owner = await account('share-owner');
     const reader = await account('share-reader');
