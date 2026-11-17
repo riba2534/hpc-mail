@@ -448,9 +448,11 @@ export async function updateDraft(
   await authorize?.(mergeContent(row.content, input));
   const sendAt = sendAtOf(input);
   const status: DraftStatus = sendAt ? 'scheduled' : sendAt === null ? 'draft' : row.status;
-  // 只改部分字段又要保持（或进入）定时状态时，需要原正文一起做完整性校验
-  const needsBody = status === 'scheduled' && (input.text === undefined || input.html === undefined);
-  const current = needsBody ? await readMailBody(env, row) : { bodyText: row.bodyText, bodyHtml: row.bodyHtml };
+  // 原正文要读全文（D1 里可能只是搜索用的截断文本）：只改了 text、html 之一时另一段沿用原文重新落库；
+  // 只改部分字段又要保持（或进入）定时状态时，原正文要一起做完整性校验
+  const keepsPart = input.text === undefined || input.html === undefined;
+  const changesPart = input.text !== undefined || input.html !== undefined;
+  const current = keepsPart && (changesPart || status === 'scheduled') ? await readMailBody(env, row) : row;
   const prepared = await prepare(env, actor.userId, id, { content: row.content, text: current.bodyText, html: current.bodyHtml },
     input, status === 'scheduled', request);
   const db = createDb(env);

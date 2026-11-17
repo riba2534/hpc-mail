@@ -167,6 +167,17 @@ describe('草稿的增删改查与权限', () => {
     await data(await call(`/v1/drafts/${created.id}`, req(me.key, 'PATCH', { html: '<p>short</p>' })));
     const job = await env.db.prepare('SELECT COUNT(*) AS n FROM storage_cleanup_jobs WHERE r2_key = ?').bind(stored!.bodyR2Key).first<{ n: number }>();
     expect(job!.n).toBe(1);
+
+    // 只改一段时另一段按全文沿用：D1 里只有截断的搜索文本（只有 HTML 时还是 HTML 转出的文字），不能当成原文写回
+    const text = '文'.repeat(5000);
+    const longText = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { text, html })), 201);
+    const patched = await data<Draft>(await call(`/v1/drafts/${longText.id}`, req(me.key, 'PATCH', { html: '<p>short</p>' })));
+    expect([patched.text, patched.html]).toEqual([text, '<p>short</p>']);
+    const htmlOnly = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { html })), 201);
+    const retexted = await data<Draft>(await call(`/v1/drafts/${htmlOnly.id}`, req(me.key, 'PATCH', { text: 'plain' })));
+    expect([retexted.text, retexted.html]).toEqual(['plain', html]);
+    const rehtml = await data<Draft>(await call(`/v1/drafts/${htmlOnly.id}`, req(me.key, 'PATCH', { html: '<p>x</p>' })));
+    expect([rehtml.text, rehtml.html]).toEqual(['plain', '<p>x</p>']);
   });
 });
 
