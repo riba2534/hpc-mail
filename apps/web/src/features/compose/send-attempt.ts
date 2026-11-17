@@ -55,16 +55,15 @@ export function classifySendError(error: unknown): SendFailure {
 }
 
 /**
- * 发信引用的原邮件已删除或对发件人不可见：服务端对 replyToMessageId / forwardAttachmentsFrom 都返回 404「邮件不存在」，
- * 转发时原附件对象丢失返回「…无法完整转发」。转发附件先于回复线程校验，两者都带时归到转发。
- * 发件邮箱、草稿附件等其他 404 不在此列，按普通错误展示。
+ * 发信引用的原邮件已删除或对发件人不可见（服务端 404 source_unavailable）。来源按请求里带的字段区分；
+ * 服务端先校验转发附件再校验回复线程，两者都带时归到转发。
  */
 export function missingSendSource(
   error: unknown,
   payload: Pick<InternalSendMailRequest, 'replyToMessageId' | 'forwardAttachmentsFrom'>,
 ): SendSource | null {
-  if (!(error instanceof ApiError) || error.code !== 'not_found') return null;
-  if (payload.forwardAttachmentsFrom && (error.message === '邮件不存在' || error.message.endsWith('无法完整转发'))) return 'forward';
-  if (payload.replyToMessageId && error.message === '邮件不存在') return 'reply';
+  if (!(error instanceof ApiError) || error.code !== 'source_unavailable') return null;
+  if (payload.forwardAttachmentsFrom) return 'forward';
+  if (payload.replyToMessageId) return 'reply';
   return null;
 }

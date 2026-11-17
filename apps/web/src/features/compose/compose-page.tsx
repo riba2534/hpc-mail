@@ -277,7 +277,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   }, []);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   // kind 为 reply / forward：回复或转发引用的原邮件已不可用
-  const [sendError, setSendError] = useState<{ message: string; kind: 'uncertain' | 'in_progress' | 'error' | SendSource } | null>(null);
+  const [sendError, setSendError] = useState<{ message: string; kind: 'uncertain' | 'in_progress' | 'key_mismatch' | 'error' | SendSource } | null>(null);
   const [dragging, setDragging] = useState(false);
   // 原邮件已删除或不可见时，用户可以去掉回复关联 / 原邮件附件，再作为新邮件发送
   const [replyToMessageId, setReplyToMessageId] = useState(initial.replyToMessageId);
@@ -463,10 +463,9 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         sendPayloadHashRef.current = null;
       }
       const sessionChanged = err instanceof ApiError && err.code === 'session_changed';
-      const message = failure === 'key_mismatch'
-        ? '发送凭据已用于其他内容，已为这封邮件更换新凭据。请先到已发送确认没有重复，再点击发送。'
-        : err instanceof ApiError ? err.message : '发送失败，请重试';
-      const fallback = failure === 'in_progress' ? 'in_progress' : failure === 'uncertain' && !sessionChanged ? 'uncertain' : 'error';
+      const message = err instanceof ApiError ? err.message : '发送失败，请重试';
+      const fallback = failure === 'in_progress' || failure === 'key_mismatch' ? failure
+        : failure === 'uncertain' && !sessionChanged ? 'uncertain' : 'error';
       setSendError({ message, kind: missingSendSource(err, payload) ?? fallback });
     },
   });
@@ -959,6 +958,12 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
                 查看是否已经发出；内容不变时再次点击发送只会查询原结果，不会重复投递，修改内容则会作为一封新邮件发送。
               </p>
             </div>
+          ) : sendError.kind === 'key_mismatch' ? (
+            <p role="alert" className="text-sm text-critical">
+              发送凭据已用于其他内容，已为这封邮件更换新凭据。请先到
+              <Link to="/sent" className="mx-0.5 font-medium text-accent hover:underline">已发送</Link>
+              确认没有重复，再点击发送。
+            </p>
           ) : (
             <p role="alert" className="text-sm text-critical">{sendError.message}</p>
           )
