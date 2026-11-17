@@ -150,6 +150,23 @@ describe('code-extract 正则', () => {
     expect(extractCodeByRegex(subject, body)).toBe('482913');
     expect(resolveVerificationCode(subject, preview, '482913', { bodyTruncated: true })).toBe('482913');
   });
+  /**
+   * 只让点链接的邮件里顺带提到 code（「不要把链接或 code 转给别人」），旁边的请求编号会被当成码；
+   * 读取时不再按摘要清空，收件时就得按全文判定。
+   */
+  it('link-only 邮件里顺带提到的 code 不把旁边的编号当成验证码', () => {
+    const tail = 'This link expires in 15 minutes. Never share this link or code with anyone.\nRequest ID: 48291734';
+    expect(extractCodeByRegex('Your secure link to Example is here', `Click the link below to securely sign in to Example.\nhttps://app.example.com/magic-link?token=AbCdEfGhIjKlMnOpQrStUvWx\n${tail}`)).toBe('');
+    expect(extractCodeByRegex('Account notice', tail)).toBe('48291734');
+  });
+  it.each([
+    ['code 后紧跟冒号', 'Click the button below to finish signing in, or enter this code: 482913'],
+    ['your … code 另起一行', 'Tap the button below to continue.\nYour login code\n482913'],
+    ['码在说法之前', '482913 is your verification code. You can also click the link below.'],
+    ['中文验证码', '点击下方按钮完成登录，或输入验证码 482913'],
+  ])('link-only 文案与明确给码并存时（%s）仍提码', (_name, body) => {
+    expect(extractCodeByRegex('Sign in to Example', body)).toBe('482913');
+  });
   it('URL 内的 code 关键词不能激活附近邮编或年份', () => {
     const body = 'Click the link below: https://example.test/verify?code=A1B2C3\nAddress 94103, year 2026.';
     expect(extractCodeByRegex('Verification link', body)).toBe('');

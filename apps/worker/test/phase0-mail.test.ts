@@ -9,6 +9,7 @@ import { createDb } from '../src/db/client.js';
 import { attachments, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import { handleInbound } from '../src/services/inbound.js';
+import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { deleteMessages, findNextMessage, getMessageDetail } from '../src/services/message.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
@@ -132,6 +133,35 @@ describe('X01 已存验证码不被摘要重提覆盖', () => {
       v1Detail: (await data<MessageDetail>(await request(`/v1/messages/${row!.id}`, auth(owner.key)))).verificationCode,
     };
     expect(codes).toEqual({ apiList: '482913', v1List: '482913', wait: '482913', thread: '482913', apiDetail: '482913', v1Detail: '482913' });
+  });
+
+  it('只让点链接的邮件收件时不存码，通知里也没有码；与上面真码在 160 字之后的登录邮件靠全文区分', async () => {
+    await baseSettings();
+    const owner = await account('x01-linkonly');
+    await updateUserNotifyPrefs(env, owner.id, { webhook: { enabled: true, url: 'https://notify.example.com/mail', secret: '' } });
+    const posted: { message: { verificationCode: string; subject: string } }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: RequestInit) => {
+      posted.push(JSON.parse(String(init?.body)));
+      return new Response('ok');
+    }));
+    const body = [
+      'Click the link below to securely sign in to Example.',
+      'https://app.example.com/magic-link?token=AbCdEfGhIjKlMnOpQrStUvWx',
+      'This link expires in 15 minutes. Never share this link or code with anyone.',
+      'Request ID: 48291734',
+    ].join('\r\n');
+    const raw = `From: Example <no-reply@app.example.com>\r\nTo: ${owner.address}\r\nSubject: Your secure link to Example is here\r\nMessage-ID: <linkonly-${rand()}@app.example.com>\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${body}\r\n`;
+    const ctx = createExecutionContext();
+    await handleInbound({ to: owner.address, from: 'no-reply@app.example.com', headers: new Headers(), raw: new Response(raw).body!,
+      forward: async () => {}, setReject: () => {} } as unknown as ForwardableEmailMessage, env, ctx);
+    await waitOnExecutionContext(ctx);
+    vi.unstubAllGlobals();
+
+    const row = await createDb(env).select().from(messages).where(eq(messages.address, owner.address)).get();
+    expect(row!.verificationCode).toBe('');
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.message).toMatchObject({ subject: 'Your secure link to Example is here', verificationCode: '' });
+    expect((await data<{ items: MessageSummary[] }>(await request(`/v1/messages?address=${owner.address}`, auth(owner.key)))).items[0]!.verificationCode).toBe('');
   });
 
   it('已存值为空的历史行只按摘要重提，详情与列表同一口径', async () => {
