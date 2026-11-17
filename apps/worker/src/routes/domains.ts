@@ -10,7 +10,7 @@ app.use('*', requireAuth);
 /** 当前用户可认领的域名：管理员全部，普通用户按公共或专属规则。 */
 app.get('/', async (c) => {
   const user = c.get('user')!;
-  const domains = await getVisibleDomains(c.env, user.id);
+  const domains = await getVisibleDomains(c.env, { userId: user.id, role: user.role });
   return ok(c, domains);
 });
 

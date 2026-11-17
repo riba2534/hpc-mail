@@ -221,7 +221,7 @@ describe('批量认领', () => {
       if (!explained && sqls.some((sql) => /INSERT INTO mailboxes/i.test(sql))) {
         explained = true;
         const bindings = [JSON.stringify([{ address: 'explain@batch.test', domain: openDomain, perUserLimit: 1000, perDomainLimit: 500,
-          ownedDomain: 0, wasTaken: 0, code: null, message: null }]), f.user.id, 0, 0, 'user', 0];
+          ownedDomain: 0, wasTaken: 0, code: null, message: null }]), f.user.id, 0, 0, 'user', 0, 'user'];
         for (const statement of sqls) {
           const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement}`).bind(...bindings).all<{ detail: string }>();
           const details = plan.results.map((row) => row.detail);

@@ -1,5 +1,6 @@
 import { batchShareMailboxesRequestSchema, replaceMailboxSharesRequestSchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
+import { AppError } from '../../lib/errors.js';
 import { ok, parseBody, parseId } from '../../lib/http.js';
 import { apiKeyAuth, assertKeyCanUseMailboxIds, filterWithinKey, requireScope } from '../../middleware/api-key-auth.js';
 import { listMailboxShares, replaceMailboxShares, revokeMailboxShare, shareMailboxes } from '../../services/mailbox-share.js';
@@ -38,6 +39,11 @@ app.delete('/:mailboxId/grantees/:userId', async (c) => {
   await assertKeyCanUseMailboxIds(c, [mailboxId]);
   await revokeMailboxShare(c.env, c.get('apiKey')!.userId, mailboxId, parseId(c.req.param('userId')));
   return ok(c, { success: true });
+});
+
+// 未匹配的 /mailboxes/shares 路径到此为止：不再落进 /mailboxes 子应用（再鉴权一次、被当成 /mailboxes/:id）
+app.all('*', () => {
+  throw new AppError('not_found', '接口不存在');
 });
 
 export default app;

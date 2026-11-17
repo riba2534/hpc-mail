@@ -12,7 +12,7 @@
 
 要在收到新邮件、发信有结果或托管域名状态变化时立即处理，就给自己的 HTTPS 接收端建一个端点，不要高频轮询列表或详情。等某一封验证码这种一次性场景仍可用 `GET /v1/messages/wait`。
 
-网页会话用 `/api/webhooks`（JWT），API Key 用 `/v1/webhooks`（需要 `webhook.write`），两者同形。每个用户最多 10 个端点。个人通知里的「通用 Webhook」是旧版单端点推送，只推新邮件、不重试，过渡期继续可用（见[个人通知](notifications.md#webhook-接收契约)）；新的集成用这里的端点。
+网页会话用 `/api/webhooks`（JWT），API Key 用 `/v1/webhooks`（需要 `webhook.write`；创建或修改订阅 `mail.received`、或带正文的端点另需 `mail.read`），两者同形。每个用户最多 10 个端点。个人通知里的「通用 Webhook」是旧版单端点推送，只推新邮件、不重试，过渡期继续可用（见[个人通知](notifications.md#webhook-接收契约)）；新的集成用这里的端点。
 
 ## 管理端点
 
@@ -29,7 +29,7 @@
 | `POST /webhooks/:id/deliveries/:deliveryId/retry` | 重试一条失败的投递 |
 
 ```bash
-# API="$BASE/v1"，AUTH 为带 webhook.write 的 Key；HPC_HOOK_URL、HPC_BOX 由用户提供
+# API="$BASE/v1"，AUTH 为带 webhook.write 与 mail.read 的 Key；HPC_HOOK_URL、HPC_BOX 由用户提供
 # 返回的 secret 只出现这一次，保存到接收端的配置里，不要写进报告
 jq -n --arg url "$HPC_HOOK_URL" --arg box "$HPC_BOX" \
   '{url:$url,events:["mail.received"],addresses:[$box],description:"agent"}' |
@@ -41,6 +41,8 @@ jq -n --arg url "$HPC_HOOK_URL" --arg box "$HPC_BOX" \
 - `addresses` 与 `domains` 是「或」关系的过滤：事件涉及的地址在 `addresses` 里，或地址的域名在 `domains` 里才投递；两者都空表示订阅类型的全部事件。托管域名事件只看 `domains`。
 - `includeBody:true` 时 `mail.received` 带正文 `text`、`html`（各截断到 65536 字符，`bodyTruncated` 标出），否则只有摘要。
 - 限定了邮箱或域名的 Key 只能创建、查看、管理过滤条件非空且全部落在自己范围内的端点（范围外的端点 404，超出范围的过滤 403）。
+- 端点能收到的来信跟随最近一次写入它的凭据：网页会话与带 `admin` scope 的管理员 Key 写入的管理员端点也收未认领地址的来信；没有 `admin` scope 的管理员 Key 创建或修改过的端点只收自己认领地址的来信。
+- 所属用户被停用后不再产生新投递，待重试的投递也不再发送。
 
 ## 事件与载荷
 
@@ -71,4 +73,4 @@ jq -n --arg url "$HPC_HOOK_URL" --arg box "$HPC_BOX" \
 
 2xx（10 秒内）算成功；3xx 不跟随，按失败处理。失败按约 1 分钟、5 分钟、30 分钟、2 小时、5 小时、10 小时、10 小时的间隔重试，共 8 次，跨度约一天半；接收端在处理完成后再返回 2xx，重复投递按 `webhook-id` 去重。第 8 次仍失败、且这个事件产生以来端点一次都没成功过时，端点自动停用：`status:"disabled"`，`disabledReason` 说明原因，并通过所有者已配置的飞书或 PushDeer 告知。修好接收端后 `PUT {enabled:true}` 重新启用，再对需要的投递调用 retry（只发一次，同一 `webhook-id`）；停用期间产生的事件不会补发。
 
-`POST /webhooks/:id/test` 同步发一条签好名的 `webhook.test` 事件并返回对方响应，对方失败时也是 HTTP 200、`ok:false`；它不计入投递记录，停用的端点也能测试。终态投递记录保留约 30 天，成功后不再保存载荷。
+`POST /webhooks/:id/test` 同步发一条签好名的 `webhook.test` 事件并返回对方响应，对方失败时也是 HTTP 200、`ok:false`；它不计入投递记录，停用的端点也能测试。终态投递记录保留约 30 天，成功后不再保存载荷。邮件永久删除（含保留期清理、释放并清空历史）时，它的未完成与失败投递随之作废、载荷清空；源邮件已删除（含回收站）的投递不能手动重试（409）。

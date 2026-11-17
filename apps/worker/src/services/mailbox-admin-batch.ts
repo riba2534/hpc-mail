@@ -22,6 +22,7 @@ import {
   ownedCountsFromResult, ownedCountsStatement, ownerLabel, releaseTargets,
 } from './mailbox.js';
 import { claimSettingsStatement } from './mailbox-policy.js';
+import { assertShareTargets } from './mailbox-share.js';
 
 interface BatchMailboxRow {
   id: number;
@@ -255,7 +256,7 @@ export async function adminTransferMailboxes(env: Env, actor: AuditActor, req: A
 async function loadShareContext(env: Env, addresses: readonly string[], userIds: readonly number[]) {
   const [rowsResult, granteeResult, membersResult] = await env.db.batch([
     mailboxesByAddressStatement(env, addresses),
-    env.db.prepare('SELECT id, status FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(userIds)),
+    env.db.prepare('SELECT id, username, status FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(userIds)),
     env.db.prepare(`SELECT s.mailbox_id, s.user_id FROM mailbox_shares s JOIN mailboxes m ON m.id = s.mailbox_id
       WHERE m.address IN (SELECT value FROM json_each(?))`).bind(JSON.stringify(addresses)),
   ]);
@@ -265,7 +266,7 @@ async function loadShareContext(env: Env, addresses: readonly string[], userIds:
     set.add(Number(row.user_id));
     members.set(Number(row.mailbox_id), set);
   }
-  return { rows: rowsByAddress(rowsResult), grantees: (granteeResult?.results ?? []) as { id: number; status: UserStatus }[], members };
+  return { rows: rowsByAddress(rowsResult), grantees: (granteeResult?.results ?? []) as { id: number; username: string; status: UserStatus }[], members };
 }
 
 /**
@@ -275,8 +276,8 @@ async function loadShareContext(env: Env, addresses: readonly string[], userIds:
 export async function adminShareMailboxes(env: Env, actor: AuditActor, req: AdminBatchShareRequest, tag: string): Promise<AdminMailboxBatchResult> {
   const userIds = [...new Set(req.userIds)];
   const { rows, grantees, members } = await loadShareContext(env, req.items.map((item) => item.address), userIds);
-  if (grantees.length !== userIds.length) throw new AppError('validation_failed', '包含不存在的用户');
-  if (grantees.some((grantee) => grantee.status !== 'active')) throw new AppError('validation_failed', '只能共享给启用中的用户');
+  // 与所有者共享同一套复核：存在、不是系统保留账号（如 CI 冒烟用户）、已启用
+  assertShareTargets(grantees, userIds.length);
   const { results, accepted } = partition(req.items, rows, (item, row) => {
     const current = members.get(row.id) ?? new Set<number>();
     const adding = userIds.filter((userId) => userId !== row.user_id && !current.has(userId));

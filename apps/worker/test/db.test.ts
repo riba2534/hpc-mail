@@ -436,8 +436,10 @@ describe('域名可见性与按域名认领上限', () => {
     expect(await getPublicDomains(env)).toEqual(['example.com']);
     const uid = await seedUser('vis-user-2', 'user');
     const aid = await seedUser('vis-domain-admin', 'admin');
-    expect(await getVisibleDomains(env, uid)).toEqual(['example.com']);
-    expect(await getVisibleDomains(env, aid)).toEqual(['example.com', 'hpc.email']);
+    expect(await getVisibleDomains(env, { userId: uid, role: 'user' })).toEqual(['example.com']);
+    expect(await getVisibleDomains(env, { userId: aid, role: 'admin' })).toEqual(['example.com', 'hpc.email']);
+    // 没有 admin scope 的管理员 Key 按普通用户规则
+    expect(await getVisibleDomains(env, { userId: aid, role: 'user' })).toEqual(['example.com']);
     const box = await claimMailbox(env, uid, 'user', { localPart: 'visme', domain: 'example.com' });
     expect(box.address).toBe('visme@example.com');
   });

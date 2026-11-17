@@ -576,6 +576,14 @@ describe('执行计划回归：永久删除清空通知载荷', () => {
     expect(plan).toMatch(/idx_messages_purge_token \(purge_token=\?\)/);
     expect(plan).toMatch(/notification_jobs_dedupe_key_unique \(dedupe_key>\? AND dedupe_key<\?\)/);
     expect(plan).not.toMatch(/SCAN (notification_jobs|j)\b/);
+
+    // Webhook 投递只扫未成功的（status 前缀），要删的邮件 id 按 purge_token 取
+    const hooks = statements.find((statement) => /UPDATE webhook_deliveries/.test(statement.sql))!;
+    const hookPlan = (await env.db.prepare(`EXPLAIN QUERY PLAN ${hooks.sql}`).bind(...hooks.params).all<{ detail: string }>())
+      .results.map((row) => row.detail).join(' | ');
+    expect(hookPlan).toMatch(/idx_webhook_deliveries_due \(status=\?\)/);
+    expect(hookPlan).toMatch(/idx_messages_purge_token \(purge_token=\?\)/);
+    expect(hookPlan).not.toMatch(/SCAN webhook_deliveries\b/);
   });
 });
 

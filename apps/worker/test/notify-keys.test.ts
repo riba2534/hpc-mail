@@ -11,9 +11,10 @@ import { createApiKey } from '../src/services/api-key.js';
 import { bumpCounter, dayWindow } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { confirmForward } from '../src/services/forward-confirm.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import type { Env } from '../src/types.js';
-import { TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
+import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
 const app = createApp();
 const db = createDb(env);
@@ -68,11 +69,16 @@ describe('通知配置开放给 notify.read / notify.write', () => {
     const user = await account('notify');
     await updateUserNotifyPrefs(env, user.id, { webhook: { enabled: true, url: 'https://hooks.example.com/a', secret: 'shh' } });
     const reader = await user.key(['notify.read']);
-    const writer = await user.key(['notify.read', 'notify.write']);
+    const writer = await user.key(['notify.read', 'notify.write', 'mail.read']);
     const prefs = await data<NotifyPrefsView>(await request('/v1/notify-prefs', { headers: auth(reader) }));
     expect(prefs.webhook).toMatchObject({ enabled: true, secret: '******' });
     expect(prefs.forwardPending).toEqual([]);
     expect((await request('/v1/notify-prefs', json(reader, { feishu: { enabled: false, webhookUrl: '', secret: '' } }, 'PUT'))).status).toBe(403);
+    // 通道会推送来信主题、验证码与正文摘要：只有 notify.write 不够，另需 mail.read（A5）
+    const notifyOnly = await user.key(['notify.read', 'notify.write']);
+    const missing = await request('/v1/notify-prefs', json(notifyOnly, { pushdeer: { enabled: true, endpoint: '', pushkey: 'PDU_TEST' } }, 'PUT'));
+    expect(missing.status).toBe(403);
+    expect(((await missing.json()) as { error: { message: string } }).error.message).toContain('mail.read');
     const updated = await data<NotifyPrefsView>(await request('/v1/notify-prefs',
       json(writer, { pushdeer: { enabled: true, endpoint: '', pushkey: 'PDU_TEST' } }, 'PUT')));
     expect(updated.pushdeer).toMatchObject({ enabled: true, pushkey: '******' });
@@ -82,7 +88,7 @@ describe('通知配置开放给 notify.read / notify.write', () => {
     expect((await data<NotificationHealth>(await request('/v1/notify-prefs/health', { headers: auth(reader) }))).channels).toHaveLength(4);
 
     const box = await own(user.id, `nk-notify-box-${seq}@hpc.email`);
-    const scoped = await user.key(['notify.read', 'notify.write'], { allowedMailboxIds: [box.id] });
+    const scoped = await user.key(['notify.read', 'notify.write', 'mail.read'], { allowedMailboxIds: [box.id] });
     expect((await request('/v1/notify-prefs', { headers: auth(scoped) })).status).toBe(200);
     expect((await request('/v1/notify-prefs', json(scoped, { pushdeer: { enabled: false, endpoint: '', pushkey: '' } }, 'PUT'))).status).toBe(403);
     expect((await request('/v1/notify-prefs/health', { headers: auth(scoped) })).status).toBe(403);
@@ -90,7 +96,42 @@ describe('通知配置开放给 notify.read / notify.write', () => {
   });
 });
 
+it('没有 admin scope 的管理员 Key 不能改通知配置：管理员的配置也推送未认领地址的来信（A27）', async () => {
+  const admin = await account('notify-admin');
+  await db.update(users).set({ role: 'admin' }).where(eq(users.id, admin.id));
+  const body = { pushdeer: { enabled: true, endpoint: '', pushkey: 'PDU_TEST' } };
+  const plain = await admin.key(['notify.read', 'notify.write', 'mail.read']);
+  const denied = await request('/v1/notify-prefs', json(plain, body, 'PUT'));
+  expect(denied.status).toBe(403);
+  expect(((await denied.json()) as { error: { message: string } }).error.message).toContain('admin scope');
+  // 存量管理员 Key 的形态（迁移 0022 补上 admin scope）
+  const scoped = await createApiKey(env, admin.id, { name: `k-${++seq}`, scopes: ['notify.read', 'notify.write', 'mail.read'], rateLimit: 600, allowedIps: [] });
+  await grantLegacyAdminScope(env, scoped.id);
+  expect((await request('/v1/notify-prefs', json(scoped.key, body, 'PUT'))).status).toBe(200);
+});
+
 describe('共享管理开放给 mailbox.share', () => {
+  it('未匹配的 /v1/mailboxes/shares 路径只鉴权一次并返回 404，不落进 /mailboxes/:id', async () => {
+    const owner = await account('share-unmatched');
+    const key = await owner.key(['mailbox.share', 'mailbox.write']);
+    const lookups: string[] = [];
+    const db = new Proxy(runtime.db, { get(target, property) {
+      if (property === 'prepare') return (query: string) => { if (/FROM api_keys k/.test(query)) lookups.push(query); return target.prepare(query); };
+      if (property === 'batch') return (statements: D1PreparedStatement[]) => target.batch(statements);
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    for (const [method, path] of [['DELETE', '/v1/mailboxes/shares'], ['GET', '/v1/mailboxes/shares/unknown'], ['PUT', '/v1/mailboxes/shares/1']] as const) {
+      lookups.length = 0;
+      const ctx = createExecutionContext();
+      const response = await app.request(path, { method, headers: auth(key) }, { ...runtime, db }, ctx);
+      await waitOnExecutionContext(ctx);
+      expect(response.status, `${method} ${path}`).toBe(404);
+      expect(((await response.json()) as { error: { code: string } }).error.code).toBe('not_found');
+      expect(lookups, `${method} ${path}`).toHaveLength(1);
+    }
+  });
+
   it('按 userId 共享、列出、批量追加、撤销；限定范围的 Key 只能管理范围内的邮箱', async () => {
     const owner = await account('share-owner');
     const reader = await account('share-reader');
@@ -150,6 +191,40 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
       .toEqual({ enabled: false, addresses: [target] });
     // 重新打开需要密码
     expect((await request('/api/me/notify-prefs', json(user.jwt, { forward: { enabled: true, addresses: [target] } }, 'PUT'))).status).toBe(403);
+  });
+
+  it('撤销与确认同时发生：撤销先落库时确认失败，地址不会写回转发目标（A16）', async () => {
+    const user = await account('forward-race');
+    const target = `nk-race-${seq}@example.net`;
+    await data(await request('/api/me/notify-prefs', json(user.jwt, { forward: { enabled: true, addresses: [target] }, password: TEST_PASSWORD }, 'PUT')));
+    const token = tokenOf(captured.filter((item) => item.to === target).at(-1)!.text)!;
+    // 确认方读完待确认记录与偏好之后、写入之前，用户撤销了这个地址（删除待确认记录，偏好内容不变）
+    let revoked = false;
+    const sqlOf = new WeakMap<D1PreparedStatement, string>();
+    const racing = new Proxy(runtime.db, { get(target_, property) {
+      if (property === 'prepare') return (query: string) => {
+        const statement = target_.prepare(query);
+        return new Proxy(statement, { get(stmt, key) {
+          if (key === 'bind') return (...args: unknown[]) => { const bound = stmt.bind(...args); sqlOf.set(bound, query); return bound; };
+          const value = Reflect.get(stmt, key);
+          return typeof value === 'function' ? value.bind(stmt) : value;
+        } });
+      };
+      if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
+        if (!revoked && statements.some((statement) => /^UPDATE users SET notify_prefs/.test(sqlOf.get(statement) ?? ''))) {
+          revoked = true;
+          await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ?').bind(user.id).run();
+        }
+        return target_.batch(statements);
+      };
+      const value = Reflect.get(target_, property);
+      return typeof value === 'function' ? value.bind(target_) : value;
+    } });
+    await expect(confirmForward({ ...runtime, db: racing }, token)).rejects.toMatchObject({ code: 'not_found' });
+    expect(revoked).toBe(true);
+    const after = await data<NotifyPrefsView>(await request('/api/me/notify-prefs', { headers: auth(user.jwt) }));
+    expect(after.forward.addresses).toEqual([]);
+    expect(after.forwardPending).toEqual([]);
   });
 
   it('从列表里去掉待确认的地址会撤销确认；每天的确认信有上限', async () => {

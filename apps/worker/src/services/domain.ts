@@ -1,4 +1,4 @@
-import { HOSTED_DOMAIN_USABLE_STATUSES, type SendIdentityBlockReason, type Settings } from '@hpc-mail/shared';
+import { HOSTED_DOMAIN_USABLE_STATUSES, type Role, type SendIdentityBlockReason, type Settings } from '@hpc-mail/shared';
 import { eq, inArray } from 'drizzle-orm';
 import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
@@ -6,7 +6,7 @@ import { hostedDomains, mailboxes } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 import { getSettings, getSettingsFresh } from './setting.js';
-import { mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy } from './mailbox-policy.js';
+import { asActor, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy } from './mailbox-policy.js';
 
 /**
  * 全部系统域名名（管理员可用范围）：完全由 settings.domains.list 决定（管理端维护，无写死 fallback）。
@@ -36,23 +36,25 @@ export async function getPublicDomains(env: Env, settings?: Settings): Promise<s
  */
 export async function getVisibleDomains(
   env: Env,
-  userId: number,
+  actor: { userId: number; role: Role },
   settings?: Settings,
 ): Promise<string[]> {
-  // 用户策略与托管域名合成一个 batch，与设置直读并行，仍是一层往返
+  const { userId } = actor;
+  // 用户策略与托管域名合成一个 batch，与设置直读并行，仍是一层往返。
+  // 管理员规则要求账户与凭据都是管理员（没有 admin scope 的管理员 Key 按普通用户，见 asActor）
   const [[userResult, hosted], resolved] = await Promise.all([
     env.db.batch([
       mailboxPolicyUserStatement(env.db, userId),
       env.db.prepare(`SELECT domain FROM hosted_domains h WHERE status IN (${USABLE_HOSTED_SQL})
-        AND ((SELECT role FROM users WHERE id = ?1) = 'admin' OR user_id = ?1
+        AND ((?2 = 'admin' AND (SELECT role FROM users WHERE id = ?1) = 'admin') OR user_id = ?1
           OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?1))
-        ORDER BY domain`).bind(userId),
+        ORDER BY domain`).bind(userId, actor.role),
     ]),
     settings ?? getSettingsFresh(env),
   ]);
   // 托管域名排在系统域名之后：普通用户是自己拥有或被共享的，管理员可在任何人的托管域名下认领
   return [
-    ...resolveMailboxPolicy(resolved, mailboxPolicyUserFromResult(userResult)).domains.map(({ domain }) => domain),
+    ...resolveMailboxPolicy(resolved, asActor(mailboxPolicyUserFromResult(userResult), actor.role)).domains.map(({ domain }) => domain),
     ...((hosted?.results ?? []) as { domain: string }[]).map((row) => row.domain),
   ];
 }

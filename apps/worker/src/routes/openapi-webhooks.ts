@@ -45,18 +45,23 @@ export function webhookPaths(kind: 'api' | 'v1'): Paths {
   const keyErrors = kind === 'v1' ? ['KeyRestricted' as const] : [];
   const restricted = kind === 'v1'
     ? ' A key restricted to mailboxes or domains only sees and manages endpoints whose filters are non-empty and inside its range (others are 404; creating or updating outside it is 403).' : '';
+  const mailRead = kind === 'v1'
+    ? ' Creating or updating an endpoint that subscribes to mail.received or has includeBody also needs mail.read (403 without it).' : '';
+  const range = ' Mail for unclaimed addresses goes to every active administrator; an endpoint last written by an administrator key without the admin scope only receives mail of addresses its owner has claimed.';
+  const conditional = kind === 'v1' ? { 'x-conditional-scopes': [{ scope: 'mail.read', when: 'the endpoint subscribes to mail.received or has includeBody' }] } : {};
+  const scopeErrors = kind === 'v1' ? ['ForbiddenScopeMailRead' as const] : [];
   return {
     '/webhooks': {
       get: operation('listWebhookEndpoints', 'List Webhook v2 endpoints', array(ref('WebhookEndpoint')), { scope, description: `Endpoints of the caller, without secrets.${restricted}` }),
-      post: operation('createWebhookEndpoint', 'Create a Webhook v2 endpoint', ref('CreatedWebhookEndpoint'), { scope, request: 'CreateWebhookEndpointRequest', status: 201,
-        errors: ['WebhookEndpointLimit', 'WebhookUrlInvalid', ...keyErrors],
-        description: `At most ${MAX_WEBHOOK_ENDPOINTS_PER_USER} endpoints per user (403 beyond). url must be https on a public host: private, reserved, link-local and metadata addresses, URL credentials and this site's own hosts and system domains are rejected with 400. ${contract}${restricted}` }),
+      post: { ...operation('createWebhookEndpoint', 'Create a Webhook v2 endpoint', ref('CreatedWebhookEndpoint'), { scope, request: 'CreateWebhookEndpointRequest', status: 201,
+        errors: ['WebhookEndpointLimit', 'WebhookUrlInvalid', ...scopeErrors, ...keyErrors],
+        description: `At most ${MAX_WEBHOOK_ENDPOINTS_PER_USER} endpoints per user (403 beyond). url must be https on a public host: private, reserved, link-local and metadata addresses, URL credentials and this site's own hosts and system domains are rejected with 400. ${contract}${range}${mailRead}${restricted}` }), ...conditional },
     },
     '/webhooks/{id}': {
       get: operation('getWebhookEndpoint', 'Read a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope }),
-      put: operation('updateWebhookEndpoint', 'Update a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope, request: 'UpdateWebhookEndpointRequest',
-        errors: ['WebhookUrlInvalid', ...keyErrors],
-        description: `Only supplied fields change; lists replace the whole list. enabled:true re-enables an endpoint (clearing disabledReason and the failure count); failed deliveries are not resent automatically, retry them explicitly.${restricted}` }),
+      put: { ...operation('updateWebhookEndpoint', 'Update a Webhook v2 endpoint', ref('WebhookEndpoint'), { scope, request: 'UpdateWebhookEndpointRequest',
+        errors: ['WebhookUrlInvalid', ...scopeErrors, ...keyErrors],
+        description: `Only supplied fields change; lists replace the whole list. enabled:true re-enables an endpoint (clearing disabledReason and the failure count); failed deliveries are not resent automatically, retry them explicitly.${range}${mailRead}${restricted}` }), ...conditional },
       delete: operation('deleteWebhookEndpoint', 'Delete a Webhook v2 endpoint and its delivery records', success, { scope }),
     },
     '/webhooks/{id}/rotate-secret': { post: operation('changeWebhookSecret', 'Rotate the signing secret', ref('CreatedWebhookEndpoint'), { scope,
@@ -68,6 +73,6 @@ export function webhookPaths(kind: 'api' | 'v1'): Paths {
       description: 'Newest first; terminal records are kept about 30 days. Payloads are not returned.' }) },
     '/webhooks/{id}/deliveries/{deliveryId}/retry': { post: operation('retryWebhookDelivery', 'Retry a failed delivery once', ref('WebhookDelivery'), { scope,
       errors: ['WebhookNotRetryable'],
-      description: 'Only failed deliveries of an active endpoint (409 otherwise); sends one more attempt with the same webhook-id. Deliveries whose source message was purged cannot be retried.' }) },
+      description: 'Only failed deliveries of an active endpoint (409 otherwise); sends one more attempt with the same webhook-id. Deliveries whose source message was deleted (trash included) or purged cannot be retried; purging a message also voids its pending deliveries. Deliveries of a disabled user are not sent.' }) },
   };
 }

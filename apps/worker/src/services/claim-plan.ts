@@ -1,7 +1,7 @@
 import type { ClaimPlan, ClaimPlanItem, ClaimPlanStrategy, DomainClaudeStats, Role, Settings } from '@hpc-mail/shared';
 import type { Env } from '../types.js';
 import { ownedCountsFromResult, ownedCountsStatement } from './mailbox.js';
-import { mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy } from './mailbox-policy.js';
+import { asActor, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy } from './mailbox-policy.js';
 import { mergeSettingRows } from './setting.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -128,7 +128,7 @@ export async function planRandomDomains(
     ...domainCountStatements(env.db, now),
   ]);
   const settings: Settings = mergeSettingRows((settingsResult?.results ?? []) as { key: string; value: string }[]);
-  const policy = resolveMailboxPolicy(settings, mailboxPolicyUserFromResult(userResult));
+  const policy = resolveMailboxPolicy(settings, asActor(mailboxPolicyUserFromResult(userResult), actor.role));
   const owned = ownedCountsFromResult(ownedResult);
   const rules = settings.claim_random;
   const counts = domainCountsFrom(statsResult, pendingResult, rules.pendingDays);

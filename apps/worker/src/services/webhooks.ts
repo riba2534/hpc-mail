@@ -8,6 +8,7 @@ import {
   type MessageRecipients,
   type Page,
   type RecipientOutcome,
+  type Role,
   type UpdateWebhookEndpointRequest,
   type WebhookDelivery,
   type WebhookDeliveryStatus,
@@ -49,6 +50,7 @@ const RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 3_600_000, 5 * 3_6
 const PROCESSING_LEASE_MS = 2 * 60_000;
 const SOURCE_GONE = '源邮件已永久删除，不再投递';
 const ENDPOINT_GONE = '端点已停用或删除，不再投递';
+const OWNER_DISABLED = '端点所属用户已停用，不再投递';
 const USER_AGENT = 'HPC-Mail-Webhooks/1.0';
 
 interface EndpointRow {
@@ -62,6 +64,7 @@ interface EndpointRow {
   domains: string;
   include_body: number;
   status: 'active' | 'disabled';
+  access_role: Role;
   disabled_reason: string;
   consecutive_failures: number;
   last_success_at: number | null;
@@ -158,28 +161,40 @@ export async function getWebhookEndpoint(env: Env, userId: number, id: number): 
   return toEndpoint(await loadEndpoint(env, userId, id));
 }
 
-export async function createWebhookEndpoint(env: Env, userId: number, req: CreateWebhookEndpointRequest, requestOrigin?: string): Promise<CreatedWebhookEndpoint> {
-  const url = await validateWebhookEndpointUrl(env, req.url, requestOrigin);
+/** 写端点的凭据：requestOrigin 用来拦指向本站的地址；accessRole 是凭据的有效角色（存为端点的 access_role） */
+export interface EndpointWriter {
+  requestOrigin?: string;
+  accessRole: Role;
+}
+
+export async function createWebhookEndpoint(env: Env, userId: number, req: CreateWebhookEndpointRequest, writer: EndpointWriter): Promise<CreatedWebhookEndpoint> {
+  const url = await validateWebhookEndpointUrl(env, req.url, writer.requestOrigin);
   const secret = newSecret();
   const now = Date.now();
   const row = await env.db.prepare(`INSERT INTO webhook_endpoints
-      (user_id, url, description, secret, events, addresses, domains, include_body, status, created_at, updated_at)
-    SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?
+      (user_id, url, description, secret, events, addresses, domains, include_body, status, access_role, created_at, updated_at)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?
     WHERE (SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = ?) < ?
     RETURNING *`).bind(userId, url, req.description, secret, JSON.stringify(req.events), JSON.stringify(req.addresses),
-    JSON.stringify(req.domains), req.includeBody ? 1 : 0, now, now, userId, MAX_WEBHOOK_ENDPOINTS_PER_USER).first<EndpointRow>();
+    JSON.stringify(req.domains), req.includeBody ? 1 : 0, writer.accessRole, now, now, userId, MAX_WEBHOOK_ENDPOINTS_PER_USER).first<EndpointRow>();
   if (!row) throw new AppError('forbidden', `每个用户最多 ${MAX_WEBHOOK_ENDPOINTS_PER_USER} 个 Webhook 端点`);
   return { ...toEndpoint(row), secret };
 }
 
+/**
+ * 修改端点。check 拿到修改后的订阅与是否带正文，在写入前校验（如 Key 另需 mail.read），不多一次读取；
+ * access_role 记为这次写入的凭据的有效角色：端点能收到的邮件范围跟随最近一次写入它的凭据
+ */
 export async function updateWebhookEndpoint(
-  env: Env, userId: number, id: number, req: UpdateWebhookEndpointRequest, requestOrigin?: string,
+  env: Env, userId: number, id: number, req: UpdateWebhookEndpointRequest,
+  writer: EndpointWriter & { check?: (next: { events: WebhookEventType[]; includeBody: boolean }) => void },
 ): Promise<WebhookEndpoint> {
   const current = await loadEndpoint(env, userId, id);
+  writer.check?.({ events: req.events ?? JSON.parse(current.events) as WebhookEventType[], includeBody: req.includeBody ?? Boolean(current.include_body) });
   const sets: string[] = [];
   const values: unknown[] = [];
   const set = (column: string, value: unknown) => { sets.push(`${column} = ?`); values.push(value); };
-  if (req.url !== undefined) set('url', await validateWebhookEndpointUrl(env, req.url, requestOrigin));
+  if (req.url !== undefined) set('url', await validateWebhookEndpointUrl(env, req.url, writer.requestOrigin));
   if (req.description !== undefined) set('description', req.description);
   if (req.events !== undefined) set('events', JSON.stringify(req.events));
   if (req.addresses !== undefined) set('addresses', JSON.stringify(req.addresses));
@@ -190,6 +205,7 @@ export async function updateWebhookEndpoint(
   } else if (req.enabled === false) {
     set('status', 'disabled'); set('disabled_reason', '');
   }
+  set('access_role', writer.accessRole);
   set('updated_at', Date.now());
   const row = await env.db.prepare(`UPDATE webhook_endpoints SET ${sets.join(', ')} WHERE id = ? AND user_id = ? RETURNING *`)
     .bind(...values, current.id, userId).first<EndpointRow>();
@@ -230,14 +246,33 @@ export async function listWebhookDeliveries(
   return { items: page.items.map(toDelivery), nextCursor: page.nextCursor };
 }
 
-/** 手动重试一条已失败的投递：只发一次，端点必须是启用状态 */
+/** 邮件事件的去重键是 `<type>:<邮件 id>`，这里取出邮件 id（SQL 表达式，列名由调用方给出） */
+const MAIL_EVENT_TYPES_SQL = `('mail.received', 'mail.sent', 'mail.failed')`;
+const eventMessageIdSql = (column: string) => `CAST(substr(${column}, instr(${column}, ':') + 1) AS INTEGER)`;
+
+/**
+ * 永久删除邮件（purgeStatements，与删除同一事务）时作废它的事件投递：载荷含主题、收件人、验证码与正文，是邮件的派生副本。
+ * 未完成与已失败的投递清空载荷、记为 SOURCE_GONE，自动重试与手动重试都不再发；已成功的投递载荷本来就是空的。
+ * 只扫未成功的投递（idx_webhook_deliveries_due 的 status 前缀），按 purge_token 取要删的邮件 id
+ */
+export function purgeWebhookDeliveriesStatement(env: Env, token: string): D1PreparedStatement {
+  return env.db.prepare(`UPDATE webhook_deliveries SET payload = '', status = 'failed', last_error = ?, updated_at = ?
+    WHERE status IN ('pending', 'processing', 'failed') AND event_type IN ${MAIL_EVENT_TYPES_SQL}
+      AND ${eventMessageIdSql('event_key')} IN (SELECT id FROM messages WHERE purge_token = ?)`)
+    .bind(SOURCE_GONE, Date.now(), token);
+}
+
+/** 手动重试一条已失败的投递：只发一次，端点必须是启用状态；邮件事件的源邮件已删除（含回收站）时拒绝 */
 export async function retryWebhookDelivery(env: Env, userId: number, endpointId: number, deliveryId: number, ctx?: ExecCtx | null): Promise<WebhookDelivery> {
   const endpoint = await loadEndpoint(env, userId, endpointId);
   if (endpoint.status !== 'active') throw new AppError('conflict', '端点已停用，先重新启用再重试');
   const row = await env.db.prepare(`UPDATE webhook_deliveries SET status = 'pending', next_attempt_at = ?, updated_at = ?
-    WHERE id = ? AND endpoint_id = ? AND status = 'failed' AND last_error <> ? RETURNING *`)
+    WHERE id = ? AND endpoint_id = ? AND status = 'failed' AND last_error <> ?
+      AND (event_type NOT IN ${MAIL_EVENT_TYPES_SQL} OR EXISTS (SELECT 1 FROM messages AS source
+        WHERE source.id = ${eventMessageIdSql('webhook_deliveries.event_key')} AND source.deleted_at IS NULL))
+    RETURNING *`)
     .bind(Date.now(), Date.now(), deliveryId, endpointId, SOURCE_GONE).first<DeliveryRow>();
-  if (!row) throw new AppError('conflict', '只有投递失败的记录可以重试');
+  if (!row) throw new AppError('conflict', '只有投递失败、且源邮件未删除的记录可以重试');
   runDetached(ctx, processWebhookDeliveries(env, { ids: [Number(row.id)] }));
   return toDelivery(row);
 }
@@ -260,8 +295,12 @@ export async function testWebhookEndpoint(env: Env, userId: number, id: number):
 
 // ———————————————————————— 事件入队 ————————————————————————
 
-/** 端点是否订阅该事件、过滤是否命中：addresses 与 domains 都为空不过滤，否则命中其一即可 */
+/**
+ * 端点是否订阅该事件、过滤是否命中：addresses 与 domains 都为空不过滤，否则命中其一即可。
+ * 所属用户停用后不再产生新投递（与其他通知渠道一致）
+ */
 const MATCH_SQL = `status = 'active' AND EXISTS (SELECT 1 FROM json_each(events) WHERE value = ?)
+  AND EXISTS (SELECT 1 FROM users AS hook_owner WHERE hook_owner.id = webhook_endpoints.user_id AND hook_owner.status = 'active')
   AND ((json_array_length(addresses) = 0 AND json_array_length(domains) = 0)
     OR EXISTS (SELECT 1 FROM json_each(addresses) WHERE value = ?)
     OR EXISTS (SELECT 1 FROM json_each(domains) WHERE value = ?))`;
@@ -272,6 +311,7 @@ const INSERT_COLUMNS = `INSERT INTO webhook_deliveries
 /**
  * mail.received 入队语句：给归属人们订阅了它、过滤命中的端点各插一条投递。载荷在首次投递时按端点是否要正文构造，
  * 这里只记邮件 id；去重键保证补录重复入队时不会多发。供收件通知入队时合进同一个 batch。
+ * 未认领地址的来信归全部管理员；access_role 为 user 的端点（由没有 admin scope 的管理员 Key 写入）只收所有者自己认领的地址
  */
 export function mailReceivedDeliveriesStatement(
   env: Env, ownerIds: readonly number[], message: { id: number; address: string }, now = Date.now(),
@@ -280,9 +320,11 @@ export function mailReceivedDeliveriesStatement(
   return env.db.prepare(`${INSERT_COLUMNS}
     SELECT id, user_id, ?, 'mail.received', ?, '', 'pending', 0, ?, ?, ?
     FROM webhook_endpoints WHERE user_id IN (SELECT value FROM json_each(?)) AND ${MATCH_SQL}
+      AND (access_role = 'admin' OR EXISTS (SELECT 1 FROM mailboxes AS hook_box
+        WHERE hook_box.address = ? AND hook_box.user_id = webhook_endpoints.user_id))
     ON CONFLICT(endpoint_id, event_key) DO NOTHING RETURNING id`)
     .bind(newEventId(), `mail.received:${message.id}`, now, now, now, JSON.stringify([...new Set(ownerIds)]),
-      'mail.received', address, getEmailDomain(address));
+      'mail.received', address, getEmailDomain(address), address);
 }
 
 /**
@@ -473,11 +515,12 @@ async function deliverOne(env: Env, id: number): Promise<'succeeded' | 'failed' 
     env.db.prepare(`UPDATE webhook_deliveries SET status = 'processing', attempts = attempts + 1,
         last_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND next_attempt_at <= ? RETURNING *`)
       .bind(startedAt, startedAt, id, startedAt),
-    env.db.prepare('SELECT * FROM webhook_endpoints WHERE id = (SELECT endpoint_id FROM webhook_deliveries WHERE id = ?)').bind(id),
+    env.db.prepare(`SELECT e.*, u.status AS owner_status FROM webhook_endpoints e LEFT JOIN users u ON u.id = e.user_id
+      WHERE e.id = (SELECT endpoint_id FROM webhook_deliveries WHERE id = ?)`).bind(id),
   ]);
   const claimed = claimResult?.results?.[0] as DeliveryRow | undefined;
   if (!claimed) return null;
-  const endpoint = endpointResult?.results?.[0] as EndpointRow | undefined;
+  const endpoint = endpointResult?.results?.[0] as (EndpointRow & { owner_status: string | null }) | undefined;
   const finish = (status: WebhookDeliveryStatus, fields: { error?: string; httpStatus?: number | null; next?: number; payload?: string }) =>
     env.db.prepare(`UPDATE webhook_deliveries SET status = ?, last_error = ?, last_http_status = ?, next_attempt_at = ?, payload = ?, updated_at = ?
       WHERE id = ? AND status = 'processing' AND attempts = ?`)
@@ -486,6 +529,11 @@ async function deliverOne(env: Env, id: number): Promise<'succeeded' | 'failed' 
   // 端点停用时保留载荷：重新启用后可以手动重试
   if (!endpoint || endpoint.status !== 'active') {
     await finish('failed', { error: ENDPOINT_GONE }).run();
+    return 'failed';
+  }
+  // 所属用户已停用：自动重试与手动重试都不再外发（停用用户的其他通知渠道同样不投递）
+  if (endpoint.owner_status !== 'active') {
+    await finish('failed', { error: OWNER_DISABLED }).run();
     return 'failed';
   }
   let payload = claimed.payload;

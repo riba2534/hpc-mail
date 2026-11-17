@@ -3,6 +3,7 @@ import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
+import { eq } from 'drizzle-orm';
 import { mailboxes, users } from '../src/db/schema.js';
 import { hmacSha256Base64 } from '../src/lib/crypto.js';
 import { signToken } from '../src/lib/jwt.js';
@@ -132,13 +133,48 @@ describe('Webhook v2 端点管理', () => {
   it('限定了范围的 Key 只能管理过滤条件落在范围内的端点', async () => {
     const user = await account('scoped');
     const open = await data<CreatedWebhookEndpoint>(await create(user.jwt, {}), 201);
-    const key = await user.key(['webhook.write'], { allowedMailboxIds: [user.box.id] });
+    const key = await user.key(['webhook.write', 'mail.read'], { allowedMailboxIds: [user.box.id] });
     expect((await create(key, {}, '/v1')).status).toBe(403);
     expect((await create(key, { domains: ['hpc.email'] }, '/v1')).status).toBe(403);
     const mine = await data<CreatedWebhookEndpoint>(await create(key, { addresses: [user.box.address] }, '/v1'), 201);
     expect((await data<WebhookEndpoint[]>(await request('/v1/webhooks', { headers: auth(key) }))).map((item) => item.id)).toEqual([mine.id]);
     expect((await request(`/v1/webhooks/${open.id}`, { headers: auth(key) })).status).toBe(404);
     expect((await request(`/v1/webhooks/${mine.id}`, json(key, { addresses: [] }, 'PUT'))).status).toBe(403);
+  });
+
+  it('Key 创建或修改订阅 mail.received、或带正文的端点另需 mail.read（A5）', async () => {
+    const user = await account('mail-read');
+    const hookOnly = await user.key(['webhook.write']);
+    expect((await create(hookOnly, {}, '/v1')).status).toBe(403);
+    expect((await create(hookOnly, { events: ['mail.sent'], includeBody: true }, '/v1')).status).toBe(403);
+    const sent = await data<CreatedWebhookEndpoint>(await create(hookOnly, { events: ['mail.sent', 'mail.failed'] }, '/v1'), 201);
+    expect((await request(`/v1/webhooks/${sent.id}`, json(hookOnly, { events: ['mail.received'] }, 'PUT'))).status).toBe(403);
+    // 网页会话建的 mail.received 端点：只有 webhook.write 的 Key 改它（如换 url）同样要 mail.read
+    const received = await data<CreatedWebhookEndpoint>(await create(user.jwt, {}), 201);
+    expect((await request(`/v1/webhooks/${received.id}`, json(hookOnly, { url: 'https://evil.example.com/x' }, 'PUT'))).status).toBe(403);
+    const kept = await data<WebhookEndpoint>(await request(`/api/webhooks/${received.id}`, { headers: auth(user.jwt) }));
+    expect(kept.url).toBe('https://hooks.example.com/hpc');
+    const reader = await user.key(['webhook.write', 'mail.read']);
+    await data(await create(reader, { url: 'https://reader.example.com/x' }, '/v1'), 201);
+    await data(await request(`/v1/webhooks/${sent.id}`, json(reader, { events: ['mail.received'] }, 'PUT')));
+  });
+
+  it('端点能收到的来信按写入它的凭据的有效角色：没有 admin scope 的管理员 Key 写的端点不收未认领地址（A27）', async () => {
+    const admin = await account('admin-role');
+    await db.update(users).set({ role: 'admin' }).where(eq(users.id, admin.id));
+    const plainKey = await admin.key(['webhook.write', 'mail.read']);
+    const viaKey = await data<CreatedWebhookEndpoint>(await create(plainKey, { url: 'https://key.example.com/x' }, '/v1'), 201);
+    const viaSession = await data<CreatedWebhookEndpoint>(await create(admin.jwt, { url: 'https://session.example.com/x' }), 201);
+    const moved = await data<CreatedWebhookEndpoint>(await create(admin.jwt, { url: 'https://moved.example.com/x' }), 201);
+    // 没有 admin scope 的 Key 改过的端点同样降为只收自己认领的地址
+    await data(await request(`/v1/webhooks/${moved.id}`, json(plainKey, { description: 'by key' }, 'PUT')));
+    const hits = receiver();
+    await receive(`wh-unclaimed-${seq}@hpc.email`, 'unclaimed mail');
+    expect(hits.map((hit) => new URL(hit.url).host)).toEqual(['session.example.com']);
+    hits.length = 0;
+    await receive(admin.box.address, 'own mail');
+    expect(hits.map((hit) => new URL(hit.url).host).sort()).toEqual(['key.example.com', 'moved.example.com', 'session.example.com']);
+    expect(viaKey.id).not.toBe(viaSession.id);
   });
 
   it('测试发送同步返回接收端结果，不写投递记录', async () => {
@@ -209,6 +245,54 @@ describe('Webhook v2 事件投递', () => {
     expect(ok).toHaveLength(1);
     const after = await data<WebhookEndpoint>(await request(`/api/webhooks/${endpoint.id}`, { headers: auth(user.jwt) }));
     expect(after).toMatchObject({ status: 'active', consecutiveFailures: 0 });
+  });
+
+  it('所属用户停用后不再生成新投递，待重试的投递也不再外发（A3）', async () => {
+    const user = await account('disabled');
+    const endpoint = await data<CreatedWebhookEndpoint>(await create(user.jwt, { includeBody: true }), 201);
+    const hits = receiver(() => 503);
+    await receive(user.box.address, 'before disable');
+    expect(hits).toHaveLength(1);
+    const pending = (await data<Page<WebhookDelivery>>(await request(`/api/webhooks/${endpoint.id}/deliveries`, { headers: auth(user.jwt) }))).items[0]!;
+    expect(pending.status).toBe('pending');
+    await env.db.prepare("UPDATE users SET status = 'disabled' WHERE id = ?").bind(user.id).run();
+    await receive(user.box.address, 'after disable');
+    const count = await env.db.prepare('SELECT COUNT(*) AS n FROM webhook_deliveries WHERE endpoint_id = ?').bind(endpoint.id).first<{ n: number }>();
+    expect(count!.n).toBe(1);
+    await env.db.prepare('UPDATE webhook_deliveries SET next_attempt_at = 0 WHERE id = ?').bind(pending.id).run();
+    await processWebhookDeliveries(env, { ids: [pending.id] });
+    expect(hits).toHaveLength(1);
+    const row = await env.db.prepare('SELECT status, last_error FROM webhook_deliveries WHERE id = ?').bind(pending.id).first<{ status: string; last_error: string }>();
+    expect(row).toMatchObject({ status: 'failed', last_error: expect.stringContaining('停用') });
+  });
+
+  it('永久删除邮件时作废它的投递载荷，不再自动或手动重发；回收站里的邮件也不能手动重发（A4）', async () => {
+    const user = await account('purge');
+    const endpoint = await data<CreatedWebhookEndpoint>(await create(user.jwt, { includeBody: true }), 201);
+    const hits = receiver(() => 503);
+    await receive(user.box.address, 'to purge');
+    await receive(user.box.address, 'to trash');
+    expect(hits).toHaveLength(2);
+    const deliveries = (await data<Page<WebhookDelivery>>(await request(`/api/webhooks/${endpoint.id}/deliveries`, { headers: auth(user.jwt) }))).items;
+    const ids = await env.db.prepare(`SELECT id, CAST(substr(event_key, 15) AS INTEGER) AS message_id, payload FROM webhook_deliveries
+      WHERE endpoint_id = ? ORDER BY id`).bind(endpoint.id).all<{ id: number; message_id: number; payload: string }>();
+    expect(ids.results.every((row) => row.payload.includes('482913'))).toBe(true);
+    const [purged, trashed] = ids.results;
+    // 第二封失败用尽后进回收站：仍保留载荷，但不能手动重发
+    await env.db.prepare("UPDATE webhook_deliveries SET status = 'failed' WHERE id = ?").bind(trashed!.id).run();
+    await data(await request('/api/messages/delete', json(user.jwt, { ids: [purged!.message_id, trashed!.message_id] })));
+    expect((await request(`/api/webhooks/${endpoint.id}/deliveries/${trashed!.id}/retry`, { method: 'POST', headers: auth(user.jwt) })).status).toBe(409);
+    await data(await request('/api/messages/purge', json(user.jwt, { ids: [purged!.message_id] })));
+    const row = await env.db.prepare('SELECT status, payload, last_error FROM webhook_deliveries WHERE id = ?').bind(purged!.id)
+      .first<{ status: string; payload: string; last_error: string }>();
+    expect(row).toMatchObject({ status: 'failed', payload: '', last_error: expect.stringContaining('永久删除') });
+    await env.db.prepare('UPDATE webhook_deliveries SET next_attempt_at = 0 WHERE id = ?').bind(purged!.id).run();
+    await processWebhookDeliveries(env, { ids: [purged!.id] });
+    vi.unstubAllGlobals();
+    const later = receiver(() => 200);
+    expect((await request(`/api/webhooks/${endpoint.id}/deliveries/${purged!.id}/retry`, { method: 'POST', headers: auth(user.jwt) })).status).toBe(409);
+    expect(later).toHaveLength(0);
+    expect(deliveries).toHaveLength(2);
   });
 
   it('发信成功与失败分别发 mail.sent / mail.failed，同一封只发一次', async () => {

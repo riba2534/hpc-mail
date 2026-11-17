@@ -171,6 +171,39 @@ describe('创建 Key 前重新验证密码', () => {
   });
 });
 
+describe('没有 admin scope 的管理员 Key 认领按普通用户规则（A26）', () => {
+  it('私有系统域名、保留前缀、他人的托管域名都不能认领，可用性与 /domains 同样按普通用户', async () => {
+    const admin = await account('claim-admin', 'admin');
+    const other = await account('claim-owner');
+    await updateSettings(env, { domains: { list: [{ domain: 'hpc.email', public: true, perUserLimit: 0 }, { domain: 'priv.test', public: false, perUserLimit: 0 }] } });
+    const hosted = `ks-claim-hosted-${seq}.test`;
+    await db.insert(hostedDomains).values({ domain: hosted, userId: other.id, status: 'active', zoneId: `z-claim-${seq}` });
+    const key = (await keyFor(admin.jwt)).key;
+    const claim = (localPart: string, domain: string, token = key) => request('/v1/mailboxes', json(token, { localPart, domain }));
+    expect((await claim(`ks-priv-${seq}`, 'priv.test')).status).toBe(403);
+    expect((await claim('postmaster', 'hpc.email')).status).toBe(403);
+    expect((await claim(`ks-hosted-${seq}`, hosted)).status).toBe(403);
+    const batch = await data<{ claimed: unknown[]; stoppedBy: { code: string } | null }>(
+      await request('/v1/mailboxes/batch', json(key, { items: [{ localPart: `ks-batch-${seq}`, domain: hosted }] })));
+    expect(batch.claimed).toEqual([]);
+    expect(batch.stoppedBy?.code).toBe('forbidden');
+    const availability = await data<{ available: boolean; reason?: string }[]>(await request('/v1/mailboxes/availability/batch', json(key, {
+      items: [{ localPart: `ks-av-${seq}`, domain: 'priv.test' }, { localPart: 'postmaster', domain: 'hpc.email' }, { localPart: `ks-av-${seq}`, domain: hosted }],
+    })));
+    expect(availability.map((item) => item.reason)).toEqual(['domain_unavailable', 'reserved', 'domain_unavailable']);
+    expect((await data<{ domains: string[] }>(await request('/v1/domains', { headers: auth(key) }))).domains).toEqual(['hpc.email']);
+
+    // 带 admin scope 的 Key 与网页会话仍按管理员规则
+    const scoped = await keyFor(admin.jwt);
+    await grantLegacyAdminScope(env, scoped.id);
+    expect((await claim(`ks-priv-${seq}`, 'priv.test', scoped.key)).status).toBe(201);
+    expect((await data<{ domains: string[] }>(await request('/v1/domains', { headers: auth(scoped.key) }))).domains).toContain(hosted);
+    const viaBatch = await data<{ claimed: unknown[] }>(await request('/v1/mailboxes/batch', json(scoped.key, { items: [{ localPart: `ks-batch-${seq}`, domain: hosted }] })));
+    expect(viaBatch.claimed).toHaveLength(1);
+    expect((await request('/api/mailboxes', json(admin.jwt, { localPart: `ks-hosted-${seq}`, domain: hosted }))).status).toBe(201);
+  });
+});
+
 describe('限定到邮箱的 Key', () => {
   it('读取、等待、未读数、变更、发信、回复来源与邮箱管理都只在范围内', async () => {
     const user = await account('restrict');
@@ -195,16 +228,28 @@ describe('限定到邮箱的 Key', () => {
     expect((await data<{ deleted: number }>(await request('/v1/messages/delete', json(key, { ids: [inHidden.id] })))).deleted).toBe(0);
 
     const send = (body: Record<string, unknown>) => request('/v1/messages', json(key, { to: [allowed.address], subject: 's', text: 't', ...body }));
-    expect((await send({ from: { mailboxId: hidden.id } })).status).toBe(403);
+    // 按 id 指定的邮箱在范围外：403，错误里只有 id、不带地址
+    const byId = await errorOf(await send({ from: { mailboxId: hidden.id } }), 403);
+    expect(byId.message).not.toContain(hidden.address);
     expect((await send({ from: hidden.address })).status).toBe(403);
-    expect((await send({ from: allowed.address, replyToMessageId: inHidden.id })).status).toBe(403);
-    expect((await send({ from: allowed.address, forwardAttachmentsFrom: inHidden.id })).status).toBe(403);
+    // 引用范围外的来源与不可见一样 404 source_unavailable，不带出地址（A2）
+    for (const body of [{ replyToMessageId: inHidden.id }, { forwardAttachmentsFrom: inHidden.id }]) {
+      const error = await errorOf(await send({ from: allowed.address, ...body }), 404);
+      expect(error.code).toBe('source_unavailable');
+      expect(error.message).not.toContain(hidden.address);
+    }
     expect((await send({ from: { mailboxId: allowed.id }, replyToMessageId: inAllowed.id })).status).toBe(201);
-    // 回复、转发端点：原信或发件地址在范围外 403
-    expect((await errorOf(await request(`/v1/messages/${inHidden.id}/reply`, json(key, { text: 'x' })), 403)).docs).toContain('#key-restricted');
-    // 发件地址在范围内也不行：原信本身在范围外
-    expect((await request(`/v1/messages/${inHidden.id}/reply`, json(key, { text: 'x', from: allowed.address }))).status).toBe(403);
-    expect((await request(`/v1/messages/${inHidden.id}/forward`, json(key, { to: [allowed.address], note: 'x' }))).status).toBe(403);
+    // 回复、转发端点：原信在范围外与不可见一样 404，发件地址在范围内也不行；发件地址在范围外 403
+    for (const [path, body] of [
+      [`/v1/messages/${inHidden.id}/reply`, { text: 'x' }],
+      [`/v1/messages/${inHidden.id}/reply`, { text: 'x', from: allowed.address }],
+      [`/v1/messages/${inHidden.id}/forward`, { to: [allowed.address], note: 'x' }],
+      ['/v1/drafts', { replyToMessageId: inHidden.id, from: allowed.address }],
+    ] as const) {
+      const error = await errorOf(await request(path, json(key, body)), 404);
+      expect(error.code).toBe('source_unavailable');
+      expect(error.message).not.toContain(hidden.address);
+    }
     expect((await request(`/v1/messages/${inAllowed.id}/reply`, json(key, { text: 'x', from: hidden.address }))).status).toBe(403);
 
     const boxes = await data<{ id: number }[]>(await request('/v1/mailboxes', { headers: auth(key) }));
@@ -217,6 +262,49 @@ describe('限定到邮箱的 Key', () => {
     expect((await request('/v1/mailboxes', json(key, { localPart: `ks-new-${seq}`, domain: 'hpc.email' }))).status).toBe(403);
     expect((await request('/v1/mailboxes/random-plan?count=1&strategy=uniform', { headers: auth(key) })).status).toBe(403);
     expect((await request(`/v1/mailboxes/${allowed.id}`, json(key, { displayName: 'ok' }, 'PUT'))).status).toBe(200);
+  });
+
+  it('wait 在全站新信多于 50 封、改为逐地址取数时也只返回范围内的邮件（A1）', async () => {
+    const user = await account('wait-gate');
+    const allowed = await own(user.id, `ks-wg-allowed-${seq}@hpc.email`);
+    const hidden = await own(user.id, `ks-wg-hidden-${seq}@hpc.email`);
+    const key = (await keyFor(user.jwt, { allowedMailboxIds: [allowed.id] })).key;
+    const inHidden = await receive(hidden.address, 'hidden code 482913');
+    // 其他人的新信把 afterId 之后的全站邮件推过 50 封，wait 走逐地址的分流语句
+    await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 60)
+      INSERT INTO messages (direction, address, domain, from_address, subject, preview, status)
+      SELECT 'inbound', 'ks-wg-filler-' || i || '@elsewhere.test', 'elsewhere.test', 'sender@example.net', 'filler', 'p', 'received' FROM n`).run();
+    const inAllowed = await receive(allowed.address, 'allowed later');
+    for (const include of ['', '&include=body']) {
+      const waited = await data<{ message: MessageSummary | null }>(
+        await request(`/v1/messages/wait?afterId=${inHidden.id - 1}&timeout=1${include}`, { headers: auth(key) }));
+      expect(waited.message?.id).toBe(inAllowed.id);
+    }
+    // 多个地址一次校验：范围外的那个报 403
+    expect((await request(`/v1/messages/wait?address=${allowed.address},${hidden.address}&timeout=1`, { headers: auth(key) })).status).toBe(403);
+    const both = await data<{ message: MessageSummary | null }>(
+      await request(`/v1/messages/wait?address=${allowed.address}&address=${allowed.address.toUpperCase()}&afterId=${inHidden.id - 1}&timeout=1`, { headers: auth(key) }));
+    expect(both.message?.id).toBe(inAllowed.id);
+  });
+
+  it('wait 的多个地址一条查询校验范围，不逐个地址查库（CR6）', async () => {
+    const user = await account('wait-batch');
+    const boxes = await Promise.all(Array.from({ length: 5 }, (_, index) => own(user.id, `ks-wb-${index}-${seq}@hpc.email`)));
+    const key = (await keyFor(user.jwt, { allowedMailboxIds: boxes.map((box) => box.id) })).key;
+    const prepared: string[] = [];
+    const db = new Proxy(env.db, {
+      get(target, property) {
+        if (property === 'prepare') return (query: string) => { prepared.push(query); return target.prepare(query); };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const ctx = createExecutionContext();
+    const response = await app.request(`/v1/messages/wait?address=${boxes.map((box) => box.address).join(',')}&timeout=1`,
+      { headers: { ...auth(key), 'CF-Connecting-IP': IP } }, { ...env, db }, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
+    expect(prepared.filter((query) => /FROM mailboxes WHERE address/.test(query))).toHaveLength(1);
   });
 
   it('释放后重新认领得到新 id，旧 Key 不再覆盖这个地址', async () => {

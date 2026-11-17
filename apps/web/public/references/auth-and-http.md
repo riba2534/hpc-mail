@@ -72,14 +72,14 @@ hpc '/auth/me'
 | `domain.read` | 自己拥有或被共享的托管域名列表、接入进度，托管域名的 DNS 记录 |
 | `domain.write` | 接入（添加，含批量）托管域名、立即检测（含批量）、重新接入、增改删 DNS 记录；见[用 API Key 接入](mailboxes-and-domains.md#用-api-key-接入) |
 | `mailbox.share` | 管理自己邮箱的共享（只按 userId，不提供用户搜索） |
-| `webhook.write` | 管理 Webhook v2 端点、测试发送、查看与重试投递，见 [Webhook](webhooks.md) |
+| `webhook.write` | 管理 Webhook v2 端点、测试发送、查看与重试投递，见 [Webhook](webhooks.md)；创建或修改订阅 `mail.received`、或带正文的端点另需 `mail.read` |
 | `notify.read` | 读取个人通知配置（飞书、PushDeer、通用 Webhook；转发目标只读）与投递健康 |
-| `notify.write` | 修改飞书、PushDeer、通用 Webhook，发送测试，手动重试通知任务；邮箱转发目标只能网页会话修改 |
+| `notify.write` | 修改飞书、PushDeer、通用 Webhook（另需 `mail.read`；管理员账户另需 `admin` scope），发送测试，手动重试通知任务；邮箱转发目标只能网页会话修改 |
 | `admin` | 管理员能力开关，见下文 |
 
 **管理员能力要显式授予。** 只有所属用户是管理员、且 Key 带 `admin` scope 时，这把 Key 才按管理员执行（`scope=unclaimed/user`、`all=1`、用任意 `mailboxId` 或系统域名任意前缀发信、不受外发配额）；没有它的管理员 Key 与普通用户完全一样。`admin` 只有管理员能授予，且必须同时设置 `allowedIps` 与不超过 90 天的 `expiresAt`（否则 400；普通用户授予 403）。升级前已存在的管理员 Key 已自动带上 `admin`，照常可用；之后修改它的 scopes、白名单或有效期时按新规则校验。`GET /v1/me` 的 `key.effectiveRole` 是这把 Key 实际的执行角色。
 
-**限定邮箱或域名。** `allowedMailboxIds`（认领行 id，来自 `GET /api/mailboxes`）与 `allowedDomains` 都为空表示不限；否则地址的域名在 `allowedDomains` 中，或该地址当前认领行的 id 在 `allowedMailboxIds` 中，才在范围内。范围外的邮件在列表、等待、未读数、联系人里不出现，按 id 读取返回 404，批量标记、删除静默跳过；请求里显式给出范围外的 `address`、`domain`、发件地址、回复或转发来源、邮箱 id 返回 403 `forbidden`（文档锚点 [key-restricted](errors.md#key-restricted)）。只限定了邮箱的 Key 不能认领新地址，`GET /v1/domains` 为空；限定了域名的 Key 只能在这些域名认领，新地址立即可用。释放后重新认领同一地址会得到新 id，旧 Key 不再覆盖它。限定了范围的 Key 只能读取通知配置，不能修改、测试、重试，也不能看投递健康；Webhook 端点必须带落在范围内的地址或域名过滤；共享只能管理范围内的邮箱；托管域名接口只能看到、添加、检测 `allowedDomains` 里的域名；随机后缀方案不可用；MCP 工具经 `/v1` 执行，同样受限。只给某个 Agent 一个地址时，用限定邮箱的 Key。
+**限定邮箱或域名。** `allowedMailboxIds`（认领行 id，来自 `GET /api/mailboxes`）与 `allowedDomains` 都为空表示不限；否则地址的域名在 `allowedDomains` 中，或该地址当前认领行的 id 在 `allowedMailboxIds` 中，才在范围内。范围外的邮件在列表、等待、未读数、联系人里不出现，按 id 读取返回 404，回复或转发范围外的来源邮件与不可见一样返回 404 `source_unavailable`，批量标记、删除静默跳过；请求里显式给出范围外的 `address`、`domain`、发件地址、邮箱 id 返回 403 `forbidden`（文档锚点 [key-restricted](errors.md#key-restricted)，按 id 指定时错误只带 id）。只限定了邮箱的 Key 不能认领新地址，`GET /v1/domains` 为空；限定了域名的 Key 只能在这些域名认领，新地址立即可用。释放后重新认领同一地址会得到新 id，旧 Key 不再覆盖它。限定了范围的 Key 只能读取通知配置，不能修改、测试、重试，也不能看投递健康；Webhook 端点必须带落在范围内的地址或域名过滤；共享只能管理范围内的邮箱；托管域名接口只能看到、添加、检测 `allowedDomains` 里的域名；随机后缀方案不可用；MCP 工具经 `/v1` 执行，同样受限。只给某个 Agent 一个地址时，用限定邮箱的 Key。
 
 `GET /v1/identities` 有 `mail.send` 或 `mailbox.read` 其中之一即可，返回能用哪些地址发信，见[发件身份](mailboxes-and-domains.md#发件身份)。
 

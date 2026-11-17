@@ -24,9 +24,10 @@ export function accountKeyPaths(): Paths {
     '/notify-prefs': {
       get: operation('getNotifyPrefs', 'Read masked notification preferences', ref('NotifyPrefs'), { scope: 'notify.read',
         description: 'Same masked structure as the session API GET /me/notify-prefs, including forward (read-only for keys) and forwardPending. Secrets are returned as ******.' }),
-      put: operation('updateNotifyPrefs', 'Update Feishu, PushDeer or generic webhook notification settings', ref('NotifyPrefs'), { scope: 'notify.write', request: 'UpdateKeyNotifyPrefsRequest',
-        errors: ['ForwardSessionOnly', 'KeyRestricted', 'PushKeyReentryRequired'],
-        description: `Replaces only the supplied channels; ****** keeps a stored secret, an empty string clears it. Enabled channels need a complete valid configuration (https public endpoints). forward cannot be changed with an API key: a request containing forward returns 403 forbidden, because forwarding sends every incoming mail elsewhere; ask the user to change it in the web session. ${restricted}` }),
+      put: { ...operation('updateNotifyPrefs', 'Update Feishu, PushDeer or generic webhook notification settings', ref('NotifyPrefs'), { scope: 'notify.write', request: 'UpdateKeyNotifyPrefsRequest',
+        errors: ['ForwardSessionOnly', 'KeyRestricted', 'PushKeyReentryRequired', 'ForbiddenScopeMailRead', 'NotifyNeedsAdminScope'],
+        description: `These channels push the subject, code and a body excerpt of incoming mail, so the key also needs mail.read; an administrator's settings also cover unclaimed addresses, so an administrator key needs the admin scope (403 otherwise). Replaces only the supplied channels; ****** keeps a stored secret, an empty string clears it. Enabled channels need a complete valid configuration (https public endpoints). forward cannot be changed with an API key: a request containing forward returns 403 forbidden, because forwarding sends every incoming mail elsewhere; ask the user to change it in the web session. ${restricted}` }),
+        'x-required-scopes': ['notify.write', 'mail.read'] },
     },
     '/notify-prefs/health': { get: operation('getNotifyHealth', 'Read recent notification delivery health and forwarding quotas', ref('NotificationHealth'), { scope: 'notify.read',
       errors: ['KeyRestricted'],

@@ -61,6 +61,7 @@ describe('系统保留用户不能作为共享成员', () => {
       request('/mailboxes/shares', s.owner.jwt, 'PUT', { mailboxId: s.box.id, userIds: [s.peer.id, s.reserved.id] }),
       request('/mailboxes/shares/batch', s.owner.jwt, 'POST', { mailboxIds: [s.box.id], userIds: [s.reserved.id] }),
       request('/admin/mailbox-shares', s.admin.jwt, 'PUT', { mailboxId: s.box.id, userIds: [s.reserved.id] }),
+      request('/admin/mailboxes/batch/share', s.admin.jwt, 'POST', { items: [{ address: s.box.address }], userIds: [s.reserved.id] }),
     ];
     for (const response of await Promise.all(attempts)) {
       expect(response.status).toBe(400);

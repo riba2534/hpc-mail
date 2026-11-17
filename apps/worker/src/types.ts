@@ -49,6 +49,8 @@ export interface ApiKeyContext {
   username: string;
   /** 执行角色：所属用户是管理员且 Key 带 admin scope 时为 admin，否则 user */
   role: Role;
+  /** 所属账户的角色（users.role）；与 role 不同时说明是没有 admin scope 的管理员 Key */
+  accountRole: Role;
   scopes: ApiScope[];
   /** 限定的邮箱认领行 id 与域名；两者都为空表示不限（见 middleware/api-key-auth.ts 的 keyRestriction） */
   allowedMailboxIds: number[];
