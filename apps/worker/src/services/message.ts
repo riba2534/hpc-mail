@@ -35,7 +35,7 @@ import { createDb, type Db } from '../db/client.js';
 import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, stars, users } from '../db/schema.js';
 import { ATTACHMENT_BUCKET_SECONDS, sha256Hex, signAttachment } from '../lib/crypto.js';
 import { etagMatches } from '../lib/etag.js';
-import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
+import { chunk, D1_ID_BATCH, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
 import { PREVIEW_LIMIT } from '../lib/text.js';
@@ -1129,6 +1129,17 @@ export async function loadAttachmentById(
 }
 
 /**
+ * 按 id 分批的批量写：D1 单条语句最多 100 个绑定参数（schema 允许一次 500 个 id），每批一条语句，
+ * 各批合进一次 batch（一次往返、同一事务），返回各批改动行数之和。
+ */
+async function runInChunks(env: Env, ids: number[], statement: (batch: number[]) => { toSQL(): { sql: string; params: unknown[] } }): Promise<number> {
+  const statements = chunk(ids).map((batch) => d1Statement(env, statement(batch)));
+  if (statements.length === 0) return 0;
+  const results = await env.db.batch(statements);
+  return results.reduce((sum, result) => sum + (result.meta.changes ?? 0), 0);
+}
+
+/**
  * 批量已读/未读：is_read 是邮件本身的状态，只能由认领人（或管理员对未认领）修改。
  * 分享来的邮件不在 owned 范围内，静默计 0，共享成员改不动所有者的已读状态。
  */
@@ -1140,14 +1151,7 @@ export async function markMessages(
 ): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  // ids 分批：D1 单条查询最多 100 个绑定参数，schema 允许一次传 500 个 id
-  let changed = 0;
-  for (const batch of chunk(ids)) {
-    const cond = and(inArray(messages.id, batch), scopeCondition(db, scope));
-    const result = await db.update(messages).set({ isRead }).where(cond).run();
-    changed += result.meta.changes ?? 0;
-  }
-  return changed;
+  return runInChunks(env, ids, (batch) => db.update(messages).set({ isRead }).where(scopedIdsCondition(db, scope, batch)));
 }
 
 /**
@@ -1177,7 +1181,11 @@ export async function markAllRead(
   return result.meta.changes ?? 0;
 }
 
-/** 批量星标/取消（每用户独立；限可见范围） */
+/**
+ * 批量星标/取消（每用户独立；限可见范围）。可见性判断写进同一条语句（INSERT … SELECT / DELETE … IN），
+ * 不再先查可见 id 再写。星标是个人标记（独立 stars 表，不影响他人），用只读可见范围即可。
+ * 每批绑定 90 个 id + 用户 id + 可见范围的 4 个参数，仍在 D1 上限内。
+ */
 export async function starMessages(
   env: Env,
   viewer: Viewer,
@@ -1185,36 +1193,18 @@ export async function starMessages(
   starred: boolean,
 ): Promise<number> {
   const db = createDb(env);
-  // 星标是个人标记（独立 stars 表，不影响他人），用只读可见范围即可
   const scope = resolveScope(viewer);
-  const visibleIds: number[] = [];
-  for (const batch of chunk(ids)) {
-    const rows = await db
-      .select({ id: messages.id })
-      .from(messages)
-      .where(and(inArray(messages.id, batch), scopeCondition(db, scope, shareAccess(viewer, scope))))
-      .all();
-    visibleIds.push(...rows.map((v) => v.id));
-  }
-  if (visibleIds.length === 0) return 0;
-
-  let changed = 0;
-  if (starred) {
-    // 每行 2 个绑定参数（userId + messageId），批次相应减半
-    for (const batch of chunk(visibleIds, D1_PAIR_BATCH)) {
-      const result = await db.insert(stars)
-        .values(batch.map((id) => ({ userId: viewer.userId, messageId: id })))
-        .onConflictDoNothing().run();
-      changed += result.meta.changes ?? 0;
-    }
-  } else {
-    for (const batch of chunk(visibleIds)) {
-      const result = await db.delete(stars)
-        .where(and(eq(stars.userId, viewer.userId), inArray(stars.messageId, batch))).run();
-      changed += result.meta.changes ?? 0;
-    }
-  }
-  return changed;
+  const access = shareAccess(viewer, scope);
+  const visible = (batch: number[]) => and(inArray(messages.id, batch), scopeCondition(db, scope, access));
+  return runInChunks(env, ids, (batch) => starred
+    ? db.insert(stars)
+      .select(db.select({ userId: sql`${viewer.userId}`.as('user_id'), messageId: messages.id, createdAt: sql`(unixepoch() * 1000)`.as('created_at') })
+        .from(messages).where(visible(batch)))
+      .onConflictDoNothing()
+    : db.delete(stars).where(and(
+      eq(stars.userId, viewer.userId),
+      inArray(stars.messageId, db.select({ id: messages.id }).from(messages).where(visible(batch))),
+    )));
 }
 
 function scopedIdsCondition(db: Db, scope: Scope, ids: number[]): SQL {
@@ -1226,35 +1216,26 @@ export async function deleteMessages(env: Env, viewer: Viewer, ids: number[]): P
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
   const deletedAt = new Date();
-  let changed = 0;
-  for (const batch of chunk(ids)) {
-    const cond = and(scopedIdsCondition(db, scope, batch), isNull(messages.deletedAt)) as SQL;
-    const result = await db.update(messages).set({ deletedAt }).where(cond).run();
-    changed += result.meta.changes ?? 0;
-  }
-  return changed;
+  return runInChunks(env, ids, (batch) => db.update(messages).set({ deletedAt })
+    .where(and(scopedIdsCondition(db, scope, batch), isNull(messages.deletedAt))));
 }
 
 /** 从回收站恢复：清空 deletedAt */
 export async function restoreMessages(env: Env, viewer: Viewer, ids: number[]): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  let changed = 0;
-  for (const batch of chunk(ids)) {
-    const cond = and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt), isNull(messages.purgeToken)) as SQL;
-    const result = await db.update(messages).set({ deletedAt: null }).where(cond).run();
-    changed += result.meta.changes ?? 0;
-  }
-  return changed;
+  return runInChunks(env, ids, (batch) => db.update(messages).set({ deletedAt: null })
+    .where(and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt), isNull(messages.purgeToken))));
 }
 
-/** 永久删除（可见范围内）：D1 行删 + R2 清理（正文/附件/原始 .eml） */
+/**
+ * 永久删除（可见范围内）：D1 行删 + R2 清理（正文/附件/原始 .eml）。各批条件交给 purgeMatchingMessages
+ * 用同一个 purge token 预订，与删除语句合进一次 batch。
+ */
 export async function purgeMessages(env: Env, viewer: Viewer, ids: number[], ctx?: ExecCtx | null): Promise<number> {
   const db = createDb(env);
   const scope = resolveMutationScope(viewer);
-  let changed = 0;
-  for (const batch of chunk(ids)) {
-    changed += await purgeMatchingMessages(env, and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt))!, batch.length, ctx);
-  }
-  return changed;
+  const conditions = chunk(ids).map((batch) => and(scopedIdsCondition(db, scope, batch), isNotNull(messages.deletedAt)) as SQL);
+  if (conditions.length === 0) return 0;
+  return purgeMatchingMessages(env, conditions, D1_ID_BATCH, ctx);
 }
