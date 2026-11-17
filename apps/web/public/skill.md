@@ -54,9 +54,9 @@ hpc '/messages' -X POST -H 'Content-Type: application/json' -H "Idempotency-Key:
   --data-binary @"$WORK/send.json" | jq '.data // .'
 ```
 
-检查：201 表示至少一个收件人成功，`status` 为 `sent`（外发已被服务商接受，不代表已进收件箱）或 `delivered`（收件人都在本站且已投递）。部分失败也是 201，看 `errorDetail` 与 `recipientOutcomes[].status`。按结果处理：
+检查：201 时 `status` 为 `sent`（外发已被服务商接受，不代表已进收件箱）、`delivered`（收件人都在本站且已投递）或 `unknown`（没有确认成功的收件人，但有结果不明的，可能已送达，先核对）。部分失败也是 201，看 `errorDetail` 与 `recipientOutcomes[].status`。按结果处理：
 
-- 422 `delivery_failed`：每个收件人都被拒收，什么也没发出。`error.details.recipientOutcomes` 给出原因，`details.messageId` 是发件记录；同 Key 重试仍是这个 422，修正后换新 Key。
+- 422 `delivery_failed`：每个收件人都明确失败，什么也没发出。`error.details.recipientOutcomes` 给出原因，`details.messageId` 是发件记录；同 Key 重试仍是这个 422，修正后换新 Key。
 - 网络错误、超时、5xx：用同一 Key、同一请求体重试，会返回原结果或继续未开始的发送。
 - 409 `send_in_progress`：原请求还在处理或结果待确认。不要换 Key 重发，先查 `GET /messages?direction=outbound&address=<发件地址>`：`pending` 是仍在投递；超过 1 小时会标为 `unknown`（投递中断、结果未确认），之后同 Key 重试返回 201 `unknown`。
 - 409 `idempotency_mismatch`：这个 Key 已用于别的内容。先核对原发送，新内容换新 Key。
@@ -125,7 +125,7 @@ SINCE=$MAX   # 所有页处理完才推进基线
 
 1. 登录用户名不是邮箱地址。一个账户可以认领多个 `localPart@domain`，邮件按完整地址归属；认领即可看到该地址的全部历史，包括认领之前收到的。
 2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
-3. 共享给你的地址（`kind=shared`，`reason=shared_readonly`）只读：可读来信、设个人星标、作为回复或转发的来源；不能发信、删除、标记已读或释放。已读状态属于所有者，未读数与 `unread=1` 只统计自己认领的地址。
+3. 共享给你的地址（`kind=shared`，`reason=shared_readonly`）对普通用户只读：可读来信、设个人星标、作为回复或转发的来源；不能发信、删除、标记已读或释放。已读状态属于所有者，未读数与 `unread=1` 只统计自己认领的地址。
 4. 管理员可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 列出可用任意前缀发信的系统域名；不能推断任意外部域名可用。
 5. scope：`mail.read` 读邮件、等待、下载附件；`mail.write` 标记已读、星标、删除与恢复；`mail.send` 发信与上传附件；`mailbox.read` 查看邮箱、可用性与随机后缀；`mailbox.write` 认领（含批量）、改显示名、释放。`/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
 6. 管理员的列表默认也只看自己的邮箱：未认领地址用 `scope=unclaimed`，只读审阅某个用户用 `scope=user&userId=`。

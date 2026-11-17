@@ -58,7 +58,7 @@ hpc '/messages' --get --data-urlencode 'q=验证码' --data-urlencode 'unread=1'
 |---|---|
 | `address` | 只等发到这些收件地址的信：一个地址、逗号分隔的多个（`address=a@example.org,b@example.org`），或重复参数（`?address=a@example.org&address=b@example.org`），两种写法可混用；去重后最多 20 个，超过或含非法地址返回 400 `validation_failed` |
 | `domain` | 只等收件地址在该域名下的信（精确匹配，不含子域名），可与 `address` 同时给 |
-| `include=body` | 命中时 `message` 是与 `GET /messages/:id` 相同的详情结构（正文、收件人、附件元数据，附件签名 `url` 5 分钟有效），省一次详情请求；不带时是摘要 |
+| `include=body` | 命中时 `message` 是与 `GET /messages/:id` 相同的详情结构（正文、收件人、附件元数据，附件签名 `url` 5 分钟有效），省一次详情请求；命中后、读取详情前邮件已被删除或移入回收站时按未命中处理，游标越过它；不带时是摘要 |
 
 可选过滤（全部满足才返回，大小写不敏感）：
 
@@ -199,9 +199,10 @@ if not matched:
 hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,address,displayName}'
 ```
 
-- 普通用户只能用自己认领的邮箱：`mailboxId` 属于自己，或地址是自己认领的。用本站别人的地址返回 403 `forbidden`（`fix` 指向 `/v1/identities`，`docs` 指向[错误说明](errors.md#forbidden-sender)）；域名不属于本站返回 400 `validation_failed`。`kind=shared` 的共享邮箱恒为 `canSend:false`、`reason:"shared_readonly"`，不能发信。
+- 普通用户只能用自己认领的邮箱：`mailboxId` 属于自己，或地址是自己认领的。用本站别人的地址返回 403 `forbidden`（`fix` 指向 `/v1/identities`，`docs` 指向[错误说明](errors.md#forbidden-sender)）；域名不属于本站返回 400 `validation_failed`。`kind=shared` 的共享邮箱对普通用户恒为 `canSend:false`、`reason:"shared_readonly"`，不能发信。
 - 托管域名上的地址（无论谁发）都要求该域发信已开通，否则 400 `validation_failed`。identities 里对应 `reason` 为 `hosted_sending_not_ready`（发信尚未就绪）或 `hosted_domain_unavailable`（域名暂停、NS 已移走或删除中）。系统域名不受此限；`/mailboxes` 每项的 `canSend` 同样只反映域名状态。
-- 管理员可用任何已认领邮箱的 `mailboxId`（这些邮箱不列在 identities 里）；用地址写法时，域名须是系统域名（identities 的 `domains` 列出，`anyLocalPart:true`）、仍有存量邮箱的旧域名或托管域名，不检查该地址是否被认领。不能推断任意外部域名可用。
+- 管理员可用任何已认领邮箱的 `mailboxId`（别人的邮箱不列在 identities 里；共享给管理员的邮箱列为 `kind=shared`，按域名状态给出 `canSend`）。用地址写法时，可用的域名就是 identities 的 `domains`（`anyLocalPart:true`）：`kind=system` 系统域名、`kind=hosted` 发信已就绪的托管域名、`kind=legacy` 已移出系统列表但仍有存量邮箱的旧域名；不检查该地址是否被认领。不能推断任意外部域名可用。
+- 显示名：写了显示名（`"Name <a@b>"`、`{address,name}`、`displayName`）就用它；没写时，发件地址有邮箱记录的用邮箱设置的显示名，否则用前缀。
 - 发件邮箱 `mailboxId` 不存在是 404 `not_found`。
 
 ### 收件人与显示名
@@ -212,7 +213,7 @@ hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,addre
 - `"Bob <bob@example.net>"`，名字与 `<` 之间的空格可省，名字可含逗号（`"Doe, John <john@example.net>"`）；名字也可以用双引号包起来，其中的引号写成 `\"`（在 JSON 里还要再转义一次）；
 - `{"address":"bob@example.net","name":"Bob"}`。
 
-地址统一转小写并严格校验：本地部分为 dot-atom（字母、数字与 RFC 5322 允许的符号，点不在首尾、不连续），最长 64；域名每段 1–63 个字母、数字或连字符，顶级域为字母或 `xn--` 开头的 punycode；总长不超过 254。带引号的本地部分、IP 字面量、空白，以及 `alice<a@b.com` 这类缺少括号的写法返回 400 `validation_failed`，message 指出是哪一项。显示名最多 64 字符，不能含控制字符或尖括号，非 ASCII 名字由服务器编码。站内收件副本的 `recipients` 只记地址。
+地址统一转小写后校验：本地部分最长 64，域名至少两段、每段非空、顶级域至少 2 个字符，总长不超过 254；接受 UTF-8 本地部分与中文等 IDN 域名（也接受 punycode）。空白、控制字符，以及尖括号、圆括号、方括号、反斜杠、逗号、分号、冒号、双引号这些会改变邮件头结构的符号一律拒绝，所以带引号的本地部分、IP 字面量和 `alice<a@b.com` 这类缺少括号的写法返回 400 `validation_failed`，message 指出是哪一项。字符串写法（含显示名）最长 400 字符。显示名最多 64 字符，不能含控制字符或尖括号，非 ASCII 名字由服务器编码。站内收件副本的 `recipients` 只记地址。
 
 ### 自定义邮件头
 
@@ -246,14 +247,14 @@ hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,addre
 | `sent` | 至少一个外部收件人被发信服务商接受；不代表已进对方收件箱 | 201 响应、列表、详情 |
 | `delivered` | 收件人都在本站，副本已落库 | 201 响应、列表、详情 |
 | `pending` | 仍在投递，逐收件人结果边投递边回填 | 列表、详情；同 Key 重试返回 409 `send_in_progress` |
-| `unknown` | 创建超过 1 小时仍是 `pending`（投递中断），已回填的结果保留，其余收件人记为 `unknown` | 列表、详情；同 Key 重试返回 201 与这个状态 |
-| `failed` | 全部收件人失败 | 列表、详情；发信接口不以 201 返回它，而是 422 `delivery_failed` |
+| `unknown` | 没有收件人确认成功，但至少一个结果不明（发信服务超时、网络错误等，可能已送达）；或创建超过 1 小时仍是 `pending`（投递中断），已回填的结果保留、其余收件人记为 `unknown` | 201 响应、列表、详情；同 Key 重试返回 201 与这个状态 |
+| `failed` | 全部收件人明确失败 | 列表、详情；发信接口不以 201 返回它，而是 422 `delivery_failed` |
 
-`recipientOutcomes` 每个去重后的收件人一项：`delivered`（站内已投递）、`sent`（外部已接受）、`failed`（`error` 为原因）、`unknown`（`error` 为「投递中断，结果未确认」，可能已经送达）。外部收件人最多 4 路并发投递，每完成一个就回填，所以 `pending` 的邮件可能已有部分结果。
+`recipientOutcomes` 每个去重后的收件人一项：`delivered`（站内已投递）、`sent`（外部已接受）、`failed`（`error` 为原因）、`unknown`（结果不明，`error` 为原因，例如发信服务超时或「投递中断，结果未确认」，可能已经送达）。只有发信服务明确拒收（目标未验证、发信域未就绪、地址非法、超出限额等）才记 `failed`；无法判断的错误一律记 `unknown`，避免诱导重复投递。外部收件人最多 4 路并发投递，每完成一个就回填，所以 `pending` 的邮件可能已有部分结果。
 
-- **201**：至少一个收件人成功。`errorDetail` 为空即全部成功；部分失败时为「部分收件人失败: 地址: 原因; …」，按[部分失败补发](#部分失败补发)处理。
-- **422 `delivery_failed`**：每个收件人都尝试过且都被拒收，什么也没发出。message 为「全部收件人投递失败: …」，`error.details` 为 `{messageId,recipientOutcomes}`，`messageId` 是已记录的发件行（`direction=outbound` 列表里可见）。这次不占当日外发配额。同 Key 重试返回同一个 422；修正收件人后用新 Key 重发。
-- **500 `internal`**：服务端在部分收件人还没尝试时出错（例如附件保存失败）。用同一 Key、同一请求体重试取回结果：可能继续发送并返回 201，也可能是 422 `delivery_failed`，此时其中的收件人可能从未发出过。
+- **201**：至少一个收件人成功，或没有成功但有结果不明的收件人（`status:"unknown"`）。`errorDetail` 为空即全部成功；部分失败时为「部分收件人失败: 地址: 原因; …」，有结果不明的收件人时为「…投递结果未确认，可能已送达，补发前先向收件人核对: …」。按[部分失败补发](#部分失败补发)处理：只补发 `failed`，`unknown` 先核对。
+- **422 `delivery_failed`**：每个收件人都明确失败，什么也没发出——发信服务逐个拒收，或服务端在开始投递前就出错（例如附件保存失败，此时每个收件人的 `error` 写明原因）。message 为「全部收件人投递失败: …」，`error.details` 为 `{messageId,recipientOutcomes}`，`messageId` 是已记录的发件行（`direction=outbound` 列表里可见）。这次不占当日外发配额，上传的草稿附件保留，可以再次引用。同 Key 重试返回同一个 422；修正后用新 Key 重发。
+- 首次响应与同 Key 重放一致（状态码、`status`、`recipientOutcomes`）。极少数情况下结果写库多次失败，同 Key 重试会一直返回 409 `send_in_progress`，直到 1 小时后被标为 `unknown`；这期间到已发送列表核对，不要换 Key 重发。
 
 ### 幂等与重试
 

@@ -70,8 +70,8 @@ hpc '/identities' | jq '.data'
 
 - `identities` 先列自己认领的邮箱（`kind=owned`），再列共享给自己的邮箱（`kind=shared`），各按地址排序。
 - `canSend=true` 的项可以作为发信的 `from`：写 `{mailboxId}`、地址字符串（可加显示名 `"Alice <alice@example.org>"`）或 `{address,name}`，见[邮件参考](mail.md#发件身份)。
-- `canSend=false` 时 `reason` 说明原因：`hosted_sending_not_ready`（托管域名的发信尚未开通，等域名进度里 `steps.sending` 变成 ready）、`hosted_domain_unavailable`（托管域名被暂停、NS 已移走或删除中）、`shared_readonly`（共享邮箱只读，永远不能发信）。用这些地址发信分别返回 400 和 403。
-- `domains` 只对管理员有内容：全部系统域名（`kind:"system"`、`anyLocalPart:true`），管理员可以在这些域名上用任意前缀发信。普通用户为空数组。
+- `canSend=false` 时 `reason` 说明原因：`hosted_sending_not_ready`（托管域名的发信尚未开通，等域名进度里 `steps.sending` 变成 ready）、`hosted_domain_unavailable`（托管域名被暂停、NS 已移走或删除中）、`shared_readonly`（共享邮箱只读，普通用户不能用它发信；管理员可用 `mailboxId` 发任何邮箱，所以管理员看到的共享项按域名状态给出 `canSend`）。用这些地址发信分别返回 400 和 403。
+- `domains` 只对管理员有内容，列出管理员可用任意前缀发信的全部域名（`anyLocalPart:true`），与实际放行规则一致：`kind:"system"` 系统域名（按设置顺序）、`kind:"hosted"` 状态可用且发信已就绪的托管域名、`kind:"legacy"` 已移出系统列表但仍有存量邮箱的旧域名。普通用户为空数组。
 - 管理员凭 `mailboxId` 使用他人邮箱发信的能力不变，但这些邮箱不在 `identities` 里。仍有存量邮箱的旧域名、托管域名上的地址写法也只对管理员开放，不能推断任意外部域名可用。
 
 ## 批量认领
