@@ -47,7 +47,7 @@ import { extractVerificationLink } from './link-extract.js';
 import { assertHostedSendable, getRoutableDomains } from './domain.js';
 import { HOSTED_SEND_CLAIM_SQL, resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
-import { getUserNotifyPrefs } from './notify-prefs.js';
+import { loadNotifyOwners } from './notify-prefs.js';
 import { bumpCounter, dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { attachmentKey, getExt, sha256Hex16 } from './storage.js';
@@ -1016,17 +1016,20 @@ export async function sendMail(
     for (const delivery of internalDeliveries) {
       try {
         const ownerIds = delivery.ownerIds;
-        forwarding.push(Promise.all(ownerIds.map(id => getUserNotifyPrefs(env, id))).then(async (prefs) => {
-          if (!prefs.some(pref => pref.forward.enabled && pref.forward.addresses.length)) return;
+        // 归属人状态与偏好读一次（同 SMTP 收件），转发与通知入队共用；读取失败时入队退回逐人读取
+        const ownersReady = loadNotifyOwners(env, ownerIds)
+          .catch((error: unknown) => { console.error('站内收件的通知偏好读取失败:', error); return undefined; });
+        forwarding.push(ownersReady.then(async (owners) => {
+          if (!owners || ![...owners.values()].some(owner => owner.prefs.forward.enabled && owner.prefs.forward.addresses.length)) return;
           await forwardReceivedMail(env, {
             messageId: delivery.messageId, ownerIds,
             fromAddress: from.address, fromName: from.displayName, toAddress: delivery.target,
             domain: getEmailDomain(delivery.target), subject: req.subject, text, html, replyTo: replyToAddresses,
             attachments: await loadForwardAttachments(),
-          }, prefs);
+          }, owners);
         }).catch(error => console.error('站内转发失败:', error)));
         await enqueueMailNotifications(env, null, {
-          ownerIds, message: { id: delivery.messageId, address: delivery.target,
+          ownerIds, owners: await ownersReady, message: { id: delivery.messageId, address: delivery.target,
             fromAddress: from.address, fromName: from.displayName, subject: req.subject,
             verificationCode: code, verificationLink, preview, createdAt: new Date().toISOString() }, text, html,
         });

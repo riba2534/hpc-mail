@@ -3,7 +3,6 @@ import { eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { attachments } from '../db/schema.js';
 import { deriveSubkey, hmacSha256Base64 } from '../lib/crypto.js';
-import { chunk } from '../lib/d1.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
 import { convertHtmlToText, escapeHtml, type MailText } from '../lib/text.js';
@@ -150,9 +149,6 @@ export const FORWARD_RELAY_SCOPE = 'fwd-relay';
 /** 已认领地址的中转按归属人日计数（subject 为用户 id） */
 export const FORWARD_RELAY_USER_SCOPE = 'fwd-relay-user';
 
-/** 转发归属人：收件链路传已读出的状态与偏好；站内互投只传偏好（与 mail.ownerIds 按下标对应），状态在这里补读 */
-export type ForwardOwners = Map<number, NotifyOwner> | UserNotifyPrefs[];
-
 interface Forwarders {
   list: { userId: number; prefs: UserNotifyPrefs }[];
   /** 来信时地址未被认领（归属人是全体管理员） */
@@ -160,29 +156,19 @@ interface Forwarders {
 }
 
 /**
- * 开启转发且仍启用的归属人，以及来信时地址是否未认领。有人开启转发时才查库，一次 batch 读地址当前的认领人，
- * 只给偏好时同批补读归属人状态（在 waitUntil 里，不在收件 Ack 前）。已停用的归属人原生与中转都不转发。
+ * 开启转发且仍启用的归属人（owners 为 loadNotifyOwners 读出的状态与偏好），以及来信时地址是否未认领。
+ * 有人开启转发时才查一次地址当前的认领人（在 waitUntil 里，不在收件 Ack 前）。已停用的归属人原生与中转都不转发。
  * 已认领地址的归属快照只有认领人一个；快照里有多人（全体管理员），或唯一那人不是当前认领人，按未认领计。
  */
-async function loadForwarders(env: Env, mail: ForwardMail, owners: ForwardOwners): Promise<Forwarders> {
-  const enabled = owners instanceof Map
-    ? mail.ownerIds.flatMap((userId) => {
-      const owner = owners.get(userId);
-      return owner?.active && owner.prefs.forward.enabled ? [{ userId, prefs: owner.prefs }] : [];
-    })
-    : mail.ownerIds.flatMap((userId, index) => owners[index]?.forward.enabled ? [{ userId, prefs: owners[index]! }] : []);
-  if (!enabled.length) return { list: [], unclaimed: false };
-  const unverified = owners instanceof Map ? [] : [...new Set(enabled.map((item) => item.userId))];
-  const [claim, ...statuses] = await env.db.batch<{ id: number }>([
-    env.db.prepare('SELECT user_id AS id FROM mailboxes WHERE address = ?1').bind(mail.toAddress),
-    ...chunk(unverified).map((ids) => env.db.prepare(`SELECT id FROM users WHERE status = 'active'
-      AND id IN (${ids.map(() => '?').join(', ')})`).bind(...ids)),
-  ]);
-  const claimant = claim?.results[0]?.id;
-  const unclaimed = !(mail.ownerIds.length === 1 && claimant !== undefined && Number(claimant) === mail.ownerIds[0]);
-  if (owners instanceof Map) return { list: enabled, unclaimed };
-  const active = new Set(statuses.flatMap((result) => result.results.map((row) => Number(row.id))));
-  return { list: enabled.filter((item) => active.has(item.userId)), unclaimed };
+async function loadForwarders(env: Env, mail: ForwardMail, owners: Map<number, NotifyOwner>): Promise<Forwarders> {
+  const list = mail.ownerIds.flatMap((userId) => {
+    const owner = owners.get(userId);
+    return owner?.active && owner.prefs.forward.enabled ? [{ userId, prefs: owner.prefs }] : [];
+  });
+  if (!list.length) return { list: [], unclaimed: false };
+  const claim = await env.db.prepare('SELECT user_id AS id FROM mailboxes WHERE address = ?1').bind(mail.toAddress).first<{ id: number }>();
+  const unclaimed = !(mail.ownerIds.length === 1 && claim !== null && Number(claim.id) === mail.ownerIds[0]);
+  return { list, unclaimed };
 }
 
 type RelayQuota = Pick<Settings['quota'], 'relayDaily' | 'relayPerUserDaily' | 'relayUnclaimedDaily'>;
@@ -222,7 +208,7 @@ async function releaseQuota(env: Env, items: CounterLimit[]): Promise<void> {
 export async function forwardReceivedMail(
   env: Env,
   mail: ForwardMail,
-  owners: ForwardOwners,
+  owners: Map<number, NotifyOwner>,
   native?: ForwardableEmailMessage,
 ): Promise<void> {
   if (await isOwnRelay(env, native?.headers.get('x-hpc-mail-relay'))) return;
