@@ -7,7 +7,7 @@ import {
 } from '@hpc-mail/shared';
 import type { Context, MiddlewareHandler } from 'hono';
 import { sha256Hex } from '../lib/crypto.js';
-import { AppError } from '../lib/errors.js';
+import { AppError, missingScopeHints } from '../lib/errors.js';
 import { bearerToken, clientIp, execCtx, routeLabel, runDetached } from '../lib/http.js';
 import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
@@ -62,7 +62,6 @@ async function loadSettingsAndKey(env: Env, keyHash: string | null): Promise<{ s
  */
 export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   const startedAt = Date.now();
-  c.set('apiStartedAt', startedAt);
 
   const token = bearerToken(c);
   const keyHash = KEY_PATTERN.test(token) ? await sha256Hex(token) : null;
@@ -157,13 +156,15 @@ async function touchLastUsed(c: Context<AppContext>, record: ApiKeyRecord, ip: s
 
 /** 校验 scope（v1 路由内调用） */
 export function requireScope(c: Context<AppContext>, scope: ApiScope): void {
+  requireAnyScope(c, [scope]);
+}
+
+/** Key 带其中任一 scope 即可（如 /identities：mail.send 或 mailbox.read）；没有 Key 时同样拒绝 */
+export function requireAnyScope(c: Context<AppContext>, scopes: readonly ApiScope[]): void {
   const apiKey = c.get('apiKey');
-  if (!apiKey || !apiKey.scopes.includes(scope)) {
-    throw new AppError('forbidden', `需要 API scope: ${scope}`, {
-      fix: `这把 Key 缺少 scope ${scope}：在网页「API Key」页面给它加上，或换用带该 scope 的 Key（GET /v1/me 可查看当前 scopes）`,
-      docs: '/references/errors.md#forbidden-scope',
-    });
-  }
+  if (apiKey && scopes.some((scope) => apiKey.scopes.includes(scope))) return;
+  const { message, ...hints } = missingScopeHints(scopes);
+  throw new AppError('forbidden', message, hints);
 }
 
 /** Key 限定范围；null 表示不限（含不经过 API Key 的请求） */

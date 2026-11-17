@@ -21,3 +21,15 @@ export class AppError extends Error {
     this.name = 'AppError';
   }
 }
+
+/** 缺少 API scope 的 403 文案：一个 scope 时要求带上它，多个时有其一即可（OpenAPI 的示例用同一份） */
+export function missingScopeHints(scopes: readonly string[]): { message: string; fix: string; docs: string } {
+  const list = scopes.join(' 或 ');
+  return {
+    message: `需要 API scope: ${list}`,
+    fix: scopes.length === 1
+      ? `这把 Key 缺少 scope ${list}：在网页「API Key」页面给它加上，或换用带该 scope 的 Key（GET /v1/me 可查看当前 scopes）`
+      : `这把 Key 需要 ${list} 其中之一：在网页「API Key」页面加上，或换用带其中一个 scope 的 Key（GET /v1/me 可查看当前 scopes）`,
+    docs: '/references/errors.md#forbidden-scope',
+  };
+}

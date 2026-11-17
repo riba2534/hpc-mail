@@ -50,7 +50,6 @@ export function createApp() {
   api.route('/avatar', avatar);
   api.route('/config', config);
   api.route('/domains', domains);
-  // 批量接口按路由挂「已鉴权即跳过」的鉴权，与同前缀子应用谁先挂都只鉴权一次
   api.route('/hosted-domains', hostedDomains);
   api.route('/identities', identities);
   api.route('/mailboxes', mailboxes);

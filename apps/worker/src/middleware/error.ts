@@ -8,7 +8,7 @@ import type { AppContext } from '../types.js';
 export const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
 
 /** 错误码说明文档；具体原因的锚点见 references/errors.md */
-export const ERRORS_DOC = '/references/errors.md';
+const ERRORS_DOC = '/references/errors.md';
 
 /**
  * 抛错处没给 fix/docs 时按错误码补的通用建议。只收录有明确改正方式的错误码；

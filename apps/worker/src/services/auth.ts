@@ -206,7 +206,7 @@ async function verifyLoginTwoFactor(
 }
 
 /** 记录已用的 TOTP 时间步；时间步不大于已记录值（重放）时返回 false */
-export async function consumeTotpStep(env: Env, userId: number, step: number): Promise<boolean> {
+async function consumeTotpStep(env: Env, userId: number, step: number): Promise<boolean> {
   const result = await env.db.prepare(`UPDATE users SET totp_last_step = ?
     WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)`).bind(step, userId, step).run();
   return (result.meta.changes ?? 0) === 1;

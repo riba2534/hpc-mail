@@ -6,13 +6,6 @@ export function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.length % 2 ? `0${hex}` : hex;
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  return out;
-}
-
 export async function sha256Hex(input: string | Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest(
     'SHA-256',

@@ -34,7 +34,7 @@ function generateKey(): { key: string; keyPrefix: string; keySuffix: string } {
   return { key, keyPrefix: key.slice(0, API_KEY_PREFIX.length + 6), keySuffix: hex.slice(-4) };
 }
 
-export function hashApiKey(key: string): Promise<string> {
+function hashApiKey(key: string): Promise<string> {
   return sha256Hex(key);
 }
 

@@ -839,28 +839,6 @@ export async function checkAvailabilityBatch(
   return items.map((item) => availabilityOf(context, item));
 }
 
-/** 取用户认领的全部地址（用于 messages 可见性过滤） */
-export async function userAddresses(env: Env, userId: number): Promise<string[]> {
-  const db = createDb(env);
-  const rows = await db
-    .select({ address: mailboxes.address })
-    .from(mailboxes)
-    .where(eq(mailboxes.userId, userId))
-    .all();
-  return rows.map((r) => r.address);
-}
-
-/** 地址 → 认领它的用户 id（地址全局唯一，至多一个 owner）；未认领返回 null */
-export async function getMailboxOwner(env: Env, address: string): Promise<number | null> {
-  const db = createDb(env);
-  const row = await db
-    .select({ userId: mailboxes.userId })
-    .from(mailboxes)
-    .where(eq(mailboxes.address, address))
-    .get();
-  return row?.userId ?? null;
-}
-
 /** 通知归属 SQL（?1 = 收件地址）：收件链路把它并进自己的 batch，必须与 resolveNotifyOwnerIds 同源 */
 export const NOTIFY_OWNER_IDS_SQL = `SELECT user_id AS id FROM mailboxes WHERE address = ?1
     UNION ALL
@@ -923,13 +901,3 @@ export async function resolveDeliveryOwners(env: Env, address: string): Promise<
   return { rejected, ownerIds: rejected ? [] : (owners?.results ?? []).map((row) => Number((row as { id: number }).id)) };
 }
 
-/** 校验地址归属（发件身份校验用） */
-export async function userOwnsAddress(env: Env, userId: number, address: string): Promise<boolean> {
-  const db = createDb(env);
-  const row = await db
-    .select({ id: mailboxes.id })
-    .from(mailboxes)
-    .where(and(eq(mailboxes.userId, userId), eq(mailboxes.address, address)))
-    .get();
-  return row !== undefined;
-}

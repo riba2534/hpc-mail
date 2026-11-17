@@ -88,16 +88,6 @@ export async function assertHostedSendable(env: Env, settings: Settings, domain:
   }
 }
 
-/** 域名是否对普通用户公开。 */
-export function isDomainPublic(settings: Settings, domain: string): boolean {
-  return settings.domains.list.some((e) => e.domain === domain && e.public);
-}
-
-/** 该域名下每个普通用户的认领上限（0=不限，仅受全局上限约束）。 */
-export function domainPerUserLimit(settings: Settings, domain: string): number {
-  return settings.domains.list.find((e) => e.domain === domain)?.perUserLimit ?? 0;
-}
-
 /**
  * 站内投递 / 已领地址发件白名单：settings 列表 ∪ 已有 mailbox 的 domain。
  * 管理员从列表拿掉某个域后，已认领用户仍应按站内互投，而不是被当成外发。

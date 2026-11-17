@@ -3,7 +3,7 @@ import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { AppError } from '../lib/errors.js';
 import { ok, parseBody, parseId, parseQuery } from '../lib/http.js';
 import {
-  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseSender, keyRestriction, requireScope,
+  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseSender, keyRestriction, requireAnyScope, requireScope,
 } from '../middleware/api-key-auth.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
@@ -30,12 +30,7 @@ function actorOf(c: Context<AppContext>): DraftActor & { sender: Sender; owner: 
 
 /** 读草稿：Key 有 mail.read 或 mail.send 之一即可（发信的 Agent 要能读回自己的草稿）；网页会话不限 */
 function requireRead(c: Context<AppContext>): void {
-  const key = c.get('apiKey');
-  if (!key || key.scopes.includes('mail.read') || key.scopes.includes('mail.send')) return;
-  throw new AppError('forbidden', '需要 API scope: mail.read 或 mail.send', {
-    fix: '这把 Key 需要 mail.read 或 mail.send 其中之一：在网页「API Key」页面加上，或换用带其中一个 scope 的 Key（GET /v1/me 可查看当前 scopes）',
-    docs: '/references/errors.md#forbidden-scope',
-  });
+  if (c.get('apiKey')) requireAnyScope(c, ['mail.read', 'mail.send']);
 }
 
 /** 写与发送：Key 需 mail.send */
