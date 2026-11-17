@@ -74,7 +74,9 @@ function CancelDialog({ task, open, onOpenChange }: { task: SystemDomainOnboardi
         <DialogHeader title={`取消接入 ${task.domain}？`} />
         <DialogBody className="flex flex-col gap-3 text-sm text-ink-secondary">
           <p>取消后不再检测或写入 Cloudflare。已经做过的修改不会自动回滚，原值见下方变更台账。</p>
-          {touched && (
+          {task.errorCode === 'mx_removed_routing_pending' ? (
+            <p className="text-critical">第三方 MX 已删除、收件路由还没开启：取消后不再重试开启路由，该域名会一直收不到信。建议先「立即检测」重试，或在 Cloudflare 开启 Email Routing、按台账恢复原 MX。</p>
+          ) : touched && (
             <p className="text-caution">catch-all 若已指向本站，这个域名的来信会继续按「未认领」进入本站；如需停止，请在 Cloudflare 恢复原规则。</p>
           )}
           {task.canDeleteZone && (
