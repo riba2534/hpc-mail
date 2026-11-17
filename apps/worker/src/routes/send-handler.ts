@@ -10,13 +10,15 @@ import {
 import type { Context } from 'hono';
 import { AppError } from '../lib/errors.js';
 import { ok, parseBody } from '../lib/http.js';
+import { beginIdempotentSend, failIdempotentSend, type IdempotencyActor } from '../services/idempotency.js';
 import {
-  beginIdempotentSend,
-  completeIdempotentSend,
-  failIdempotentSend,
-  type IdempotencyActor,
-} from '../services/idempotency.js';
-import { decodeInlineAttachments, deliveryFailedError, sendMail, type DecodedAttachment, type Sender } from '../services/outbound.js';
+  decodeInlineAttachments,
+  deliveryFailedError,
+  releaseDeliveryLeases,
+  sendMail,
+  type DecodedAttachment,
+  type Sender,
+} from '../services/outbound.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
 import { fetchUrlAttachments, releaseUrlAttachments, type FetchedUrlAttachment } from '../services/url-attachment.js';
 import type { AppContext, Env, ExecCtx } from '../types.js';
@@ -33,11 +35,16 @@ export interface SendEnvironment {
 
 export function sendEnvironment(c: Context<AppContext>): SendEnvironment {
   const url = new URL(c.req.url);
-  const selfHosts = [url.hostname];
+  return { env: c.env, ctx: c.executionCtx, origin: url.origin, selfHosts: selfHostsOf(c) };
+}
+
+/** 本站自身的主机名：请求主机与 env.site_origin 的主机 */
+export function selfHostsOf(c: Context<AppContext>): string[] {
+  const hosts = [new URL(c.req.url).hostname];
   if (c.env.site_origin) {
-    try { selfHosts.push(new URL(c.env.site_origin).hostname); } catch { /* 配置错误时只拦请求主机 */ }
+    try { hosts.push(new URL(c.env.site_origin).hostname); } catch { /* 配置错误时只拦请求主机 */ }
   }
-  return { env: c.env, ctx: c.executionCtx, origin: url.origin, selfHosts };
+  return hosts;
 }
 
 /** 发信请求体超过上限时在解析前拒绝：JSON 解析、幂等哈希、base64 解码会同时持有好几份内容 */
@@ -47,27 +54,37 @@ export function assertSendBodySize(c: Context<AppContext>): void {
   }
 }
 
+/** 全部收件人被明确拒收为 422（首次与同 Key 重放一致），其余（含部分失败、结果未确认的 unknown）照常返回 */
+export function settledResult(summary: MessageSummary): MessageSummary {
+  if (summary.status === 'failed') {
+    throw deliveryFailedError(summary.id, summary.recipientOutcomes ?? [], summary.errorDetail || '全部收件人投递失败');
+  }
+  return summary;
+}
+
 /** 三种附件来源合并：attachments[]（base64 与 URL 按原顺序）在前，上传 token 在后 */
 async function prepareAttachments(
   se: SendEnvironment,
   sender: Sender,
   req: InternalSendMailRequest,
-): Promise<{ attachments: DecodedAttachment[]; fetched: FetchedUrlAttachment[] }> {
+  leaseToken: string,
+  fetched: FetchedUrlAttachment[],
+): Promise<DecodedAttachment[]> {
   const decoded = decodeInlineAttachments(req.attachments.filter((item) => !isUrlAttachment(item)));
-  const tokens = await resolveDraftAttachments(se.env, sender.userId, req.attachmentTokens);
+  const tokens = await resolveDraftAttachments(se.env, sender.userId, req.attachmentTokens, leaseToken);
   const used = [...decoded, ...tokens].reduce((sum, att) => sum + ('bytes' in att ? att.bytes.byteLength : att.size), 0);
-  const fetched = await fetchUrlAttachments(se.env, sender.userId, req.attachments.filter(isUrlAttachment), {
+  fetched.push(...await fetchUrlAttachments(se.env, sender.userId, req.attachments.filter(isUrlAttachment), {
     selfHosts: se.selfHosts, budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - used,
-  });
+  }));
   let inline = 0;
   let remote = 0;
   const ordered = req.attachments.map((item): DecodedAttachment => (isUrlAttachment(item) ? fetched[remote++]! : decoded[inline++]!));
-  return { attachments: [...ordered, ...tokens], fetched };
+  return [...ordered, ...tokens];
 }
 
 /**
- * 发一封信：幂等占位 → 准备附件（base64、上传 token、URL 拉取）→ sendMail → 回填幂等结果、回收附件。
- * 失败抛 AppError（与单发的 HTTP 错误相同）；全部收件人失败的结果重放时同样抛 422。
+ * 发一封信：幂等占位 → 准备附件（base64、上传 token、URL 拉取）→ sendMail（投递结束时回填幂等结果、释放租约）
+ * → 回收附件。失败抛 AppError（与单发的 HTTP 错误相同）；全部收件人失败时首次与重放都抛 422。
  */
 export async function sendOne(
   se: SendEnvironment,
@@ -77,35 +94,31 @@ export async function sendOne(
   idempotencyKey: string | undefined,
 ): Promise<MessageSummary> {
   const idem = await beginIdempotentSend(se.env, actor, idempotencyKey, sendRequestFingerprint(req));
-  if (idem.kind === 'replay') {
-    // 全部收件人失败的结果重放时与首次一样是 422；部分失败、unknown 等仍是 201
-    const replay = idem.response;
-    if (replay.status === 'failed') {
-      throw deliveryFailedError(replay.id, replay.recipientOutcomes ?? [], replay.errorDetail || '全部收件人投递失败');
-    }
-    return replay;
-  }
+  if (idem.kind === 'replay') return settledResult(idem.response);
+  // 本次发送引用的草稿与原附件都登记在这个租约下，投递结束时释放
+  const leaseToken = crypto.randomUUID();
+  // 拉取转存的 URL 附件不归调用方持有：无论结果如何都在本次请求里回收（已发出的邮件按附件行引用保留对象）
+  const fetched: FetchedUrlAttachment[] = [];
   let summary: MessageSummary;
-  let fetched: FetchedUrlAttachment[] = [];
   try {
-    const prepared = await prepareAttachments(se, sender, req);
-    fetched = prepared.fetched;
-    summary = await sendMail(se.env, se.ctx, sender, req, prepared.attachments, se.origin, idem.handle);
+    const attachments = await prepareAttachments(se, sender, req, leaseToken, fetched);
+    summary = await sendMail(se.env, se.ctx, sender, req, attachments, se.origin, idem.handle, leaseToken);
   } catch (error) {
-    // 全部失败（422）时幂等键已绑定发件行，这里不会动它，重放由发件行推出同样的结果。
-    // 拉取转存的 URL 附件不归调用方持有，立即释放（同 Key 重试会重新拉取）
-    await Promise.all([failIdempotentSend(se.env, idem.handle, error), releaseUrlAttachments(se.env, sender.userId, fetched)]);
+    // 投递开始后 sendMail 不再抛错（全部失败也返回结果）；这里是投递前的异常，幂等记录按错误类型删除或标 failed，租约随之释放。
+    // 同 Key 重试会重新拉取 URL 附件
+    await Promise.all([
+      failIdempotentSend(se.env, idem.handle, error),
+      releaseDeliveryLeases(se.env, leaseToken),
+      releaseUrlAttachments(se.env, sender.userId, fetched),
+    ]);
     throw error;
   }
-  // 邮件已发出：结果缓存与草稿回收失败都不能翻转请求结果（前端会提示重发，token 又还在，收件人就收到两封）。
-  // 草稿回收失败留给 24h 的草稿清理兜底；两者互不依赖，并行写
-  await Promise.all([
-    completeIdempotentSend(se.env, idem.handle, summary)
-      .catch((error) => console.error('已投递邮件的幂等结果回填失败，保持原键以便查询:', error)),
-    consumeDraftAttachments(se.env, sender.userId, [...req.attachmentTokens.map((ref) => ref.token), ...fetched.map((att) => att.token)])
-      .catch((error) => console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', error)),
-  ]);
-  return summary;
+  // 全部失败不回收上传附件：同一 token 修正后可以再发。其余结果下邮件可能已发出，回收失败不能翻转请求结果
+  // （前端会提示重发，token 又还在，收件人就收到两封），留给 24h 的草稿清理兜底
+  const consumed = [...(summary.status !== 'failed' ? req.attachmentTokens.map((ref) => ref.token) : []), ...fetched.map((att) => att.token)];
+  await consumeDraftAttachments(se.env, sender.userId, consumed)
+    .catch((error) => console.error('草稿附件回收失败（邮件已发送，留给定时清理）:', error));
+  return settledResult(summary);
 }
 
 /**

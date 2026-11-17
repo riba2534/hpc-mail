@@ -1,6 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { DraftStatus, MessageRecipients, RecipientOutcome, StoredDraftContent, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
+import type { DraftStatus, MessageAuth, MessageRecipients, RecipientOutcome, StoredDraftContent, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -93,6 +93,8 @@ export const messages = sqliteTable(
     verificationCode: text('verification_code').notNull().default(''),
     /** 收件时识别出的验证/登录链接（仅 http/https，≤2048）；识别不到或历史邮件为空串 */
     verificationLink: text('verification_link').notNull().default(''),
+    /** 收件时采信的发件认证结果（lib/auth-results.ts）；null=没有可信结果（历史邮件、站内互投、发件） */
+    auth: text('auth', { mode: 'json' }).$type<MessageAuth>(),
     messageId: text('message_id'),
     inReplyTo: text('in_reply_to'),
     references: text('references').notNull().default(''),
@@ -497,7 +499,7 @@ export const deliveryObjectLeases = sqliteTable('delivery_object_leases', {
 
 /**
  * 服务端草稿与定时发送（/v1/drafts、/api/drafts）。内容存解析后的发信字段（content JSON，只含附件 token），
- * 正文单独两列，避免 JSON 转义把 1MiB 正文放大到超过 D1 单行上限。
+ * 正文不进 JSON，按邮件正文的规则落 R2（D1 只留短文本）。
  * 状态见 shared DRAFT_STATUSES；发送时按 (actor_type='draft', actor_id=id, key=attempt) 占用幂等记录，
  * 发件行在外发前绑定，进程中断后可据此判断是否已经外发，绝不自动重发。
  */
@@ -509,8 +511,10 @@ export const drafts = sqliteTable(
     status: text('status').$type<DraftStatus>().notNull().default('draft'),
     version: integer('version').notNull().default(1),
     content: text('content', { mode: 'json' }).notNull().$type<StoredDraftContent>(),
+    /** 正文与邮件同一口径（services/mail-body.ts）：完整 text/html 在 R2（bodyR2Key），D1 只留短文本，读全文用 readMailBody */
     bodyText: text('body_text').notNull().default(''),
     bodyHtml: text('body_html').notNull().default(''),
+    bodyR2Key: text('body_r2_key'),
     /** 列表摘要（同 messages.preview） */
     preview: text('preview').notNull().default(''),
     sendAt: integer('send_at', { mode: 'timestamp_ms' }),
@@ -543,6 +547,8 @@ export const drafts = sqliteTable(
     index('idx_drafts_due').on(t.sendAt).where(sql`${t.status} = 'scheduled'`),
     index('idx_drafts_sending').on(t.claimedAt).where(sql`${t.status} = 'sending'`),
     index('idx_drafts_sent').on(t.sentAt).where(sql`${t.status} = 'sent'`),
+    // 对象清理按 r2_key 判断草稿正文是否仍被引用
+    index('idx_drafts_body_r2').on(t.bodyR2Key).where(sql`${t.bodyR2Key} IS NOT NULL`),
     uniqueIndex('idx_drafts_idempotency').on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
   ],
 );

@@ -1,9 +1,10 @@
 import type { MessageSummary } from '@hpc-mail/shared';
 import { and, eq, isNull, sql } from 'drizzle-orm';
-import { createDb } from '../db/client.js';
+import { createDb, type Db } from '../db/client.js';
 import { idempotencyRecords, messages, attachments } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
+import { COUNTS_AS_ATTACHMENT } from '../lib/attachment-rule.js';
 import { summarize } from './message.js';
 import type { Env } from '../types.js';
 
@@ -84,7 +85,8 @@ export async function beginIdempotentSend(
     if (existing.messageId) {
       const row = await db.select().from(messages).where(eq(messages.id, existing.messageId)).get();
       if (row && row.status !== 'pending') {
-        const attachment = await db.select({ id: attachments.id }).from(attachments).where(eq(attachments.messageId, row.id)).get();
+        const attachment = await db.select({ id: attachments.id }).from(attachments)
+          .where(and(eq(attachments.messageId, row.id), COUNTS_AS_ATTACHMENT)).get();
         const response = summarize(row, !!attachment, false);
         try { await completeIdempotentSend(env, handle, response); }
         catch (error) { console.error('Idempotency recovery persistence deferred:', error); }
@@ -135,17 +137,21 @@ export async function bindIdempotentSend(
   if (!bound.length) throw new AppError('send_in_progress', `${detail}，请查询发送记录`);
 }
 
+/** 记下本次发送的响应（含全部失败的 422 结果），同 Key 重放直接返回它；可与发件行的最终结果合进同一个 batch */
+export function completeIdempotentStatement(db: Db, handle: IdempotencyHandle, response: MessageSummary) {
+  return db
+    .update(idempotencyRecords)
+    .set({ status: 'completed', responseJson: JSON.stringify(response), errorDetail: '', updatedAt: new Date() })
+    .where(and(recordOf(handle), eq(idempotencyRecords.status, 'pending')));
+}
+
 export async function completeIdempotentSend(
   env: Env,
   handle: IdempotencyHandle | null,
   response: MessageSummary,
 ): Promise<void> {
   if (!handle) return;
-  const db = createDb(env);
-  await db
-    .update(idempotencyRecords)
-    .set({ status: 'completed', responseJson: JSON.stringify(response), errorDetail: '', updatedAt: new Date() })
-    .where(and(recordOf(handle), eq(idempotencyRecords.status, 'pending')));
+  await completeIdempotentStatement(createDb(env), handle, response);
 }
 
 /**

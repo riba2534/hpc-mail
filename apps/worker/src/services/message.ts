@@ -29,19 +29,21 @@ import {
   type Column,
   type SQL,
 } from 'drizzle-orm';
-import { union } from 'drizzle-orm/sqlite-core';
+import { union, unionAll } from 'drizzle-orm/sqlite-core';
 import { createDb, type Db } from '../db/client.js';
 import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, stars, users } from '../db/schema.js';
 import { signAttachment } from '../lib/crypto.js';
 import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
+import { COUNTS_AS_ATTACHMENT, countsAsAttachment } from '../lib/attachment-rule.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
-import { PREVIEW_LIMIT } from '../lib/text.js';
+import { detectPromptInjection, extractReplyText } from '../lib/agent-text.js';
+import { mailText, PREVIEW_LIMIT } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { resolveVerificationCode } from './code-extract.js';
 import { getSettings } from './setting.js';
-import { getJson } from './storage.js';
+import { readMailBody } from './mail-body.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 
 export interface Viewer {
@@ -66,6 +68,7 @@ type MessageSummaryRow = Pick<
   | 'preview'
   | 'verificationCode'
   | 'verificationLink'
+  | 'auth'
   | 'status'
   | 'errorDetail'
   | 'recipientOutcomes'
@@ -86,6 +89,7 @@ const summarySelection = {
   preview: messages.preview,
   verificationCode: messages.verificationCode,
   verificationLink: messages.verificationLink,
+  auth: messages.auth,
   status: messages.status,
   errorDetail: messages.errorDetail,
   recipientOutcomes: messages.recipientOutcomes,
@@ -165,14 +169,20 @@ function domainCondition(scope: Scope, domain: string): SQL {
   return scope === 'unclaimed' ? eq(messages.domain, domain) : sql`+${messages.domain} = ${domain}`;
 }
 
-/** 分享给 userId、且认领人仍启用的地址 */
-function sharedAddressQuery(db: Db, userId: number) {
+/**
+ * mailboxes 按域名收窄时写成一元 +domain，不让它参与选索引：始终按 user_id（或共享关系）只读调用者自己的邮箱行，
+ * 不会改走 idx_mailboxes_domain 读出全站该域的认领行
+ */
+const mailboxOnDomain = (domain: string | undefined) => (domain ? sql`+${mailboxes.domain} = ${domain}` : undefined);
+
+/** 分享给 userId、且认领人仍启用的地址；给了 domain 时只取该域的 */
+function sharedAddressQuery(db: Db, userId: number, domain?: string) {
   return db
     .select({ address: mailboxes.address })
     .from(mailboxShares)
     .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
     .innerJoin(users, eq(users.id, mailboxes.userId))
-    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active')));
+    .where(and(eq(mailboxShares.userId, userId), eq(users.status, 'active'), mailboxOnDomain(domain)));
 }
 
 /**
@@ -198,14 +208,18 @@ function scopeCondition(db: Db, scope: Scope, access: ScopeAccess = 'owned'): SQ
 }
 
 /**
- * 只用于已限定「inbound + 未删除」的查询：可见地址集合 = 认领 ∪ 分享，用 UNION 代替 OR。
+ * 只用于已限定「inbound + 未删除」的查询（wait）：可见地址集合 = 认领 ∪ 分享，用 UNION ALL 代替 OR。
  * 分享分支本身要求 inbound + 未删除，外层条件已覆盖，语义与 scopeCondition 一致；
- * 去掉 OR 后规划器才能按地址逐个走 idx_messages_visible，而不是扫全站未删除邮件。
+ * 去掉 OR 后地址集合是唯一的 IN 条件，INDEXED BY 才能逐个地址取数，而不是扫全站未删除邮件。
+ * 邮箱不能共享给自己的所有者，两支不相交，不需要 UNION 去重的临时 B 树（每个地址省一行读取）。
+ * 给了 domain 时在子查询里先收窄到该域的地址，逐地址探查的次数只随该域的可见地址数增长。
  */
-function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess): SQL {
-  if (scope === 'unclaimed' || access === 'owned') return scopeCondition(db, scope, access);
-  const owned = db.select({ address: mailboxes.address }).from(mailboxes).where(eq(mailboxes.userId, scope.ownerId));
-  return inArray(messages.address, union(owned, sharedAddressQuery(db, scope.ownerId)));
+function inboxScopeCondition(db: Db, scope: Scope, access: ScopeAccess, domain?: string): SQL {
+  if (scope === 'unclaimed') return scopeCondition(db, scope, access);
+  const owned = db.select({ address: mailboxes.address }).from(mailboxes)
+    .where(and(eq(mailboxes.userId, scope.ownerId), mailboxOnDomain(domain)));
+  if (access === 'owned') return inArray(messages.address, owned);
+  return inArray(messages.address, unionAll(owned, sharedAddressQuery(db, scope.ownerId, domain)));
 }
 
 /**
@@ -288,6 +302,8 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     preview: row.preview,
     verificationCode,
     verificationLink: row.verificationLink ?? '',
+    // 收件才有认证结果；null 表示没有可信结果（历史邮件、站内互投），与「认证失败」不同
+    auth: row.direction === 'inbound' ? (row.auth ?? null) : undefined,
     status: row.status,
     errorDetail: row.errorDetail ?? '',
     recipientOutcomes: row.recipientOutcomes,
@@ -298,16 +314,6 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     size: row.size,
     createdAt: row.createdAt.toISOString(),
   };
-}
-
-/**
- * hasAttachments 的口径：带 Content-ID 的 inline 部件是正文里的内嵌图（logo、签名图），不算附件，
- * 否则带内嵌 logo 的通知邮件在列表里也显示回形针。SQL 与 JS 两种写法供列表与详情共用同一规则。
- */
-const COUNTS_AS_ATTACHMENT = sql`NOT (${attachmentsTable.disposition} = 'inline' AND ${attachmentsTable.contentId} <> '')`;
-
-function countsAsAttachment(att: { disposition: string; contentId: string }): boolean {
-  return !(att.disposition === 'inline' && att.contentId !== '');
 }
 
 /** 给定邮件集合的附件标记与当前用户的星标标记，合成一次 batch 往返 */
@@ -332,7 +338,11 @@ async function messageFlags(db: Db, userId: number, ids: number[]): Promise<{ at
   return { attachments, starred };
 }
 
-/** 列表搜索语义（主题/发件地址/发件名/文本正文/收件人子串）；全部已读按同一语义收窄 */
+/**
+ * 列表搜索语义（主题/发件地址/发件名/正文/收件人子串）；全部已读按同一语义收窄。
+ * 正文只搜 D1 的 body_text：正文前 BODY_PREVIEW_BYTES 的纯文本，只有 HTML 的邮件为 HTML 转出的文字（mail-body.ts）；
+ * 尚未回填的旧行仍是完整文本段。
+ */
 function searchCondition(q: string | undefined): SQL | undefined {
   if (!q) return undefined;
   const term = q.toLowerCase();
@@ -491,7 +501,7 @@ const PENDING_ATTACHMENTS_GRACE_MS = 2 * 60_000;
  * 调用方超时后可从它继续。hasCode 与返回的 verificationCode 同一口径；AI 可能稍后补码的新邮件、
  * 附件尚未落库（pending）的新邮件都不计入已检查，下一次轮询再判定——游标推过去调用方就再也看不到它。
  * address（多个地址）与 domain 在 SQL 里收窄，不参与「跳过」；include=body 时命中项返回与详情相同的结构，
- * 可见性已由本查询的范围条件确定，整行与附件、星标合成一次 batch，不再走详情的可见性校验。
+ * 读整行时带上本查询的同一组范围条件复核，与附件、星标合成一次 batch，不再走详情的可见性校验。
  */
 export async function findNextMessage(
   env: Env,
@@ -502,7 +512,7 @@ export async function findNextMessage(
   const db = createDb(env);
   const scope = resolveScope(viewer);
   const conditions: SQL[] = [
-    inboxScopeCondition(db, scope, shareAccess(viewer, scope)),
+    inboxScopeCondition(db, scope, shareAccess(viewer, scope), input.domain),
     eq(messages.direction, 'inbound'),
     isNull(messages.deletedAt),
     gt(messages.id, input.afterId),
@@ -510,11 +520,16 @@ export async function findNextMessage(
   if (input.address) conditions.push(inArray(messages.address, input.address));
   if (input.domain) conditions.push(domainCondition(scope, input.domain));
   const filtered = Boolean(input.from || input.subjectContains || input.hasCode);
-  // 指定地址时逐个地址按 id 取：多地址的 IN 会让规划器为省排序改沿 idx_messages_live 扫全站 afterId 之后的邮件，
-  // 没有新信的轮询（最常见）每次都要读完这段；逐地址读取量只随这几个地址的新信增长
+  // 指定地址、或范围是自己/某用户的可见地址（domain 已并进地址子查询）时，逐个地址按 id 取：
+  // 否则规划器为省排序沿 idx_messages_live 扫全站 afterId 之后的邮件，没有新信的轮询（最常见）每次都要读完这段。
+  // 逐地址的读取量约为调用方的邮箱行数 + 每个可见地址两行（物化与探查）+ 这些地址的新信；原计划物化地址子查询
+  // 同样要读邮箱行和每个地址一行，所以地址再多也只比原计划的下限多每地址一行（至多约 1.5 倍），且不再随全站新信增长，
+  // 不设地址数上限、不回退。
+  // 未认领范围的地址集合不可枚举：只给 domain 时交给规划器走 idx_messages_domain（该域的新信），什么都不给时仍按 id 扫全站新信
+  const byAddress = Boolean(input.address) || scope !== 'unclaimed';
   const rows = await db
     .select(waitColumns)
-    .from(input.address ? MESSAGES_BY_ADDRESS : MESSAGES)
+    .from(byAddress ? MESSAGES_BY_ADDRESS : MESSAGES)
     .where(and(...conditions))
     .orderBy(asc(messages.id))
     .limit(filtered ? WAIT_SCAN_BATCH : 1)
@@ -541,12 +556,14 @@ export async function findNextMessage(
       continue;
     }
     if (input.include === 'body') {
+      // 两次读取之间被删除、移入回收站或失去可见性（共享撤销、释放、过户）的不再以详情返回：
+      // 它已不在等待范围内，游标越过它继续往后找
       const [[full], attRows, starRows] = await db.batch([
-        db.select().from(messages).where(eq(messages.id, row.id)), ...detailExtras(db, viewer.userId, row.id),
+        db.select().from(messages).where(and(eq(messages.id, row.id), ...conditions)), ...detailExtras(db, viewer.userId, row.id),
       ]);
-      // 两次读取之间被永久删除：等同不存在，继续往后找
       if (!full) { scannedThroughId = row.id; continue; }
-      return { message: await buildDetail(env, full, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
+      const body = await readMailBody(env, full);
+      return { message: await buildDetail(env, full, body, attRows, starRows.length > 0, attachmentTtlSeconds), scannedThroughId: row.id };
     }
     const flags = await messageFlags(db, viewer.userId, [row.id]);
     return { message: { ...summary, hasAttachments: flags.attachments.has(row.id), isStarred: flags.starred.has(row.id) }, scannedThroughId: row.id };
@@ -857,13 +874,6 @@ function rewriteCidUrls(
   return { html: rewritten, inlined };
 }
 
-/** 完整正文：超过 D1 上限的正文在 R2，D1 里只有截断预览 */
-async function fullBody(env: Env, row: Pick<MessageRow, 'bodyText' | 'bodyHtml' | 'bodyR2Key'>) {
-  if (!row.bodyR2Key) return { bodyText: row.bodyText, bodyHtml: row.bodyHtml };
-  const full = await getJson<{ text?: string; html?: string }>(env, row.bodyR2Key);
-  return { bodyText: full?.text ?? row.bodyText, bodyHtml: full?.html ?? row.bodyHtml };
-}
-
 /** 主题与完整正文（可见性同详情），供翻译等只需要文字内容的读取 */
 export async function getMessageContent(
   env: Env,
@@ -871,7 +881,7 @@ export async function getMessageContent(
   id: number,
 ): Promise<{ subject: string; bodyText: string; bodyHtml: string }> {
   const row = await loadVisible(env, viewer, id);
-  return { subject: row.subject, ...(await fullBody(env, row)) };
+  return { subject: row.subject, ...(await readMailBody(env, row)) };
 }
 
 /** 详情所需的附件全行与当前用户星标，调用方放进同一次 batch */
@@ -882,22 +892,22 @@ function detailExtras(db: Db, userId: number, id: number) {
   ] as const;
 }
 
-/** 由已确认可见的整行组装详情：完整正文、附件签名 URL、CID 内联图替换 */
+/** 由已确认可见的整行与完整正文（readMailBody）组装详情：附件签名 URL、CID 内联图替换 */
 async function buildDetail(
   env: Env,
   row: MessageRow,
+  body: { bodyText: string; bodyHtml: string },
   attRows: (typeof attachmentsTable.$inferSelect)[],
   starred: boolean,
   attachmentTtlSeconds?: number,
 ): Promise<MessageDetail> {
-  const [body, signed] = await Promise.all([
-    fullBody(env, row),
-    Promise.all(attRows.map(async (a) => {
-      const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
-      return { ...a, url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}` };
-    })),
-  ]);
+  const signed = await Promise.all(attRows.map(async (a) => {
+    const { exp, sig } = await signAttachment(env.jwt_secret, a.id, attachmentTtlSeconds);
+    return { ...a, url: `/api/attachments/${a.id}?exp=${exp}&sig=${sig}` };
+  }));
   const { html, inlined } = rewriteCidUrls(body.bodyHtml, signed);
+  // 给 Agent 的收件预处理在读取时惰性计算，不占收件链路的 CPU；HTML-only 邮件才需要转换
+  const plain = row.direction === 'inbound' ? mailText(body.bodyText, body.bodyHtml).plain : '';
   return {
     // 验证码与列表、wait、线程同一口径（summarize）：已存值优先，详情不再按正文另算一份
     ...summarize(row, attRows.some(countsAsAttachment), starred),
@@ -916,6 +926,9 @@ async function buildDetail(
       url: a.url,
     })),
     hasRaw: !!row.rawR2Key,
+    ...(row.direction === 'inbound'
+      ? { extractedText: extractReplyText(plain), risk: detectPromptInjection(row.subject, plain) }
+      : {}),
   };
 }
 
@@ -931,8 +944,11 @@ export async function getMessageDetail(
 ): Promise<MessageDetail> {
   const db = createDb(env);
   const row = await loadVisible(env, viewer, id);
-  const [attRows, starRows] = await db.batch(detailExtras(db, viewer.userId, id));
-  return buildDetail(env, row, attRows, starRows.length > 0, attachmentTtlSeconds);
+  // 正文在 R2 时，R2 读取与附件/星标的 D1 batch 并行，详情只多 max(R2, D1) 而不是两者之和
+  const [[attRows, starRows], body] = await Promise.all([
+    db.batch(detailExtras(db, viewer.userId, id)), readMailBody(env, row),
+  ]);
+  return buildDetail(env, row, body, attRows, starRows.length > 0, attachmentTtlSeconds);
 }
 
 /** 取原始 .eml R2 对象（校验可见性）；无存档返回 null */

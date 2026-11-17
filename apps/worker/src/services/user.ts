@@ -1,5 +1,5 @@
-import type { AdminUser, CreateUserRequest, SearchUsersQuery, UpdateUserRequest, UserSearchResults } from '@hpc-mail/shared';
-import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
+import { RESERVED_USERNAMES, type AdminUser, type CreateUserRequest, type SearchUsersQuery, type UpdateUserRequest, type UserSearchResults } from '@hpc-mail/shared';
+import { and, asc, desc, eq, ne, notInArray, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { mailboxes, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
@@ -88,10 +88,12 @@ export async function listUsers(env: Env): Promise<AdminUser[]> {
 }
 
 /** 过户和共享候选搜索：只读必要字段，限制结果数，不扫描/返回用户的全部邮箱及 Key 统计。 */
+/** 选人搜索（共享成员、托管域名成员、过户目标）：系统保留账号（CI 冒烟用户）不出现在候选里 */
 export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<UserSearchResults> {
   const rows = await createDb(env).select({ id: users.id, username: users.username, role: users.role })
     .from(users)
     .where(and(eq(users.status, 'active'),
+      notInArray(users.username, [...RESERVED_USERNAMES]),
       sql`instr(lower(${users.username}), ${req.q}) > 0`,
       req.excludeUserId === undefined ? undefined : ne(users.id, req.excludeUserId)))
     .orderBy(sql`CASE WHEN lower(${users.username}) = ${req.q} THEN 0
@@ -102,6 +104,7 @@ export async function searchUsers(env: Env, req: SearchUsersQuery): Promise<User
 
 export async function createUser(env: Env, req: CreateUserRequest): Promise<AdminUser> {
   const db = createDb(env);
+  if (RESERVED_USERNAMES.includes(req.username)) throw new AppError('conflict', '该用户名为系统保留，不能使用');
   const existing = await db.select().from(users).where(eq(users.username, req.username)).get();
   if (existing) throw new AppError('conflict', '用户名已存在');
   const passwordHash = await hashPassword(req.password);

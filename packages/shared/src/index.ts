@@ -15,3 +15,5 @@ export * from './schemas/notify-prefs.js';
 export * from './schemas/audit.js';
 export * from './schemas/hosted-domain.js';
 export * from './schemas/hosted-dns.js';
+export * from './schemas/ops.js';
+// MCP 工具参数只有 worker 用，经子路径 @hpc-mail/shared/mcp 导入，不进前端按需加载的整包契约 chunk

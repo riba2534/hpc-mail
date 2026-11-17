@@ -1,16 +1,17 @@
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import PostalMime from 'postal-mime';
 import { createDb } from '../src/db/client.js';
 import { attachments, deliveryObjectLeases, idempotencyRecords, mailboxes, messages, users } from '../src/db/schema.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { beginIdempotentSend } from '../src/services/idempotency.js';
-import { sendMail } from '../src/services/outbound.js';
+import { finalWriteRetry, sendMail } from '../src/services/outbound.js';
 import { getMessageDetail, purgeMessages } from '../src/services/message.js';
 import { updateSettings } from '../src/services/setting.js';
 import { releaseMailbox } from '../src/services/mailbox.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
+import { BODY_PREVIEW_BYTES } from '../src/services/mail-body.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { createApp } from '../src/app.js';
 
@@ -239,7 +240,8 @@ describe('收发件功能与故障恢复', () => {
     await Promise.all([waitOnExecutionContext(ctx1), waitOnExecutionContext(ctx2)]);
     const rows = await createDb(env).select().from(messages).where(eq(messages.subject, 'functional-inbound-normal')).all();
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.bodyText.length).toBe(64 * 1024);
+    expect(rows[0]!.bodyText.length).toBe(BODY_PREVIEW_BYTES);
+    expect(rows[0]!.bodyHtml).toBe('');
     expect(rows[0]!.rawR2Key).not.toBeNull();
     expect(rows[0]!.bodyR2Key).not.toBeNull();
     expect((await getMessageDetail(env, viewer, rows[0]!.id)).bodyText === parsed.text).toBe(true);
@@ -259,7 +261,8 @@ describe('收发件功能与故障恢复', () => {
       if (property === 'prepare') return (query: string) => {
         if (failures === 0 && query.startsWith('update "messages"') && query.includes('"recipient_outcomes"')) {
           failures++;
-          throw new Error('injected status failure');
+          // 执行时失败（与线上 D1 报错同一时机）
+          return target.prepare('SELECT * FROM injected_status_failure');
         }
         return target.prepare(query);
       };
@@ -278,6 +281,10 @@ describe('收发件功能与故障恢复', () => {
   });
 
   it('所有结果回填均失败时返回真实投递结果，pending 幂等键阻止重复发送', async () => {
+    // 后台退避重试同样失败；缩短间隔，免得重试在用例结束后还挂着
+    const delays = finalWriteRetry.delaysMs;
+    finalWriteRetry.delaysMs = [1, 1];
+    onTestFinished(() => { finalWriteRetry.delaysMs = delays; });
     const sender = await seedUser('functional-status-unknown');
     const req = { from: { localPart: 'functional-status-unknown', domain: 'hpc.email' },
       to: ['unknown@example.net'], cc: [], bcc: [], subject: 'status-unknown', text: 'body' };
@@ -287,7 +294,8 @@ describe('收发件功能与故障恢复', () => {
     const { customEnv, captured } = captureEnv();
     const db = new Proxy(env.db, { get(target, property) {
       if (property === 'prepare') return (query: string) => {
-        if (query.startsWith('update "messages"') && query.includes('"recipient_outcomes"')) throw new Error('persistent D1 failure');
+        // 执行时失败（与线上 D1 报错同一时机）
+        if (query.startsWith('update "messages"') && query.includes('"recipient_outcomes"')) return target.prepare('SELECT * FROM persistent_d1_failure');
         return target.prepare(query);
       };
       const value = Reflect.get(target, property);
@@ -307,7 +315,7 @@ describe('收发件功能与故障恢复', () => {
     const { customEnv, captured } = captureEnv();
     const realSend = customEnv.email.send;
     customEnv.email.send = async (mail: any) => {
-      if (mail.to === 'failed@example.net') throw new Error('rejected');
+      if (mail.to === 'failed@example.net') throw Object.assign(new Error('rejected'), { code: 'E_DELIVERY_FAILED' });
       return realSend(mail);
     };
     const summary = await sendMail(customEnv, { waitUntil: () => {} }, sender, {
@@ -336,7 +344,7 @@ describe('收发件功能与故障恢复', () => {
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map(row => row.bodyR2Key)).size).toBe(2);
     for (const row of rows) {
-      expect(new TextEncoder().encode(row.bodyText).length).toBeLessThanOrEqual(64 * 1024);
+      expect(new TextEncoder().encode(row.bodyText).length).toBeLessThanOrEqual(BODY_PREVIEW_BYTES);
       expect(row.bodyText).not.toContain('�');
       expect(JSON.parse(await (await env.r2.get(row.bodyR2Key!))!.text()).text).toBe(text);
     }
@@ -426,10 +434,12 @@ describe('收发件功能与故障恢复', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    await expect(sendMail({ ...env, db }, { waitUntil: () => {} }, sender, {
+    // 全部失败时 sendMail 返回 failed 结果，由路由转成 422
+    const summary = await sendMail({ ...env, db }, { waitUntil: () => {} }, sender, {
       from: { localPart: 'functional-atomic-internal', domain: 'hpc.email' },
       to: ['atomic-receiver@another.test'], cc: [], bcc: [], subject: 'atomic-internal', text: 'body',
-    }, [{ filename: 'important.txt', mimeType: 'text/plain', contentId: '', disposition: 'attachment', bytes: new TextEncoder().encode('important') }], 'https://hpc.email')).rejects.toThrow();
+    }, [{ filename: 'important.txt', mimeType: 'text/plain', contentId: '', disposition: 'attachment', bytes: new TextEncoder().encode('important') }], 'https://hpc.email');
+    expect(summary.status).toBe('failed');
     const rows = await createDb(env).select().from(messages).where(eq(messages.subject, 'atomic-internal')).all();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.direction).toBe('outbound');

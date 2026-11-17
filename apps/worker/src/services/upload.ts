@@ -7,9 +7,9 @@ import {
 import { and, eq, inArray, isNull, or } from 'drizzle-orm';
 import type { Env } from '../types.js';
 import { createDb } from '../db/client.js';
-import { draftAttachments } from '../db/schema.js';
+import { deliveryObjectLeases, draftAttachments } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
-import { attachmentDisposition, type StoredAttachment } from './outbound.js';
+import { attachmentDisposition, leaseColumns, type StoredAttachment } from './outbound.js';
 
 /** 草稿附件 R2 key：draft/{userId}/{token}。发送后附件行直接引用这个对象，草稿行删除、对象保留 */
 export function draftKey(userId: number, token: string): string {
@@ -57,16 +57,18 @@ export async function reserveDraftAttachment(
 
 /**
  * 发送时按 token 解析草稿附件：校验归属 + ready + 合计大小，转成引用草稿对象的 StoredAttachment。
+ * 读草稿行与为 ready 草稿登记投递租约（leaseToken）在同一个 batch 里：之后草稿被删除或到期，对象也要等投递结束才回收。
  * 被服务端草稿引用（draft_id 非空）的附件只能由该草稿使用：options.draftId 为发送中的草稿 id，
  * 不传（直接发信）时只接受没有被草稿引用的附件。
  * 不读 R2：站内互投与超限转下载链接都用不到内容，需要内联进外发 MIME 时才由 sendMail 按需读取。
- * 任意 token 不存在 / 不归属 / 未完成上传 → 抛错（防止漏发附件或越权引用他人草稿）。
+ * 任意 token 不存在 / 不归属 / 未完成上传 → 抛错（防止漏发附件或越权引用他人草稿），已登记的租约由调用方释放。
  * 同一 token 引用多次时以第一次的内联参数为准。
  */
 export async function resolveDraftAttachments(
   env: Env,
   userId: number,
   refs: (string | AttachmentTokenRef)[],
+  leaseToken: string,
   options: { draftId?: number } = {},
 ): Promise<StoredAttachment[]> {
   const byToken = new Map<string, AttachmentTokenRef>();
@@ -76,17 +78,20 @@ export async function resolveDraftAttachments(
   }
   if (byToken.size === 0) return [];
   const db = createDb(env);
-  const rows = await db
-    .select()
-    .from(draftAttachments)
-    .where(and(
-      eq(draftAttachments.userId, userId),
-      inArray(draftAttachments.token, [...byToken.keys()]),
-      options.draftId === undefined
-        ? isNull(draftAttachments.draftId)
-        : or(isNull(draftAttachments.draftId), eq(draftAttachments.draftId, options.draftId)),
-    ))
-    .all();
+  const owned = and(
+    eq(draftAttachments.userId, userId),
+    inArray(draftAttachments.token, [...byToken.keys()]),
+    options.draftId === undefined
+      ? isNull(draftAttachments.draftId)
+      : or(isNull(draftAttachments.draftId), eq(draftAttachments.draftId, options.draftId)),
+  );
+  const [, rows] = await db.batch([
+    db.insert(deliveryObjectLeases)
+      .select(db.select(leaseColumns(draftAttachments.r2Key, leaseToken)).from(draftAttachments)
+        .where(and(owned, eq(draftAttachments.status, 'ready'))))
+      .onConflictDoNothing(),
+    db.select().from(draftAttachments).where(owned),
+  ]);
   const rowByToken = new Map(rows.map((r) => [r.token, r]));
 
   let declaredTotal = 0;

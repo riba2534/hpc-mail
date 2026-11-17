@@ -6,6 +6,7 @@ CREATE TABLE `drafts` (
 	`content` text NOT NULL,
 	`body_text` text DEFAULT '' NOT NULL,
 	`body_html` text DEFAULT '' NOT NULL,
+	`body_r2_key` text,
 	`preview` text DEFAULT '' NOT NULL,
 	`send_at` integer,
 	`created_via` text NOT NULL,
@@ -28,6 +29,7 @@ CREATE INDEX `idx_drafts_user` ON `drafts` (`user_id`,`id`);--> statement-breakp
 CREATE INDEX `idx_drafts_due` ON `drafts` (`send_at`) WHERE "drafts"."status" = 'scheduled';--> statement-breakpoint
 CREATE INDEX `idx_drafts_sending` ON `drafts` (`claimed_at`) WHERE "drafts"."status" = 'sending';--> statement-breakpoint
 CREATE INDEX `idx_drafts_sent` ON `drafts` (`sent_at`) WHERE "drafts"."status" = 'sent';--> statement-breakpoint
+CREATE INDEX `idx_drafts_body_r2` ON `drafts` (`body_r2_key`) WHERE "drafts"."body_r2_key" IS NOT NULL;--> statement-breakpoint
 CREATE UNIQUE INDEX `idx_drafts_idempotency` ON `drafts` (`idempotency_key`) WHERE "drafts"."idempotency_key" IS NOT NULL;--> statement-breakpoint
 ALTER TABLE `draft_attachments` ADD `draft_id` integer;--> statement-breakpoint
 CREATE INDEX `idx_draft_attachments_draft` ON `draft_attachments` (`draft_id`) WHERE "draft_attachments"."draft_id" IS NOT NULL;
