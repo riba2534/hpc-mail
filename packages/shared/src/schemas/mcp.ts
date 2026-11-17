@@ -3,7 +3,7 @@ import { MAX_PAGE_SIZE, MAX_WAIT_ADDRESSES, MESSAGE_DIRECTIONS } from '../consta
 import {
   emailAddressSchema, internalSendMailSchema, listMessagesQuerySchema, replyMessageRequestSchema, waitMessagesQuerySchema,
 } from './mail.js';
-import { claimMailboxRequestSchema } from './mailbox.js';
+import { LIST_PAGE_DEFAULT_LIMIT, LIST_PAGE_MAX_LIMIT, claimMailboxRequestSchema, domainSchema } from './mailbox.js';
 
 /**
  * 远程 MCP（同一 Worker 的 /mcp，Streamable HTTP，无状态）。工具参数用 JSON 原生类型（布尔、整数、数组），
@@ -35,11 +35,17 @@ const flag = (description: string) => z.boolean().optional().describe(descriptio
 export const mcpToolInputSchemas = {
   get_me: z.object({}).strict(),
   list_identities: z.object({ response_format: responseFormat }),
-  list_mailboxes: z.object({ response_format: responseFormat }),
+  list_mailboxes: z.object({
+    q: z.string().trim().toLowerCase().max(254).optional().describe('只列地址包含该文本的邮箱（按字面匹配）'),
+    domain: domainSchema.optional().describe('只列这个域名下的邮箱'),
+    cursor: z.string().max(128).optional().describe('上一页返回的 nextCursor，原样传回'),
+    limit: z.number().int().min(1).max(LIST_PAGE_MAX_LIMIT).optional().describe(`每页条数，默认 ${LIST_PAGE_DEFAULT_LIMIT}`),
+    response_format: responseFormat,
+  }),
   claim_mailbox: claimMailboxRequestSchema.extend({ response_format: responseFormat }),
   release_mailbox: z.object({
     mailboxId: z.number().int().positive().optional().describe('要释放的邮箱 id（claim_mailbox、list_mailboxes 返回）'),
-    address: emailAddressSchema.optional().describe('也可以给完整地址，服务端先查 GET /v1/mailboxes 找到 id（另需 mailbox.read）'),
+    address: emailAddressSchema.optional().describe('也可以给完整地址，服务端按地址过滤 GET /v1/mailboxes 找到 id（另需 mailbox.read）'),
     deleteHistory: z.boolean().default(false).describe('true 时永久删除该地址的全部历史邮件；默认保留给下一个认领者'),
   }).refine((value) => (value.mailboxId === undefined) !== (value.address === undefined), {
     message: 'mailboxId 与 address 必须且只能给一个',
@@ -100,6 +106,15 @@ export function mcpSearchQuery(args: McpToolArgs<'search_messages'>): Record<str
   }
   if (args.afterId !== undefined) query.afterId = String(args.afterId);
   if (args.limit !== undefined) query.limit = String(args.limit);
+  return query;
+}
+
+/** list_mailboxes 参数 → GET /v1/mailboxes 查询串：始终带 limit，走分页模式，邮箱再多也只取一页 */
+export function mcpMailboxQuery(args: Omit<McpToolArgs<'list_mailboxes'>, 'response_format'>): Record<string, string> {
+  const query: Record<string, string> = { limit: String(args.limit ?? LIST_PAGE_DEFAULT_LIMIT) };
+  for (const key of ['q', 'domain', 'cursor'] as const) {
+    if (args[key] !== undefined) query[key] = args[key];
+  }
   return query;
 }
 
