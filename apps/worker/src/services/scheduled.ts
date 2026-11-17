@@ -23,7 +23,10 @@ import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js'
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
-/** 幂等记录保留：已完成与结果已落在发件行上的 2 天，失败的 7 天 */
+/**
+ * 幂等记录保留：已完成的 2 天（按创建时间）；仍是 pending、但发件行已终态的同样保留 2 天（按最后更新时间），
+ * 保留期内同 Key 重试仍被拦下，不会当成新请求重发；失败的 7 天。
+ */
 const IDEMPOTENCY_SETTLED_RETENTION_MS = 2 * DAY_MS;
 const IDEMPOTENCY_FAILED_RETENTION_MS = 7 * DAY_MS;
 /** Claude 地址事实归纳窗口：5 分钟一次扫最近 1 小时，每日再扫最近 3 天，重叠窗口兜住漏跑 */
@@ -203,8 +206,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     (await db.delete(apiRateLimits).where(lt(apiRateLimits.windowStart, staleWindow)).run()).meta.changes ?? 0);
   await step(report, 'sessions.cleanup', async () =>
     (await db.delete(sessions).where(lt(sessions.expiresAt, new Date())).run()).meta.changes ?? 0);
-  // 幂等记录：已完成的；失败的（失败时一定没有外发，保留 7 天便于排查）；
-  // 以及仍是 pending、但绑定的发件行已终态的（回填结果失败时留下，结果以发件行为准）
+  // 幂等记录：已完成的；失败的（保留 7 天便于排查）；以及仍是 pending、但绑定的发件行已终态的
+  // （回填结果失败时留下，结果以发件行为准）。发件行仍是 pending 或没有绑定的不删
   await step(report, 'idempotency.cleanup', async () => {
     const settledBefore = new Date(Date.now() - IDEMPOTENCY_SETTLED_RETENTION_MS);
     const settledMessage = db.select({ id: messages.id }).from(messages).where(and(
@@ -213,7 +216,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
       and(eq(idempotencyRecords.status, 'completed'), lt(idempotencyRecords.createdAt, settledBefore)),
       and(eq(idempotencyRecords.status, 'failed'),
         lt(idempotencyRecords.createdAt, new Date(Date.now() - IDEMPOTENCY_FAILED_RETENTION_MS))),
-      and(eq(idempotencyRecords.status, 'pending'), lt(idempotencyRecords.createdAt, settledBefore), exists(settledMessage)),
+      and(eq(idempotencyRecords.status, 'pending'), lt(idempotencyRecords.updatedAt, settledBefore), exists(settledMessage)),
     )).run()).meta.changes ?? 0;
   });
   await step(report, 'retention', () => runRetention(env));

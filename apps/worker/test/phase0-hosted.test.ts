@@ -40,15 +40,16 @@ describe('定时任务分工', () => {
 });
 
 describe('每日维护的清理规则', () => {
-  it('幂等记录：已完成 2 天、失败 7 天、pending 但发件行已终态 2 天后删除，其余保留', async () => {
+  it('幂等记录：已完成 2 天、失败 7 天、pending 但发件行已终态的按最后更新 2 天后删除，其余保留', async () => {
     const user = (await db.insert(users).values({ username: 'phase0-idem', passwordHash: 'x', authVersionMigrated: true }).returning().get())!;
     const outbound = async (status: string) => (await db.insert(messages).values({
       address: 'sender@phase0.test', domain: 'phase0.test', direction: 'outbound', status, subject: status,
     }).returning().get())!.id;
-    const record = async (key: string, status: 'pending' | 'completed' | 'failed', ageMs: number, messageId: number | null = null) => {
-      const at = new Date(Date.now() - ageMs);
+    const record = async (key: string, status: 'pending' | 'completed' | 'failed', ageMs: number, messageId: number | null = null,
+      updatedAgeMs = ageMs) => {
       await db.insert(idempotencyRecords).values({
-        actorType: 'user', actorId: user.id, key, requestHash: 'h', status, messageId, createdAt: at, updatedAt: at,
+        actorType: 'user', actorId: user.id, key, requestHash: 'h', status, messageId,
+        createdAt: new Date(Date.now() - ageMs), updatedAt: new Date(Date.now() - updatedAgeMs),
       });
     };
     await record('completed-old', 'completed', 3 * DAY);
@@ -59,7 +60,9 @@ describe('每日维护的清理规则', () => {
     await record('pending-sent', 'pending', 3 * DAY, await outbound('sent'));
     await record('pending-delivered', 'pending', 3 * DAY, await outbound('delivered'));
     await record('pending-failed', 'pending', 3 * DAY, await outbound('failed'));
+    // 发件行已终态但记录未过保留期：同 Key 重试仍要被拦下，不能删
     await record('pending-recent-sent', 'pending', 60 * 60 * 1000, await outbound('sent'));
+    await record('pending-recently-bound', 'pending', 3 * DAY, await outbound('delivered'), 60 * 60 * 1000);
     await record('pending-still-sending', 'pending', 3 * DAY, await outbound('pending'));
     await record('pending-unbound', 'pending', 3 * DAY);
     await record('pending-missing-row', 'pending', 3 * DAY, 987654321);
@@ -68,7 +71,7 @@ describe('每日维护的清理规则', () => {
     const kept = (await db.select({ key: idempotencyRecords.key }).from(idempotencyRecords)
       .where(eq(idempotencyRecords.actorId, user.id)).all()).map((row) => row.key).sort();
     expect(kept).toEqual(['completed-new', 'failed-new', 'pending-missing-row', 'pending-recent-sent',
-      'pending-still-sending', 'pending-unbound']);
+      'pending-recently-bound', 'pending-still-sending', 'pending-unbound']);
   });
 
   it('按 Key 计的被拒请求计数（api-reject）随其他分钟级计数一起回收', async () => {
