@@ -29,4 +29,19 @@ describe('外发状态徽标', () => {
     expect(screen.getByText('部分失败')).toBeInTheDocument();
     expect(screen.getByText('部分收件人失败: bad@example.com: rejected')).toHaveClass('text-critical');
   });
+
+  it('部分送达、其余只是结果未确认：显示「部分待确认」与提醒色说明；同时有明确失败时仍为「部分失败」', () => {
+    const detail = '部分收件人投递结果未确认，可能已送达，补发前先向收件人核对: slow@example.com: timeout';
+    show(outbound({ status: 'sent', errorDetail: detail, recipientOutcomes: [
+      { address: 'to@example.com', status: 'sent' }, { address: 'slow@example.com', status: 'unknown', error: 'timeout' },
+    ] }));
+    expect(screen.getByText('部分待确认')).toBeInTheDocument();
+    expect(screen.queryByText('部分失败')).toBeNull();
+    expect(screen.getByText(detail)).toHaveClass('text-caution');
+    show(outbound({ id: 3, status: 'sent', errorDetail: '部分收件人失败: bad@example.com: rejected；部分收件人投递结果未确认', recipientOutcomes: [
+      { address: 'to@example.com', status: 'sent' }, { address: 'bad@example.com', status: 'failed', error: 'rejected' },
+      { address: 'slow@example.com', status: 'unknown', error: 'timeout' },
+    ] }));
+    expect(screen.getByText('部分失败')).toBeInTheDocument();
+  });
 });

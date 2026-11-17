@@ -414,9 +414,17 @@ export function SettingsPage() {
           />
           <NumberRow
             label="转发中转每人每日上限"
-            description="按收件地址的归属人计，同一封信转给多个目标各计一次；原生转发不计入。"
+            description="已认领地址按认领人计，同一封信转给多个目标各计一次；原生转发不计入。"
             value={draft.quota.relayPerUserDaily}
             onChange={(v) => patch((s) => void (s.quota.relayPerUserDaily = v))}
+            max={100000}
+            suffix="封/天"
+          />
+          <NumberRow
+            label="未认领地址转发中转每日上限"
+            description="未认领地址的来信归全体管理员，任何人都能往这类地址灌信，全体管理员共用这一个额度，不按人数叠加；原生转发不计入。"
+            value={draft.quota.relayUnclaimedDaily}
+            onChange={(v) => patch((s) => void (s.quota.relayUnclaimedDaily = v))}
             max={100000}
             suffix="封/天"
           />
