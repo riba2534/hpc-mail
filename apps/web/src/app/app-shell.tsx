@@ -52,6 +52,11 @@ import { preloadable } from './route-modules';
 import type { RouteHandle } from './router';
 import { ShortcutsHelpDialog } from './shortcuts-help-dialog';
 
+// 只在外壳主内容区渲染的路由组件随外壳 chunk 下发（router 经 loadAppShell 取用）
+export { AdminGuard } from './admin-guard';
+export { NotFoundPage } from './not-found-page';
+export { PageError } from './page-error';
+
 const ChangePasswordDialog = lazyWithReload(
   preloadable(() => import('./change-password-dialog')),
   (m) => m.ChangePasswordDialog,

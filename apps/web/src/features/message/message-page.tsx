@@ -50,6 +50,7 @@ import { attachmentIcon } from './attachment-icon';
 import { countRemoteImages } from './count-remote-images';
 import { downloadWithAuth, openOrDownloadWithAuth } from './download';
 import { EmailHtml } from '@/lib/email-html';
+import { EmailBodyBoundary } from '@/lib/email-html/body-error-boundary';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
 import { extractOtp } from '@/lib/otp';
@@ -555,16 +556,23 @@ export function MessagePage() {
             </div>
           )}
 
-          {message.bodyHtml ? (
-            <EmailHtml
-              html={message.bodyHtml}
-              allowRemoteImages={showRemoteImages}
-              trustedImageOrigins={[globalThis.location.origin]}
-              onContentChange={setHtmlRoot}
-            />
-          ) : (
-            <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
-          )}
+          <EmailBodyBoundary
+            resetKey={message.id}
+            text={message.bodyText}
+            html={message.bodyHtml}
+            onDownloadRaw={message.hasRaw ? () => void downloadEml() : undefined}
+          >
+            {message.bodyHtml ? (
+              <EmailHtml
+                html={message.bodyHtml}
+                allowRemoteImages={showRemoteImages}
+                trustedImageOrigins={[globalThis.location.origin]}
+                onContentChange={setHtmlRoot}
+              />
+            ) : (
+              <PlainTextBody text={message.bodyText || '（无正文）'} transformText={translation.transformText} />
+            )}
+          </EmailBodyBoundary>
 
           {listedAttachments.length > 0 && (
             <div className="border-t border-line pt-4">
