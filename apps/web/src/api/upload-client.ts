@@ -1,7 +1,6 @@
 import { clearAuthToken, getAuthToken } from '@/lib/auth-token';
+import { API_BASE } from './client';
 import { ApiError, NETWORK_ERROR_MESSAGE } from './errors';
-
-const API_BASE = '/api';
 
 export interface UploadProgress {
   loaded: number;

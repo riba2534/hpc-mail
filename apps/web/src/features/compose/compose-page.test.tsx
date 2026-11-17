@@ -111,6 +111,25 @@ describe('ComposePage complete delivery',()=>{
     await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:expect.stringContaining('1 个收件人发送失败')})));
     client.clear();
   });
+  it('201 + status unknown：提示先向收件人核对再补发，进入详情页而不是报成功',async()=>{
+    mocks.send.mockResolvedValueOnce({id:23,status:'unknown',errorDetail:'投递结果未确认，可能已送达，补发前先向收件人核对: to@example.com: timeout',
+      recipientOutcomes:[{address:'to@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人的投递结果未确认',
+      description:expect.stringContaining('请先向收件人核对')})));
+    expect(mocks.toast).not.toHaveBeenCalledWith(expect.objectContaining({variant:'success'}));
+    expect(await screen.findByText('mail page')).toBeInTheDocument();
+    client.clear();
+  });
+  it('部分送达、部分失败、部分未确认：标题同时说明失败与未确认',async()=>{
+    mocks.send.mockResolvedValueOnce({id:24,status:'sent',errorDetail:'部分收件人失败',recipientOutcomes:[{address:'to@example.com',status:'sent'},
+      {address:'bad@example.com',status:'failed',error:'rejected'},{address:'slow@example.com',status:'unknown',error:'timeout'}]});
+    const client=show({fromAddress:'first@one.example',to:['to@example.com','bad@example.com','slow@example.com'],subject:'test',body:'body'});
+    fireEvent.click(screen.getByRole('button',{name:'发送'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({variant:'error',title:'1 个收件人发送失败，1 个收件人的投递结果未确认'})));
+    client.clear();
+  });
 });
 
 
@@ -432,10 +451,13 @@ describe('source mail no longer available', () => {
   it('a reply whose original is gone can be sent as a new mail after the user confirms, with a new key', async () => {
     mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
     const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
+    expect(screen.getByRole('heading', { level: 1, name: '回复邮件' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
     expect(mocks.send.mock.calls[0]![0]).toMatchObject({ replyToMessageId: 5 });
     fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
+    // 去掉回复关联后就是一封新邮件，标题随之变化
+    expect(screen.getByRole('heading', { level: 1, name: '写邮件' })).toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 50));
     // 只去掉关联，不自动重发
     expect(mocks.send).toHaveBeenCalledOnce();
@@ -446,6 +468,16 @@ describe('source mail no longer available', () => {
     expect(mocks.send.mock.calls[1]![0]).toEqual(rest);
     expect(mocks.send.mock.calls[1]![1]).not.toBe(mocks.send.mock.calls[0]![1]);
     await screen.findByText('sent page');
+    client.clear();
+  });
+
+  it('a reply-forward whose reply thread is gone (details.source = reply) offers to drop the reply link, not the attachments', async () => {
+    mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404, details: { source: 'reply' } }));
+    const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, forwardAttachmentsFrom: 8, sourceMessageId: 5 });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
+    fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
+    expect(screen.getByText(/将保留原邮件附件/)).toBeInTheDocument();
     client.clear();
   });
 

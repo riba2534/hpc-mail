@@ -6,6 +6,8 @@ declare global {
   namespace Cloudflare {
     interface Env extends WorkerEnv {
       TEST_MIGRATIONS: D1Migration[];
+      TEST_RATE_LIMIT_2: RateLimit;
+      TEST_RATE_LIMIT_1: RateLimit;
     }
   }
 }

@@ -6,8 +6,8 @@
 
 - **平台账户（user）**：用户名 + 密码登录的身份，与邮箱地址解耦。角色只有 `admin` / `user` 两种。
 - **邮箱地址（mailbox）**：`前缀@系统域名`，由用户认领，全局唯一占用；释放后他人可再认领。邮件按地址关联，认领即可见该地址全部历史邮件。
-- **域名（domain）**：系统收件域，由部署配置决定，全站共享。
-- **发件身份**：user 只能以自己认领的地址发件；admin 可用任意前缀@系统域名。
+- **域名（domain）**：系统收件域由管理员在「域名」页维护（`settings.domains.list`），可设为仅管理员或公开；用户还可以托管自己的域名（`hosted_domains`），只有所有者、成员与管理员能在其上认领。
+- **发件身份**：user 只能以自己认领的地址发件，共享来的邮箱只读；admin 另可用任意已认领邮箱，或系统域名、托管域名上的任意前缀（托管域名需发信就绪）。
 
 ## 2. 设计基调：Graphite + Indigo（浅色单主题）
 
@@ -50,9 +50,9 @@
 
 ## 4. 组件清单（apps/web/src/components/ui）
 
-Button（primary/secondary/ghost/danger × sm/md）、IconButton、Input、PasswordInput、Textarea、Combobox、Select、Checkbox、Switch、SegmentedControl、FilterChip、Badge、Table、Dialog、ConfirmDialog、Sheet、DropdownMenu、Tabs、Tooltip、Toast、EmptyState、Skeleton、Spinner、CopyButton、FormField。
+Button（primary/secondary/ghost/danger × sm/md）、IconButton、Input、PasswordInput、Textarea、Combobox、Select、Checkbox、Switch、SegmentedControl、FilterChip、Badge、Table、Dialog、ConfirmDialog、Sheet、DropdownMenu、Tabs、Toast、EmptyState、Skeleton、Spinner、CopyButton、FormField。
 
-自有源码 + Radix 无样式基元；不引大型组件库。
+自有源码 + Radix 无样式基元；不引大型组件库。提示文字用原生 `title`，不引 Tooltip 组件。
 
 ## 5. 布局
 

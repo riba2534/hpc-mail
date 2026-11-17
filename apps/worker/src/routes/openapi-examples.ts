@@ -16,6 +16,7 @@ const inboundSummary = {
   fromAddress: 'no-reply@service.example', fromName: 'Example Service', subject: 'Your verification code',
   preview: 'Your verification code is 482913. It expires in 10 minutes.', verificationCode: '482913', verificationLink: '',
   status: 'received', errorDetail: '', isRead: false, isStarred: false, hasAttachments: true, size: 52480, createdAt: AT,
+  auth: { spf: 'pass', dkim: 'pass', dkimDomain: 'service.example', dmarc: 'pass', aligned: true },
 };
 /** 发信成功（201）的摘要：外部收件人已被服务商接受 */
 export const sentMessageExample = {
@@ -53,6 +54,7 @@ export const SCHEMA_EXAMPLES: Record<string, unknown> = {
     ...inboundSummary, replyTo: [], recipients: { to: ['alice@example.org'], cc: [], bcc: [] },
     bodyText: 'Your verification code is 482913. It expires in 10 minutes.',
     bodyHtml: '<p>Your verification code is <b>482913</b>. It expires in 10 minutes.</p>', attachments: [attachment], hasRaw: true,
+    extractedText: 'Your verification code is 482913. It expires in 10 minutes.', risk: { promptInjection: false, reasons: [] },
   },
   MessagePage: { items: [inboundSummary], nextCursor: 'MTAyNA' },
   SessionMessagePage: { items: [inboundSummary], nextCursor: 'MTAyNA', head: '1024:0:3f9a' },
@@ -193,6 +195,9 @@ export const ERROR_EXAMPLES = {
   ClaimDomainForbidden: { code: 'forbidden', message: '当前用户无权认领该域名' },
   ClaudeSuspended: { code: 'forbidden', message: '该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领' },
   MailboxOwnerChanged: { code: 'conflict', message: '邮箱所有者已改变，请刷新后重试' },
+  NotFoundTargetUser: { code: 'not_found', message: '目标用户不存在' },
+  BatchStateChanged: { code: 'conflict', message: '邮箱归属、用户状态或额度在提交前已改变，本批未做任何修改，请刷新后重试' },
+  GranteeMissing: { code: 'validation_failed', message: '包含不存在的用户' },
   ShareOwnMailboxOnly: { code: 'forbidden', message: '只能共享自己已认领的地址' },
   ShareToOwner: { code: 'validation_failed', message: '邮箱所有者已经拥有访问权限，无需共享' },
   ShareListChanged: { code: 'conflict', message: '共享名单已改变，请刷新后重试' },

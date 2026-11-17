@@ -17,7 +17,7 @@ rules:
       field: operationId
       function: pattern
       functionOptions:
-        match: "^(?:list|get|create|update|delete|replace|send|claim|release|transfer|check|search|sync|count|wait|mark|star|restore|purge|share|revoke|remove|upload|download|complete|register|start|enable|disable|change|retry|test|translate|suspend|resume)[A-Z][A-Za-z0-9]*$"
+        match: "^(?:list|get|create|update|delete|replace|send|claim|release|transfer|check|search|sync|count|wait|mark|star|restore|purge|share|unshare|revoke|remove|upload|download|complete|register|start|enable|disable|change|retry|test|translate|suspend|resume)[A-Z][A-Za-z0-9]*$"
   hpc-operation-security:
     description: 每个 operation 显式声明 security（公开接口为 []）
     message: "{{path}} 没有声明 security"

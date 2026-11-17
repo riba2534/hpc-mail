@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { ok } from '../lib/http.js';
 import { getPublicDomains } from '../services/domain.js';
 import { hostedDomainsAvailable } from '../services/hosted-domain.js';
+import { buildId } from '../services/ops-probe.js';
 import { getSettings, isTranslationReady } from '../services/setting.js';
 import type { AppContext } from '../types.js';
 
@@ -23,7 +24,7 @@ app.get('/', async (c) => {
     hostedDomainsEnabled: hostedDomainsAvailable(c.env, settings),
   };
   c.header('Cache-Control', 'no-store');
-  c.header('X-HPC-Build', c.env.build_sha ?? 'local');
+  c.header('X-HPC-Build', buildId(c.env));
   return ok(c, config);
 });
 

@@ -54,7 +54,7 @@ export function ApiKeysPage() {
     mutationFn: (key: ApiKeySummary) =>
       apiKeyApi.update(key.id, { status: key.status === 'active' ? 'disabled' : 'active' }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.root }),
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '状态切换失败' },
   });
 
   const remove = useMutation({
@@ -64,7 +64,7 @@ export function ApiKeysPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.root });
       setDeleting(null);
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '删除失败' },
   });
 
   const items = data ?? [];

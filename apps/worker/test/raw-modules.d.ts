@@ -8,3 +8,11 @@ declare module '*.txt?raw' {
   const content: string;
   export default content;
 }
+// Vite 的 import.meta.glob：测试里枚举 apps/web/public 下的文档文件
+interface ImportMeta {
+  glob(pattern: string, options?: { query?: string; import?: string; eager?: boolean }): Record<string, unknown>;
+}
+declare module '*/_headers?raw' {
+  const content: string;
+  export default content;
+}

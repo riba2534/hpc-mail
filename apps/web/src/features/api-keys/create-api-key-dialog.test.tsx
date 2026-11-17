@@ -24,6 +24,7 @@ vi.stubGlobal(
 import {
   buildCurlExample,
   CreateApiKeyDialog,
+  domainScopeNote,
   expiryFromPreset,
   matchScopePreset,
 } from './create-api-key-dialog';
@@ -61,9 +62,20 @@ describe('API Key 预设工具函数', () => {
   it('勾选恰好等于预设时识别预设，否则为自定义', () => {
     expect(matchScopePreset(['mailbox.read', 'mail.read'])).toBe('read');
     expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read'])).toBe('send');
-    expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'])).toBe('full');
+    expect(
+      matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write', 'domain.read', 'domain.write']),
+    ).toBe('full');
+    // 托管域名两项加入之前的「完全访问」：已有 Key 不自动获得新 scope，按自定义显示
+    expect(matchScopePreset(['mail.read', 'mail.write', 'mail.send', 'mailbox.read', 'mailbox.write'])).toBe('custom');
     expect(matchScopePreset(['mail.read'])).toBe('custom');
     expect(matchScopePreset([])).toBe('custom');
+  });
+
+  it('托管域名权限的说明：写权限提示风险，只读说明用途，未勾选不提示', () => {
+    expect(domainScopeNote(['mail.read', 'domain.read', 'domain.write'])).toMatchObject({ tone: 'caution', text: expect.stringContaining('DNS 解析') });
+    expect(domainScopeNote(['domain.write'])?.text).toContain('删除域名');
+    expect(domainScopeNote(['domain.read'])).toMatchObject({ tone: 'info', text: expect.stringContaining('接入进度') });
+    expect(domainScopeNote(['mail.read', 'mailbox.write'])).toBeNull();
   });
 
   it('有效期预设换算为绝对时间', () => {
@@ -114,6 +126,9 @@ describe('CreateApiKeyDialog', () => {
     expect(screen.getByRole('checkbox', { name: '标记已读/删除' })).toBeChecked();
 
     await user.click(screen.getByRole('checkbox', { name: '管理邮箱' }));
+    await user.click(screen.getByRole('checkbox', { name: '查看托管域名' }));
+    expect(screen.getByRole('radio', { name: '完全访问' })).toHaveAttribute('aria-checked', 'false');
+    await user.click(screen.getByRole('checkbox', { name: '接入域名与解析' }));
     expect(screen.getByRole('radio', { name: '完全访问' })).toHaveAttribute('aria-checked', 'true');
 
     await user.click(screen.getByRole('checkbox', { name: '发送邮件' }));
@@ -122,6 +137,27 @@ describe('CreateApiKeyDialog', () => {
 
     await user.click(screen.getByRole('checkbox', { name: '发送邮件' }));
     expect(screen.getByRole('radio', { name: '完全访问' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('托管域名权限默认不勾选；勾选后显示用途，写权限与「完全访问」显示风险提示并随请求提交', async () => {
+    mocks.create.mockResolvedValue(createdKey());
+    const user = userEvent.setup();
+    renderDialog();
+    expect(screen.getByRole('checkbox', { name: '查看托管域名' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: '接入域名与解析' })).not.toBeChecked();
+    expect(screen.queryByText(/托管域名的 DNS 解析/)).toBeNull();
+
+    await user.click(screen.getByRole('checkbox', { name: '查看托管域名' }));
+    expect(screen.getByText(/可读取你托管域名的接入进度/)).toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: '查看托管域名' }));
+    await user.click(screen.getByRole('radio', { name: '完全访问' }));
+    expect(screen.getByRole('checkbox', { name: '接入域名与解析' })).toBeChecked();
+    expect(screen.getByText(/修改托管域名的 DNS 解析/)).toHaveClass('text-caution');
+
+    await user.type(screen.getByLabelText(/名称/), '域名脚本');
+    await user.click(screen.getByRole('button', { name: '创建' }));
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    expect(mocks.create.mock.calls[0]![0].scopes).toEqual(expect.arrayContaining(['domain.read', 'domain.write']));
   });
 
   it('有效期预设提交 now + N 天；自定义未选时间时就地提示', async () => {

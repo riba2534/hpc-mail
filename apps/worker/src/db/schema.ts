@@ -1,6 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
-import type { MessageRecipients, RecipientOutcome, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
+import type { MessageAuth, MessageRecipients, RecipientOutcome, UserMailboxPolicy, UserNotifyPrefs } from '@hpc-mail/shared';
 
 /** 统一时间戳列：unix 毫秒，Drizzle 映射为 Date */
 const createdAtColumn = () =>
@@ -55,7 +55,12 @@ export const mailboxes = sqliteTable(
     displayName: text('display_name').notNull().default(''),
     createdAt: createdAtColumn(),
   },
-  (t) => [index('idx_mailboxes_user').on(t.userId), index('idx_mailboxes_domain').on(t.domain)],
+  (t) => [
+    index('idx_mailboxes_user').on(t.userId),
+    index('idx_mailboxes_domain').on(t.domain),
+    // domain 视图把 domain 下推到认领地址子查询（user_id = ? AND domain = ?），按用户取某个域的地址不必回表
+    index('idx_mailboxes_user_domain').on(t.userId, t.domain),
+  ],
 );
 
 export const messages = sqliteTable(
@@ -93,6 +98,8 @@ export const messages = sqliteTable(
     verificationCode: text('verification_code').notNull().default(''),
     /** 收件时识别出的验证/登录链接（仅 http/https，≤2048）；识别不到或历史邮件为空串 */
     verificationLink: text('verification_link').notNull().default(''),
+    /** 收件时采信的发件认证结果（lib/auth-results.ts）；null=没有可信结果（历史邮件、站内互投、发件） */
+    auth: text('auth', { mode: 'json' }).$type<MessageAuth>(),
     messageId: text('message_id'),
     inReplyTo: text('in_reply_to'),
     references: text('references').notNull().default(''),

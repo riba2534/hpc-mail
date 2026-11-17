@@ -28,6 +28,11 @@ const ACTION_META: Record<string, { label: string; tone: BadgeTone }> = {
   'mailbox.transfer': { label: '过户邮箱', tone: 'caution' },
   'mailbox.share': { label: '共享邮箱', tone: 'neutral' },
   'mailbox.unshare': { label: '取消共享', tone: 'neutral' },
+  'mailbox.claim': { label: '代用户认领', tone: 'neutral' },
+  'mailbox.release': { label: '释放他人邮箱', tone: 'critical' },
+  'mailbox.update': { label: '修改他人发件名', tone: 'neutral' },
+  'mail.read_user': { label: '查看用户邮件', tone: 'caution' },
+  'mail.purge_unclaimed': { label: '永久删除未认领邮件', tone: 'critical' },
 };
 
 const ALL_ACTIONS = 'all';

@@ -119,7 +119,16 @@ function tracedEnv() {
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
-  return { env: { ...env, db } as Env, calls, reset: () => { calls.length = 0; } };
+  // 完整正文在 R2：记录正文对象的读取次数
+  const r2Gets: string[] = [];
+  const r2 = new Proxy(env.r2, {
+    get(target, property) {
+      if (property === 'get') return (key: string, ...rest: unknown[]) => { r2Gets.push(key); return (target.get as (...a: unknown[]) => unknown)(key, ...rest); };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return { env: { ...env, db, r2 } as Env, calls, r2Gets, reset: () => { calls.length = 0; r2Gets.length = 0; } };
 }
 
 const viewerOf = (user: { id: number; role: 'admin' | 'user' }, extra: Partial<Viewer> = {}): Viewer =>
@@ -327,22 +336,25 @@ describe('详情 ETag / If-None-Match（R19）', () => {
     expect(probe.headers.get('ETag')).toBeNull();
   });
 
-  it('304 只用一次往返且不补读正文；ETag 不一致才补读正文', async () => {
+  it('304 只用一次 D1 往返且不读 R2 正文；ETag 不一致才读 R2 全文', async () => {
     await baseSettings();
     const owner = await account('etag-rt');
-    const id = await mail(owner.address, { bodyHtml: '<p>html body</p>' });
+    const bodyR2Key = `body/${rand()}`;
+    await env.r2.put(bodyR2Key, JSON.stringify({ text: 'hello body full', html: '<p>html body</p>' }));
+    const id = await mail(owner.address, { bodyText: 'hello body', bodyHtml: '', bodyR2Key });
     const viewer = viewerOf(owner);
     const fresh = await getMessageDetailConditional(env, viewer, id);
     if (fresh.notModified) throw new Error('首次读取不应是 304');
     const traced = tracedEnv();
     expect(await getMessageDetailConditional(traced.env, viewer, id, { ifNoneMatch: fresh.etag })).toEqual({ etag: fresh.etag, notModified: true });
     expect(traced.calls.map((call) => call.kind)).toEqual(['batch']);
+    expect(traced.r2Gets).toEqual([]);
     traced.reset();
     const changed = await getMessageDetailConditional(traced.env, viewer, id, { ifNoneMatch: 'W/"other"' });
     expect(changed.notModified).toBe(false);
-    if (!changed.notModified) expect(changed.detail).toMatchObject({ bodyText: 'hello body', bodyHtml: '<p>html body</p>' });
-    expect(traced.calls.map((call) => call.kind)).toEqual(['batch', 'single']);
-    expect(traced.calls[1]!.sql[0]).toMatch(/body_text/);
+    if (!changed.notModified) expect(changed.detail).toMatchObject({ bodyText: 'hello body full', bodyHtml: '<p>html body</p>' });
+    expect(traced.calls.map((call) => call.kind)).toEqual(['batch']);
+    expect(traced.r2Gets).toEqual([bodyR2Key]);
   });
 
   it('有附件时 ETag 随签名时间桶变化：/v1 按分钟，站内按整点；无附件不随时间变化', async () => {

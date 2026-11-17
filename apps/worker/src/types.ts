@@ -1,7 +1,11 @@
 import type { ApiScope, Role, UserStatus } from '@hpc-mail/shared';
+import type { RateLimitBindingName } from './services/rate-limit.js';
 
-/** Worker 运行时绑定与变量（对应 wrangler.toml） */
-export interface Env {
+/**
+ * Worker 运行时绑定与变量（对应 wrangler.toml）。
+ * Rate Limiting binding（rl_*）可缺省：缺失时 services/rate-limit.ts 退回进程内计数。
+ */
+export interface Env extends Partial<Record<RateLimitBindingName, RateLimit>> {
   db: D1Database;
   kv: KVNamespace;
   r2: R2Bucket;

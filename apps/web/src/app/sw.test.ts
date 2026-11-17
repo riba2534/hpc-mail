@@ -53,8 +53,8 @@ function loadWorker({ network, httpCached = () => true }: { network: (url: strin
     fetchMock,
   ) as { isShellNavigation: (request: { mode: string; method: string; url: string }, origin: string) => boolean; SHELL_CACHE: string };
 
-  /** 派发 fetch 事件；返回页面拿到的响应（未接管时为 null）与后台任务 */
-  async function navigate(path: string, { mode = 'navigate', method = 'GET' } = {}) {
+  /** 只派发 fetch 事件：返回页面拿到的响应 Promise 与后台任务，不等它们完成 */
+  function dispatch(path: string, { mode = 'navigate', method = 'GET' } = {}) {
     let responded: Promise<Response> | null = null;
     const pending: Promise<unknown>[] = [];
     listeners.get('fetch')!({
@@ -62,7 +62,12 @@ function loadWorker({ network, httpCached = () => true }: { network: (url: strin
       respondWith: (promise: Promise<Response>) => (responded = promise),
       waitUntil: (promise: Promise<unknown>) => pending.push(promise),
     });
-    const response = responded ? await (responded as Promise<Response>) : null;
+    return { responded: responded as Promise<Response> | null, pending };
+  }
+  /** 派发 fetch 事件；返回页面拿到的响应（未接管时为 null）与后台任务 */
+  async function navigate(path: string, options: { mode?: string; method?: string } = {}) {
+    const { responded, pending } = dispatch(path, options);
+    const response = responded ? await responded : null;
     await Promise.all(pending);
     return response;
   }
@@ -72,7 +77,7 @@ function loadWorker({ network, httpCached = () => true }: { network: (url: strin
     await Promise.all(pending);
   }
   const shellText = async () => (await (await caches.open(exports.SHELL_CACHE)).match('/'))?.text();
-  return { ...exports, self, caches, fetchMock, navigate, lifecycle, shellText };
+  return { ...exports, self, caches, fetchMock, dispatch, navigate, lifecycle, shellText };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -175,6 +180,30 @@ describe('fetch 事件', () => {
     release();
     expect(await (await reload)!.text()).toBe(NEW_SHELL);
     await firstOpen;
+  });
+
+  it('上一次后台更新迟迟不返回时最多等 1.5 秒，随后用缓存的外壳应答（弱网不长时间白屏）', async () => {
+    let hang = false;
+    const worker = loadWorker({ network: () => (hang ? new Promise<Response>(() => {}) : Promise.resolve(html(SHELL))) });
+    await worker.navigate('/inbox');
+    hang = true;
+    vi.useFakeTimers();
+    try {
+      // 这次导航先拿到缓存，但它的后台更新一直挂起
+      expect(await (await worker.dispatch('/inbox').responded)!.text()).toBe(SHELL);
+      let settled = false;
+      const next = worker.dispatch('/mail/1').responded!.then((response) => {
+        settled = true;
+        return response;
+      });
+      await vi.advanceTimersByTimeAsync(1_400);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(settled).toBe(true);
+      expect(await (await next).text()).toBe(SHELL);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
