@@ -40,7 +40,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 ### 响应信封约定（前后端都依赖）
 
-成功 = HTTP 2xx + `{ data: ... }`；失败 = HTTP 4xx/5xx + `{ error: { code, message }, requestId }`。web 的 `api/client.ts` 按 `response.ok` 分支、401 自动清 token。列表统一游标分页：`?cursor=&limit=` → `{ items, nextCursor }`。
+成功 = HTTP 2xx + `{ data: ... }`；失败 = HTTP 4xx/5xx + `{ error: { code, message }, requestId }`。web 的 `api/client.ts` 按 `response.ok` 分支、401 自动清 token。列表统一游标分页：`?cursor=&limit=` → `{ items, nextCursor }`。例外：邮箱列表（含 all=1）、全站共享、全站托管域名为兼容 /v1 旧脚本，只有带 `cursor` 或 `limit` 时才返回分页，否则仍是完整数组；共享分页的 LIMIT 先作用于 mailboxes 再 JOIN。
 
 ## 关键设计决策与硬约束
 
