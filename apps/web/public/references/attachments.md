@@ -6,7 +6,7 @@ shell 示例复用 [入口指南](../skill.md) 的请求函数。`/api` JWT 和 
 
 ## 下载
 
-详情 `attachments` 每项含 `id,filename,mimeType,size,contentId,disposition,url`。`url` 是签名链接，可能为相对路径；有效期至少 1 小时，按整点对齐，同一小时内重复读取详情得到相同的 URL。按可信实例 origin 解析，过期后重新读详情获取，不自己伪造签名。Agent 优先用下面带凭证的下载端点，不依赖签名链接的时效。
+详情 `attachments` 每项含 `id,filename,mimeType,size,contentId,disposition,url`。`url` 是签名链接，可能为相对路径。`/api` 详情（站内页面用）的附件与内嵌图签名按整点对齐，有效 1–2 小时，同一小时内重复读取得到相同的 URL；`/v1` 详情的签名 URL 只有 5 分钟。按可信实例 origin 解析，过期后重新读详情获取，不自己伪造签名。Agent 应使用下面带凭证的下载端点（Key 用 `/v1/messages/:id/attachments/:attId`），不依赖签名链接的时效。
 
 - Key 下载：`GET /v1/messages/:messageId/attachments/:attachmentId`，支持同邮件详情的只读 `scope/userId`；鉴权验证附件确实属于该邮件。
 - JWT 下载：`GET /api/attachments/:attachmentId`，可见性与详情相同；管理员审阅其他用户的邮件时带与详情相同的 `scope=user&userId=…`（未认领地址用 `scope=unclaimed`）。普通用户带 `scope=user` 或 `scope=unclaimed` 返回 403，非法 scope 返回 400。
@@ -23,7 +23,7 @@ hpc "/messages/$MESSAGE_ID/attachments/$ATTACHMENT_ID" --output "$HPC_DOWNLOAD_F
 
 1. 小附件可直接放发送请求的 `attachments:[{filename,contentType,content}]`；content 为无 `data:` 前缀的 base64，可含折行空白。`filename` 1–255 字符，不能有 `/`、`\` 或 `..`；`contentType` 3–128 字符。
 2. 独立上传后在发送请求放 `attachmentTokens:["…"]`，无需把文件重新 base64；上传成功后才能发送。JSON 的 MIME 字段名上传为 `mimeType`，内联为 `contentType`，不要混用。
-3. 转发或已确认部分失败的补发，用 `forwardAttachmentsFrom=原邮件 ID` 复制原附件，保留 inline/CID；此时不重复引用原附件 Tokens/重复 base64 加入。来源须对发件人可见（自己认领地址上的邮件、共享给自己的未删除来信，管理员另含未认领地址），否则 404；Key 还需要 `mail.read`。
+3. 转发或已确认部分失败的补发，用 `forwardAttachmentsFrom=原邮件 ID` 复制原附件，保留 inline/CID；此时不重复引用原附件 Tokens/重复 base64 加入。来源须对发件人可见（自己认领地址上的邮件、共享给自己的未删除来信，管理员另含未认领地址），否则或原附件已丢失时返回 404 `source_unavailable`；Key 还需要 `mail.read`。
 
 三路合并后最多 10 个、每个及合计最多 50 MiB（`50*1024*1024` 字节）。正文另限合计 UTF-8 1 MiB。上传配额每用户最多 20 个待发送附件、声明大小合计最多 100 MiB，包括尚未完成上传；取消时及时删除，未消费草稿约 24 小时后定时清理。附件 Token 过期/上传失败时不能默默略掉附件发送。
 

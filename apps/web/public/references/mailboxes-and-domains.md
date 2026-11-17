@@ -110,7 +110,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 | `GET /hosted-domains` | 自己拥有（`role:"owner"`）与被共享（`role:"member"`）的域名；管理员全站用 `GET /admin/hosted-domains?status=&q=` |
 | `POST /hosted-domains` | `{domain}`，填已注册的根域名 → 201，`status:"pending"`、`nameServers` 两条、`originalNameServers`、`warnings`（如需先关闭 DNSSEC）、`expiresAt`（到期未改 NS 自动删除） |
 | `GET /hosted-domains/:id` | 进度：`status` 与 `steps:{nameServers,routing,catchAll,sending}`（各为 waiting/ready/error）、`lastError`、`checkedAt` |
-| `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态；每人每分钟最多 10 次（被节流、无权限的也计），超出或全站 Cloudflare 额度用完返回 429 |
+| `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态；每人每分钟最多 10 次（被节流、无权限的也计），超出或全站 Cloudflare 额度用完返回 429；真正触发复查时计 4 次全站额度，托管功能关闭或站点缺少 Cloudflare 凭据时不计 |
 | `PUT /hosted-domains/:id` | `{memberLimit}`：每位成员在该域最多认领数，0 不限 |
 | `GET` / `PUT /hosted-domains/:id/members` | 成员名单；PUT `{userIds,expectedOwnerId}` 整体替换（已禁用的现有成员可保留，新增的须为启用中的用户），选人用 `GET /mailboxes/share-users` |
 | `DELETE /hosted-domains/:id/members/:userId` | 移除成员；成员传自己的 id 即退出共享。已认领的地址保留 |
@@ -123,7 +123,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - 权限：所有者与管理员可查看进度、管理成员、过户、删除；管理员还能在任何人的托管域名下认领地址，并像其他邮箱一样用 `/admin/mailboxes/:id/transfer`、`/admin/mailbox-shares` 过户或共享其中的地址（含自动认领给所有者的地址）；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；自动认领默认不限数量（`hosted_domains.autoClaimLimit` 为 0），管理员设了正数上限时，域内地址达到上限后未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
 - 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
-- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；全站 Cloudflare 调用额度见下文 DNS 解析的限流说明，添加计 2 次、立即检测计 4 次。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
+- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；全站 Cloudflare 调用额度见下文 DNS 解析的限流说明：添加时占位计 2 次（额度不足直接 429），开通前的后台预配置再计 5 次；删除计 2 次，只计数不会因额度被拒。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
 
 ### 托管域名的 DNS 解析
 
@@ -166,6 +166,6 @@ done
 
 - 受保护的记录：根域 MX、根域 SPF（`v=spf1` 开头的 TXT）、`_dmarc`、`_domainkey` 及其子域、`cf-bounce` 及其子域上的任何记录，以及根域 CNAME（与收件需要的 MX、TXT 不能共存，改用 A/AAAA）。新增或改成这些都会在写入 Cloudflare 之前返回 400；其他名称上的 SPF、MX（如 `mail` 子域）不受限制。
 - 权限与状态：所有者与管理员可用，成员 403，其他用户 404。等待改 NS（`pending`）时也能读写，便于先补好网站记录；`suspended` 时所有者只读，管理员仍可修改；`deleting` 或 zone 还在创建中返回 409。只要求本站配置了 Cloudflare 凭据，不受管理员托管开关影响；未配置时 403。
-- 上限与限流：每个域名最多 100 条非邮箱记录（只读记录也计入），达到后新增返回 403；四个接口共用每人每分钟 30 次（管理员同样计数）。所有域名共用站长的 Cloudflare Token，用户操作全站合计每分钟最多 150 次 Cloudflare 调用，由 DNS 解析、添加托管域名（计 2 次）和立即检测（计 4 次）共用：解析列表计 1 次，新增、修改、删除各计 2 次，只计能真正调用 Cloudflare 的请求（超出个人限额、无权访问、删除中或创建中的不计）。任一超出返回 429，稍后重试。
+- 上限与限流：每个域名最多 100 条非邮箱记录（只读记录也计入），达到后新增返回 403；四个接口共用每人每分钟 30 次（管理员同样计数）。所有域名共用站长的 Cloudflare Token，用户操作全站合计每分钟最多 150 次 Cloudflare 调用，由 DNS 解析与托管域名的添加（占位 2 次、后台预配置 5 次）、立即检测（4 次）、删除（2 次，只计数不拒绝）共用：解析列表计 1 次，新增、修改、删除各计 2 次，只计能真正调用 Cloudflare 的请求（超出个人限额、无权访问、删除中或创建中的不计）。任一超出返回 429，稍后重试。
 - 常见错误：请求体不合法、修改类型、与邮箱冲突、Cloudflare 拒绝记录值返回 400，message 为具体原因；修改或删除 `mail`/`readonly` 记录返回 403，message 为 `lockedReason`；记录不存在或 `recordId` 格式不对返回 404；同名下已有相同或不能共存的记录返回 409；Cloudflare 中的 zone 已不可用返回 409，需联系管理员；Cloudflare 繁忙返回 429；超时、5xx 或响应读不出来返回 500「Cloudflare 没有返回明确结果，请刷新列表确认是否已生效」，写操作可能已经生效，先重新列出记录再决定是否重试。
 

@@ -260,7 +260,17 @@ describe('Phase-0 hardening is reflected in both OpenAPI documents', () => {
     expect(send['x-required-scopes']).toEqual(['mail.send']);
     expect(send['x-conditional-scopes']).toEqual([{ scope: 'mail.read', when: expect.stringContaining('forwardAttachmentsFrom') }]);
     const description = specs.v1.components.schemas.SendMailRequest!.description as string;
-    expect(description).toContain('404 not_found');
+    expect(description).toContain('404 source_unavailable');
+    expect(description).toContain('A missing sender mailboxId stays 404 not_found');
+    for (const spec of Object.values(specs)) {
+      const error = spec.components.schemas.Error!.properties as Record<string, Schema>;
+      const code = (error.error!.properties as Record<string, Schema>).code!;
+      expect(code.enum).toContain('source_unavailable');
+      expect(code.description).toContain('source_unavailable (404)');
+    }
+    expect(specs.v1.paths['/messages/{id}']!.get!.description).toContain('expire after 5 minutes');
+    expect(specs.api.paths['/messages/{id}']!.get!.description).toContain('valid for 1–2 hours');
+    expect(specs.v1.info.description).toContain('（账户级）');
     expect(description).toContain('Administrators may use any claimed mailbox');
     expect(description).toContain('hosted domain');
     expect(description).not.toContain('A mailboxId must belong to the caller');

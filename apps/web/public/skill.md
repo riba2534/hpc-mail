@@ -74,7 +74,7 @@ jq --argjson from "$FROM_ID" --arg text '回复正文' '.data as $m | {from:{mai
 
 - `replyToMessageId` 只写入线程头。回复全部时从原信 `recipients.to/cc` 重新计算收件人，去掉自己的地址，不要带上原 Bcc。
 - 转发：自己写新的 `to`、`Fwd: ` 主题和正文（需要原文就自己引用 `bodyText/bodyHtml`），加 `forwardAttachmentsFrom: <原邮件 id>` 复制原附件和内嵌图。
-- 带这两个字段时 Key 还需要 `mail.read`。来源可以是自己地址的邮件或共享给你的未删除来信，看不到或不存在都返回 404；发件人仍须是自己认领的地址。
+- 带这两个字段时 Key 还需要 `mail.read`。来源可以是自己地址的邮件或共享给你的未删除来信；不存在、看不到或原附件已丢失返回 404 `source_unavailable`，此时去掉这两个字段即可作为新邮件发送。发件人仍须是自己认领的地址。
 
 ### ④ 附件
 ```bash
@@ -86,7 +86,7 @@ TOKEN=$(hpc '/uploads?filename=report.pdf&mimeType=application/pdf' -X POST \
   -H 'Content-Type: application/octet-stream' --data-binary @report.pdf | jq -er '.data.token')
 ```
 
-合计最多 10 个、50 MiB；`contentType` 与上传的 `mimeType` 是两个字段名。外部收件人的整封邮件超过约 4 MiB 时，附件改为 90 天有效的下载链接。分片上传、下载与保留规则见[附件](references/attachments.md)。
+合计最多 10 个、50 MiB；`contentType` 与上传的 `mimeType` 是两个字段名。外部收件人的整封邮件超过约 4 MiB 时，附件改为 90 天有效的下载链接。下载收到的附件用 `GET /messages/:id/attachments/:attId`，详情里的签名 `url` 只有 5 分钟。分片上传、下载与保留规则见[附件](references/attachments.md)。
 
 ### ⑤ 临时地址：检查、认领、释放
 ```bash
