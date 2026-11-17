@@ -1,5 +1,4 @@
 import {
-  MAX_ATTACHMENT_TOTAL_BYTES,
   isUrlAttachment,
   type AttachmentTokenRef,
   type InternalSendMailRequest,
@@ -10,18 +9,19 @@ import { AppError } from '../lib/errors.js';
 import type { Env, ExecCtx } from '../types.js';
 import { beginIdempotentSend, failIdempotentSend, type IdempotencyActor } from './idempotency.js';
 import {
-  attachmentSize,
   decodeInlineAttachments,
   deliveryFailedError,
   releaseDeliveryLeases,
   sendMail,
   type DecodedAttachment,
+  type LateAttachments,
   type Sender,
   type SendMailInput,
 } from './outbound.js';
 import { fromRequiredError } from './reply-forward.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from './upload.js';
 import { fetchUrlAttachments, releaseUrlAttachments, type FetchedUrlAttachment } from './url-attachment.js';
+import type { UrlBufferBudget } from './url-fetch-budget.js';
 import { emitSendResult } from './webhooks.js';
 
 /** 发一封信所需的请求环境（与 Hono Context 无关：单发、批量的每一项、草稿发送共用） */
@@ -32,6 +32,8 @@ export interface SendEnvironment {
   origin: string;
   /** 本站自身的主机名：URL 附件不能指向它们 */
   selfHosts: string[];
+  /** 本请求「长度未知」URL 附件的内存缓冲预算：整个请求（含批量的各项）共用一份 */
+  urlBuffer: UrlBufferBudget;
 }
 
 /** 占用幂等键之后才准备的发信内容：回复/转发要读来源邮件，重放时不再读取 */
@@ -58,22 +60,34 @@ export function settledResult(summary: MessageSummary): MessageSummary {
   return summary;
 }
 
-/** 三种附件来源合并：attachments[]（base64 与 URL 按原顺序）在前，上传 token 在后；URL 附件拉取后记进 fetched */
+/**
+ * 三种附件来源：base64 与上传 token 先备好；URL 附件交给 sendMail 在发件授权与外发配额都通过后再拉取（late），
+ * 拉取后按 attachments[] 的原顺序与 base64 合并、token 附件排在后面，拉到的记进 fetched 供回收。
+ */
 async function prepareAttachments(
   se: SendEnvironment,
   sender: Sender,
   plan: SendPlan,
   leaseToken: string,
   fetched: FetchedUrlAttachment[],
-): Promise<DecodedAttachment[]> {
+): Promise<{ ready: DecodedAttachment[]; late?: LateAttachments }> {
   const { items, tokens } = plan.attachments;
   const decoded = decodeInlineAttachments(items.filter((item) => !isUrlAttachment(item)));
   const stored = await resolveDraftAttachments(se.env, sender.userId, tokens, leaseToken, { draftId: plan.draftId });
-  const used = [...decoded, ...stored].reduce((sum, att) => sum + attachmentSize(att), 0);
-  fetched.push(...await fetchUrlAttachments(se.env, sender.userId, items.filter(isUrlAttachment), {
-    selfHosts: se.selfHosts, budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - used,
-  }));
-  return [...inItemOrder<DecodedAttachment>(items, decoded, fetched), ...stored];
+  const urls = items.filter(isUrlAttachment);
+  if (!urls.length) return { ready: [...decoded, ...stored] };
+  return {
+    ready: [...decoded, ...stored],
+    late: {
+      count: urls.length,
+      load: async (budgetBytes) => {
+        fetched.push(...await fetchUrlAttachments(se.env, sender.userId, urls, {
+          selfHosts: se.selfHosts, budgetBytes, memory: se.urlBuffer,
+        }));
+        return [...inItemOrder<DecodedAttachment>(items, decoded, fetched), ...stored];
+      },
+    },
+  };
 }
 
 /** attachments[] 的 base64 与 URL 两路分开处理后，按请求里的原顺序合并（发信与保存草稿共用） */
@@ -108,9 +122,9 @@ export async function deliverSend(
   try {
     const plan = await prepare();
     tokens = plan.attachments.tokens.map((ref) => ref.token);
-    const attachments = await prepareAttachments(se, sender, plan, leaseToken, fetched);
+    const { ready, late } = await prepareAttachments(se, sender, plan, leaseToken, fetched);
     try {
-      summary = await sendMail(se.env, se.ctx, sender, plan.req, attachments, se.origin, idem.handle, leaseToken);
+      summary = await sendMail(se.env, se.ctx, sender, plan.req, ready, se.origin, idem.handle, leaseToken, late);
     } catch (error) {
       // 发信鉴权里只有发件身份会报 forbidden
       if (plan.defaultFromAddress && error instanceof AppError && error.code === 'forbidden') throw fromRequiredError(plan.defaultFromAddress);

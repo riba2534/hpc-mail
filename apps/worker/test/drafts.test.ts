@@ -524,3 +524,31 @@ describe('草稿接口的未知字段（E2）', () => {
     expect(await row(draft.id)).toMatchObject({ version: 1 });
   });
 });
+
+describe('草稿里的 URL 附件（A12）', () => {
+  it('未发送草稿已达上限时不去拉取，直接 409；保存时的拉取计入每分钟额度', async () => {
+    const me = await account('draft-url-limit');
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.hostname === 'cloudflare-dns.com') return Response.json({ Status: 0, Answer: [{ type: url.searchParams.get('type') === '1' ? 1 : 28, data: url.searchParams.get('type') === '1' ? '93.184.216.34' : '2606:2800:220:1::1' }] });
+      return new Response('pdf', { headers: { 'Content-Length': '3' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const saved = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { attachments: [{ url: 'https://files.example.com/a.pdf' }] })), 201);
+      expect(saved.attachments).toMatchObject([{ filename: 'a.pdf', size: 3 }]);
+      const counter = await env.db.prepare(`SELECT SUM(count) AS n FROM rate_counters WHERE scope = 'url-fetch' AND subject = ?`).bind(String(me.id)).first<{ n: number }>();
+      expect(counter!.n).toBe(1);
+      const now = Date.now();
+      await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+        INSERT INTO drafts (user_id, status, content, created_via, created_at, updated_at) SELECT ?, 'draft', '{}', 'web', ?, ? FROM n`)
+        .bind(MAX_DRAFTS_PER_USER - 1, me.id, now, now).run();
+      fetchMock.mockClear();
+      expect((await failure(await call('/v1/drafts', req(me.key, 'POST', { attachments: [{ url: 'https://files.example.com/b.pdf' }] })), 409)).code)
+        .toBe('draft_limit_reached');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

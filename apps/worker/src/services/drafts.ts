@@ -36,6 +36,7 @@ import { attachmentDisposition, decodeInlineAttachments, type BytesAttachment, t
 import { deliverSend, inItemOrder, planOf, settledResult, type SendEnvironment } from './send-flow.js';
 import { draftKey, newDraftToken, releaseDraftStatements, releaseDrafts, reserveDraftAttachment } from './upload.js';
 import { fetchUrlAttachments, releaseUrlAttachments } from './url-attachment.js';
+import { newUrlBufferBudget, reserveUrlFetches } from './url-fetch-budget.js';
 
 type DraftRow = typeof drafts.$inferSelect;
 
@@ -65,7 +66,7 @@ export interface DraftActor {
 }
 
 /** 保存草稿时的请求环境：附件下载链接的 origin，URL 附件不能指向的本站主机 */
-export type DraftRequestEnv = Pick<SendEnvironment, 'origin' | 'selfHosts'>;
+export type DraftRequestEnv = Pick<SendEnvironment, 'origin' | 'selfHosts' | 'urlBuffer'>;
 
 /** 定时发送因 5xx 且确认未外发时最多尝试几次，之后标 failed */
 const MAX_SCHEDULED_ATTEMPTS = 3;
@@ -232,11 +233,21 @@ async function storeBase64(env: Env, userId: number, { filename, mimeType, bytes
 async function materialize(
   env: Env,
   userId: number,
+  draftId: number | null,
   items: NonNullable<DraftInput['attachments']>,
   usedBytes: number,
   request: DraftRequestEnv,
 ): Promise<AttachmentTokenRef[]> {
   if (!items.length) return [];
+  const urls = items.filter(isUrlAttachment);
+  if (urls.length) {
+    // 拉取之前先占每分钟拉取额度；新建时同一次往返读出未发送草稿数，已到上限就不去拉（不然每次被拒前都先拉一遍）
+    const [unsent] = await reserveUrlFetches(env, userId, urls.length, draftId === null
+      ? [env.db.prepare(`SELECT COUNT(*) AS n FROM drafts WHERE user_id = ? AND status <> 'sent'`).bind(userId)] : []);
+    if (draftId === null && Number((unsent?.results[0] as { n?: number } | undefined)?.n ?? 0) >= MAX_DRAFTS_PER_USER) {
+      throw new AppError('draft_limit_reached', `未发送的草稿最多 ${MAX_DRAFTS_PER_USER} 份`);
+    }
+  }
   const created: { token: string }[] = [];
   try {
     // base64 与发信同一解码；合计超限时一个都不转存
@@ -245,8 +256,8 @@ async function materialize(
     if (total > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
     for (const att of decoded) created.push({ token: await storeBase64(env, userId, att) });
     const stored = [...created];
-    const fetched = await fetchUrlAttachments(env, userId, items.filter(isUrlAttachment), {
-      selfHosts: request.selfHosts, budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - total,
+    const fetched = await fetchUrlAttachments(env, userId, urls, {
+      selfHosts: request.selfHosts, budgetBytes: MAX_ATTACHMENT_TOTAL_BYTES - total, memory: request.urlBuffer,
     });
     created.push(...fetched);
     const tokens = inItemOrder<{ token: string }>(items, stored, fetched);
@@ -310,7 +321,7 @@ async function prepare(
   if (sendable) assertSendable({ ...content, attachmentTokens: kept }, text, html, replacesAttachments ? input.attachments : []);
   let created: AttachmentTokenRef[] = [];
   if (replacesAttachments) {
-    created = await materialize(env, userId, input.attachments ?? [], await usableTokenBytes(env, userId, kept, draftId), request);
+    created = await materialize(env, userId, draftId, input.attachments ?? [], await usableTokenBytes(env, userId, kept, draftId), request);
   }
   let body: Prepared['body'] = null;
   if (input.text !== undefined || input.html !== undefined) {
@@ -764,7 +775,8 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
       // 发信角色取账户角色与安排者有效角色中较低的一个：Key 安排的按 apiKeyAuth 的同一规则（管理员 Key 要带 admin scope
       // 才是管理员），否则管理员名下的普通 Key 可以借定时发送冒用任意邮箱、绕过外发配额
       const sender = { userId: row.userId, role: schedulerRole(owner!.role, key) };
-      const summary = await performSend({ env, ctx, origin: env.site_origin ?? row.origin, selfHosts: [] }, row, sender, 'scheduled', 'scheduled');
+      const summary = await performSend({ env, ctx, origin: env.site_origin ?? row.origin, selfHosts: [], urlBuffer: newUrlBufferBudget() },
+        row, sender, 'scheduled', 'scheduled');
       if (summary) report.sent++;
       else report.failed++;
     } catch (error) {

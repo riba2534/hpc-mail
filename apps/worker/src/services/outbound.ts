@@ -48,7 +48,8 @@ import { assertHostedSendable, getRoutableDomains } from './domain.js';
 import { HOSTED_SEND_CLAIM_SQL, resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
 import { loadNotifyOwners } from './notify-prefs.js';
-import { bumpCounter, dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
+import { bumpCounter, counterResult, counterStatement, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
+import { settleUrlFetch, urlFetchStatement } from './url-fetch-budget.js';
 import { getSettings } from './setting.js';
 import { attachmentKey, getExt, sha256Hex16 } from './storage.js';
 import { assertSendBodySize, bodyBytes, storeMailBody } from './mail-body.js';
@@ -264,24 +265,49 @@ async function assertOutboundQuota(
   quota: { dailyOutbound: number; dailyRecipients: number },
   sender: Sender,
   recipientCount: number,
+  urlCount = 0,
 ): Promise<void> {
-  if (sender.role === 'admin') return;
-  if (quota.dailyOutbound === 0 && quota.dailyRecipients === 0) return;
+  const counted = sender.role !== 'admin' && (quota.dailyOutbound > 0 || quota.dailyRecipients > 0);
+  if (!counted && !urlCount) return;
   const subject = String(sender.userId);
   const window = dayWindow();
-  const cur = await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, subject, window, 1, recipientCount);
-  const overMails = quota.dailyOutbound > 0 && cur.count > quota.dailyOutbound;
-  const overRecipients = quota.dailyRecipients > 0 && cur.units > quota.dailyRecipients;
-  if (overMails || overRecipients) {
-    // 拒绝的这次不该占额度，立即回退
-    await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, subject, window, -1, -recipientCount);
-    throw new AppError(
-      'rate_limited',
-      overMails
-        ? `已达每日外发上限（${quota.dailyOutbound} 封），请明日再试`
-        : `已达每日外发收件人上限（${quota.dailyRecipients}）`,
-    );
+  const minute = minuteWindow(1);
+  // 外发日配额与 URL 附件的每分钟拉取额度（管理员也计）合在同一次往返里占用
+  const results = await env.db.batch([
+    ...(counted ? [counterStatement(env, OUTBOUND_QUOTA_SCOPE, subject, window, 1, recipientCount)] : []),
+    ...(urlCount ? [urlFetchStatement(env, sender.userId, urlCount, minute)] : []),
+  ]);
+  if (counted) {
+    const cur = counterResult(results[0]) ?? { count: 1, units: recipientCount };
+    const overMails = quota.dailyOutbound > 0 && cur.count > quota.dailyOutbound;
+    const overRecipients = quota.dailyRecipients > 0 && cur.units > quota.dailyRecipients;
+    if (overMails || overRecipients) {
+      // 拒绝的这次不该占额度，立即回退
+      await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, subject, window, -1, -recipientCount);
+      throw new AppError(
+        'rate_limited',
+        overMails
+          ? `已达每日外发上限（${quota.dailyOutbound} 封），请明日再试`
+          : `已达每日外发收件人上限（${quota.dailyRecipients}）`,
+      );
+    }
   }
+  if (urlCount) {
+    try { await settleUrlFetch(env, sender.userId, urlCount, minute, results[counted ? 1 : 0]); }
+    catch (error) {
+      if (counted) await bumpCounter(env, OUTBOUND_QUOTA_SCOPE, subject, window, -1, -recipientCount);
+      throw error;
+    }
+  }
+}
+
+/**
+ * 发件授权与外发配额都通过之后才补上的附件（URL 附件拉取）：count 是将补上的个数（参与个数上限与拉取额度），
+ * load 拿到剩余字节预算，返回替换 attachments 的完整请求附件列表（转发的原附件另行追加在后）。
+ */
+export interface LateAttachments {
+  count: number;
+  load(budgetBytes: number): Promise<DecodedAttachment[]>;
 }
 
 /** 全部收件人都失败时把已占的额度还回去（不烧信誉的原有语义） */
@@ -708,6 +734,7 @@ export async function sendMail(
   origin: string,
   handle?: IdempotencyHandle | null,
   leaseToken: string = crypto.randomUUID(),
+  late?: LateAttachments,
 ): Promise<MessageSummary> {
   assertNoHeaderInjection(req.subject);
   let text = req.text ?? '';
@@ -733,9 +760,10 @@ export async function sendMail(
   ]);
   const from = resolveFrom(sender, req, domains, fromBox);
   await assertHostedSendable(env, settings, from.domain);
+  let forwarded: DecodedAttachment[] = [];
   if (req.forwardAttachmentsFrom) {
-    const forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
-      attachments.length, attachments.reduce((sum, att) => sum + attachmentSize(att), 0), leaseToken, req.verifiedSource);
+    forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
+      attachments.length + (late?.count ?? 0), attachments.reduce((sum, att) => sum + attachmentSize(att), 0), leaseToken, req.verifiedSource);
     attachments = [...attachments, ...forwarded];
     const siteOrigin = env.site_origin ?? origin;
     // 补发/重发沿用的正文里有上次注入的下载区块：这些附件会重新带上，先去掉旧区块再判断是否重新注入，
@@ -751,10 +779,10 @@ export async function sendMail(
         return `cid:${cid}`;
       });
   }
-  if (attachments.length > MAX_ATTACHMENTS) {
+  if (attachments.length + (late?.count ?? 0) > MAX_ATTACHMENTS) {
     throw new AppError('validation_failed', `附件最多 ${MAX_ATTACHMENTS} 个`);
   }
-  const totalAttachmentBytes = attachments.reduce((sum, att) => sum + attachmentSize(att), 0);
+  let totalAttachmentBytes = attachments.reduce((sum, att) => sum + attachmentSize(att), 0);
   if (totalAttachmentBytes > MAX_ATTACHMENT_TOTAL_BYTES) {
     throw new AppError('payload_too_large', '附件合计超过大小上限');
   }
@@ -781,7 +809,7 @@ export async function sendMail(
   // 摘要与各份正文的 D1 搜索文本共用一次 HTML → 纯文本转换
   const view = mailText(text, html);
   const preview = view.preview();
-  const size = bodyBytes(text, html) + totalAttachmentBytes;
+  let size = bodyBytes(text, html) + totalAttachmentBytes;
   const code = settings.code_extract.enabled ? extractCodeByRegex(req.subject, text) : '';
   // 只写站内收件副本；发件记录本身不是「收到的验证邮件」
   const verificationLink = settings.code_extract.enabled && internalTargets.length
@@ -789,7 +817,20 @@ export async function sendMail(
   // 抑制名单按发件域名生效，只拦站外收件人；全部收件人都被抑制时不建发件行、不占配额
   const suppressed = suppressedFor(suppressionRows.filter(row => externalTargets.includes(row.address)), from.domain);
   if (suppressed.size && suppressed.size === uniqueTargets.length) throw recipientSuppressedError([...suppressed.values()]);
-  await assertOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
+  await assertOutboundQuota(env, settings.quota, sender, uniqueTargets.length, late?.count ?? 0);
+  if (late) {
+    // URL 附件在发件授权与配额都通过之后才拉取：无权的发件人、超额的请求不会让服务端去抓外部地址
+    try {
+      attachments = [...await late.load(MAX_ATTACHMENT_TOTAL_BYTES - totalAttachmentBytes), ...forwarded];
+      totalAttachmentBytes = attachments.reduce((sum, att) => sum + attachmentSize(att), 0);
+      if (totalAttachmentBytes > MAX_ATTACHMENT_TOTAL_BYTES) throw new AppError('payload_too_large', '附件合计超过大小上限');
+      size = bodyBytes(text, html) + totalAttachmentBytes;
+    } catch (error) {
+      await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length)
+        .catch((cause) => console.error('URL 附件拉取失败后的外发配额退还失败:', cause));
+      throw error;
+    }
+  }
 
   let outbound: typeof messages.$inferSelect | undefined;
   let storedBody: Awaited<ReturnType<typeof storeMailBody>> | undefined;

@@ -34,6 +34,7 @@ import { markStaleOutbound } from './outbound-recovery.js';
 import { repairPendingInbound } from './inbound-repair.js';
 import { offloadMailBodies } from './body-offload.js';
 import { dispatchDueDrafts, purgeSentDrafts } from './drafts.js';
+import { URL_FETCH_SCOPE } from './url-fetch-budget.js';
 import { cleanupDeliveryRefs } from './delivery-events.js';
 import { syncDeliveryEventSubscriptions } from './event-subscriptions.js';
 import { cleanupExpiredSuppressions } from './suppression.js';
@@ -303,7 +304,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, [
       'api-user', 'api-global', 'api-wait', API_REJECT_SCOPE, 'auth-user', 'auth-global', TRANSLATE_REQUESTS_SCOPE,
       HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE,
-      CANARY_RATE_SCOPE,
+      CANARY_RATE_SCOPE, URL_FETCH_SCOPE,
     ], minuteWindow(1) - 120);
     await purgeCounters(env, SYSTEM_DOMAIN_CF_SCOPE, minuteWindow(SYSTEM_DOMAIN_CF_WINDOW_MINUTES) - 24);
     await purgeCounters(env, ['login-fail', REAUTH_FAIL_SCOPE], minuteWindow(15) - 8);
