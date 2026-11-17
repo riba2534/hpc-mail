@@ -3,6 +3,7 @@ import {
   type DeliveryEventsOverview,
   type DeliveryEventSubscriptionView,
 } from '@hpc-mail/shared';
+import { errorText } from '../lib/errors.js';
 import type { Env } from '../types.js';
 import {
   CloudflareApiError,
@@ -31,12 +32,11 @@ interface Row {
   status: 'active' | 'error'; last_error: string; checked_at: number | null;
 }
 
-function errorText(error: unknown): string {
-  const text = error instanceof Error ? error.message : String(error);
+function subscriptionError(error: unknown): string {
   // 403 多半是 Token 缺权限：建订阅需要 Queues:Edit，系统域名还需要能读到所在 zone
   const hint = error instanceof CloudflareApiError && (error.status === 403 || error.has(10000, 9109))
     ? '（Cloudflare Token 需要 Account → Queues:Edit，并能访问该域名所在 zone）' : '';
-  return `${text}${hint}`.slice(0, 500);
+  return `${errorText(error)}${hint}`.slice(0, 500);
 }
 
 /** 系统域名可能是 zone 的子域（已验证的发信子域）：从完整域名逐级向上找账户里的 zone */
@@ -90,7 +90,7 @@ async function ensureOne(env: Env, creds: CloudflareCredentials, target: Target,
     return true;
   } catch (error) {
     console.error(`投递事件订阅 ${target.domain} 建立失败:`, error);
-    try { await saveRow(env, target, { zoneId, subscriptionId: null, status: 'error', lastError: errorText(error) }); }
+    try { await saveRow(env, target, { zoneId, subscriptionId: null, status: 'error', lastError: subscriptionError(error) }); }
     catch (saveError) { console.error('投递事件订阅状态保存失败:', saveError); }
     return false;
   }
@@ -142,7 +142,7 @@ export async function syncDeliveryEventSubscriptions(env: Env, options: { verify
     state = await loadQueueState(creds, queue);
   } catch (error) {
     // Queue 不可用时整轮失败：只给还没有记录的域名写 error，已生效的订阅保持原状态
-    const message = errorText(error);
+    const message = subscriptionError(error);
     console.error('投递事件 Queue 不可用:', message);
     for (const target of due.filter((item) => rows.get(item.domain)?.status !== 'active')) {
       await saveRow(env, target, { zoneId: target.zoneId ?? '', subscriptionId: null, status: 'error', lastError: message })
@@ -178,7 +178,7 @@ export async function subscribeHostedDomainEvents(env: Env, creds: CloudflareCre
     try {
       state = await loadQueueState(creds, queue);
     } catch (error) {
-      await saveRow(env, target, { zoneId, subscriptionId: null, status: 'error', lastError: errorText(error) });
+      await saveRow(env, target, { zoneId, subscriptionId: null, status: 'error', lastError: subscriptionError(error) });
       return;
     }
     await ensureOne(env, creds, target, state);
