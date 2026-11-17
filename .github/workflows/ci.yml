@@ -25,13 +25,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
-      # 两份 OpenAPI 导出后按仓库根 .spectral.yaml 检查；Spectral 固定版本经 npx 现装，不跑安装脚本，env -i 只给 PATH/HOME
+      # 两份 OpenAPI 导出后按仓库根 .spectral.yaml 检查（固定版本、不跑安装脚本、env -i 隔离环境）
       - name: OpenAPI 规范检查（Spectral）
-        run: |
-          node apps/worker/scripts/export-openapi.mjs "$RUNNER_TEMP/openapi"
-          env -i PATH="$PATH" HOME="$HOME" npm_config_ignore_scripts=true \
-            npx --yes @stoplight/spectral-cli@6.17.1 lint "$RUNNER_TEMP/openapi/api.json" "$RUNNER_TEMP/openapi/v1.json" \
-            --ruleset .spectral.yaml --fail-severity=error
+        run: bash scripts/check-openapi.sh "$RUNNER_TEMP/openapi"
       - run: node scripts/check-deploy-scripts.mjs
       - run: pnpm build
       - run: pnpm audit --prod --audit-level high
