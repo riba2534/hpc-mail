@@ -203,11 +203,15 @@ export async function runScheduled(env: Env, maintenance = true, cron = maintena
   else await runRegular(env, report);
   console.log(JSON.stringify({ event: 'scheduled', maintenance, ms: Date.now() - started, steps: report }));
   await writeCronHeartbeat(env, cron, report.filter((item) => item.failed).map((item) => item.step));
+  // 入站 pending 自愈排在全部步骤、汇总日志与心跳之后：修复大邮件时 isolate 可能因内存或 CPU 上限被直接终止，
+  // 不能连累本轮其他步骤。结果见它自己的 inbound_repair 日志；修不了而转 degraded 的行下一轮补入通知
+  if (!maintenance) {
+    try { await repairPendingInbound(env); }
+    catch (error) { console.error('定时任务步骤 inbound.repair 失败:', error); }
+  }
 }
 
 async function runRegular(env: Env, report: StepReport[]): Promise<void> {
-  // 停在 pending 超过 15 分钟的入站信用 R2 原文重走收件；排在通知补录之前，修不了而转为 degraded 的本轮就能补入通知
-  await step(report, 'inbound.repair', () => repairPendingInbound(env));
   await step(report, 'notification.repair', () => repairUnqueuedNotifications(env));
   await step(report, 'notification.process', async () => (await processNotificationJobs(env)).processed);
   // Recover a metadata purge interrupted between reservation and transaction completion.
