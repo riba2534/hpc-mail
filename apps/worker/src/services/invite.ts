@@ -1,7 +1,8 @@
 import type { CreateInviteRequest, Invite } from '@hpc-mail/shared';
-import { and, desc, eq, gt, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { desc, eq, isNotNull } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { invites, users } from '../db/schema.js';
+import { chunk } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
 
@@ -59,7 +60,9 @@ export async function createInvites(
     status: 'active' as const,
     createdBy,
   }));
-  const rows = await db.insert(invites).values(values).returning();
+  // 每行绑定 7 个参数，一次最多 50 行会超过 D1 的 100 个上限：每批 14 行，放进同一个 batch（一次往返、同一事务）
+  const [first, ...rest] = chunk(values, 14).map((part) => db.insert(invites).values(part).returning());
+  const rows = (await db.batch([first!, ...rest])).flat();
   return rows.map((row) => serialize(row));
 }
 
@@ -88,25 +91,4 @@ export async function revokeInvite(env: Env, id: number): Promise<void> {
   const row = await db.select({ id: invites.id }).from(invites).where(eq(invites.id, id)).get();
   if (!row) throw new AppError('not_found', '邀请码不存在');
   await db.update(invites).set({ status: 'revoked' }).where(eq(invites.id, id));
-}
-
-/** 原子校验并消费邀请码：单条件 UPDATE，失败即 invite_invalid，返回 invite id */
-export async function consumeInvite(env: Env, code: string): Promise<number> {
-  const db = createDb(env);
-  const now = new Date();
-  const updated = await db
-    .update(invites)
-    .set({ usedCount: sql`${invites.usedCount} + 1` })
-    .where(
-      and(
-        eq(invites.code, code),
-        eq(invites.status, 'active'),
-        lt(invites.usedCount, invites.maxUses),
-        or(isNull(invites.expiresAt), gt(invites.expiresAt, now)),
-      ),
-    )
-    .returning({ id: invites.id })
-    .get();
-  if (!updated) throw new AppError('invite_invalid', '邀请码无效或已用尽');
-  return updated.id;
 }

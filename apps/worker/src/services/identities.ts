@@ -1,5 +1,5 @@
-import type { Role, SendIdentities, SendIdentity, SendIdentityDomain } from '@hpc-mail/shared';
-import { and, asc, eq } from 'drizzle-orm';
+import { HOSTED_DOMAIN_USABLE_STATUSES, type Role, type SendIdentities, type SendIdentity, type SendIdentityDomain } from '@hpc-mail/shared';
+import { and, asc, eq, inArray } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { hostedDomains, mailboxShares, mailboxes, users } from '../db/schema.js';
 import type { Env } from '../types.js';
@@ -7,7 +7,8 @@ import { hostedSendBlock } from './domain.js';
 import { getSettings } from './setting.js';
 
 /**
- * 发件身份：自己认领的邮箱、共享给我的邮箱，管理员另列可用任意前缀的域名。
+ * 发件身份：自己认领的邮箱、共享给我的邮箱，以及可用任意前缀的域名：管理员见下；普通用户为自己作为所有者、
+ * 发信就绪的托管域名（发出时自动认领给所有者，outbound.ts 的 HOSTED_SEND_CLAIM_SQL）。
  * 能否发信与管理员的 domains 都按实际放行规则算（outbound.ts 的 resolveFrom + assertHostedSendable）：
  * 托管域名需未停用且发信就绪，系统域名与已移出列表的旧域名不受此限。普通用户共享来的邮箱恒不能发；
  * 管理员凭 mailboxId 能用任何邮箱发信，共享给他的同样只按域名判定，其他人未共享的邮箱不在这里列出。
@@ -39,8 +40,13 @@ export async function listSendIdentities(env: Env, actor: { userId: number; role
   const hosted = db.select({ domain: hostedDomains.domain, status: hostedDomains.status, sendingStatus: hostedDomains.sendingStatus })
     .from(hostedDomains).orderBy(asc(hostedDomains.domain));
   const claimed = db.selectDistinct({ domain: mailboxes.domain }).from(mailboxes).orderBy(asc(mailboxes.domain));
+  // 普通用户：自己拥有的、可用且发信就绪的托管域名
+  const ownHosted = db.select({ domain: hostedDomains.domain }).from(hostedDomains)
+    .where(and(eq(hostedDomains.userId, actor.userId), inArray(hostedDomains.status, [...HOSTED_DOMAIN_USABLE_STATUSES]),
+      eq(hostedDomains.sendingStatus, 'ready')))
+    .orderBy(asc(hostedDomains.domain));
   const [rows, settings] = await Promise.all([
-    admin ? db.batch([owned, shared, hosted, claimed]) : db.batch([owned, shared]),
+    admin ? db.batch([owned, shared, hosted, claimed]) : db.batch([owned, shared, ownHosted]),
     admin ? getSettings(env) : null,
   ]);
   const [ownedRows, sharedRows] = rows;
@@ -54,12 +60,14 @@ export async function listSendIdentities(env: Env, actor: { userId: number; role
       return { kind: 'shared', ...box, canSend: reason === null, reason };
     }),
   ];
-  if (rows.length !== 4 || !settings) return { identities, domains: [] };
+  const entry = (kind: SendIdentityDomain['kind']) => (domain: string): SendIdentityDomain => ({ domain, kind, anyLocalPart: true });
+  if (rows.length !== 4 || !settings) {
+    return { identities, domains: ((rows[2] ?? []) as { domain: string }[]).map(({ domain }) => domain).map(entry('hosted')) };
+  }
 
   const [, , hostedRows, claimedRows] = rows;
   const system = settings.domains.list.map(({ domain }) => domain);
   const known = new Set([...system, ...hostedRows.map(({ domain }) => domain)]);
-  const entry = (kind: SendIdentityDomain['kind']) => (domain: string): SendIdentityDomain => ({ domain, kind, anyLocalPart: true });
   return {
     identities,
     domains: [

@@ -1,7 +1,10 @@
 import {
-  ALLOWED_CUSTOM_HEADERS, API_SCOPES, MAIL_AUTH_RESULTS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, PROMPT_INJECTION_REASONS, MAX_REPLY_TO,
-  MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
-  MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, internalSendMailSchema,
+  SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_ONBOARDING_STATES, SYSTEM_DOMAIN_SEVERITIES, SYSTEM_DOMAIN_VERDICTS, SYSTEM_DOMAIN_WRITE_STEPS,
+  SYSTEM_DOMAIN_ZONE_CATEGORIES,
+  ALLOWED_CUSTOM_HEADERS, API_SCOPES, DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, ERROR_STATUS, MAIL_AUTH_RESULTS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES,
+  PROMPT_INJECTION_REASONS, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
+  MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, SUPPRESSION_REASONS, internalSendMailSchema,
+  type DeliveryEventSubscriptionView, type RecipientOutcome,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
@@ -10,6 +13,7 @@ import { buildSessionOpenApiSpec } from '../src/routes/api-openapi.js';
 import { buildOpenApiSpec } from '../src/routes/v1/openapi.js';
 import type { Schema } from '../src/routes/openapi-common.js';
 import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../src/services/hosted-domain.js';
+import { recipientSuppressedError } from '../src/services/suppression.js';
 import skillDoc from '../../web/public/skill.md?raw';
 import llmsDoc from '../../web/public/llms.txt?raw';
 import administrationDoc from '../../web/public/references/administration.md?raw';
@@ -87,6 +91,36 @@ describe('OpenAPI routes and public contracts', () => {
     const path = '/hosted-domains/{id}/dns-records/{recordId}';
     expect(specs.v1.paths[path]!.parameters).toEqual(specs.api.paths[path]!.parameters);
     expect(specs.v1.components.schemas.HostedDnsRecordInput).toEqual(input);
+  });
+
+  it('系统域名一键接入：9 个管理员接口只在 /api，枚举与 shared 一致，409 带 details.precheck', () => {
+    const ops = operations('api').filter((op) => op.includes('/admin/system-domains'));
+    expect(ops.sort()).toEqual([
+      'GET /api/admin/system-domains/onboardings', 'GET /api/admin/system-domains/onboardings/{id}', 'GET /api/admin/system-domains/precheck',
+      'GET /api/admin/system-domains/zones', 'POST /api/admin/system-domains/onboardings', 'POST /api/admin/system-domains/onboardings/{id}/cancel',
+      'POST /api/admin/system-domains/onboardings/{id}/check', 'POST /api/admin/system-domains/onboardings/{id}/confirm',
+      'PUT /api/admin/system-domains/hidden-zones',
+    ]);
+    expect(operations('v1').some((op) => op.includes('system-domains'))).toBe(false);
+    for (const [path, item] of Object.entries(specs.api.paths).filter(([path]) => path.startsWith('/admin/system-domains'))) {
+      for (const [method, op] of Object.entries(item)) if (methods.has(method)) expect((op as Schema)['x-required-role'], path).toBe('admin');
+    }
+    const schema = (name: string) => specs.api.components.schemas[name]!.properties as Record<string, Schema>;
+    expect(schema('SystemDomainOnboarding').state!.enum).toEqual([...SYSTEM_DOMAIN_ONBOARDING_STATES]);
+    expect(schema('SystemDomainCheck').severity!.enum).toEqual([...SYSTEM_DOMAIN_SEVERITIES]);
+    expect((schema('SystemDomainCheck').ack!.anyOf as Schema[])[0]!.enum).toEqual([...SYSTEM_DOMAIN_ACKS]);
+    expect(schema('SystemDomainPrecheck').verdict!.enum).toEqual([...SYSTEM_DOMAIN_VERDICTS]);
+    expect(((schema('SystemDomainPrecheck').steps!.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual([...SYSTEM_DOMAIN_WRITE_STEPS]);
+    expect(schema('SystemDomainZone').category!.enum).toEqual([...SYSTEM_DOMAIN_ZONE_CATEGORIES]);
+    const post = specs.api.paths['/admin/system-domains/onboardings']!.post as Schema;
+    expect(Object.keys(post.responses as Schema)).toContain('201');
+    expect(String(post.description)).toContain('error.details.precheck');
+    const details = ((specs.api.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).details!;
+    expect(details.properties as Record<string, Schema>).toHaveProperty('precheck');
+    // /v1 的错误信封不引入管理员 schema
+    expect(specs.v1.components.schemas).not.toHaveProperty('SystemDomainPrecheck');
+    expect(administrationDoc).toContain('## 系统域名一键接入');
+    for (const ack of SYSTEM_DOMAIN_ACKS) expect(administrationDoc).toContain(`\`${ack}\``);
   });
 
   it('describes every mounted endpoint and does not invent unimplemented endpoints', () => {
@@ -410,7 +444,7 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       expect(error.code!.enum).toEqual(expect.arrayContaining(['header_not_allowed', 'delivery_failed', 'payload_too_large']));
       for (const text of ['header_not_allowed (400)', 'delivery_failed (422)', 'payload_too_large (413)']) expect(error.code!.description).toContain(text);
       expect(envelope.required).toEqual(['code', 'message']);
-      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes']);
+      expect(Object.keys(props(error.details!))).toEqual(['headers', 'messageId', 'recipientOutcomes', 'suppressed', 'precheck']);
       expect(error.docs).toMatchObject({ format: 'uri' });
     }
   });
@@ -474,6 +508,124 @@ describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () 
       mail: mailDoc, mailboxes: mailboxesDoc, mcp: mcpDoc, notifications: notificationsDoc, webhooks: webhooksDoc };
     for (const [name, doc] of Object.entries(references)) {
       if (doc.split('\n').length > 100) expect(doc.split('\n').slice(0, 5).join('\n'), name).toContain('## 目录');
+    }
+  });
+});
+
+describe('外发投递回执与抑制名单反映在两份 OpenAPI 与 Agent 文档中', () => {
+  const props = (schema: Schema) => schema.properties as Record<string, Schema>;
+  const dataOf = (operation: Schema) => {
+    const responses = operation.responses as Record<string, { content: Record<string, { schema: { properties: { data: Schema } } }> }>;
+    return responses['200']!.content['application/json']!.schema.properties.data;
+  };
+  // 共享类型的全部取值：漏写或多写一个都会让 tsc 报错，规范里的枚举再与它们比对
+  const outcomeStatuses: Record<RecipientOutcome['status'], true> = { delivered: true, sent: true, failed: true, unknown: true, bounced: true, complained: true };
+  const subscriptionKinds: Record<DeliveryEventSubscriptionView['kind'], true> = { system: true, hosted: true };
+  const subscriptionStatuses: Record<DeliveryEventSubscriptionView['status'], true> = { active: true, error: true };
+  const sorted = (values: unknown) => [...values as string[]].sort();
+
+  it('逐收件人结果：bounced、complained 与 code、event、eventAt、smtpStatus', () => {
+    for (const spec of Object.values(specs)) {
+      const outcome = props(spec.components.schemas.MessageSummary!).recipientOutcomes!.items as Schema;
+      const fields = props(outcome);
+      expect(sorted(fields.status!.enum)).toEqual(sorted(Object.keys(outcomeStatuses)));
+      for (const text of ['bounced:', 'complained:', 'code recipient_suppressed', 'smtpStatus', 'stay sent']) expect(fields.status!.description).toContain(text);
+      expect(fields.code).toMatchObject({ type: 'string', enum: ['recipient_suppressed'] });
+      expect(fields.event).toMatchObject({ type: 'string', enum: [...DELIVERY_EVENT_TYPES] });
+      expect(fields.eventAt).toMatchObject({ type: 'string', format: 'date-time' });
+      expect(fields.smtpStatus).toMatchObject({ type: 'string' });
+      expect(outcome.required).toEqual(['address', 'status']);
+      // delivery_failed 的 details 与发件摘要用同一份结构
+      const details = props(props(props(spec.components.schemas.Error!).error!).details!);
+      expect(details.recipientOutcomes!.items).toEqual(outcome);
+    }
+  });
+
+  it('发件整体状态与 errorDetail 随回执更新，幂等重放仍是首次结果', () => {
+    for (const spec of Object.values(specs)) {
+      const description = props(spec.components.schemas.MessageSummary!).status!.description as string;
+      for (const text of ['delivery receipts', 'becomes failed', 'errorDetail is rebuilt', 'still returns the first response']) expect(description).toContain(text);
+    }
+  });
+
+  it('recipient_suppressed 错误码（422）与 details.suppressed', () => {
+    expect(ERROR_STATUS.recipient_suppressed).toBe(422);
+    for (const spec of Object.values(specs)) {
+      const error = props(props(spec.components.schemas.Error!).error!);
+      expect(error.code!.enum).toContain('recipient_suppressed');
+      expect(error.code!.description).toContain('recipient_suppressed (422)');
+      expect(props(error.details!).suppressed).toMatchObject({ type: 'array', items: { $ref: '#/components/schemas/SuppressedRecipient' } });
+      const suppressed = spec.components.schemas.SuppressedRecipient!;
+      expect(suppressed.required).toEqual(['address', 'reason', 'sendingDomain', 'since', 'expiresAt']);
+      expect(props(suppressed).reason).toMatchObject({ type: 'string', enum: [...SUPPRESSION_REASONS] });
+      expect(props(suppressed).expiresAt!.anyOf).toEqual([{ type: 'string', format: 'date-time' }, { type: 'null' }]);
+    }
+  });
+
+  it('两个发信端点的 422、说明与 Idempotency-Key 写明抑制名单与回执', () => {
+    for (const operation of [specs.v1.paths['/messages']!.post!, specs.api.paths['/messages/send']!.post!]) {
+      const responses = operation.responses as Record<string, { description: string }>;
+      for (const text of ['recipient_suppressed:', 'details.suppressed', 'no outbound message was recorded', 'released', 'code recipient_suppressed']) {
+        expect(responses['422']!.description).toContain(text);
+      }
+      const header = (operation.parameters as Array<{ name: string; description: string }>).find(param => param.name === 'Idempotency-Key')!;
+      expect(header.description).toContain('422 recipient_suppressed');
+      expect(operation.description).toContain('delivery receipts enabled, Cloudflare receipts later update recipientOutcomes');
+    }
+  });
+
+  it('管理员抑制名单、订阅状态与 delivery_events 设置只在会话 API', () => {
+    const list = specs.api.paths['/admin/suppressions']!.get!;
+    const remove = specs.api.paths['/admin/suppressions/{id}']!.delete!;
+    const overview = specs.api.paths['/admin/delivery-events']!.get!;
+    for (const operation of [list, remove, overview]) expect(operation['x-required-role']).toBe('admin');
+    expect((list.parameters as Array<{ name: string }>).map(param => param.name)).toEqual(['q', 'cursor', 'limit']);
+    expect(props(dataOf(list)).items!.items).toEqual({ $ref: '#/components/schemas/EmailSuppression' });
+    expect(dataOf(remove)).toMatchObject({ properties: { success: { const: true } } });
+    expect(remove.description).toContain('Cloudflare keeps its own suppression list');
+    expect(dataOf(overview)).toEqual({ $ref: '#/components/schemas/DeliveryEventsOverview' });
+    const schemas = specs.api.components.schemas;
+    expect(schemas.EmailSuppression!.required).toEqual([...schemas.SuppressedRecipient!.required as string[], 'id', 'detail', 'updatedAt']);
+    const view = props(schemas.DeliveryEventsOverview!);
+    expect(schemas.DeliveryEventsOverview!.required).toEqual(['enabled', 'credentials', 'queue', 'subscriptions']);
+    // 投递回执显式启用：queue 为部署注入的队列名，null 表示部署未启用
+    expect(view.queue).toMatchObject({ anyOf: [{ type: 'string' }, { type: 'null' }] });
+    expect(view.queue!.description).toContain('DELIVERY_EVENTS_QUEUE');
+    expect(view.queue!.description).toContain(DELIVERY_EVENTS_QUEUE);
+    const subscription = view.subscriptions!.items as Schema;
+    expect(subscription.required).toEqual(['domain', 'kind', 'zoneId', 'subscriptionId', 'status', 'lastError', 'checkedAt']);
+    expect(sorted(props(subscription).kind!.enum)).toEqual(sorted(Object.keys(subscriptionKinds)));
+    expect(sorted(props(subscription).status!.enum)).toEqual(sorted(Object.keys(subscriptionStatuses)));
+    for (const name of ['Settings', 'UpdateSettingsRequest']) {
+      const setting = props(schemas[name]!).delivery_events!;
+      expect(Object.keys(props(setting))).toEqual(['enabled']);
+      expect(setting.description).toContain('events from existing subscriptions are still applied');
+    }
+    for (const path of ['/admin/suppressions', '/admin/suppressions/{id}', '/admin/delivery-events']) expect(specs.v1.paths).not.toHaveProperty(path);
+    for (const name of ['EmailSuppression', 'DeliveryEventsOverview']) expect(specs.v1.components.schemas).not.toHaveProperty(name);
+  });
+
+  it('Agent 文档写明投递回执、抑制名单、管理接口与中转转发回执', () => {
+    for (const text of ['422 `recipient_suppressed`', '](references/errors.md#recipient_suppressed)', '`bounced`', '](references/mail.md#投递回执)']) {
+      expect(skillDoc, text).toContain(text);
+    }
+    for (const heading of ['#### 投递回执', '#### 抑制名单']) expect(mailDoc).toContain(`\n${heading}\n`);
+    for (const text of ['| `bounced` |', '| `complained` |', '`event`', '`eventAt`', '`smtpStatus`', '「全部收件人投递失败: …」', '停在 `sent`',
+      'details.suppressed', '`code:"recipient_suppressed"`', '不会解除 Cloudflare 侧的条目']) {
+      expect(mailDoc, text).toContain(text);
+    }
+    // 服务端错误信封里的 docs 链接要能落到 errors.md 的小节
+    expect(recipientSuppressedError([]).hints.docs).toBe('/references/errors.md#recipient_suppressed');
+    expect(errorsDoc).toMatch(/^## recipient_suppressed$/m);
+    for (const text of ['details.suppressed', '`hard_bounce`', '`soft_bounce`', '`complaint`', '`DELETE /api/admin/suppressions/:id`']) expect(errorsDoc, text).toContain(text);
+    for (const text of ['`GET /admin/delivery-events`', '`GET /admin/suppressions?', '`DELETE /admin/suppressions/:id`', '| `delivery_events` |', 'Queues:Edit',
+      'Cloudflare 侧的抑制需要在 Cloudflare 控制台另行解除']) {
+      expect(administrationDoc, text).toContain(text);
+    }
+    expect(notificationsDoc).toContain('「Cloudflare 侧最终投递失败：<SMTP 应答或原因>」');
+    // 回执产生的 Webhook 事件尚未生效，对外文档与规范都不能提
+    for (const doc of [skillDoc, llmsDoc, administrationDoc, attachmentsDoc, authDoc, errorsDoc, mailDoc, mailboxesDoc, notificationsDoc, JSON.stringify(specs)]) {
+      expect(doc).not.toMatch(/mail\.(delivered|bounced)/);
     }
   });
 });
@@ -603,17 +755,59 @@ describe('Agent docs reference only real endpoints and anchors', () => {
   });
 });
 
+describe('PR4b：回复/转发接口与托管域名任意前缀在 OpenAPI 与文档中一致', () => {
+  it('/v1 有 reply/forward，需要 mail.send+mail.read，请求体严格、错误含 from_required；/api 没有', () => {
+    for (const op of ['reply', 'forward'] as const) {
+      const operation = specs.v1.paths[`/messages/{id}/${op}`]!.post!;
+      expect(operation['x-required-scopes']).toEqual(['mail.send', 'mail.read']);
+      const request = (operation.requestBody as { content: Record<string, { schema: Schema }> }).content['application/json']!.schema;
+      const schema = specs.v1.components.schemas[(request.$ref as string).split('/').pop()!]!;
+      expect(schema.additionalProperties).toBe(false);
+      expect(Object.keys(schema.properties as object)).toEqual(op === 'reply'
+        ? ['replyAll', 'text', 'html', 'quote', 'from', 'attachments', 'attachmentTokens', 'headers']
+        : ['to', 'cc', 'bcc', 'note', 'includeOriginal', 'from']);
+      const responses = operation.responses as Record<string, { description: string }>;
+      expect(responses['400']!.description).toContain('from_required');
+      expect(responses['404']!.description).toContain('source_unavailable');
+      expect(responses).toHaveProperty('201');
+      expect(responses).toHaveProperty('422');
+      expect(specs.api.paths).not.toHaveProperty(`/messages/{id}/${op}`);
+    }
+    const reply = specs.v1.components.schemas.ReplyMessageRequest!.properties as Record<string, Schema>;
+    expect(reply.quote!.default).toBe(true);
+    expect(reply.replyAll!.default).toBe(false);
+    expect((specs.v1.components.schemas.ForwardMessageRequest!.properties as Record<string, Schema>).includeOriginal!.default).toBe(true);
+    const errorCode = ((specs.v1.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).code!;
+    expect(errorCode.enum).toContain('from_required');
+  });
+
+  it('identities 的 domains 有 kind=hosted，发信说明写明托管所有者任意前缀；文档同步', () => {
+    for (const spec of Object.values(specs)) {
+      const domains = (spec.components.schemas.SendIdentities!.properties as Record<string, Schema>).domains!;
+      expect(((domains.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual(['system', 'hosted', 'legacy']);
+      expect(spec.components.schemas.SendMailRequest!.description).toContain('owner of a hosted domain');
+    }
+    expect(mailDoc).toContain('POST /v1/messages/:id/reply');
+    expect(mailDoc).toContain('POST /v1/messages/:id/forward');
+    expect(mailDoc).toContain('kind:"hosted"');
+    expect(errorsDoc).toMatch(/^## from_required$/m);
+    expect(skillDoc).toContain('/reply');
+    expect(mailboxesDoc).toContain('kind:"hosted"');
+  });
+});
+
 describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文档', () => {
-  /** /v1 只开放这八个托管域名操作，读写分别要求 domain.read / domain.write */
+  /** /v1 只开放这九个托管域名操作，读写分别要求 domain.read / domain.write */
   const keyOperations: Record<string, Record<string, string>> = {
     '/hosted-domains': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}': { get: 'domain.read' },
     '/hosted-domains/{id}/check': { post: 'domain.write' },
+    '/hosted-domains/{id}/reconnect': { post: 'domain.write' },
     '/hosted-domains/{id}/dns-records': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}/dns-records/{recordId}': { put: 'domain.write', delete: 'domain.write' },
   };
 
-  it('八个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
+  it('九个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
     let checked = 0;
     for (const [path, scopes] of Object.entries(keyOperations)) {
       expect(specs.v1.paths[path]!.parameters, path).toEqual(specs.api.paths[path]!.parameters);
@@ -629,7 +823,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
         checked++;
       }
     }
-    expect(checked).toBe(8);
+    expect(checked).toBe(9);
   });
 
   it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
@@ -646,7 +840,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     // 两份规格只在认证相关措辞上不同：/v1 写明管理员 Key 的范围与审计记法，/api 保持原说明
     expect(specs.v1.paths['/hosted-domains']!.get!.description).toContain('/api/admin/hosted-domains');
     expect(specs.v1.paths['/hosted-domains/{id}']!.get!.description).toContain('JWT-only');
-    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
+    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/reconnect', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
       ['/hosted-domains/{id}/dns-records/{recordId}', 'put'], ['/hosted-domains/{id}/dns-records/{recordId}', 'delete']] as const) {
       expect(specs.v1.paths[path]![method]!.description, `${method} ${path}`).toContain('API Key #id');
       expect(specs.api.paths[path]![method]!.description, `${method} ${path}`).not.toContain('API Key');

@@ -241,11 +241,14 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 | Variable（可选） | `CANARY_FROM_DOMAIN` / `CANARY_TO_DOMAIN` | 两个都设置即启用部署后的**收件金丝雀**：经 `send_email` 从发件域外发一封信到收件域，确认新版本的收件链路可用（两个域名须在系统域名列表内，收件域已配好 catch-all）。默认不启用；Workers Free 计划只能发往已验证地址，不要启用 |
 | Variable（可选） | `DEPLOY_CANARY` | `on`：启用金丝雀并由服务端取系统域名按字母序的前两个；`off`：一律跳过 |
 | Secret（可选） | `ADMIN_TOTP_SECRET` | 管理员 TOTP 种子（base32）。管理员开了两步验证后，部署冒烟用它算验证码登录，保住管理员检查；不设则跳过管理员检查 |
+| Variable（可选） | `DELIVERY_EVENTS_QUEUE` | 启用**外发投递回执**：填队列名（如 `hpc-mail-email-events`）。不设置则整个功能跳过、部署不需要 Queue 权限。启用前先补 Token 权限，见下方说明 |
 | Variable（可选） | `PLACEMENT_REGION` | Worker 放置区域，填 D1 主库附近的云区域（如主库在美西填 `aws:us-west-1`，在新加坡填 `aws:ap-southeast-1`）。设置后 API 请求在数据库附近执行，每个请求只跨一次远程；不设则在离用户最近的节点执行。D1 主库位置在建库时用 `wrangler d1 create --location <wnam/enam/weur/apac…>` 指定，应选在多数访问的入口节点附近（Cloudflare 日志里的 colo） |
 
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
 >
 > **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。
+>
+> **外发投递回执（可选，默认不启用）**：送达、退信、投诉经 Cloudflare Email Sending 的事件订阅投递到 Queue，由 Worker 回写到已发送邮件的逐收件人结果，退信与投诉进入抑制名单，之后从同一发信域名发给这些地址直接失败。启用分三步：① 给 `CLOUDFLARE_API_TOKEN` 加 **Account → Queues:Edit**（CI 要建 Queue 并挂 consumer）；② 给 `CF_HOSTED_DOMAINS_TOKEN` 加 **Account → Queues:Edit**（Worker 用它为每个发信域名建立事件订阅，它已有的 Email Sending:Edit 也要保留）；③ 设置 Variable `DELIVERY_EVENTS_QUEUE`。设置后 CI 在迁移前只读预检 Token 能否访问 Queues（不能就在发布前失败，Job Summary 写明缺 Queues:Edit），再在「部署 Worker」前创建 Queue、注入 consumer 与 Worker 变量；不设置时这些步骤全部跳过，Job Summary 记一行「投递回执未启用」，Worker 也不建订阅、发信不查抑制名单。系统域名的订阅还要求托管域名 Token 能读取域名所在 zone——被 Exclude 的 zone 会在「系统设置 → 投递回执」显示失败，可手动建立（之后自动识别为已订阅）：`npx wrangler@latest queues subscription create <队列名> --source email.sending --events message.delivered,message.bounced,message.failed,message.rejected,message.complained --zone-id <ZONE_ID> --domain <域名>`。
 
 > 仓库公开时 Actions 日志也公开。`CLOUDFLARE_ACCOUNT_ID`、`D1_DATABASE_ID`、`KV_NAMESPACE_ID` 与 6 位及以上的 `ADMIN_USERNAME` 在工作流第一步就被屏蔽，之后的日志里显示为 `***`（更短的用户名如 `admin` 不屏蔽，否则日志里所有同样的词都会被打码）。第一步的环境变量回显仍是明文；想让它们完全不出现在日志里，把这四项改配成同名 **Secret**（工作流优先读 Secret，读不到才用 Variable）。
 

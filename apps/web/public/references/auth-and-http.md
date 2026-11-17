@@ -146,7 +146,8 @@ KEY_RESPONSE=$(jq -n --arg password "$HPC_PASSWORD" --argjson box "$HPC_MAILBOX_
 | 403 `totp_setup_required` | 见 API 绑定流程 |
 | 403 `reauth_required`、`reauth_failed` | 创建 Key、新增或启用转发目标、开关两步验证要在请求体带当前密码 `password`；缺少或错误分别返回这两个码，不会让会话失效 |
 | 404 `not_found` | 资源不存在或不在可见范围；核对 ID/作用域 |
-| 404 `source_unavailable` | 回复或转发引用的原邮件不存在、不可见，或原附件已丢失；去掉 `replyToMessageId`/`forwardAttachmentsFrom` 后可作为新邮件发送 |
+| 404 `source_unavailable` | 回复或转发引用的原邮件不存在、不可见，或原附件已丢失；去掉 `replyToMessageId`/`forwardAttachmentsFrom`（或改用普通发送）后可作为新邮件发送 |
+| 400 `from_required` | 回复/转发接口没给 `from`，而原信的收件地址不是你的发件身份（如共享邮箱）；在 `from` 写自己的地址 |
 | 409 `address_taken` | 地址被占用；可用性检查只是提示，最终以认领结果为准 |
 | 409 `conflict` | 并发冲突或版本过期：重新读取当前状态再决定 |
 | 409 `send_in_progress` | 同一 Idempotency-Key 的发送仍在处理或结果待确认：查已发送邮件核对，稍后用同一 Key 重试，绝不换 Key 重发 |

@@ -1,7 +1,10 @@
-import { batchMailboxRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, updateMailboxRequestSchema } from '@hpc-mail/shared';
+import {
+  batchMailboxRequestSchema, claimMailboxRequestSchema, claimPlanQuerySchema, listMailboxesQuerySchema, updateMailboxRequestSchema,
+} from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { execCtx, ok, parseBody, parseBooleanFlag, parseId, parseQuery } from '../../lib/http.js';
 import { AppError } from '../../lib/errors.js';
+import { pageRequestOf } from '../../lib/pagination.js';
 import {
   apiKeyAuth, assertKeyCanUseDomain, assertKeyCanUseMailbox, assertKeyUnrestricted, keyRestriction, requireScope,
   restrictionAllowsMailbox,
@@ -42,8 +45,11 @@ app.get('/', async (c) => {
   const key = c.get('apiKey')!;
   const all = parseBooleanFlag(c.req.query('all'));
   if (all && key.role !== 'admin') throw new AppError('forbidden', '需要管理员权限');
-  const list = await listMailboxes(c.env, all ? { all: true } : { userId: key.userId });
-  return ok(c, withinKey(c, list, (box) => box.id));
+  const query = parseQuery(c, listMailboxesQuerySchema);
+  const scope = all ? { all: true } : { userId: key.userId };
+  // 限定了范围的 Key 只列范围内的邮箱（在查询里收窄，分页大小不受影响）
+  const restrict = keyRestriction(c) ?? undefined;
+  return ok(c, await listMailboxes(c.env, { ...scope, q: query.q, domain: query.domain, restrict }, pageRequestOf(query)));
 });
 
 app.get('/availability', async (c) => {

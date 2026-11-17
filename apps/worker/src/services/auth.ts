@@ -25,7 +25,7 @@ import { getSystemFromAddress } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { sendPushDeerNotification } from './pushdeer.js';
-import { getUserEpoch, mirrorUserEpoch, createSession, destroySession } from './session.js';
+import { createSession, destroySession } from './session.js';
 import { getSettings } from './setting.js';
 
 const LOGIN_WINDOW_MINUTES = 15;
@@ -211,10 +211,10 @@ export async function consumeTotpStep(env: Env, userId: number, step: number): P
   return (result.meta.changes ?? 0) === 1;
 }
 
-/** 签发会话令牌；ctx 用于把会话 KV 兼容写放进 waitUntil，不阻塞响应 */
-export async function issueToken(env: Env, user: typeof users.$inferSelect, ctx?: ExecCtx | null): Promise<string> {
-  const sid = await createSession(env, user.id, user, ctx);
-  return signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: user.authVersion });
+/** 签发会话令牌：先写 D1 会话行（条件复核凭据），再签 JWT */
+export async function issueToken(env: Env, user: typeof users.$inferSelect): Promise<string> {
+  const sid = await createSession(env, user.id, user);
+  return signToken(env.jwt_secret, { sub: user.id, sid, uepoch: user.authVersion });
 }
 
 let dummyHash: Promise<string> | undefined;
@@ -236,17 +236,13 @@ export async function login(
   let issuing = false;
   try {
     user = await db.select().from(users).where(eq(users.username, req.username)).get();
-    if (user && !user.authVersionMigrated) {
-      await getUserEpoch(env, user.id);
-      user = await db.select().from(users).where(eq(users.id, user.id)).get();
-    }
     // 用户不存在时也做一次同等耗时的哈希比较，响应时间不泄露用户名是否存在
     const valid = user ? await verifyPassword(req.password, user.passwordHash) : await verifyPassword(req.password, await dummyPasswordHash()) && false;
     if (!user || !valid) throw new AppError('bad_credentials', '用户名或密码错误');
     if (user.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
     await verifyLoginTwoFactor(env, user, req.totp);
     issuing = true;
-    token = await issueToken(env, user, ctx);
+    token = await issueToken(env, user);
   } catch (error) {
     // 猜错口令或两步验证码记作一次失败、占位保留：口令已对时只剩 6 位验证码要猜，同样靠这里的上限防爆破。
     // 停用、需要验证码、读库或签发异常（含签发时凭据恰好被改）与猜测无关，退回本次占位
@@ -302,7 +298,7 @@ export async function login(
   return { token, user: toSessionUser(user) };
 }
 
-export async function register(env: Env, req: RegisterRequest, ip: string, ctx?: ExecCtx | null): Promise<LoginResponse> {
+export async function register(env: Env, req: RegisterRequest, ip: string): Promise<LoginResponse> {
   await assertRegisterAllowed(env, ip);
   await recordRegisterAttempt(env, ip);
   const settings = await getSettings(env);
@@ -331,8 +327,8 @@ export async function register(env: Env, req: RegisterRequest, ip: string, ctx?:
       const inserted = await env.db
         .prepare(
           `INSERT INTO users
-            (username, password_hash, role, status, invite_id, last_login_at, last_login_ip)
-           SELECT ?, ?, 'user', 'active', id, ?, ?
+            (username, password_hash, role, status, auth_version_migrated, invite_id, last_login_at, last_login_ip)
+           SELECT ?, ?, 'user', 'active', 1, id, ?, ?
            FROM invites
            WHERE code = ? AND status = 'active' AND used_count < max_uses
              AND (expires_at IS NULL OR expires_at > ?)
@@ -361,6 +357,7 @@ export async function register(env: Env, req: RegisterRequest, ip: string, ctx?:
         passwordHash,
         role: 'user',
         status: 'active',
+        authVersionMigrated: true,
         inviteId: null,
         lastLoginAt: new Date(),
         lastLoginIp: ip,
@@ -368,7 +365,7 @@ export async function register(env: Env, req: RegisterRequest, ip: string, ctx?:
       .returning();
   }
   if (!row) throw new AppError('internal', '用户创建失败');
-  const token = await issueToken(env, row!, ctx);
+  const token = await issueToken(env, row!);
   return { token, user: toSessionUser(row!) };
 }
 
@@ -380,7 +377,6 @@ export async function changePassword(
   env: Env,
   user: AuthUser,
   req: ChangePasswordRequest,
-  ctx?: ExecCtx | null,
 ): Promise<ChangePasswordResponse> {
   const db = createDb(env);
   const row = await db.select().from(users).where(eq(users.id, user.id)).get();
@@ -390,7 +386,7 @@ export async function changePassword(
   }
   const passwordHash = await hashPassword(req.newPassword);
   const update = db.update(users).set({ passwordHash,
-    authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true })
+    authVersion: sql`${users.authVersion} + 1` })
     .where(and(eq(users.id, user.id), eq(users.passwordHash, row.passwordHash), eq(users.authVersion, row.authVersion)))
     .returning();
   let updated: typeof users.$inferSelect | undefined;
@@ -403,11 +399,10 @@ export async function changePassword(
     updated = await update.get();
   }
   if (!updated) throw new AppError('conflict', '密码已在另一请求中修改，请重新登录');
-  await mirrorUserEpoch(env, user.id, updated.authVersion, ctx);
-  const token = await issueToken(env, updated, ctx);
+  const token = await issueToken(env, updated);
   return { token, user: toSessionUser(updated), revokedApiKeys };
 }
 
-export async function logout(env: Env, sid: string, ctx?: ExecCtx | null): Promise<void> {
-  await destroySession(env, sid, ctx);
+export async function logout(env: Env, sid: string): Promise<void> {
+  await destroySession(env, sid);
 }

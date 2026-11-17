@@ -14,7 +14,7 @@ import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
 import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
 import {
-  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, assertKeyCanUseMailbox, keyRestriction, requireScope,
+  apiKeyAuth, assertKeyCanUseAddress, assertKeyCanUseDomain, assertKeyCanUseSender, keyRestriction, requireScope,
 } from '../../middleware/api-key-auth.js';
 import {
   countUnread,
@@ -36,7 +36,7 @@ import {
 } from '../../services/message.js';
 import type { Context } from 'hono';
 import type { InternalSendMailRequest } from '@hpc-mail/shared';
-import { handleSend } from '../send-handler.js';
+import { handleCompose, handleSend } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -75,13 +75,7 @@ async function assertSendWithinRestriction(
   req: InternalSendMailRequest,
 ): Promise<void> {
   if (!keyRestriction(c)) return;
-  if (req.from.mailboxId !== undefined) {
-    const box = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id = ?')
-      .bind(req.from.mailboxId).first<{ id: number; domain: string; address: string }>();
-    if (box) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
-  } else {
-    await assertKeyCanUseAddress(c, `${req.from.localPart}@${req.from.domain}`);
-  }
+  await assertKeyCanUseSender(c, req.from);
   for (const id of new Set([req.replyToMessageId, req.forwardAttachmentsFrom])) {
     if (id === undefined) continue;
     const source = await loadSourceMessage(c.env, key, id, '引用的原邮件不存在或不可见');
@@ -97,6 +91,19 @@ function assertKeyCanUseDomainOrMailboxes(c: Context<AppContext>, domain: string
   const restriction = keyRestriction(c);
   if (!restriction || restriction.domains.includes(domain) || restriction.mailboxIds.length) return;
   assertKeyCanUseDomain(c, domain);
+}
+
+/**
+ * 回复与转发：服务端按原信算收件人、主题、引用与线程头，from 缺省用原信的收件地址。
+ * 会读出原信内容，与 POST / 引用来源邮件一样同时需要 mail.send 与 mail.read。
+ */
+for (const op of ['reply', 'forward'] as const) {
+  app.post(`/:id/${op}`, (c) => {
+    requireScope(c, 'mail.send');
+    requireScope(c, 'mail.read');
+    const key = c.get('apiKey')!;
+    return handleCompose(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, op, parseId(c.req.param('id')));
+  });
 }
 
 /** 标记已读/未读——Agent 处理完邮件后维护状态用（需 mail.write） */

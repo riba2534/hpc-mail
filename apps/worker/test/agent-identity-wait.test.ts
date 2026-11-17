@@ -69,7 +69,7 @@ async function inbound(address: string, extra: Partial<typeof messages.$inferIns
 const head = async () => (await env.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM messages').first<{ id: number }>())!.id;
 
 describe('发件身份 GET /v1/identities 与 /api/identities', () => {
-  it('自己的邮箱按域名状态给 canSend/reason，共享来的只读；普通用户没有 domains', async () => {
+  it('自己的邮箱按域名状态给 canSend/reason，共享来的只读；普通用户的 domains 只有自己发信就绪的托管域名', async () => {
     const user = await actor('w2-identity-user');
     const owner = await actor('w2-identity-owner');
     const gone = await actor('w2-identity-gone');
@@ -98,7 +98,8 @@ describe('发件身份 GET /v1/identities 与 /api/identities', () => {
         { kind: 'owned', mailboxId: paused.id, address: paused.address, domain: 'w2-paused.example', displayName: '', canSend: false, reason: 'hosted_domain_unavailable' },
         { kind: 'shared', mailboxId: shared.id, address: shared.address, domain: 'w2.example', displayName: '', canSend: false, reason: 'shared_readonly' },
       ],
-      domains: [],
+      // 未就绪、暂停的托管域名不能用任意前缀
+      domains: [{ domain: 'w2-ready.example', kind: 'hosted', anyLocalPart: true }],
     };
     expect(await data<SendIdentities>(await request('/v1/identities', auth(user.key)))).toEqual(expected);
     expect(await data<SendIdentities>(await request('/api/identities', auth(user.jwt)))).toEqual(expected);

@@ -120,6 +120,8 @@ function fakeCloudflare(opts: { createError?: number } = {}) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     const method = (init?.method ?? 'GET').toUpperCase();
+    // 他人添加前的公开委派预检：RDAP 查不到、DoH 的 NS 为空，按「委派已知且不指向本站」放行
+    if (url.hostname === 'rdap.org') return json({ errorCode: 404 }, 404);
     if (url.hostname === 'cloudflare-dns.com') return json({ Status: 0, Answer: [] });
     expect(url.origin).toBe('https://api.cloudflare.com');
     expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-token');

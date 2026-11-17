@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { SECRET_MASK as SHARED_SECRET_MASK, type Settings } from '@hpc-mail/shared';
@@ -25,9 +25,10 @@ const mocks = vi.hoisted(() => ({
   update: vi.fn(),
   post: vi.fn(),
   toast: vi.fn(),
+  deliveryEvents: vi.fn(),
 }));
 vi.mock('@/api/resources', () => ({ adminApi: { getSettings: mocks.get, updateSettings: mocks.update } }));
-vi.mock('@/api/client', () => ({ api: { post: mocks.post } }));
+vi.mock('@/api/client', () => ({ api: { post: mocks.post, get: mocks.deliveryEvents } }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 
 import { parseReservedLocalParts, SECRET_MASK, SettingsPage } from './settings-page';
@@ -300,6 +301,60 @@ describe('SettingsPage 转发中转配额', () => {
         }),
       ),
     );
+    client.clear();
+  });
+});
+
+describe('SettingsPage 投递回执', () => {
+  function mountWith(settings: Settings) {
+    mocks.get.mockResolvedValue(structuredClone(settings));
+    mocks.update.mockImplementation(async (patch: Partial<Settings>) => ({ ...structuredClone(settings), ...patch }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const router = createMemoryRouter([{ path: '/', element: <SettingsPage /> }]);
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    return client;
+  }
+
+  it('显示各域名订阅状态与失败原因，开关随整页保存', async () => {
+    mocks.update.mockClear();
+    mocks.deliveryEvents.mockResolvedValue({ enabled: true, credentials: true, queue: 'hpc-mail-email-events', subscriptions: [
+      { domain: 'ok.example', kind: 'system', zoneId: 'z1', subscriptionId: 's1', status: 'active', lastError: '', checkedAt: null },
+      { domain: 'bad.example', kind: 'hosted', zoneId: 'z2', subscriptionId: null, status: 'error', lastError: '403 Authentication error', checkedAt: null },
+    ] });
+    const client = mountWith({ ...structuredClone(SETTINGS), delivery_events: { enabled: true } } as Settings);
+    const toggle = await screen.findByRole('switch', { name: '自动订阅投递事件' });
+    expect(toggle).toBeChecked();
+    const status = await screen.findByLabelText('投递事件订阅状态');
+    expect(status).toHaveTextContent('Queue hpc-mail-email-events：已订阅 1 个发信域名，1 个失败');
+    expect(status).toHaveTextContent('bad.example：403 Authentication error');
+    expect(status).not.toHaveTextContent('ok.example');
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await waitFor(() => expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ delivery_events: { enabled: false } })));
+    expect(mocks.deliveryEvents).toHaveBeenCalledWith('/admin/delivery-events');
+    client.clear();
+  });
+
+  it('部署未启用或没有凭据时说明原因；旧服务端没有该设置时不显示分区', async () => {
+    mocks.deliveryEvents.mockResolvedValue({ enabled: true, credentials: false, queue: 'hpc-mail-email-events', subscriptions: [] });
+    let client = mountWith({ ...structuredClone(SETTINGS), delivery_events: { enabled: true } } as Settings);
+    expect(await screen.findByLabelText('投递事件订阅状态')).toHaveTextContent('未配置 Cloudflare 凭据');
+    client.clear();
+    cleanup();
+    mocks.deliveryEvents.mockResolvedValue({ enabled: true, credentials: true, queue: null, subscriptions: [] });
+    client = mountWith({ ...structuredClone(SETTINGS), delivery_events: { enabled: true } } as Settings);
+    expect(await screen.findByLabelText('投递事件订阅状态')).toHaveTextContent('本站部署未启用投递回执（未设置 GitHub Variable DELIVERY_EVENTS_QUEUE）');
+    client.clear();
+    cleanup();
+    mocks.deliveryEvents.mockClear();
+    client = mountWith(structuredClone(SETTINGS));
+    await screen.findByText('邮箱认领策略');
+    expect(screen.queryByText('投递回执')).toBeNull();
+    expect(mocks.deliveryEvents).not.toHaveBeenCalled();
     client.clear();
   });
 });

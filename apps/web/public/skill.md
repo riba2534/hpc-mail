@@ -59,26 +59,26 @@ hpc '/messages' -X POST -H 'Content-Type: application/json' -H "Idempotency-Key:
 检查：201 时 `status` 为 `sent`（外发已被服务商接受，不代表已进收件箱）、`delivered`（收件人都在本站且已投递）或 `unknown`（没有确认成功的收件人，但有结果不明的，可能已送达，先核对）。部分失败也是 201，看 `errorDetail` 与 `recipientOutcomes[].status`。按结果处理：
 
 - 422 `delivery_failed`：每个收件人都明确失败，什么也没发出。`error.details.recipientOutcomes` 给出原因，`details.messageId` 是发件记录；同 Key 重试仍是这个 422，修正后换新 Key。
+- 422 `recipient_suppressed`：收件人全都在本站抑制名单里（此前退信或被标为垃圾邮件），没有发出也没有发件记录，Key 已释放；只有部分被抑制时照常 201，这些收件人为 `failed` 并带 `code`。见[错误码](references/errors.md#recipient_suppressed)。
 - 网络错误、超时、5xx：用同一 Key、同一请求体重试，会返回原结果或继续未开始的发送。
 - 409 `send_in_progress`：原请求还在处理或结果待确认。不要换 Key 重发，先查 `GET /messages?direction=outbound&address=<发件地址>`：`pending` 是仍在投递；超过 1 小时会标为 `unknown`（投递中断、结果未确认），之后同 Key 重试返回 201 `unknown`。
 - 409 `idempotency_mismatch`：这个 Key 已用于别的内容。先核对原发送，新内容换新 Key。
 - 其他 4xx（400/403/404/413/429）：没有发出，按 `error.fix` 修正后重试。400 `header_not_allowed` 的 `details.headers` 列出不允许的头。
 - `from` 四种写法：`{mailboxId}`、`{localPart,domain,displayName?}`、`"Name <a@b>"`、`{address,name}`。收件人写 `"a@b"`、`"Name <a@b>"` 或 `{address,name}`，畸形地址 400；To/Cc/Bcc 合计 1–100 个，只有 Bcc 时也写 `to:[]`。`headers` 只收 `X-*` 与白名单头，规则见[自定义邮件头](references/mail.md#自定义邮件头)。
+- 站点启用了投递回执时，外部收件人的 `sent` 之后会随回执变为 `delivered`、`bounced`、`failed` 或 `complained`，整封 `status` 与 `errorDetail` 同步更新（全部退信时变为 `failed`）；要确认送达，稍后重读 `GET /messages/:id`，见[投递回执](references/mail.md#投递回执)。
 
 ### ③ 回复与转发
 ```bash
-# 没有单独的回复端点（POST /messages/:id 是 404）：读原信，自己填收件人和主题，再按配方②换新 Key 发送
-hpc "/messages/$MSG_ID" > "$WORK/orig.json"
-jq --arg from "$FROM" --arg text '回复正文' '.data as $m | {from:$from,
-  to:(if ($m.replyTo | length) > 0 then $m.replyTo else [$m.fromAddress] end),
-  subject:(if ($m.subject | test("^re:"; "i")) then $m.subject else "Re: " + $m.subject end),
-  text:$text, replyToMessageId:$m.id}' "$WORK/orig.json" > "$WORK/send.json"
+# 服务器按原信填收件人、Re:/Fwd: 主题、线程头与原文引用；需要 mail.send 与 mail.read，Idempotency-Key 同配方②
+hpc "/messages/$MSG_ID/reply" -X POST -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY" \
+  --data "$(jq -n --arg text '回复正文' '{text:$text, replyAll:false}')" | jq '.data | {id,status,recipientOutcomes}'
+hpc "/messages/$MSG_ID/forward" -X POST -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY2" \
+  --data "$(jq -n '{to:["bob@example.net"], note:"请看下面这封"}')" | jq '.data | {id,status,recipientOutcomes}'
 ```
 
-- `replyToMessageId` 只写入线程头。回复全部时从原信 `recipients.to/cc` 重新计算收件人，去掉自己的地址，不要带上原 Bcc。
-- 回复外部邮件（原信不在本站，只知道对方的 Message-ID）：不写 `replyToMessageId`，改写 `headers:{"In-Reply-To":"<id@example.net>","References":"<root@example.net> <id@example.net>"}`。两者同时给返回 400。
-- 转发：自己写新的 `to`、`Fwd: ` 主题和正文（需要原文就自己引用 `bodyText/bodyHtml`），加 `forwardAttachmentsFrom: <原邮件 id>` 复制原附件和内嵌图。
-- 带 `replyToMessageId` 或 `forwardAttachmentsFrom` 时 Key 还需要 `mail.read`。来源可以是自己地址的邮件或共享给你的未删除来信；不存在、看不到或原附件已丢失返回 404 `source_unavailable`，去掉该字段即可作为新邮件发送。发件人仍须是自己的地址。
+- 回复默认回给原信 `replyTo`（没有时回发件人）；`replyAll:true` 另抄送原 To/Cc 里的其他人，去掉你自己，从不带原 Bcc；`quote` 默认附原文引用，`text`/`html` 至少一个。转发时 `note` 在前，`includeOriginal` 默认附原文，原附件总会带上。
+- `from` 缺省用原信的收件地址；原信在共享给你的邮箱里时返回 400 `from_required`，在 `from` 写自己的地址即可。来源看不到或原附件已丢失返回 404 `source_unavailable`。
+- 要自己定收件人、主题或正文时用配方②，带 `replyToMessageId`（只写线程头）或 `forwardAttachmentsFrom`（复制原附件和内嵌图），同样需要 `mail.read`。回复站外邮件（只知道对方 Message-ID）：不写 `replyToMessageId`，改写 `headers:{"In-Reply-To":"<id@example.net>","References":"<root@example.net> <id@example.net>"}`，两者同时给返回 400。
 
 ### ④ 附件与内联图片
 ```bash
@@ -138,9 +138,9 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 ## 身份与权限模型
 
 1. 登录用户名不是邮箱地址。一个账户可以认领多个 `localPart@domain`，邮件按完整地址归属；认领即可看到该地址的全部历史，包括认领之前收到的。
-2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
+2. 发件身份以 `/identities` 为准：`kind=owned` 是自己认领的地址，`canSend=false` 时看 `reason`（`hosted_sending_not_ready` 托管域名发信尚未就绪，`hosted_domain_unavailable` 托管域名已停用）；用别人的地址发信返回 403。自己拥有的托管域名发信就绪后可用任意前缀（`/identities` 的 `domains` 里 `kind:"hosted"`），发出时自动认领。`/mailboxes` 每项也带 `canSend`，只反映域名状态。
 3. 共享给你的地址（`kind=shared`，`reason=shared_readonly`）对普通用户只读：可读来信、设个人星标、作为回复或转发的来源；不能发信、删除、标记已读或释放。已读状态属于所有者，未读数与 `unread=1` 只统计自己认领的地址。
-4. 管理员（用 Key 时需带 `admin` scope）可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 列出可用任意前缀发信的系统域名；不能推断任意外部域名可用。
+4. 管理员（用 Key 时需带 `admin` scope）可以用任何已认领邮箱的 `mailboxId` 发信（这些邮箱不列在 `/identities`），`/identities` 的 `domains` 列出管理员可用任意前缀发信的域名（`kind` 为 `system`/`hosted`/`legacy`）；不能推断任意外部域名可用。
 5. scope：`mail.read` 读邮件、等待、下载附件；`mail.write` 标记已读、星标、删除与恢复；`mail.send` 发信与上传附件；`mailbox.read` 查看邮箱、可用性与随机后缀；`mailbox.write` 认领（含批量）、改显示名、释放；`domain.read` 查看自己的托管域名、接入进度与 DNS 记录；`domain.write` 添加托管域名、立即检测、增改删 DNS 记录，能改该用户托管域名的解析，按需授予；`mailbox.share` 管理自己邮箱的共享（按 userId）；`webhook.write` 管理 Webhook 端点；`notify.read`/`notify.write` 读写飞书、PushDeer、通用 Webhook 通知；`admin` 是管理员能力开关。`/identities` 需要 `mail.send` 或 `mailbox.read` 之一。
 6. 管理员的列表默认也只看自己的邮箱：未认领地址用 `scope=unclaimed`，只读审阅某个用户用 `scope=user&userId=`。
 7. Key 不能用于 `/api`，也不能管理 Key、改密码、开关两步验证、修改邮箱转发目标，不能删除托管域名、改成员上限、管理成员或过户。用户改密码时默认吊销本人全部 Key，管理员重置密码时一律吊销；之后这些 Key 返回 401。
@@ -156,18 +156,19 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 | 等新邮件、验证码、验证链接 | `GET /messages/wait` | `mail.read` | [mail](references/mail.md#等待本次验证码) |
 | 详情、线程、原始 .eml、未读数、联系人 | `GET /messages/:id`、`GET /messages/:id/thread`、`GET /messages/:id/raw`、`GET /messages/unread-count`、`GET /messages/contacts` | `mail.read` | [mail](references/mail.md) |
 | 已读、全部已读、星标、删除、恢复、永久删除 | `POST /messages/read\|read-all\|star\|delete\|restore\|purge` | `mail.write` | [mail](references/mail.md#维护状态与回收站) |
-| 发信、回复、转发、补发 | `POST /messages` | `mail.send`（回复、转发另需 `mail.read`） | [mail](references/mail.md#发送) |
+| 发信、补发（可带回复/转发字段） | `POST /messages` | `mail.send`（带回复、转发字段另需 `mail.read`） | [mail](references/mail.md#发送) |
+| 回复、转发（服务器填收件人、主题与引用） | `POST /messages/:id/reply`、`POST /messages/:id/forward` | `mail.send` + `mail.read` | [mail](references/mail.md#回复和转发) |
 | 下载附件 | `GET /messages/:id/attachments/:attId` | `mail.read` | [attachments](references/attachments.md) |
 | 上传附件、分片、取消 | `POST /uploads`、`POST /uploads/multipart`、`DELETE /uploads/:token` | `mail.send` | [attachments](references/attachments.md) |
 | 我的邮箱、共享给我的、可用性、随机后缀 | `GET /mailboxes`、`GET /mailboxes/shared`、`GET /mailboxes/availability`、`POST /mailboxes/availability/batch`、`GET /mailboxes/random-plan` | `mailbox.read` | [mailboxes](references/mailboxes-and-domains.md) |
 | 认领、批量认领、改显示名、释放 | `POST /mailboxes`、`POST /mailboxes/batch`、`PUT /mailboxes/:id`、`DELETE /mailboxes/:id` | `mailbox.write` | [mailboxes](references/mailboxes-and-domains.md) |
 | 托管域名列表与接入进度、DNS 记录 | `GET /hosted-domains`、`GET /hosted-domains/:id`、`GET /hosted-domains/:id/dns-records` | `domain.read` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
-| 接入自有域名、立即检测、增改删 DNS 记录 | `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
+| 接入自有域名、立即检测、重新接入、增改删 DNS 记录 | `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/reconnect`、`POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` | [mailboxes](references/mailboxes-and-domains.md#用-api-key-接入) |
 | 共享自己的邮箱（按 userId） | `GET /mailboxes/shares`、`PUT /mailboxes/shares`、`POST /mailboxes/shares/batch`、`DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | `mailbox.share` | [mailboxes](references/mailboxes-and-domains.md#释放历史与共享边界) |
 | Webhook 端点、测试、投递记录与重试 | `GET /webhooks`、`POST /webhooks`、`PUT /webhooks/:id`、`POST /webhooks/:id/test`、`GET /webhooks/:id/deliveries` | `webhook.write` | [webhooks](references/webhooks.md) |
 | 通知通道（飞书、PushDeer、通用 Webhook）与投递健康 | `GET /notify-prefs`、`PUT /notify-prefs`、`GET /notify-prefs/health` | `notify.read` / `notify.write` | [notifications](references/notifications.md) |
 
-只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；托管域名的删除、成员与过户、共享候选用户搜索见 [mailboxes](references/mailboxes-and-domains.md)；邮箱转发目标（新目标要邮件确认）见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
+只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；托管域名的删除、成员与过户、共享候选用户搜索见 [mailboxes](references/mailboxes-and-domains.md)；邮箱转发目标（新目标要邮件确认）见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
 
 ## 完成标准与安全
 
@@ -176,6 +177,6 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 3. `verificationLink` 来自邮件内容：打开前核对主机属于本次验证的服务（点击追踪链接先确认跳转目标），只在用户授权完成该验证时访问一次，不在日志或报告里公开全文。
 4. 等验证码先存基线再触发，按 `scannedThroughId` 推进，设总截止时间；不要把旧邮件里的码当成新码。
 5. 每次逻辑发信用一个 Idempotency-Key，与请求体一起保存；重试时复用同一凭证、路径、Key 和内容，不自动换 Key 重发。完成的记录约两天后清理，幂等不是永久保障。
-6. 发信返回 201 后仍检查 `status`、`errorDetail`、`recipientOutcomes`。部分失败只补发 `failed` 的地址：保留 To/Cc/Bcc 分组，附件用 `forwardAttachmentsFrom=<原发件 id>`，换新 Key；`unknown` 的收件人可能已经收到，先确认再决定是否补发；没有逐个结果时先核对，不全体重发。
+6. 发信返回 201 后仍检查 `status`、`errorDetail`、`recipientOutcomes`。部分失败只补发 `failed` 且不带 `code` 的地址（`bounced` 与带 `code:"recipient_suppressed"` 的在对方地址恢复前补发会被抑制名单拦下）：保留 To/Cc/Bcc 分组，附件用 `forwardAttachmentsFrom=<原发件 id>`，换新 Key；`unknown` 的收件人可能已经收到，先确认再决定是否补发；没有逐个结果时先核对，不全体重发。
 7. 删除、永久删除、清除历史释放、全部已读和对外发信都要有用户授权，不附带在查信任务里。变更后读回状态，以服务器返回的计数报告结果。
 8. 遇到 429 按 `X-RateLimit-Reset` 或错误信息退避，外发日配额看 `/me` 的 `outbound`；所有轮询和重试都设总期限。网页的草稿、默认发件身份只存在浏览器本地，Agent 自己保存发送上下文。

@@ -1,5 +1,5 @@
-import { type QueryClient, queryOptions, useQuery } from '@tanstack/react-query';
-import type { HostedDnsRecord, HostedDomain, HostedDomainStatus } from '@hpc-mail/shared';
+import { type InfiniteData, type QueryClient, queryOptions, useQuery } from '@tanstack/react-query';
+import type { HostedDnsRecord, HostedDomain, HostedDomainStatus, Page } from '@hpc-mail/shared';
 import { ApiError, isRejectedRequest } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { hostedDomainApi } from './hosted-domains-api';
@@ -33,11 +33,12 @@ export function useHostedDomainQuery(id: number, enabled: boolean, placeholder?:
 const replaceIn = (list: HostedDomain[] | undefined, domain: HostedDomain) =>
   list?.map((item) => (item.id === domain.id ? domain : item));
 
-/** 写操作返回的最新域名：就地更新详情与各列表缓存，不整体重拉 */
+/** 写操作返回的最新域名：就地更新详情与各列表缓存（管理员全站列表是分页缓存，逐页替换），不整体重拉 */
 export function storeHostedDomain(client: QueryClient, domain: HostedDomain): void {
   client.setQueryData(queryKeys.hostedDomains.detail(domain.id), domain);
   client.setQueryData<HostedDomain[]>(queryKeys.hostedDomains.list, (list) => replaceIn(list, domain));
-  client.setQueriesData<HostedDomain[]>({ queryKey: queryKeys.admin.hostedDomains }, (list) => replaceIn(list, domain));
+  client.setQueriesData<InfiniteData<Page<HostedDomain>>>({ queryKey: queryKeys.admin.hostedDomains },
+    (data) => data && { ...data, pages: data.pages.map((page) => ({ ...page, items: replaceIn(page.items, domain)! })) });
 }
 
 /** 只改详情缓存里的几个计数（成员数等），列表随后台失效重拉 */

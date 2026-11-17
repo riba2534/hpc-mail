@@ -829,6 +829,27 @@ export async function loadSourceMessage(
   return row;
 }
 
+/**
+ * 回复/转发接口按原信生成收件人、主题与引用：可见口径与错误同 loadSourceMessage，另带完整正文（含 R2 中的大正文）。
+ */
+export async function loadSourceContent(
+  env: Env,
+  sender: { userId: number; role: Role },
+  id: number,
+  unavailableMessage: string,
+): Promise<MessageRow> {
+  const db = createDb(env);
+  const row = await db.select().from(messages).where(eq(messages.id, id)).get();
+  if (!row) throw new AppError('source_unavailable', unavailableMessage);
+  try {
+    await assertVisible(db, { userId: sender.userId, role: sender.role }, row);
+  } catch (error) {
+    if (error instanceof AppError && error.code === 'not_found') throw new AppError('source_unavailable', unavailableMessage);
+    throw error;
+  }
+  return { ...row, ...(await readMailBody(env, row)) };
+}
+
 /** 详情需要完整行（含正文）；只做可见性判定的调用方用 assertVisible 并自选列 */
 async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
   const db = createDb(env);

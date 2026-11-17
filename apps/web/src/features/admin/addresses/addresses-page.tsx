@@ -1,11 +1,10 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { measureElement as measureSize, useWindowVirtualizer } from '@tanstack/react-virtual';
 import { ArrowRightLeft, AtSign, Mail, MoreHorizontal, Search, Share2, Trash2 } from 'lucide-react';
 import {
   memo,
   type RefObject,
   useCallback,
-  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -35,9 +34,13 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
 import { useIsMobile } from '@/lib/use-media-query';
-import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+import { LoadMoreFooter } from '../load-more-footer';
+import { adminMailboxesQueryOptions } from './admin-mailboxes';
 import { TransferMailboxDialog } from './transfer-mailbox-dialog';
 import { AddressShareDialog } from './address-share-dialog';
+
+/** 搜索词停止输入这么久后才请求服务端 */
+const SEARCH_DEBOUNCE_MS = 300;
 
 function ForceReleaseDialog({ mailbox, onClose }: { mailbox: Mailbox | null; onClose: () => void }) {
   const queryClient = useQueryClient();
@@ -123,6 +126,8 @@ interface RowActions {
 
 interface AddressListProps {
   mailboxes: Mailbox[];
+  /** 还有未加载的页时总数未知（ARIA 约定为 -1） */
+  total: number;
   actions: RowActions;
 }
 
@@ -229,12 +234,12 @@ function SpacerRow({ height }: { height: number }) {
   );
 }
 
-const AddressTable = memo(function AddressTable({ mailboxes, actions }: AddressListProps) {
+const AddressTable = memo(function AddressTable({ mailboxes, total, actions }: AddressListProps) {
   const navigate = useNavigate();
   const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLTableSectionElement>(mailboxes, 57);
   return (
     // 只渲染部分行时列宽不能随可见内容跳动：固定表格布局，地址列占剩余宽度，超长截断并用 title 显示全文
-    <Table className="table-fixed" aria-rowcount={mailboxes.length + 1}>
+    <Table className="table-fixed" aria-rowcount={total < 0 ? -1 : total + 1}>
       <colgroup>
         <col />
         <col className="w-[15%]" />
@@ -327,7 +332,7 @@ const AddressCard = memo(function AddressCard({
   );
 });
 
-const AddressCards = memo(function AddressCards({ mailboxes, actions }: AddressListProps) {
+const AddressCards = memo(function AddressCards({ mailboxes, total, actions }: AddressListProps) {
   const navigate = useNavigate();
   const { listRef, rows, measureElement, before, after } = useWindowRows<HTMLUListElement>(mailboxes, 90);
   return (
@@ -341,7 +346,7 @@ const AddressCards = memo(function AddressCards({ mailboxes, actions }: AddressL
             key={mailbox.id}
             mailbox={mailbox}
             index={row.index}
-            total={mailboxes.length}
+            total={total}
             measureElement={measureElement}
             navigate={navigate}
             actions={actions}
@@ -355,10 +360,21 @@ const AddressCards = memo(function AddressCards({ mailboxes, actions }: AddressL
 
 export function AddressesPage() {
   const isMobile = useIsMobile();
-  const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(true);
   const [q, setQ] = useState('');
-  // 输入框随按键即时更新，过滤结果与列表重渲染延后进行，不阻塞输入
-  const deferredQ = useDeferredValue(q);
+  const [debouncedQ, setDebouncedQ] = useState('');
+  useEffect(() => {
+    const timer = globalThis.setTimeout(() => setDebouncedQ(q.trim().toLowerCase()), SEARCH_DEBOUNCE_MS);
+    return () => globalThis.clearTimeout(timer);
+  }, [q]);
+  const {
+    data, isLoading, isError, error, refetch, hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage,
+  } = useInfiniteQuery({
+    ...adminMailboxesQueryOptions({ q: debouncedQ || undefined }),
+    // 换搜索词时先保留上一次的结果，新结果到达后再替换，不闪回骨架屏
+    placeholderData: (previous) => previous,
+  });
+  const mailboxes = useMemo(() => data?.pages.flatMap((page) => page.items) ?? [], [data]);
+  const loadMore = useCallback(() => void fetchNextPage({ cancelRefetch: false }), [fetchNextPage]);
   const [releasing, setReleasing] = useState<Mailbox | null>(null);
   const [transferring, setTransferring] = useState<Mailbox | null>(null);
   const [sharing, setSharing] = useState<Mailbox | null>(null);
@@ -374,38 +390,39 @@ export function AddressesPage() {
     () => ({ onTransfer: setTransferring, onShare: setSharing, onRelease: setReleasing, shareTrigger }),
     [],
   );
-
-  const filtered = useMemo(() => {
-    const term = deferredQ.trim().toLowerCase();
-    const list = mailboxes ?? [];
-    if (!term) return list;
-    return list.filter(
-      (m) => m.address.includes(term) || (m.ownerUsername ?? '').toLowerCase().includes(term),
-    );
-  }, [mailboxes, deferredQ]);
+  const total = hasNextPage ? -1 : mailboxes.length;
 
   return (
     <div className="mx-auto max-w-4xl">
       <PageHeader title="全站地址" description="查看所有已认领地址及其收发件，管理共享、过户或强制释放。" />
       <div className="relative mb-4">
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-ink-tertiary" />
-        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索地址或用户名" className="pl-9" />
+        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索地址或用户名" maxLength={254} className="pl-9" />
       </div>
 
       {isLoading ? (
         <Skeleton className="h-40 w-full rounded-lg" />
-      ) : isError ? (
+      ) : isError && mailboxes.length === 0 ? (
         <QueryErrorState error={error} onRetry={() => void refetch()} />
-      ) : filtered.length === 0 ? (
+      ) : mailboxes.length === 0 ? (
         <EmptyState
           icon={AtSign}
-          title={deferredQ ? '没有匹配的地址' : '还没有任何认领地址'}
+          title={debouncedQ ? '没有匹配的地址' : '还没有任何认领地址'}
           className="rounded-lg border border-line bg-surface"
         />
-      ) : isMobile ? (
-        <AddressCards mailboxes={filtered} actions={actions} />
       ) : (
-        <AddressTable mailboxes={filtered} actions={actions} />
+        <>
+          {isMobile ? (
+            <AddressCards mailboxes={mailboxes} total={total} actions={actions} />
+          ) : (
+            <AddressTable mailboxes={mailboxes} total={total} actions={actions} />
+          )}
+          {isError ? (
+            <QueryErrorState error={error} onRetry={() => void (isFetchNextPageError ? fetchNextPage() : refetch())} />
+          ) : (
+            <LoadMoreFooter hasNextPage={hasNextPage} isFetchingNextPage={isFetchingNextPage} onLoadMore={loadMore} />
+          )}
+        </>
       )}
 
       <ForceReleaseDialog mailbox={releasing} onClose={() => setReleasing(null)} />

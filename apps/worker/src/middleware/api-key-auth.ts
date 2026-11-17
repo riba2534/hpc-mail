@@ -274,6 +274,23 @@ export function assertKeyCanUseMailbox(c: Context<AppContext>, mailbox: { id: nu
   }
 }
 
+/**
+ * 发件地址在 Key 范围内：from 解析后的 mailboxId 或 localPart+domain。发件邮箱不存在时放过，交给发信流程按原口径报 404。
+ */
+export async function assertKeyCanUseSender(
+  c: Context<AppContext>,
+  from: { mailboxId?: number; localPart?: string; domain?: string },
+): Promise<void> {
+  if (!keyRestriction(c)) return;
+  if (from.mailboxId !== undefined) {
+    const box = await c.env.db.prepare('SELECT id, domain, address FROM mailboxes WHERE id = ?')
+      .bind(from.mailboxId).first<{ id: number; domain: string; address: string }>();
+    if (box) assertKeyCanUseMailbox(c, { id: Number(box.id), domain: box.domain, address: box.address });
+    return;
+  }
+  if (from.localPart && from.domain) await assertKeyCanUseAddress(c, `${from.localPart}@${from.domain}`);
+}
+
 /** 限定了范围的 Key 不能用账户级能力（通知配置写入、通知健康等会涉及范围外邮件的接口） */
 export function assertKeyUnrestricted(c: Context<AppContext>, what: string): void {
   if (keyRestriction(c)) throw restrictedError(what);

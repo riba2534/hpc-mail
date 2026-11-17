@@ -1,12 +1,13 @@
 import {
   HOSTED_DOMAIN_USABLE_STATUSES,
   type BatchClaimMailboxResult, type ClaimMailboxRequest, type ClaimPlanStrategy, type HostedDomainStatus, type Mailbox, type MailboxAvailability,
-  type MailboxTransferResult, type MailboxUnavailableReason, type Role, type TransferMailboxRequest,
+  type MailboxTransferResult, type MailboxUnavailableReason, type Page, type Role, type TransferMailboxRequest,
 } from '@hpc-mail/shared';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, lt, or, sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { hostedDomains, mailboxes, messages, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
+import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import {
   claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
@@ -37,29 +38,68 @@ function serialize(row: MailboxRow, messageCount: number, ownerUsername?: string
 /** 列表项的发信判定所需列：托管域名 LEFT JOIN 进同一条查询，不多一次往返 */
 const sendableColumns = { status: hostedDomains.status, sendingStatus: hostedDomains.sendingStatus };
 
-export async function listMailboxes(
-  env: Env,
-  opts: { userId?: number; all?: boolean },
-): Promise<Mailbox[]> {
+/** 地址或所有者用户名包含 q（调用方已转小写；地址入库即为小写）：instr 按字面匹配，% 和 _ 不当通配符 */
+export function mailboxSearchSql(q: string): SQL {
+  return or(sql`instr(${mailboxes.address}, ${q}) > 0`,
+    sql`${mailboxes.userId} IN (SELECT id FROM users WHERE instr(lower(username), ${q}) > 0)`)!;
+}
+
+export interface ListMailboxesOptions {
+  userId?: number;
+  all?: boolean;
+  q?: string;
+  domain?: string;
+  /** API Key 限定范围：只列 id 在 mailboxIds 或域名在 domains 中的邮箱（两个列表各以一个 JSON 参数绑定） */
+  restrict?: { mailboxIds: number[]; domains: string[] };
+}
+
+function restrictedMailboxes(restrict: ListMailboxesOptions['restrict']): SQL | undefined {
+  if (!restrict) return undefined;
+  return or(
+    sql`${mailboxes.id} IN (SELECT value FROM json_each(${JSON.stringify(restrict.mailboxIds)}))`,
+    sql`${mailboxes.domain} IN (SELECT value FROM json_each(${JSON.stringify(restrict.domains)}))`,
+  );
+}
+
+/**
+ * 本人或全站（all）邮箱，按 id 倒序。page 为 null 时返回完整数组（旧行为）；
+ * 分页时 LIMIT 作用在 mailboxes 上，没有排序步骤，messageCount 子查询只为返回的行计算。
+ */
+export async function listMailboxes(env: Env, opts: ListMailboxesOptions): Promise<Mailbox[]>;
+export async function listMailboxes(env: Env, opts: ListMailboxesOptions, page: PageRequest | null): Promise<Mailbox[] | Page<Mailbox>>;
+export async function listMailboxes(env: Env, opts: ListMailboxesOptions, page: PageRequest | null = null): Promise<Mailbox[] | Page<Mailbox>> {
   const db = createDb(env);
+  const where = and(
+    opts.all ? undefined : eq(mailboxes.userId, opts.userId!),
+    opts.domain ? eq(mailboxes.domain, opts.domain) : undefined,
+    opts.q ? mailboxSearchSql(opts.q) : undefined,
+    restrictedMailboxes(opts.restrict),
+    page?.cursorId ? lt(mailboxes.id, page.cursorId) : undefined,
+  );
+  let items: Mailbox[];
   if (opts.all) {
     const rows = await db
       .select({ mailbox: mailboxes, username: users.username, messageCount: messageCountSql, ...sendableColumns })
       .from(mailboxes)
       .leftJoin(users, eq(users.id, mailboxes.userId))
       .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
+      .where(where)
       .orderBy(desc(mailboxes.id))
+      .limit(fetchLimit(page))
       .all();
-    return rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount), r.username ?? ''), canSend: hostedSendBlock(r) === null }));
+    items = rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount), r.username ?? ''), canSend: hostedSendBlock(r) === null }));
+  } else {
+    const rows = await db
+      .select({ mailbox: mailboxes, messageCount: messageCountSql, ...sendableColumns })
+      .from(mailboxes)
+      .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
+      .where(where)
+      .orderBy(desc(mailboxes.id))
+      .limit(fetchLimit(page))
+      .all();
+    items = rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount)), canSend: hostedSendBlock(r) === null }));
   }
-  const rows = await db
-    .select({ mailbox: mailboxes, messageCount: messageCountSql, ...sendableColumns })
-    .from(mailboxes)
-    .leftJoin(hostedDomains, eq(hostedDomains.domain, mailboxes.domain))
-    .where(eq(mailboxes.userId, opts.userId!))
-    .orderBy(desc(mailboxes.id))
-    .all();
-  return rows.map((r) => ({ ...serialize(r.mailbox, Number(r.messageCount)), canSend: hostedSendBlock(r) === null }));
+  return page ? toPage(items, page.limit, (box) => box.id) : items;
 }
 
 /** 管理员按 id 读任意邮箱：与 ?all=1 列表同形（含所有者用户名、邮件数与 canSend），一次查询 */
@@ -749,6 +789,15 @@ export const HOSTED_AUTO_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, 
   SELECT ?1, ?2, user_id, '' FROM hosted_domains WHERE domain = ?2 AND status IN (${USABLE_HOSTED_SQL})
     AND (SELECT lim = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE domain = ?2) < lim
       FROM (SELECT COALESCE((SELECT json_extract(value, '$.autoClaimLimit') FROM settings WHERE key = 'hosted_domains'), 0) AS lim))`;
+
+/**
+ * 托管域名所有者发信（?1 = 发件地址，?2 = 域名，?3 = 发信人）：域名可用且发信已就绪时，未认领的地址
+ * 在发出前认领给所有者，发件记录与之后的回信都在他名下可见。与所有者手动认领同一口径：不占全站每人上限，
+ * 也不受只约束收件自动认领的 autoClaimLimit；地址已有主人时不改动，由调用方按主人判定。
+ */
+export const HOSTED_SEND_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, domain, user_id, display_name)
+  SELECT ?1, ?2, user_id, '' FROM hosted_domains WHERE domain = ?2 AND user_id = ?3
+    AND status IN (${USABLE_HOSTED_SQL}) AND sending_status = 'ready'`;
 
 /** 收件域名的托管状态与该地址是否已有主人（?1 = 收件地址，?2 = 域名）；非托管域名无结果 */
 export const HOSTED_STATUS_SQL = `SELECT status, EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1) AS claimed

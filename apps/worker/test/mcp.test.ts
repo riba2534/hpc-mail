@@ -13,7 +13,6 @@ import { updateSettings } from '../src/services/setting.js';
 import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 import type { Env } from '../src/types.js';
 import { fakeRateLimits } from './fake-rate-limits.js';
-// @ts-expect-error Vite 的 ?raw 导入（只用于部署配置断言）
 import wranglerToml from '../wrangler.toml?raw';
 import skillDoc from '../../web/public/skill.md?raw';
 import llmsDoc from '../../web/public/llms.txt?raw';

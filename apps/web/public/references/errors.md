@@ -8,7 +8,7 @@
 
 - `code` 稳定，按它分支；`message` 是给人看的中文说明，可能调整措辞。
 - `fix`（可选）是可以直接照做的改正建议；`docs`（可选）指向本页对应小节，按请求的站点补成绝对 URL。
-- `details`（可选）是结构化补充：`headers` 列出出问题的邮件头；`messageId` 与 `recipientOutcomes` 出现在 `delivery_failed` 上。
+- `details`（可选）是结构化补充：`headers` 列出出问题的邮件头；`messageId` 与 `recipientOutcomes` 出现在 `delivery_failed` 上；`suppressed` 出现在 `recipient_suppressed` 上。
 - 报告问题时附上 `requestId`（与响应头 `X-Request-ID` 相同）。
 
 下面各节对应 `docs` 链接的锚点；其余错误码见文末[其他错误码](#其他错误码)。
@@ -49,11 +49,21 @@ API Key 缺少接口要求的 scope（HTTP 403 `forbidden`），`fix` 写明缺�
 
 ## source_unavailable
 
-`replyToMessageId` 或 `forwardAttachmentsFrom` 引用的原邮件不存在、不可见，或附件已丢失（HTTP 404）。去掉这个字段后可以作为新邮件发送，丢失的附件需要重新附上。回复站外邮件不用 `replyToMessageId`，改在 `headers` 里写 `In-Reply-To`/`References`。
+`replyToMessageId` 或 `forwardAttachmentsFrom` 引用的原邮件、或回复/转发接口路径里的原邮件不存在、不可见，或附件已丢失（HTTP 404）。去掉这个字段（或改用普通发送）后可以作为新邮件发送，丢失的附件需要重新附上。回复站外邮件不用 `replyToMessageId`，改在 `headers` 里写 `In-Reply-To`/`References`。
+
+## from_required
+
+回复或转发没给 `from`，而缺省的发件地址——原信的收件地址——不是你能用的发件身份（HTTP 400 `from_required`），典型情况是原信在别人共享给你的邮箱里。在请求的 `from` 写自己的地址（写法同普通发送），先调 `GET /v1/identities` 从 `canSend=true` 的项里选。显式给了 `from` 但无权使用时是 403 `forbidden`，见 [forbidden-sender](#forbidden-sender)。
 
 ## delivery_failed
 
 全部收件人都明确失败，没有任何一份投递成功（HTTP 422）：发信服务逐个拒收，或服务端在开始投递前出错。结果不明的收件人（超时、网络错误）不算失败，那种情况返回 201 与 `status:"unknown"`。`details.messageId` 是已记录的发件行（在 `direction=outbound` 列表里可见），`details.recipientOutcomes` 给出每个收件人的失败原因。这次不占当日外发配额。同一个 `Idempotency-Key` 重试会返回同样的错误；按原因修正收件人后换新 Key 重发。只有部分收件人失败时仍返回 201，结果在 `recipientOutcomes` 里，只补发 `failed` 的地址。
+
+## recipient_suppressed
+
+全部收件人都在本站抑制名单里（HTTP 422）：此前从同一发信域名发给他们的信被退回，或被标为垃圾邮件。什么也没有发出，没有创建发件记录，不占当日外发配额，`Idempotency-Key` 已释放，改正后可以继续用。`details.suppressed` 每项为 `{address,reason,sendingDomain,since,expiresAt}`：`reason` 为 `hard_bounce`（永久退信，地址或域名不可用）、`soft_bounce`（临时失败且重试耗尽）或 `complaint`（收件人投诉）；`expiresAt` 是自动解除时间，null 表示需管理员解除。
+
+换用其他收件人；对方地址恢复后由管理员在抑制名单中解除（`DELETE /api/admin/suppressions/:id`，见[管理员功能](administration.md#投递回执与抑制名单)），软退信 24 小时、一般硬退信 7 天后自动解除。名单只拦从 `sendingDomain` 发出的信，但不要为绕过它改用其他发信域名：地址不存在会再次退信，投诉过的人不应再收到这类邮件。只有部分收件人被抑制时照常发送其余收件人（201），被抑制的收件人在 `recipientOutcomes` 里为 `failed` 并带 `code:"recipient_suppressed"`，补发时去掉它们；其余收件人也全部失败时是 422 `delivery_failed`。详见[抑制名单](mail.md#抑制名单)。
 
 ## rate_limited
 

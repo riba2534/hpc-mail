@@ -79,3 +79,39 @@ export async function checkDomainOnboarding(
 export async function hasDnssec(domain: string): Promise<boolean> {
   return (await dohQuery(domain, 'DS')).some((answer) => answer.type === 43);
 }
+
+const normalizeNs = (name: string) => name.trim().toLowerCase().replace(/\.$/, '');
+
+/**
+ * 域名在注册局的 NS 委派（不需要凭据）：先查 RDAP（rdap.org 跳转到注册局，给出的就是父域委派），
+ * 失败再用 DoH 查 NS。返回 null 表示无法确定——NS 仍指向某个已删除的 zone 时递归解析通常是 SERVFAIL，
+ * 所以查询失败不能当成「没有指向本站」。
+ */
+export async function lookupDelegation(domain: string): Promise<string[] | null> {
+  try {
+    const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+      headers: { accept: 'application/rdap+json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const body = (await res.json()) as { nameservers?: { ldhName?: string }[] };
+      if (Array.isArray(body.nameservers)) {
+        return body.nameservers.map((ns) => normalizeNs(ns.ldhName ?? '')).filter(Boolean);
+      }
+    }
+  } catch {
+    // 回落到 DoH
+  }
+  try {
+    const res = await fetch(`${DOH_ENDPOINT}?name=${encodeURIComponent(domain)}&type=NS`, {
+      headers: { accept: 'application/dns-json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as DohResponse;
+    if (body.Status !== 0) return null;
+    return (body.Answer ?? []).filter((answer) => answer.type === 2).map((answer) => normalizeNs(answer.data)).filter(Boolean);
+  } catch {
+    return null;
+  }
+}

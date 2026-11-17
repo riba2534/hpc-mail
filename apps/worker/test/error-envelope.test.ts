@@ -85,7 +85,7 @@ describe('错误信封的 fix / docs / details', () => {
   it('代码里引用的每个错误文档锚点都存在', () => {
     const referenced = [...Object.values(DEFAULT_ERROR_HINTS).map((hint) => hint!.docs!),
       '/references/errors.md#forbidden-scope', '/references/errors.md#forbidden-sender',
-      '/references/errors.md#header_not_allowed', '/references/errors.md#payload_too_large'];
+      '/references/errors.md#header_not_allowed', '/references/errors.md#payload_too_large', '/references/errors.md#recipient_suppressed'];
     for (const docs of referenced) {
       const [file, anchor] = docs.split('#') as [string, string];
       expect(file).toBe('/references/errors.md');

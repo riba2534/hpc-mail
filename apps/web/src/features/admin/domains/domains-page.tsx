@@ -1,4 +1,4 @@
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   ArrowDown,
@@ -28,8 +28,12 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { toast } from '@/components/ui/toast';
-import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
+import { adminMailboxesQueryOptions } from '@/features/admin/addresses/admin-mailboxes';
 import { cn } from '@/lib/cn';
+import { CloudflareZonesCard } from './cloudflare-zones-card';
+
+// 接入详情页与收件域名页同一个 chunk，路由共用同一个 preloadable loader
+export { OnboardingDetailPage } from './onboarding-detail-page';
 
 const WORKER_NAME = 'hpc-cloud-mail';
 const CLOUDFLARE_DASH = 'https://dash.cloudflare.com';
@@ -214,22 +218,31 @@ function DomainRow({
   );
 }
 
+/** 删除确认里的影响面：只看第一页，还有下一页时说「至少」，不编造总数 */
+function affectedSummary(query: { data?: { pages: { items: unknown[] }[] }; hasNextPage: boolean; isError: boolean }): string {
+  const first = query.data?.pages[0]?.items.length;
+  if (first === undefined) return query.isError ? '（该域的认领地址数暂时无法读取。）' : '（正在统计该域的认领地址…）';
+  if (first === 0) return '（当前该域下暂无已认领地址。）';
+  return query.hasNextPage ? `该域至少有 ${first} 个已认领地址。` : `该域当前有 ${first} 个已认领地址。`;
+}
+
 export function DomainsPage() {
   const queryClient = useQueryClient();
   const { data: settings, isLoading, isError, error: settingsError, refetch } = useQuery({
     queryKey: queryKeys.admin.settings,
     queryFn: () => adminApi.getSettings(),
   });
-  // 全站已认领地址：用于删域名前预估影响面
-  const { data: allMailboxes } = useMailboxesQuery(true);
   const [newDomain, setNewDomain] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // 删域名前预估影响面：确认弹窗打开时只取该域的第一页已认领地址
+  const affected = useInfiniteQuery({ ...adminMailboxesQueryOptions({ domain: removing ?? undefined }), enabled: removing !== null });
   // 接入指南：还没有域名时默认展开，已有域名时默认折叠；用户手动切换后以手动为准
   const [guideToggled, setGuideToggled] = useState<boolean | null>(null);
+  // 手动添加收在折叠区：主路径是下方「Cloudflare 中可接入的域名」的一键接入
+  const [manualOpen, setManualOpen] = useState(false);
 
   const list = settings?.domains.list ?? [];
-  const affected = removing ? (allMailboxes ?? []).filter((box) => box.domain === removing) : [];
 
   // 每个域名一条接入自检 query，进页面自动探测 MX；支持单独「重新检测」
   const statusQueries = useQueries({
@@ -319,7 +332,7 @@ export function DomainsPage() {
     <div className="mx-auto flex max-w-2xl flex-col gap-5">
       <PageHeader
         title="收件域名"
-        description="接入一个新域名分两侧：Cloudflare 侧开启收件能力，本站侧把域名加入系统。新域名默认仅管理员可用，需手动公开给普通用户。"
+        description="站长 Cloudflare 账户里的域名可以在下方一键接入；也可以在 Cloudflare 手动配好后在这里手动添加。新域名默认仅管理员可用，需手动公开给普通用户。"
       />
 
       {/* 接入向导 */}
@@ -415,27 +428,41 @@ export function DomainsPage() {
           </p>
         </div>
 
-        <form onSubmit={addDomain} className="flex items-start gap-2">
-          <div className="flex-1">
-            <Input
-              aria-label="新增收件域名"
-              aria-describedby={error ? 'new-domain-error' : undefined}
-              disabled={!canEdit}
-              placeholder="example.com"
-              value={newDomain}
-              invalid={error !== null}
-              onChange={(event) => {
-                setNewDomain(event.target.value);
-                if (error) setError(null);
-              }}
-            />
-            {error && <p id="new-domain-error" role="alert" className="mt-1 text-xs text-critical">{error}</p>}
-          </div>
-          <Button type="submit" variant="secondary" loading={persist.isPending} disabled={!canEdit}>
-            <Plus className="size-4" />
-            添加
-          </Button>
-        </form>
+        <div className="flex flex-col gap-2">
+          <button
+            type="button"
+            aria-expanded={manualOpen}
+            aria-controls="manual-domain-form"
+            onClick={() => setManualOpen(!manualOpen)}
+            className="flex items-center gap-1.5 self-start rounded-sm text-[13px] text-ink-secondary hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            <ChevronDown aria-hidden className={cn('size-4 transition-transform', manualOpen && 'rotate-180')} />
+            手动添加（已在 Cloudflare 手动配好收件路由与 catch-all 的域名）
+          </button>
+          {manualOpen && (
+            <form id="manual-domain-form" onSubmit={addDomain} className="flex items-start gap-2">
+              <div className="flex-1">
+                <Input
+                  aria-label="新增收件域名"
+                  aria-describedby={error ? 'new-domain-error' : undefined}
+                  disabled={!canEdit}
+                  placeholder="example.com"
+                  value={newDomain}
+                  invalid={error !== null}
+                  onChange={(event) => {
+                    setNewDomain(event.target.value);
+                    if (error) setError(null);
+                  }}
+                />
+                {error && <p id="new-domain-error" role="alert" className="mt-1 text-xs text-critical">{error}</p>}
+              </div>
+              <Button type="submit" variant="secondary" loading={persist.isPending} disabled={!canEdit}>
+                <Plus className="size-4" />
+                添加
+              </Button>
+            </form>
+          )}
+        </div>
 
         {isLoading ? (
           <Skeleton className="h-24 w-full rounded-md" />
@@ -467,11 +494,13 @@ export function DomainsPage() {
           <EmptyState
             icon={Globe}
             title="还没有配置收件域名"
-            description="按上方向导先在 Cloudflare 开启 Email Routing 并把 catch-all 指向本 Worker，再在这里把域名添加进来。"
+            description="在下方「Cloudflare 中可接入的域名」一键接入；或按上方向导在 Cloudflare 手动配好后，用「手动添加」把域名加进来。"
             className="rounded-md border border-dashed border-line"
           />
         )}
       </section>
+
+      <CloudflareZonesCard />
 
       <ConfirmDialog
         open={removing !== null}
@@ -479,11 +508,7 @@ export function DomainsPage() {
         title="移除这个域名？"
         description={
           removing
-            ? `移除 ${removing} 后将停止新的地址认领。已有邮箱和历史邮件保留，已有邮箱仍可收发；关闭收件还需在 Cloudflare 停用 Catch-all。${
-                affected.length > 0
-                  ? `当前已加载 ${affected.length} 个该域的认领地址。`
-                  : '（当前该域下暂无已认领地址。）'
-              }`
+            ? `移除 ${removing} 后将停止新的地址认领。已有邮箱和历史邮件保留，已有邮箱仍可收发；移除不会停止 Cloudflare 的收件路由，关闭收件还需在 Cloudflare 停用 Catch-all。${affectedSummary(affected)}`
             : undefined
         }
         confirmLabel="移除"

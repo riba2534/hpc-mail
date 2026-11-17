@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { MAX_HOSTED_DOMAIN_BATCH, MAX_HOSTED_DOMAIN_MEMBERS } from '../constants.js';
 import type { ErrorCode } from '../envelope.js';
-import { domainSchema } from './mailbox.js';
+import { domainSchema, withOptionalPage } from './mailbox.js';
 
 /**
  * 托管域名：用户把自己的域名 NS 指向站长 Cloudflare 账户分配的名称服务器，系统自动开通收发。
@@ -154,7 +154,8 @@ export interface HostedDomainTransferResult {
   movedMailboxes: number;
 }
 
-export const adminHostedDomainsQuerySchema = z.object({
+/** 管理员全站托管域名：数组模式最多 1000 条；分页模式按 id 倒序（见 withOptionalPage） */
+export const adminHostedDomainsQuerySchema = withOptionalPage({
   status: z.enum(HOSTED_DOMAIN_STATUSES).optional(),
   q: z.string().trim().toLowerCase().max(253).optional(),
 });

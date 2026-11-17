@@ -17,6 +17,49 @@ export const domainSchema = z
   .regex(/^[a-z0-9.-]+\.[a-z]{2,}$/, '域名格式非法')
   .refine((v) => v.split('.').every((label) => label.length >= 1 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)), '域名标签需为 1-63 位，不能以连字符开头或结尾');
 
+/** 管理列表可选分页的每页条数 */
+export const LIST_PAGE_DEFAULT_LIMIT = 50;
+export const LIST_PAGE_MAX_LIMIT = 200;
+
+const blankAsUndefined = (value: unknown) => (value === '' ? undefined : value);
+
+/** 查询参数里出现 cursor 或 limit（值可为空）即分页模式 */
+const markPaged = (raw: unknown) =>
+  raw !== null && typeof raw === 'object' ? { ...raw, paged: 'cursor' in raw || 'limit' in raw } : raw;
+
+/**
+ * 可选分页的列表查询：分页模式（paged=true）响应 Page，cursor 为空即首页，limit 缺省 50；
+ * 两个参数都没出现时 paged=false，响应保持旧版的完整数组，已有脚本不受影响。
+ */
+export function withOptionalPage<T extends z.ZodRawShape>(shape: T) {
+  const limitMessage = `limit 需为 1-${LIST_PAGE_MAX_LIMIT} 的整数`;
+  return z.preprocess(markPaged, z.object({
+    ...shape,
+    paged: z.boolean(),
+    cursor: z.preprocess(blankAsUndefined, z.string().max(128).optional()),
+    limit: z.preprocess(blankAsUndefined, z.coerce.number().int(limitMessage).min(1, limitMessage).max(LIST_PAGE_MAX_LIMIT, limitMessage).optional())
+      .default(LIST_PAGE_DEFAULT_LIMIT),
+  }));
+}
+
+/** 地址或所有者用户名的子串，按字面匹配（不支持通配符） */
+const listSearchSchema = z.string().trim().toLowerCase().max(254).optional();
+
+/** GET /api/mailboxes 与 /v1/mailboxes（all=1 另由路由校验权限）；q、domain 在两种模式下都生效 */
+export const listMailboxesQuerySchema = withOptionalPage({
+  q: listSearchSchema,
+  domain: z.preprocess(blankAsUndefined, domainSchema.optional()),
+});
+export type ListMailboxesQuery = z.infer<typeof listMailboxesQuerySchema>;
+
+/** GET /api/admin/mailbox-shares：mailboxId 只取该邮箱（0 或 1 项的数组，忽略分页参数） */
+export const adminMailboxSharesQuerySchema = withOptionalPage({
+  mailboxId: z.string().regex(/^[1-9]\d*$/, 'mailboxId 需为正整数').transform(Number)
+    .refine(Number.isSafeInteger, 'mailboxId 需为正整数').optional(),
+  q: listSearchSchema,
+});
+export type AdminMailboxSharesQuery = z.infer<typeof adminMailboxSharesQuerySchema>;
+
 export const CLAIM_PLAN_STRATEGIES = ['uniform', 'claude'] as const;
 export type ClaimPlanStrategy = (typeof CLAIM_PLAN_STRATEGIES)[number];
 
@@ -113,9 +156,10 @@ export interface SendIdentity {
 }
 
 /**
- * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"）：目前只对管理员列出，
- * 与管理员发信的实际放行规则一致——system 系统域名；hosted 发信已就绪的托管域名；
- * legacy 已从系统列表移除、但仍有存量邮箱的旧域名。
+ * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"），与发信的实际放行规则一致：
+ * 管理员得到 system 系统域名、hosted 发信已就绪的托管域名、legacy 已从系统列表移除但仍有存量邮箱的旧域名；
+ * 普通用户只得到自己作为所有者、已生效且发信就绪的托管域名（hosted），发出时自动把该地址认领给所有者
+ * （不占全站每人认领上限），成员与共享不适用。
  */
 export interface SendIdentityDomain {
   domain: string;

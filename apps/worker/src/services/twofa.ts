@@ -4,10 +4,9 @@ import { createDb } from '../db/client.js';
 import { users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import { generateRecoveryCodes, generateTotpSecret, matchTotpStep, otpauthUri } from '../lib/totp.js';
-import type { Env, ExecCtx } from '../types.js';
+import type { Env } from '../types.js';
 import { issueToken } from './auth.js';
 import { verifyReauthPassword } from './reauth.js';
-import { mirrorUserEpoch } from './session.js';
 
 /** 开始登记：先重新验证密码（拿到会话令牌的人不能给账号绑上自己的验证器），再生成密钥（未启用） */
 export async function setupTwoFactor(env: Env, userId: number, password: string): Promise<TwoFactorSetup> {
@@ -29,7 +28,7 @@ export async function setupTwoFactor(env: Env, userId: number, password: string)
  * 其他会话（包括可能失窃的旧令牌）立即失效，返回的 token 替换当前会话。
  * 验证码错误返回 400（不用 401，网页客户端遇到 401 会清掉会话）。
  */
-export async function enableTwoFactor(env: Env, userId: number, code: string, ctx?: ExecCtx | null): Promise<TwoFactorEnabled> {
+export async function enableTwoFactor(env: Env, userId: number, code: string): Promise<TwoFactorEnabled> {
   const db = createDb(env);
   const user = await db.select().from(users).where(eq(users.id, userId)).get();
   if (!user || !user.totpSecret) throw new AppError('validation_failed', '请先开始登记');
@@ -40,21 +39,20 @@ export async function enableTwoFactor(env: Env, userId: number, code: string, ct
   const updated = await db
     .update(users)
     .set({ totpEnabledAt: new Date(), totpRecoveryCodes: hashes, totpLastStep: step,
-      authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true })
+      authVersion: sql`${users.authVersion} + 1` })
     .where(sql`${users.id} = ${userId} AND ${users.totpEnabledAt} IS NULL AND ${users.totpSecret} = ${user.totpSecret}
       AND (${users.totpLastStep} IS NULL OR ${users.totpLastStep} < ${step})`)
     .returning()
     .get();
   if (!updated) throw new AppError('conflict', '两步验证状态已改变，请刷新后重试');
-  await mirrorUserEpoch(env, userId, updated.authVersion, ctx);
-  return { recoveryCodes: plain, token: await issueToken(env, updated, ctx) };
+  return { recoveryCodes: plain, token: await issueToken(env, updated) };
 }
 
 /**
  * 关闭两步验证：必须重新验证当前密码（只凭 TOTP 码不能关闭）。已启用时递增鉴权版本让其他会话失效；
  * 只是取消未完成的登记时不影响其他会话。返回的 token 替换当前会话。
  */
-export async function disableTwoFactor(env: Env, userId: number, password: string, ctx?: ExecCtx | null): Promise<TwoFactorDisabled> {
+export async function disableTwoFactor(env: Env, userId: number, password: string): Promise<TwoFactorDisabled> {
   await verifyReauthPassword(env, userId, password);
   const db = createDb(env);
   const user = await db.select().from(users).where(eq(users.id, userId)).get();
@@ -63,11 +61,10 @@ export async function disableTwoFactor(env: Env, userId: number, password: strin
   const updated = await db
     .update(users)
     .set({ totpSecret: null, totpEnabledAt: null, totpRecoveryCodes: null, totpLastStep: null,
-      ...(enabled ? { authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true } : {}) })
+      ...(enabled ? { authVersion: sql`${users.authVersion} + 1` } : {}) })
     .where(eq(users.id, userId))
     .returning()
     .get();
   if (!updated) throw new AppError('not_found', '用户不存在');
-  if (enabled) await mirrorUserEpoch(env, userId, updated.authVersion, ctx);
-  return { success: true, token: await issueToken(env, updated, ctx) };
+  return { success: true, token: await issueToken(env, updated) };
 }

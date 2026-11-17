@@ -217,7 +217,7 @@ describe('R04 全站限流桶不被单个用户打满', () => {
     expect(fakes.rl_auth_global.calls).toEqual(['instance']);
   });
 
-  it('/api 慢路径（鉴权版本待迁移）同样不进全站桶', async () => {
+  it('/api 旧标记（auth_version_migrated=0）的用户走同一路径，同样不进全站桶', async () => {
     const { env: target, fakes } = fakeRateLimits();
     const hot = await seedUser('p0-auth-slow', { migrated: false });
     fakes.rl_auth_user.fill(String(hot.id));

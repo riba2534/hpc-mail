@@ -7,6 +7,8 @@
 - [强制过户邮箱](#强制过户邮箱)：把邮箱连同历史转给另一个用户
 - [邀请码](#邀请码)
 - [系统设置与域名](#系统设置与域名)：设置项、外发与中转配额、系统域名
+- [投递回执与抑制名单](#投递回执与抑制名单)：回执订阅状态、抑制名单的查看与解除
+- [系统域名一键接入](#系统域名一键接入)：把站长 Cloudflare 账户里的域名一键配好收发并加入系统域名
 - [Key 与管理审计](#key-与管理审计)
 
 所有 `/api/admin/*` 必须有效 **管理员 JWT**，API Key 的 scopes 不提供这些权限。调用先 `GET /api/auth/me` 核对当前角色；没有管理员权限时报告限制，不换身份、猜测他人 ID 或通过 `/v1` 规避。shell 示例复用 [入口指南](../skill.md)，设 `API="$BASE/api"`、`AUTH` 为管理员 JWT。
@@ -50,7 +52,7 @@
 
 管理员 JWT 可 `POST /api/admin/mailboxes/:id/transfer`，将任意现有已认领邮箱直接转给指定的启用中用户（普通用户或管理员）。自己或别人认领的均可；此操作不经过未认领状态。目标普通用户有专属邮箱权限时，域名范围、系统保留前缀、总数和单域名数量必须符合其权限，超出时先调整配置。目标用户使用公共配置或为管理员时，保留原有强制过户豁免。它不创建尚未存在的邮箱。
 
-先读 `GET /api/mailboxes?all=1`（已知邮箱 ID 时用 `GET /api/admin/mailboxes/:id`，不存在返回 404）核对邮箱 `id,address,userId`，再用 `GET /api/admin/users/search?q=用户名&excludeUserId=当前主人ID` 查找目标用户。q 为 1–32 字符的用户名片段，完全匹配优先，其次前缀和其他包含匹配；hasMore=true 时继续补充用户名缩小范围。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
+先读 `GET /api/mailboxes?all=1&q=<地址片段>&limit=50`（已知邮箱 ID 时用 `GET /api/admin/mailboxes/:id`，不存在返回 404）核对邮箱 `id,address,userId`，再用 `GET /api/admin/users/search?q=用户名&excludeUserId=当前主人ID` 查找目标用户。q 为 1–32 字符的用户名片段，完全匹配优先，其次前缀和其他包含匹配；hasMore=true 时继续补充用户名缩小范围。body 为 `{userId:目标用户ID,expectedOwnerId:列表中的当前主人ID}`，两者必须是正整数。
 
 ```bash
 # API="$BASE/api"，AUTH 为管理员 JWT；三个 ID 均来自上面的实际查询
@@ -76,7 +78,7 @@ hpc '/messages' --get --data-urlencode 'scope=user' \
 hpc '/messages' --get --data-urlencode 'scope=unclaimed' --data-urlencode 'direction=inbound'
 ```
 
-详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。要查看某个已认领邮箱自己的收件或发件，用 `scope=user&userId=<归属人>&address=<完整地址>`，再以 `direction=inbound|outbound` 区分。全站地址管理用 `GET /mailboxes?all=1`，编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
+详情/线程/raw 同样带 scope 与 userId，管理员审阅其他用户为只读，所有邮件状态变更（含星标）仅支持 `mine/unclaimed`。未认领邮件修改需显式 `scope=unclaimed`；默认列表只自己的认领邮箱。要查看某个已认领邮箱自己的收件或发件，用 `scope=user&userId=<归属人>&address=<完整地址>`，再以 `direction=inbound|outbound` 区分。全站地址管理用 `GET /mailboxes?all=1`（带 `limit`/`cursor` 分页、`q`/`domain` 筛选，见[邮箱列表](mailboxes-and-domains.md#发现域名与邮箱)），编辑/释放对应 `/mailboxes/:id`；管理员共享管理可处理**全站任意已认领邮箱**，成员可为启用中的普通用户或管理员。域名与共享完整契约见 [邮箱、多域名参考](mailboxes-and-domains.md)。
 
 ## 邀请码
 
@@ -107,6 +109,7 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 | `ai_model` | `{baseUrl,apiKey,model}`；全站唯一的 AI 模型（OpenAI 兼容 Chat Completions），翻译与验证码 AI 兜底共用；三项都非空才算已配置。baseUrl 为 https 根地址，不含 `/chat/completions`；apiKey 只写，回显为 `******`，提交 `******` 保留原值、空串清除；沿用已存 Key 时 baseUrl 的 origin 与路径必须与已保存的一致（协议、主机、端口或路径变化都算换了接口，末尾斜杠视为相同），否则仍提交 `******` 返回 400 `validation_failed`，需要重新填写 apiKey，防止已存的 Key 被发往新地址；清空 baseUrl 可沿用已存 Key |
 | `translation` | `{enabled,dailyCharsPerUser}`；AI 翻译开关与额度。enabled=true 要求 `ai_model` 已配置，同一请求同时提交两者时按合并后的结果校验（翻译开着时不能单独清空模型）；dailyCharsPerUser 0–10000000，每用户每 UTC 日发送给模型的字符数，0 不限，admin 不豁免 |
 | `hosted_domains` | `{enabled,maxPerUser,maxPendingPerUser,maxPendingTotal,pendingDays,autoClaimLimit}`；用户托管域名开关与额度（Worker 还需配置 Cloudflare 凭据，`/api/config` 的 `hostedDomainsEnabled` 反映两者）。maxPerUser 0–1000（0 不限）为普通用户最多拥有的域名数；maxPendingPerUser 1–100 与 maxPendingTotal 1–1000 限制同时等待 NS 生效的数量，保护站长 Cloudflare 账户的添加额度；pendingDays 1–28 天未改 NS 自动删除；autoClaimLimit 0–100000（默认 0 不限）为每个托管域名自动认领的地址上限，设为正数时域内地址达到后未认领新地址的来信拒收，手动认领始终不受限。管理员不受个人上限，受全站等待数限制。全站托管域名、暂停/恢复与凭据健康检查见 `/api/admin/hosted-domains…`，详情、成员、过户、删除复用 `/api/hosted-domains/:id…`（管理员有全部权限），见[邮箱参考](mailboxes-and-domains.md#用户托管域名) |
+| `delivery_events` | `{enabled}`，默认 true；外发投递回执的事件订阅开关。关闭只停止新建订阅，已有订阅的事件仍会回写，见[投递回执与抑制名单](#投递回执与抑制名单) |
 
 外发 dailyRecipients 以每次请求去重后的收件地址计数，不是跨全天同一收件人只计一次；站内/外收件均计入。系统当前策略必须先读取，不把 schema 默认值当线上设置。
 
@@ -117,6 +120,62 @@ AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Wo
 `POST /admin/settings/ai-model-test` 用固定英文示例按翻译格式真实调用一次 AI 模型，返回 `{ok:true,latencyMs,sample}`；body 可省略，`{baseUrl,apiKey,model}` 中未提交或为空的字段、以及 apiKey 为 `******` 时用已保存的 `ai_model`，不要求任何功能已启用，便于保存前验证。沿用已存 apiKey（未填、空串或 `******`）时 baseUrl 的 origin 与路径必须与已保存的一致（末尾斜杠视为相同），否则返回 400 `validation_failed`，要测试新地址需同时填写 apiKey。三项解析后仍缺失返回 400；服务失败返回 500，message 说明 HTTP 状态码、超时或返回格式无效，不回显 Key。测试会产生一次真实外部调用，不计用户额度。
 
 通知/转发已为个人偏好，不在上述系统设置中；通过 `/api/me/notify-prefs` 修改当前管理员的个人通道，不能 PUT 旧全局 `feishu/notify_webhook/gmail_forward` 字段。
+
+## 投递回执与抑制名单
+
+外发投递回执来自 Cloudflare Email Sending 的事件订阅：送达、退信、失败、拒绝、投诉事件按发信域名投递到部署时配置的 Queue，本站据此回写发件的逐收件人结果（见[投递回执](mail.md#投递回执)），退信与投诉的收件人进入抑制名单（见[抑制名单](mail.md#抑制名单)）。这个功能需要站长在部署时显式启用（GitHub Variable `DELIVERY_EVENTS_QUEUE`）；没启用时 `GET /admin/delivery-events` 的 `queue` 为 null，不建订阅、发信也不查抑制名单。启用后，设置 `delivery_events.enabled` 开启（默认）且 Worker 有 Cloudflare 凭据时，定时任务每 5 分钟为还没有订阅的系统域名补建订阅、每日核对一次，托管域名开通发信时立即订阅。关闭后不再新建订阅，已有订阅的事件仍会回写。
+
+| 方法与 `/api` 路径 | 契约 |
+|---|---|
+| `GET /admin/delivery-events` | `{enabled,credentials,queue,subscriptions:[{domain,kind,zoneId,subscriptionId,status,lastError,checkedAt}]}`；`queue` 为部署配置的队列名，null 表示部署未启用；`kind` 为 `system\|hosted`，`status` 为 `active`（已订阅）或 `error`（建立失败，见 `lastError`，定时任务约 6 小时后重试）。只列定时任务处理过的域名 |
+| `GET /admin/suppressions?q=…&cursor=…&limit=30` | 有效（未过期）的抑制条目，按 id 倒序分页；`q` 按收件地址或发信域名包含匹配，不区分大小写；limit 1–100，默认 30 |
+| `DELETE /admin/suppressions/:id` | 解除一条，`{success:true}`；不存在返回 404 `not_found`；记管理审计 `suppression.delete`（target 为收件地址，detail 为「发信域名 <域名>」） |
+
+抑制条目为 `{id,address,reason,sendingDomain,since,expiresAt,detail,updatedAt}`：`reason` 为 `hard_bounce`（永久退信）、`soft_bounce`（临时失败且重试耗尽）或 `complaint`（被标为垃圾邮件）；`expiresAt` 为 null 表示长期有效，只能由管理员解除；`detail` 是收件服务器的退信说明或投诉类型。条目只拦从 `sendingDomain` 发给该地址的信。解除前先确认对方地址已恢复（例如用户确认邮箱可用），解除后下一次发信才会重新尝试；投诉条目按用户授权处理，不要为了让发信通过而批量解除。解除只删本站条目，Cloudflare 侧的抑制需要在 Cloudflare 控制台另行解除，否则发送仍会被它拒绝。
+
+`credentials:false` 时不会自动建立订阅；没有订阅的域名收不到回执，结果停在 `sent`。建立订阅需要 Worker 的 Cloudflare Token（部署时的 `CF_HOSTED_DOMAINS_TOKEN`）具有 Account → Queues:Edit 权限，系统域名还要求它能读取域名所在的 zone，缺权限时 `lastError` 会给出提示。Token 读不到的系统域名可由站长在 Cloudflare 侧为该域名手动建立同一 Queue 的 email.sending 订阅，下一次重试或每日核对会识别并标为 `active`。
+
+## 系统域名一键接入
+
+只用管理员 JWT（`/api`），API Key 与 `/v1` 都没有这些接口。Worker 配有 Cloudflare 凭据即可用，不受 `hosted_domains.enabled` 开关控制。它替管理员在站长 Cloudflare 账户里开启 Email Routing、把 catch-all 指向本站 Worker、接入 Email Sending，收发都就绪后把域名追加到 `settings.domains.list`（`{public:false,perUserLimit:0,random:true}`，之后照常用 `PUT /admin/settings` 调整）。
+
+| 方法与 `/api` 路径 | 契约 |
+|---|---|
+| `GET /admin/system-domains/zones?hidden=0\|1&refresh=0\|1` | 账户 zone 分类：`zones` 是可接入（available）与接入中（onboarding，行上带任务摘要），`others` 是已是系统域名、用户托管（管理员名下的会标出）与记录不一致；每次最多预检 10 个可接入 zone 给出 `readiness.verdict`（ready/confirm/blocked/pending），其余 `unchecked`；无凭据时 `configured:false` |
+| `GET /admin/system-domains/precheck?mode=existing_zone&zoneId=…` 或 `?mode=new_zone&domain=…` | 只读预检：`checks`（severity none/info/confirm/blocker）、计划 `steps`、`requiredAcks`、`fingerprint`、RDAP 注册商；业务冲突不报错 |
+| `POST /admin/system-domains/onboardings` | 一键接入，体 `{mode,zoneId\|domain,fingerprint?,accept?}`；201 新建，同域名同方式进行中任务重放 200；需确认或有阻断时 409，`error.details.precheck` 带最新预检 |
+| `GET /admin/system-domains/onboardings?active=0\|1` | 任务列表（倒序） |
+| `GET /admin/system-domains/onboardings/:id` | 任务详情：分项 `steps`、最近预检、已确认项、变更台账 `changes`（含原值） |
+| `POST /admin/system-domains/onboardings/:id/check` | 立即检测或重试；15 秒内重复或正在处理时直接返回当前状态 |
+| `POST /admin/system-domains/onboardings/:id/confirm` | 只用于 `needs_confirmation`（远端在确认后又变了）：带 `fingerprint` 与 `accept`；指纹过期 409 并附新预检 |
+| `POST /admin/system-domains/onboardings/:id/cancel` | 取消，体 `{deleteCreatedZone?}`；只有本任务创建且从未激活的 zone 才能删（`canDeleteZone`），否则 400 |
+| `PUT /admin/system-domains/hidden-zones` | `{domain,hidden,expectedRevision}` 隐藏或恢复可接入列表中的 zone，revision 过期 409 |
+
+流程：读 zones → 选一个 available zone → `verdict=ready` 直接 POST；`confirm` 先 GET precheck，把要确认的变更逐条告诉用户、取得授权后带 `fingerprint` 与 `accept`（即 `requiredAcks`）POST；`blocked` 按 `checks` 里的说明处理后再检测。任务状态 `creating_zone → awaiting_ns → configuring → finalizing → completed`，`needs_confirmation`、`blocked` 等人处理（blocked 每 30 分钟自动复检），每 5 分钟由定时任务推进；轮询详情即可。
+
+```bash
+# API="$BASE/api"，AUTH 为管理员 JWT；HPC_ZONE_ID 来自 zones，用户已确认 requiredAcks 中的每一项
+PRECHECK=$(hpc "/admin/system-domains/precheck?mode=existing_zone&zoneId=$HPC_ZONE_ID")
+jq --arg zone "$HPC_ZONE_ID" '{mode:"existing_zone",zoneId:$zone,fingerprint:.data.fingerprint,accept:.data.requiredAcks}' <<< "$PRECHECK" |
+  hpc '/admin/system-domains/onboardings' -X POST -H 'Content-Type: application/json' --data-binary @-
+```
+
+需确认项（`ack`）的含义，每一项都要先征得用户同意：
+
+- `mx.delete`（危险）：根域有第三方 MX 或 null MX。确认后系统删除这些记录并紧接着开启 Email Routing，该域名**不再经原服务商收信**；原记录写进台账，可手动恢复。删除后 Routing 没开起来时任务 `blocked`、`errorCode=mx_removed_routing_pending`，按最短间隔重试。
+- `catchAll.replace`：catch-all 正指向其他 Worker、转发或丢弃，替换后原目标收不到这个域名的信。由其他 Worker 的 wrangler `addresses` 管理的 catch-all 是阻断项，不能替换。
+- `spf.merge`：把 `include:_spf.mx.cloudflare.net` 合并进唯一的一条 SPF；多条 SPF、含宏、超过 10 次查询为阻断项。
+- `rules.bypass`：启用中的专用地址规则优先于 catch-all，这些地址的来信不进本站（不修改规则）。
+- `dmarc.create`：没有 `_dmarc` 且域名另有邮件服务，接入发信时 Cloudflare 会写入 `p=reject`。
+- `ns.change`：`new_zone` 要把 NS 改到 Cloudflare，影响整个域名的 DNS；原记录不会自动迁移。
+
+规则与边界：
+
+- 任意读取失败都是阻断项，不会当作「不存在」去写入；不自动回滚，不关闭 Routing、不删除发信子域，只有取消时可删除本任务新建且从未激活的 zone。
+- 系统域名、用户托管域名与进行中的接入任务三方同名互斥；`new_zone` 新建的待激活 zone 与托管域名一起计入 `hosted_domains.maxPendingTotal`。
+- 接入完成前到达的来信按「未认领」收下。之后从系统域名列表移除不会停止 Cloudflare 的收件路由。
+- Cloudflare 调用另有额度：每 5 分钟 120 次；超出或 Cloudflare 返回 429 后的退避期内，这些接口返回 429 `rate_limited`。
+- 审计 action：`system_domain.create`、`.confirm`、`.cancel`、`.complete`、`.zone_delete`、`.fail`、`.hide`、`.unhide`。
 
 ## Key 与管理审计
 

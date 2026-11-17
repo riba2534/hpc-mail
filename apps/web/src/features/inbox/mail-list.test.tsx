@@ -3,8 +3,8 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ListMessagesQuery, MessageSummary } from '@hpc-mail/shared';
-const mocks=vi.hoisted(()=>({restore:vi.fn(async(_ids:number[])=>({changed:0})),purge:vi.fn(async()=>({changed:1})),remove:vi.fn(async(ids:number[])=>({deleted:ids.length})),markRead:vi.fn(async(ids:number[])=>({changed:ids.length})),star:vi.fn(async(ids:number[])=>({changed:ids.length})),toast:vi.fn(),items:[] as MessageSummary[]}));
-vi.mock('@/api/resources',()=>({messageApi:{restore:mocks.restore,purge:mocks.purge,remove:mocks.remove,markRead:mocks.markRead,star:mocks.star}}));
+const mocks=vi.hoisted(()=>({restore:vi.fn(async(_ids:number[])=>({changed:0})),purge:vi.fn(async()=>({changed:1})),remove:vi.fn(async(ids:number[])=>({deleted:ids.length})),markRead:vi.fn(async(ids:number[])=>({changed:ids.length})),star:vi.fn(async(ids:number[])=>({changed:ids.length})),toast:vi.fn(),items:[] as MessageSummary[],detail:vi.fn((_id:number,_view?:unknown,signal?:AbortSignal)=>new Promise((_,reject)=>{signal?.addEventListener('abort',()=>reject(new DOMException('aborted','AbortError')))}))}));
+vi.mock('@/api/resources',()=>({messageApi:{restore:mocks.restore,purge:mocks.purge,remove:mocks.remove,markRead:mocks.markRead,star:mocks.star,detail:mocks.detail}}));
 vi.mock('@/components/ui/toast',()=>({toast:mocks.toast}));
 vi.mock('@/features/mailboxes/use-mailboxes',()=>({useMailboxesQuery:()=>({data:[{id:1,address:'me@example.com',domain:'example.com'}]})}));
 vi.mock('./use-star',()=>({useStarMutation:()=>({mutate:vi.fn()})}));
@@ -12,7 +12,7 @@ vi.mock('./use-messages',()=>({useMessagesQuery:()=>({data:{pages:[{items:mocks.
 vi.mock('@tanstack/react-virtual',()=>({useWindowVirtualizer:()=>({getVirtualItems:()=>mocks.items.map((_,index)=>({index,start:index*84})),getTotalSize:()=>mocks.items.length*84,measureElement:vi.fn(),scrollToIndex:vi.fn()})}));
 import { MailList } from './mail-list';
 const mail=(id:number,extra:Partial<MessageSummary>={})=>({id,direction:'inbound',address:'me@example.com',domain:'example.com',fromAddress:'sender@example.com',fromName:'',subject:`mail-${id}`,preview:'body',verificationCode:'',status:'received',errorDetail:'',isRead:true,isStarred:false,hasAttachments:false,size:4,createdAt:'2026-10-05T00:00:00Z',...extra}) as MessageSummary;
-beforeEach(()=>{mocks.toast.mockClear();mocks.remove.mockClear();mocks.markRead.mockClear();mocks.restore.mockClear();mocks.items=[1,2].map((id)=>mail(id))});
+beforeEach(()=>{mocks.detail.mockClear();mocks.toast.mockClear();mocks.remove.mockClear();mocks.markRead.mockClear();mocks.restore.mockClear();mocks.items=[1,2].map((id)=>mail(id))});
 function Detail(){const location=useLocation();return <p>detail {location.pathname} {JSON.stringify(location.state)}</p>}
 function show(query:Partial<ListMessagesQuery>={trash:true},variant:'inbox'|'trash'='trash'){const client=new QueryClient();render(<QueryClientProvider client={client}><MemoryRouter><Routes><Route path="/" element={<MailList query={query} variant={variant} emptyTitle="empty"/>}/><Route path="/mail/:id" element={<Detail/>}/></Routes></MemoryRouter></QueryClientProvider>);return client}
 function selectAll(){fireEvent.click(screen.getAllByRole('checkbox',{name:/^选择：/})[0]!);fireEvent.click(screen.getByRole('checkbox',{name:/^选择：/}))}
@@ -128,6 +128,31 @@ describe('inbox list toolbar and rows',()=>{
     fireEvent.keyDown(window,{key:'k'});
     fireEvent.keyDown(window,{key:'o'});
     expect(await screen.findByText(/detail \/mail\/1/)).toHaveTextContent('"direction":"inbound"');
+    client.clear();
+  });
+});
+
+describe('hover prefetch',()=>{
+  const inbox={scope:'mine' as const,direction:'inbound' as const};
+  const wait=(ms:number)=>act(()=>new Promise((resolve)=>setTimeout(resolve,ms)));
+  it('waits 250ms on a row before prefetching its detail; passing over a row does not prefetch',async()=>{
+    const client=show(inbox,'inbox');
+    const row=screen.getByRole('link',{name:'sender@example.com，mail-1'});
+    fireEvent.mouseEnter(row);await wait(180);fireEvent.mouseLeave(row);await wait(150);
+    expect(mocks.detail).not.toHaveBeenCalled();
+    fireEvent.mouseEnter(row);await wait(300);
+    expect(mocks.detail.mock.calls.map(([id])=>id)).toEqual([1]);
+    client.clear();
+  });
+  it('keeps at most one hover prefetch in flight: the previous one is cancelled',async()=>{
+    const client=show(inbox,'inbox');
+    fireEvent.mouseEnter(screen.getByRole('link',{name:'sender@example.com，mail-1'}));await wait(300);
+    const first=mocks.detail.mock.calls[0]![2] as AbortSignal;
+    expect(first.aborted).toBe(false);
+    fireEvent.mouseEnter(screen.getByRole('link',{name:'sender@example.com，mail-2'}));await wait(300);
+    expect(mocks.detail.mock.calls.map(([id])=>id)).toEqual([1,2]);
+    expect(first.aborted).toBe(true);
+    expect((mocks.detail.mock.calls[1]![2] as AbortSignal).aborted).toBe(false);
     client.clear();
   });
 });

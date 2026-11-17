@@ -194,6 +194,15 @@ export const hostedDomainsSettingSchema = z.object({
   autoClaimLimit: z.number().int().min(0).max(100000).default(0),
 });
 
+/**
+ * 外发投递回执：开启且 Worker 配置了 Cloudflare 凭据时，定时任务为每个系统域名与已开通发信的托管域名
+ * 建立 Email Sending 事件订阅；送达、退信、投诉写回逐收件人结果，退信与投诉进入抑制名单。
+ * 关闭只停止新建订阅，已有订阅的事件仍会回写。
+ */
+export const deliveryEventsSettingSchema = z.object({
+  enabled: z.boolean(),
+});
+
 // gmail_forward / feishu / notify_webhook 已从系统设置下放为「每用户的个人转发与通知偏好」
 // （见 schemas/notify-prefs.ts）；下面三个 schema 定义保留、被个人偏好复用。
 export const SETTING_SCHEMAS = {
@@ -210,6 +219,7 @@ export const SETTING_SCHEMAS = {
   translation: translationSettingSchema,
   claim_random: claimRandomSettingSchema,
   hosted_domains: hostedDomainsSettingSchema,
+  delivery_events: deliveryEventsSettingSchema,
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
 
@@ -240,6 +250,7 @@ export const DEFAULT_SETTINGS: Settings = {
   translation: { enabled: false, dailyCharsPerUser: 200_000 },
   claim_random: { paidSuspendedLimit: 2, pendingDays: 7, suspendedPercent: 50, dailyLimit: 3 },
   hosted_domains: { enabled: true, maxPerUser: 3, maxPendingPerUser: 1, maxPendingTotal: 10, pendingDays: 7, autoClaimLimit: 0 },
+  delivery_events: { enabled: true },
 };
 
 export const updateSettingsRequestSchema = z
@@ -258,6 +269,7 @@ export const updateSettingsRequestSchema = z
     translation: translationSettingSchema.optional(),
     claim_random: claimRandomSettingSchema.optional(),
     hosted_domains: hostedDomainsSettingSchema.optional(),
+    delivery_events: deliveryEventsSettingSchema.optional(),
   })
   .refine((v) => Object.keys(SETTING_SCHEMAS).some((key) => v[key as SettingKey] !== undefined), {
     message: '至少提供一个待更新配置',

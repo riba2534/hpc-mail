@@ -17,6 +17,7 @@ export const queryKeys = {
 
   mailboxes: {
     root: ['mailboxes'] as const,
+    /** 管理页的全站分页在 list('all') 后追加筛选条件（见 features/admin/addresses/admin-mailboxes.ts），不进入口 chunk */
     list: (scope: 'mine' | 'all') => ['mailboxes', 'list', scope] as const,
     availability: (localPart: string, domain: string) =>
       ['mailboxes', 'availability', domain, localPart] as const,

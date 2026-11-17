@@ -45,7 +45,7 @@ app.post('/login', async (c) => {
 
 app.post('/register', async (c) => {
   const req = await parseBody(c, registerRequestSchema);
-  const result = await register(c.env, req, clientIp(c), execCtx(c));
+  const result = await register(c.env, req, clientIp(c));
   return ok(c, result, 201);
 });
 
@@ -69,7 +69,7 @@ app.delete('/avatar', requireAuth, async (c) => {
 app.put('/password', requireAuth, async (c) => {
   const user = c.get('user')!;
   const req = await parseBody(c, changePasswordRequestSchema);
-  const result = await changePassword(c.env, user, req, execCtx(c));
+  const result = await changePassword(c.env, user, req);
   if (result.revokedApiKeys) {
     await logAdminAction(c.env, user, 'apikey.revoke_all', user.username, `修改密码时吊销 ${result.revokedApiKeys} 个 API Key`, clientIp(c));
   }
@@ -85,19 +85,19 @@ app.post('/2fa/setup', requireAuth, async (c) => {
 /** 两步验证：校验一次性码并启用（返回一次性恢复码与替换当前会话的新令牌，其他会话失效） */
 app.post('/2fa/enable', requireAuth, async (c) => {
   const req = await parseBody(c, enableTwoFactorRequestSchema);
-  return ok(c, await enableTwoFactor(c.env, c.get('user')!.id, req.code, execCtx(c)), 201);
+  return ok(c, await enableTwoFactor(c.env, c.get('user')!.id, req.code), 201);
 });
 
 /** 两步验证：关闭（需当前密码；返回替换当前会话的新令牌，其他会话失效） */
 app.post('/2fa/disable', requireAuth, async (c) => {
   const req = await parseBody(c, disableTwoFactorRequestSchema);
-  return ok(c, await disableTwoFactor(c.env, c.get('user')!.id, req.password, execCtx(c)));
+  return ok(c, await disableTwoFactor(c.env, c.get('user')!.id, req.password));
 });
 
 app.post('/logout', requireAuth, async (c) => {
   const sid = c.get('sessionId');
   if (!sid) throw new AppError('unauthorized', '会话不存在');
-  await logout(c.env, sid, execCtx(c));
+  await logout(c.env, sid);
   return ok(c, { success: true });
 });
 

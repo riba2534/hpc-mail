@@ -200,6 +200,12 @@ describe('限定到邮箱的 Key', () => {
     expect((await send({ from: allowed.address, replyToMessageId: inHidden.id })).status).toBe(403);
     expect((await send({ from: allowed.address, forwardAttachmentsFrom: inHidden.id })).status).toBe(403);
     expect((await send({ from: { mailboxId: allowed.id }, replyToMessageId: inAllowed.id })).status).toBe(201);
+    // 回复、转发端点：原信或发件地址在范围外 403
+    expect((await errorOf(await request(`/v1/messages/${inHidden.id}/reply`, json(key, { text: 'x' })), 403)).docs).toContain('#key-restricted');
+    // 发件地址在范围内也不行：原信本身在范围外
+    expect((await request(`/v1/messages/${inHidden.id}/reply`, json(key, { text: 'x', from: allowed.address }))).status).toBe(403);
+    expect((await request(`/v1/messages/${inHidden.id}/forward`, json(key, { to: [allowed.address], note: 'x' }))).status).toBe(403);
+    expect((await request(`/v1/messages/${inAllowed.id}/reply`, json(key, { text: 'x', from: hidden.address }))).status).toBe(403);
 
     const boxes = await data<{ id: number }[]>(await request('/v1/mailboxes', { headers: auth(key) }));
     expect(boxes.map((box) => box.id)).toEqual([allowed.id]);

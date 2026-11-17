@@ -23,6 +23,11 @@ export interface Env extends Partial<Record<RateLimitBindingName, RateLimit>> {
   cf_account_id?: string;
   /** 托管域名 catch-all 投递的目标脚本名，须与 wrangler.toml 的 name 一致 */
   worker_name?: string;
+  /**
+   * 投递回执 Queue 名：设置了 GitHub Variable DELIVERY_EVENTS_QUEUE 时 CI 注入（同时注入 Queue consumer）；
+   * 未设置即未启用投递回执
+   */
+  delivery_events_queue?: string;
 }
 
 /** 内部 API 鉴权后的用户上下文 */
