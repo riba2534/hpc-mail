@@ -226,7 +226,8 @@ describe('批量认领', () => {
           const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement}`).bind(...bindings).all<{ detail: string }>();
           const details = plan.results.map((row) => row.detail);
           expect(details.filter((detail) => detail === 'MATERIALIZE live_owned')).toHaveLength(1);
-          expect(details.filter((detail) => /SEARCH mailboxes USING (?:COVERING )?INDEX idx_mailboxes_user \(user_id=\?\)/.test(detail))).toHaveLength(1);
+          // 0025 起 (user_id, domain) 复合索引同样能按 user_id 前缀取数，规划器可能选它
+          expect(details.filter((detail) => /SEARCH mailboxes USING (?:COVERING )?INDEX idx_mailboxes_user(?:_domain)? \(user_id=\?\)/.test(detail))).toHaveLength(1);
           expect(details.some((detail) => /SCAN mailboxes\b/.test(detail))).toBe(false);
         }
       }
