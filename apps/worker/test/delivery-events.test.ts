@@ -205,11 +205,12 @@ describe('外发回执回写与抑制名单', () => {
     const sid = await createSession(env, f.user.id);
     const token = await signToken(env.jwt_secret, { sub: f.user.id, sid, epoch: 0, uepoch: 0 });
     const { runtime } = mailEnv();
-    const request = () => {
+    const request = async () => {
       const ctx = createExecutionContext();
-      return app.request('/api/messages/send', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: { localPart: `${f.prefix}-owner`, domain: 'hpc.email' }, to: [target], subject: `${f.prefix}-api`, text: 'x' }) }, runtime, ctx)
-        .then(async (response) => { await waitOnExecutionContext(ctx); return response; });
+      const response = await app.request('/api/messages/send', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: { localPart: `${f.prefix}-owner`, domain: 'hpc.email' }, to: [target], subject: `${f.prefix}-api`, text: 'x' }) }, runtime, ctx);
+      await waitOnExecutionContext(ctx);
+      return response;
     };
     const rejected = await request();
     expect(rejected.status).toBe(422);
