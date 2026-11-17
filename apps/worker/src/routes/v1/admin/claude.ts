@@ -1,7 +1,7 @@
 import { claudeAddressesQuerySchema, claudeDomainsQuerySchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { ok, parseQuery } from '../../../lib/http.js';
-import { lookupClaudeAddresses, lookupClaudeDomains } from '../../../services/claude-facts.js';
+import { lookupClaudeAddresses, lookupClaudeDomains } from '../../../services/admin-lookup.js';
 import type { AppContext } from '../../../types.js';
 
 /** /v1/admin 的 Claude 事实与收据（鉴权由 admin/index.ts 统一完成）；只读，不写审计 */

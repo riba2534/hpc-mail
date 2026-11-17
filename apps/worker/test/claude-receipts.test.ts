@@ -8,7 +8,7 @@ import { claudeAddressFacts, claudeReceipts, mailboxes, messages, users } from '
 import { createApiKey } from '../src/services/api-key.js';
 import {
   CLAUDE_DOMAIN_BANS_SQL, CLAUDE_DOMAIN_COUNTS_SQL, CLAUDE_MAIL_STATS_SQL, CLAUDE_RECEIPTS_LOOKUP_SQL, lookupClaudeAddresses, lookupClaudeDomains,
-} from '../src/services/claude-facts.js';
+} from '../src/services/admin-lookup.js';
 import {
   backfillClaudeReceipts, harvestRecentClaudeReceipts, parseClaudeReceipt, RECEIPT_BACKFILL_PROGRESS_KEY, RECEIPT_BACKFILL_SCAN_SQL,
   RECEIPT_LEGACY_AUTH_CUTOFF_MS, RECEIPT_PURGE_SQL, RECEIPT_WINDOW_SQL, type ReceiptBackfillProgress,
