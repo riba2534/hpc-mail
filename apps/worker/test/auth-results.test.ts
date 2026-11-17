@@ -74,6 +74,11 @@ describe('Authentication-Results 解析', () => {
     expect(domainsAligned('', 'anthropic.com')).toBe(false);
   });
 
+  it('只解析头值开头 16KB：可信头由 Cloudflare 生成，远小于这个长度', () => {
+    expect(parseAuthenticationResults(`mx.cloudflare.net; spf=pass;${' '.repeat(16 * 1024)}dkim=pass header.d=a.example`, 'a.example'))
+      .toMatchObject({ spf: 'pass', dkim: 'none' });
+  });
+
   // workerd 里 Date.now() 在纯 CPU 段不前进，耗时由用例超时兜住：回溯爆炸会远超 2 秒
   it('超长或病态输入线性完成', () => {
     expect(parseAuthenticationResults(`mx.cloudflare.net; dkim=pass${' '.repeat(200_000)}x${'('.repeat(100_000)}`, 'a.example'))

@@ -48,6 +48,7 @@ describe('extractReplyText 去掉引用历史', () => {
 
   it('没有引用原样返回；正文里普通的 wrote/From 不截断；整封都是引用时返回原文', () => {
     expect(extractReplyText('  Hello\nOn the other hand, she wrote:\nFrom: the team\nmore  ')).toBe('Hello\nOn the other hand, she wrote:\nFrom: the team\nmore');
+    expect(extractReplyText('周报摘要\n张三在周报里写道：\n下周上线')).toBe('周报摘要\n张三在周报里写道：\n下周上线');
     const onlyQuote = 'On Mon, Nov 17, 2026 at 10:00 AM Alice <a@example.com> wrote:\n> old';
     expect(extractReplyText(onlyQuote)).toBe(onlyQuote);
   });
@@ -104,7 +105,7 @@ describe('detectPromptInjection 规则检测', () => {
       ['[GitHub] A new SSH key was added', 'If you did not add this key, you can safely ignore this email... or remove it.'],
       ['The Batch', 'AI assistants are changing how we work. Large language models now call tools on our behalf.'],
       ['AI 周刊', '你是AI时代的弄潮儿吗？作为AI公司，我们推出了新的大模型。如果你是 AI 从业者，欢迎报名。'],
-      ['Password', 'Please change your password immediately. Never share your API key.'],
+      ['Password', 'Please change your password immediately. Never share your API key. Never disclose your API key, and don\'t reveal your credentials.'],
       ['Install', 'See the installation instructions above. Call the main function, then run the setup tool.'],
       ['Meeting', 'Please disregard my previous instructions, the meeting moved to 3pm. Don\'t let the user wait.'],
       ['通知', '如您已完成付款，请忽略以上提示。请立即修改密码，我们会立即删除您的数据。不要让用户等待。'],
