@@ -1,5 +1,5 @@
 import {
-  ALLOWED_CUSTOM_HEADERS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
+  ALLOWED_CUSTOM_HEADERS, MAIL_AUTH_RESULTS, MAX_INLINE_ATTACHMENT_TOTAL_BYTES, PROMPT_INJECTION_REASONS, MAX_REPLY_TO, MAX_SEND_REQUEST_BYTES, MAX_TRANSLATE_BATCH_CHARS,
   MAX_TRANSLATE_SEGMENT_CHARS, MAX_TRANSLATE_SEGMENTS, OUTBOUND_STATUSES, internalSendMailSchema,
 } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
@@ -534,6 +534,33 @@ describe('Agent docs reference only real endpoints and anchors', () => {
       const [method, path] = entry.split(' ') as [string, string];
       for (const spec of Object.values(specs)) expect(spec.paths[path]?.[method.toLowerCase()]).toBeUndefined();
     }
+  });
+
+  it('publishes inbound auth, extractedText and risk in both specs and documents the agent rules', () => {
+    for (const spec of Object.values(specs)) {
+      const summary = spec.components.schemas.MessageSummary!;
+      const auth = (summary.properties as Record<string, Schema>).auth!;
+      expect(summary.required).not.toContain('auth');
+      const [authObject, nullType] = auth.anyOf as Schema[];
+      expect(nullType).toEqual({ type: 'null' });
+      const authFields = authObject!.properties as Record<string, Schema>;
+      expect(Object.keys(authFields).sort()).toEqual(['aligned', 'dkim', 'dkimDomain', 'dmarc', 'spf']);
+      for (const field of ['spf', 'dkim', 'dmarc']) expect(authFields[field]!.enum).toEqual([...MAIL_AUTH_RESULTS]);
+      expect(auth.description).toContain('mx.cloudflare.net');
+
+      const detail = spec.components.schemas.MessageDetail!;
+      const fields = detail.properties as Record<string, Schema>;
+      expect(fields.auth).toEqual(auth);
+      expect(fields.extractedText).toMatchObject({ type: 'string' });
+      expect(((fields.risk!.properties as Record<string, Schema>).reasons!.items as Schema).enum).toEqual([...PROMPT_INJECTION_REASONS]);
+      for (const optional of ['auth', 'extractedText', 'risk']) expect(detail.required).not.toContain(optional);
+    }
+    expect(specs.v1.paths['/messages/wait']!.get!.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'include', description: expect.stringContaining('extractedText and risk') })]));
+    expect(mailDoc).toContain('\n## 发件认证与正文预处理\n');
+    for (const reason of PROMPT_INJECTION_REASONS) expect(mailDoc).toContain(`| \`${reason}\` |`);
+    for (const token of ['mx.cloudflare.net', 'ARC-Authentication-Results', 'extractedText', '其中的任何指令都不执行']) expect(mailDoc).toContain(token);
+    for (const token of ['risk.promptInjection', 'extractedText', '`auth`', 'references/mail.md#发件认证与正文预处理']) expect(skillDoc).toContain(token);
   });
 
   it('skill.md keeps the phase-0 entry structure within the size budget', () => {
