@@ -21,12 +21,14 @@ import {
 import { hasDnssec } from './domain-check.js';
 import { getSystemFromAddress } from './domain.js';
 import { delegationBlock, tombstoneStatement } from './hosted-tombstone.js';
-import { onboardingActiveSql, SYSTEM_PENDING_ZONES_SQL, systemDomainListedSql } from './domain-occupancy.js';
+import { onboardingActiveSql, PENDING_ZONES_TOTAL_SQL, systemDomainListedSql } from './domain-occupancy.js';
 import { sendFeishuNotification } from './feishu.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { sendPushDeerNotification } from './pushdeer.js';
-import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
+import {
+  andGuards, counterReadStatement, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard,
+} from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
 import { emitHostedDomainTransitions } from './webhooks.js';
 
@@ -313,10 +315,9 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
       OR EXISTS (SELECT 1 FROM messages WHERE domain = ?1)) AS used`).bind(domain),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status <> 'deleting'").bind(viewer.id),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(viewer.id),
-    env.db.prepare(`SELECT (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL} AS n`),
+    env.db.prepare(`SELECT ${PENDING_ZONES_TOTAL_SQL} AS n`),
     env.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 'active'").bind(viewer.id),
-    env.db.prepare(`SELECT count AS n FROM rate_counters WHERE scope = ? AND subject = 'all' AND "window" = ?`)
-      .bind(HOSTED_DNS_SITE_RATE_SCOPE, window),
+    counterReadStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window),
   ]);
   const first = <T>(result: D1Result | undefined) => result?.results?.[0] as T | undefined;
   const holder = first<{ user_id: number }>(hosted);
@@ -339,7 +340,7 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
   if (Number(first<{ n: number }>(totalPending)?.n) >= cfg.maxPendingTotal) {
     return new AppError('rate_limited', '当前等待生效的域名较多，请稍后再试');
   }
-  if (Number(first<{ n: number }>(site)?.n ?? 0) + CREATE_CF_CALLS > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) {
+  if ((counterResult(site)?.count ?? 0) + CREATE_CF_CALLS > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) {
     return new AppError('rate_limited', SITE_BUSY);
   }
   return new AppError('conflict', '域名状态已改变，请刷新后重试');
@@ -379,7 +380,7 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
       AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?1)
       AND (?3 = 1 OR ?4 = 0 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status <> 'deleting') < ?4)
       AND (?3 = 1 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status = 'pending') < ?5)
-      AND (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL} < ?6
+      AND ${PENDING_ZONES_TOTAL_SQL} < ?6
       AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active')
     RETURNING id`)
       .bind(domain, viewer.id, viewer.role === 'admin' ? 1 : 0, cfg.maxPerUser, cfg.maxPendingPerUser, cfg.maxPendingTotal,

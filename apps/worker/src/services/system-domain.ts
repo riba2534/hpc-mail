@@ -26,7 +26,7 @@ import {
 } from './cloudflare.js';
 import {
   ACTIVE_ONBOARDING_COUNT_SQL, hostedTakenSql, onboardingActiveSql, ONBOARDING_TERMINAL_SQL, SYSTEM_DOMAIN_COUNT_SQL,
-  SYSTEM_PENDING_ZONES_SQL, systemDomainListedSql,
+  maxPendingTotalSql, PENDING_ZONES_TOTAL_SQL, systemDomainListedSql,
 } from './domain-occupancy.js';
 import {
   APPLY_CF_CALLS, applyMailPlan, dnssecState, gatePlan, INSPECT_CF_CALLS, type ApplyHooks, type MailStepSnapshot,
@@ -807,8 +807,7 @@ async function reserve(env: Env, r: Reservation): Promise<OnboardingRow | null> 
     SELECT ${values.map((_, i) => `?${i + 1}`).join(', ')}
     WHERE NOT ${systemDomainListedSql('?1')} AND NOT ${hostedTakenSql('?1')} AND NOT ${onboardingActiveSql('?1')}
       AND ${SYSTEM_DOMAIN_COUNT_SQL} + ${ACTIVE_ONBOARDING_COUNT_SQL} < ${MAX_SYSTEM_DOMAINS}
-      AND (?2 <> 'new_zone' OR (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL}
-        < COALESCE((SELECT json_extract(value, '$.maxPendingTotal') FROM settings WHERE key = 'hosted_domains'), ?${n + 1}))
+      AND (?2 <> 'new_zone' OR ${PENDING_ZONES_TOTAL_SQL} < ${maxPendingTotalSql(`?${n + 1}`)})
     RETURNING *`).bind(...values.map(([, value]) => value), DEFAULT_SETTINGS.hosted_domains.maxPendingTotal);
   try {
     const raw = await statement.first<Record<string, unknown>>();

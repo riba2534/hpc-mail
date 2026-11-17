@@ -10,7 +10,7 @@ import {
   MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE, checkHostedDomain, createHostedDomain,
   hostedDomainsAvailable,
 } from './hosted-domain.js';
-import { minuteWindow } from './rate-counter.js';
+import { counterReadStatement, counterResult, minuteWindow } from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
 
 type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
@@ -49,10 +49,11 @@ const RETRY_FIX = '约 1 分钟后只用未处理的项重试';
  */
 async function affordable(env: Env, viewer: Viewer, plan: BatchPlan, total: number): Promise<{ count: number; reason: string }> {
   const window = minuteWindow(1);
-  const read = (scope: string, subject: string) => env.db
-    .prepare('SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?').bind(scope, subject, window);
-  const [user, site] = await env.db.batch([read(plan.scope, String(viewer.id)), read(HOSTED_DNS_SITE_RATE_SCOPE, 'all')]);
-  const used = (result: D1Result | undefined) => Number((result?.results?.[0] as { count?: number } | undefined)?.count ?? 0);
+  const [user, site] = await env.db.batch([
+    counterReadStatement(env, plan.scope, String(viewer.id), window),
+    counterReadStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window),
+  ]);
+  const used = (result: D1Result | undefined) => counterResult(result)?.count ?? 0;
   const userLeft = Math.max(0, plan.limit - used(user));
   const siteLeft = Math.max(0, Math.floor((MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - used(site)) / plan.calls));
   return { count: Math.min(total, userLeft, siteLeft), reason: userLeft <= siteLeft ? plan.userBusy : SITE_BUSY };
