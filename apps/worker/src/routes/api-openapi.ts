@@ -130,13 +130,13 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/me/notify-prefs/pushdeer-test': { post: operation('testPushDeerNotification', 'Send a real PushDeer test with saved settings', okResult, { errors: ['PushKeyMissing'], description: 'Performs an external notification and validates HTTP and provider JSON success. This is not a dry run.' }) },
     '/api-keys': {
       get: operation('listApiKeys', 'List own API keys without plaintext secrets', array(ref('ApiKeySummary'))),
-      post: operation('createApiKey', 'Create an API key', ref('CreatedApiKey'), { errors: ['ApiKeyLimit', 'ReauthRequired', 'ReauthFailed', 'AdminScopeForbidden', 'AdminScopeRules'], request: 'CreateApiKeyRequest', status: 201,
-        description: 'Requires the current password (password); missing returns 403 reauth_required, wrong returns 403 reauth_failed. The full key is returned only once. Scopes limit /v1 operations and never grant JWT-only functions (account settings, mail forwarding targets, 2FA, key management, administration). allowedMailboxIds/allowedDomains restrict the key to those mailboxes or domains; ids must be mailboxes the caller owns. The admin scope can only be granted by administrators and requires allowedIps plus an expiresAt at most 90 days ahead (400 otherwise; 403 for non-administrators); only with it does an administrator key act as administrator.' }),
+      post: operation('createApiKey', 'Create an API key', ref('CreatedApiKey'), { errors: ['ApiKeyLimit', 'ReauthRequired', 'ReauthFailed', 'AdminScopeForbidden'], request: 'CreateApiKeyRequest', status: 201,
+        description: 'Requires the current password (password); missing returns 403 reauth_required, wrong returns 403 reauth_failed. The full key is returned only once. Scopes limit /v1 operations and never grant JWT-only functions (account settings, mail forwarding targets, 2FA, key management, administration). allowedMailboxIds/allowedDomains restrict the key to those mailboxes or domains; ids must be mailboxes the caller owns. The admin scope can only be granted by administrators (403 for non-administrators); allowedIps and expiresAt stay optional as for other scopes. Only with it does an administrator key act as administrator.' }),
     },
     '/api-keys/{id}': {
       get: operation('getApiKey', 'Read own API key metadata', ref('ApiKeySummary')),
-      put: operation('updateApiKey', 'Update own API key limits/scopes/status', ref('ApiKeySummary'), { errors: ['AdminScopeForbidden', 'AdminScopeRules'], request: 'UpdateApiKeyRequest',
-        description: 'Only supplied fields change; allowedMailboxIds/allowedDomains replace the whole list. When scopes, allowedIps or expiresAt change, the resulting key is validated against the admin scope rules (allowlist and at most 90 days); renaming or disabling an existing key is not.' }),
+      put: operation('updateApiKey', 'Update own API key limits/scopes/status', ref('ApiKeySummary'), { errors: ['AdminScopeForbidden'], request: 'UpdateApiKeyRequest',
+        description: 'Only supplied fields change; allowedMailboxIds/allowedDomains replace the whole list. Adding the admin scope requires an administrator (403 otherwise).' }),
       delete: operation('revokeApiKey', 'Revoke own API key', success),
     },
     '/api-keys/{id}/logs': { get: operation('listApiKeyLogs', 'Read own API key audit logs', page(ref('ApiRequestLog')), { parameters: pageQuery,

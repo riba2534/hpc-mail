@@ -111,25 +111,34 @@ describe('管理员 Key 需要显式 admin scope', () => {
     expect((await request('/v1/mailboxes?all=1', { headers: { ...auth(created.key), 'CF-Connecting-IP': '198.51.100.1' } })).status).toBe(403);
   });
 
-  it('只有管理员能授予 admin，且必须有 IP 白名单与不超过 90 天的有效期；修改时按结果校验', async () => {
+  it('只有管理员能授予 admin；IP 白名单与有效期都可选，修改时只校验新授予', async () => {
     const user = await account('grant-user');
     const admin = await account('grant-admin', 'admin');
     const create = (jwt: string, body: Record<string, unknown>) => request('/api/api-keys', json(jwt, {
       name: 'admin-key', scopes: ['mailbox.read', 'admin'], rateLimit: 60, password: TEST_PASSWORD, ...body,
     }));
+    expect((await errorOf(await create(user.jwt, {}), 403)).code).toBe('forbidden');
     expect((await errorOf(await create(user.jwt, { allowedIps: [IP], expiresAt: inDays(30) }), 403)).code).toBe('forbidden');
-    expect((await errorOf(await create(admin.jwt, { expiresAt: inDays(30) }), 400)).message).toContain('IP 白名单');
-    expect((await errorOf(await create(admin.jwt, { allowedIps: [IP] }), 400)).message).toContain('有效期');
-    expect((await errorOf(await create(admin.jwt, { allowedIps: [IP], expiresAt: inDays(91) }), 400)).message).toContain('90');
+    // 不带白名单、不设有效期的管理员 Key 照常创建并按管理员执行
+    const bare = await data<CreatedApiKey>(await create(admin.jwt, {}), 201);
+    expect(bare).toMatchObject({ allowedIps: [], expiresAt: null });
+    expect(bare.scopes).toContain('admin');
+    expect((await data<ApiKeySelf>(await request('/v1/me', { headers: auth(bare.key) }))).key.effectiveRole).toBe('admin');
+    expect((await request('/v1/mailboxes?all=1', { headers: auth(bare.key) })).status).toBe(200);
+    const longLived = await data<CreatedApiKey>(await create(admin.jwt, { expiresAt: inDays(400) }), 201);
+    expect(longLived.scopes).toContain('admin');
+
     const plain = await keyFor(admin.jwt);
-    expect((await request(`/api/api-keys/${plain.id}`, json(admin.jwt, { scopes: ['mailbox.read', 'admin'] }, 'PUT'))).status).toBe(400);
     expect((await request(`/api/api-keys/${plain.id}`, json(user.jwt, { scopes: ['mailbox.read', 'admin'] }, 'PUT'))).status).toBe(404);
     const upgraded = await data<CreatedApiKey>(await request(`/api/api-keys/${plain.id}`,
-      json(admin.jwt, { scopes: ['mailbox.read', 'admin'], allowedIps: [IP], expiresAt: inDays(10) }, 'PUT')));
+      json(admin.jwt, { scopes: ['mailbox.read', 'admin'] }, 'PUT')));
+    expect(upgraded).toMatchObject({ allowedIps: [], expiresAt: null });
     expect(upgraded.scopes).toContain('admin');
-    expect((await request(`/api/api-keys/${plain.id}`, json(admin.jwt, { expiresAt: null }, 'PUT'))).status).toBe(400);
+    expect((await request(`/api/api-keys/${plain.id}`, json(admin.jwt, { expiresAt: inDays(5) }, 'PUT'))).status).toBe(200);
+    expect((await request(`/api/api-keys/${plain.id}`, json(admin.jwt, { expiresAt: null, allowedIps: [] }, 'PUT'))).status).toBe(200);
     const userKey = await keyFor(user.jwt);
-    expect((await request(`/api/api-keys/${userKey.id}`, json(user.jwt, { scopes: ['mail.read', 'admin'], allowedIps: [IP], expiresAt: inDays(5) }, 'PUT'))).status).toBe(403);
+    expect((await errorOf(await request(`/api/api-keys/${userKey.id}`, json(user.jwt, { scopes: ['mail.read', 'admin'] }, 'PUT')), 403)).code)
+      .toBe('forbidden');
     // 存量管理员 Key（迁移加上的 admin，没有白名单）只改名照常可以
     const legacy = await keyFor(admin.jwt);
     await grantLegacyAdminScope(env, legacy.id);

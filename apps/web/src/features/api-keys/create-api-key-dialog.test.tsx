@@ -220,7 +220,8 @@ describe('CreateApiKeyDialog', () => {
     expect(mocks.create.mock.calls[0]![0]).toMatchObject({ password: 'current-pass', allowedMailboxIds: [42], allowedDomains: ['mine.example'] });
   });
 
-  it('管理员能力只对管理员显示，勾选后提示并按规则校验白名单与有效期', async () => {
+  it('管理员能力只对管理员显示，勾选后提示用途，不设 IP 白名单与有效期也能创建', async () => {
+    mocks.create.mockResolvedValue(createdKey({ scopes: ['mail.read', 'mailbox.read', 'admin'] }));
     const user = userEvent.setup();
     renderDialog();
     expect(screen.queryByRole('checkbox', { name: '管理员能力' })).toBeNull();
@@ -228,11 +229,15 @@ describe('CreateApiKeyDialog', () => {
 
     renderDialog('admin');
     await user.click(screen.getByRole('checkbox', { name: '管理员能力' }));
-    expect(screen.getByText(/必须设置 IP 白名单/)).toBeInTheDocument();
+    expect(screen.getByText(/管理员运维接口/)).toBeInTheDocument();
+    expect(screen.queryByText(/IP 白名单，有效期/)).toBeNull();
     await fillRequired(user, '运维');
     await user.click(screen.getByRole('button', { name: '创建' }));
-    expect(screen.getByRole('alert')).toHaveTextContent('IP 白名单');
-    expect(mocks.create).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('alert')).toBeNull();
+    const body = mocks.create.mock.calls[0]![0];
+    expect(body.scopes).toContain('admin');
+    expect(body).toMatchObject({ allowedIps: [], expiresAt: undefined });
   });
 
   it('创建成功后展示 curl 示例、发信提示与接入说明链接', async () => {

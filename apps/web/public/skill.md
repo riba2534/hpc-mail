@@ -22,7 +22,7 @@ hpc '/identities' | jq '.data.identities[] | {mailboxId,address,kind,canSend,rea
 hpc '/messages' --get --data-urlencode 'limit=5' | jq '.data.items[] | {id,address,fromAddress,subject,verificationCode}'
 ```
 
-失败统一返回 `{error:{code,message,fix?,docs?,details?},requestId}`：按 `code` 分支，先照 `fix` 修正，`docs` 指向[错误码说明](references/errors.md)。缺少 scope 是 403 `forbidden`，`fix` 写明缺哪个。账户设置、邮箱转发目标、管理员功能以及托管域名的删除、成员与过户只能用 JWT（清单在能力地图下方）：经 `/api/auth/login` 登录后把 `API` 换成 `$BASE/api`、`AUTH` 换成 token，见[鉴权](references/auth-and-http.md)。Key 与 JWT 不能互换；`/api` 的发信路径是 `/messages/send`，没有 `wait`。
+失败统一返回 `{error:{code,message,fix?,docs?,details?},requestId}`：按 `code` 分支，先照 `fix` 修正，`docs` 指向[错误码说明](references/errors.md)。缺少 scope 是 403 `forbidden`，`fix` 写明缺哪个。账户设置、邮箱转发目标、管理员功能（能力地图里的运维接口除外）以及托管域名的删除、成员与过户只能用 JWT（清单在能力地图下方）：经 `/api/auth/login` 登录后把 `API` 换成 `$BASE/api`、`AUTH` 换成 token，见[鉴权](references/auth-and-http.md)。Key 与 JWT 不能互换；`/api` 的发信路径是 `/messages/send`，没有 `wait`。
 
 支持 MCP 的客户端可直接接入 `https://hpc.email/mcp`（Streamable HTTP，同一把 Key），提供收发、等验证码与地址管理等 10 个工具，见 [MCP](references/mcp.md)。
 
@@ -169,8 +169,9 @@ hpc "/hosted-domains/$HD_ID" | jq '.data | {status,steps,lastError}'      # 之�
 | 共享自己的邮箱（按 userId） | `GET /mailboxes/shares`、`PUT /mailboxes/shares`、`POST /mailboxes/shares/batch`、`DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | `mailbox.share` | [mailboxes](references/mailboxes-and-domains.md#释放历史与共享边界) |
 | Webhook 端点、换密钥、测试、投递记录与重试 | `GET\|POST /webhooks`、`GET\|PUT\|DELETE /webhooks/:id`、`POST /webhooks/:id/rotate-secret\|test`、`GET /webhooks/:id/deliveries`、`POST /webhooks/:id/deliveries/:deliveryId/retry` | `webhook.write`（订阅 `mail.received` 或带正文另需 `mail.read`） | [webhooks](references/webhooks.md) |
 | 通知通道（飞书、PushDeer、通用 Webhook）、测试、投递健康与重试 | `GET /notify-prefs`、`PUT /notify-prefs`、`POST /notify-prefs/feishu-test\|pushdeer-test`、`GET /notify-prefs/health`、`POST /notify-prefs/jobs/:id/retry` | 读 `notify.read`，改、测试与重试 `notify.write`（改通道另需 `mail.read`，管理员账户还需 `admin`） | [notifications](references/notifications.md) |
+| 管理员运维：批量认领、释放、过户、共享，按地址、用户名、域名查归属与 Claude 状态 | `POST /admin/mailboxes/batch/claim\|release\|transfer\|share\|unshare`、`PUT /admin/mailboxes/shares`、`GET /admin/mailboxes`、`GET /admin/users`、`GET /admin/hosted-domains`、`GET /admin/claude/domains\|addresses` | 管理员账户的 Key 带 `admin`（`key.effectiveRole=admin`） | [administration](references/administration.md#管理员-key-运维接口) |
 
-只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；托管域名的删除、成员上限、成员与过户、共享候选用户搜索见 [mailboxes](references/mailboxes-and-domains.md)；邮箱转发目标（新目标要邮件确认）见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
+只能用 JWT（`/api`）：登录、改密码、两步验证和 API Key 管理见 [auth](references/auth-and-http.md)；托管域名的删除、成员上限、成员与过户、共享候选用户搜索见 [mailboxes](references/mailboxes-and-domains.md)；邮箱转发目标（新目标要邮件确认）见 [notifications](references/notifications.md)；翻译见 [mail](references/mail.md)；管理员功能（含把站长 Cloudflare 账户里的域名一键接入为系统域名；上表的运维接口除外）见 [administration](references/administration.md)。错误码与改正方法见 [errors](references/errors.md)。完整规格：[API Key OpenAPI](https://hpc.email/v1/openapi.json)、[JWT OpenAPI](https://hpc.email/api/openapi.json)，公开可读。只拿到本文时，参考文件在 `https://hpc.email/references/<文件名>`。
 
 ## 完成标准与安全
 

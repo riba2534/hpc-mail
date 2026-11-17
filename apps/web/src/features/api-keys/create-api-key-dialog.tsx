@@ -7,7 +7,6 @@ import {
   type CreateApiKeyInput,
   type CreatedApiKey,
   DEFAULT_API_RATE_LIMIT,
-  MAX_ADMIN_KEY_TTL_DAYS,
   MAX_API_RATE_LIMIT,
   createApiKeyRequestSchema,
 } from '@hpc-mail/shared';
@@ -346,7 +345,7 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
                     )}
                     {scopes.includes('admin') && (
                       <p className="text-xs text-caution">
-                        「管理员能力」让这把密钥能看全站邮件、用任意邮箱发信。必须设置 IP 白名单，有效期不超过 {MAX_ADMIN_KEY_TTL_DAYS} 天。
+                        「管理员能力」让这把密钥能看全站邮件、用任意邮箱发信，并调用管理员运维接口（/v1/admin）。
                         不勾选时，你的密钥与普通用户的权限相同。
                       </p>
                     )}
