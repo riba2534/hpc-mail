@@ -39,6 +39,12 @@ interface Payload {
 }
 const MAIL_CHANNELS = ['feishu', 'pushdeer', 'webhook'] as const;
 const PROCESSING_LEASE_MS = 2 * 60_000;
+const SOURCE_PURGED = '源邮件已永久删除，不再推送';
+
+/** 永久删除邮件时载荷被清空（purgeStatements）；这类任务不再推送 */
+function payloadPurged(payload: Record<string, unknown>): boolean {
+  return Object.keys(payload).length === 0;
+}
 export const FORWARD_DOMAIN_DAILY_LIMIT = 500;
 export const FORWARD_TARGET_DAILY_LIMIT = 200;
 
@@ -230,7 +236,11 @@ export async function processNotificationJobs(
       let lastHttpStatus: number | null = null;
       let nextAttemptAt = new Date();
       try {
-        if (!await deliver(env, claimed, options.owners)) {
+        if (payloadPurged(claimed.payload)) {
+          status = 'skipped';
+          lastError = SOURCE_PURGED;
+          result.skipped += 1;
+        } else if (!await deliver(env, claimed, options.owners)) {
           status = 'skipped';
           lastError = '用户或该通知通道已停用';
           result.skipped += 1;
@@ -251,7 +261,10 @@ export async function processNotificationJobs(
         }
       }
       // 若成功外发后状态写入失败，保留 processing，下一轮标记 unknown；不把它当未发自动重试。
-      await db.update(notificationJobs).set({ status, lastError, lastHttpStatus, nextAttemptAt, updatedAt: new Date() })
+      // 成功与跳过是终态，载荷（主题、验证码、正文摘录）不再需要，随状态一起清空；failed/unknown 留作重试
+      const terminal = status === 'succeeded' || status === 'skipped';
+      await db.update(notificationJobs).set({ status, lastError, lastHttpStatus, nextAttemptAt, updatedAt: new Date(),
+        ...(terminal ? { payload: {} } : {}) })
         .where(and(eq(notificationJobs.id, claimed.id), eq(notificationJobs.status, 'processing'), eq(notificationJobs.attempts, claimed.attempts)));
     }
   }));
@@ -288,7 +301,17 @@ export async function retryNotificationJob(env: Env, userId: number, id: number)
   if (row.channel === 'forward') throw new AppError('validation_failed', '邮箱转发请在确认收件情况后重新转发原邮件');
   if (row.messageId === null) throw new AppError('validation_failed', '请使用发送测试按钮重新验证配置');
   if (!['failed', 'unknown'].includes(row.status)) throw new AppError('conflict', '该通知任务无需重试');
-  const prefs = await getUserNotifyPrefs(env, userId);
+  // 源邮件已永久删除时不再推送它的内容：任务转为 skipped 并清空载荷
+  const [source, prefs] = await Promise.all([
+    db.select({ id: messages.id }).from(messages).where(eq(messages.id, row.messageId)).get(),
+    getUserNotifyPrefs(env, userId),
+  ]);
+  if (!source) {
+    await db.update(notificationJobs).set({ status: 'skipped', payload: {}, lastError: SOURCE_PURGED, updatedAt: new Date() })
+      .where(and(eq(notificationJobs.id, id), eq(notificationJobs.userId, userId),
+        eq(notificationJobs.attempts, row.attempts), inArray(notificationJobs.status, ['failed', 'unknown'])));
+    throw new AppError('not_found', SOURCE_PURGED);
+  }
   if (!prefs[row.channel].enabled) throw new AppError('validation_failed', '请先启用该通知通道');
   // Attempts also fence the processor that owns this lease. Keep them monotonic:
   // resetting to zero lets an expired first attempt overwrite a new first attempt.

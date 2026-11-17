@@ -26,6 +26,11 @@ async function seed(username: string): Promise<number> {
   const [user] = await createDb(env).insert(users).values({ username, passwordHash: 'x', role: 'user', status: 'active' }).returning({ id: users.id });
   return user!.id;
 }
+async function seedMessage(address: string): Promise<number> {
+  const [row] = await createDb(env).insert(messages).values({ direction: 'inbound', address, domain: 'hpc.email',
+    fromAddress: info.fromAddress, subject: info.subject, preview: 'test body', status: 'received' }).returning({ id: messages.id });
+  return row!.id;
+}
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('通知截止时间与响应判定', () => {
@@ -269,7 +274,9 @@ describe('持久通知队列', () => {
     const id = await seed('notify-manual-retry');
     const other = await seed('notify-other');
     await updateUserNotifyPrefs(env, id, { webhook });
-    const ids = await enqueueMailNotifications(env, null, mail(106, [id]));
+    // 重试会复核源邮件仍在，任务须指向真实存在的邮件
+    const source = await seedMessage('notify-manual-retry@hpc.email');
+    const ids = await enqueueMailNotifications(env, null, mail(source, [id]));
     vi.stubGlobal('fetch', vi.fn(async () => new Response('failed', { status: 503 })));
     await processNotificationJobs(env, { jobIds: ids });
     await expect(retryNotificationJob(env, other, ids[0]!)).rejects.toThrow('不存在');
