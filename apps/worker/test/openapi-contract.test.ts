@@ -643,16 +643,17 @@ describe('PR4b：回复/转发接口与托管域名任意前缀在 OpenAPI 与�
 });
 
 describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文档', () => {
-  /** /v1 只开放这八个托管域名操作，读写分别要求 domain.read / domain.write */
+  /** /v1 只开放这九个托管域名操作，读写分别要求 domain.read / domain.write */
   const keyOperations: Record<string, Record<string, string>> = {
     '/hosted-domains': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}': { get: 'domain.read' },
     '/hosted-domains/{id}/check': { post: 'domain.write' },
+    '/hosted-domains/{id}/reconnect': { post: 'domain.write' },
     '/hosted-domains/{id}/dns-records': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}/dns-records/{recordId}': { put: 'domain.write', delete: 'domain.write' },
   };
 
-  it('八个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
+  it('九个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
     let checked = 0;
     for (const [path, scopes] of Object.entries(keyOperations)) {
       expect(specs.v1.paths[path]!.parameters, path).toEqual(specs.api.paths[path]!.parameters);
@@ -668,7 +669,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
         checked++;
       }
     }
-    expect(checked).toBe(8);
+    expect(checked).toBe(9);
   });
 
   it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
@@ -685,7 +686,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     // 两份规格只在认证相关措辞上不同：/v1 写明管理员 Key 的范围与审计记法，/api 保持原说明
     expect(specs.v1.paths['/hosted-domains']!.get!.description).toContain('/api/admin/hosted-domains');
     expect(specs.v1.paths['/hosted-domains/{id}']!.get!.description).toContain('JWT-only');
-    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
+    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/reconnect', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
       ['/hosted-domains/{id}/dns-records/{recordId}', 'put'], ['/hosted-domains/{id}/dns-records/{recordId}', 'delete']] as const) {
       expect(specs.v1.paths[path]![method]!.description, `${method} ${path}`).toContain('API Key #id');
       expect(specs.api.paths[path]![method]!.description, `${method} ${path}`).not.toContain('API Key');

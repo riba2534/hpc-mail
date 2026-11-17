@@ -586,12 +586,16 @@ describe('托管域名的异常与上限', () => {
     expect((await db.select().from(hostedDomains).where(eq(hostedDomains.id, reserved.id)).get())!.zoneId).toBe(cf.zoneByName(domain)!.id);
   });
 
-  it('zone 被外部删除后：已生效的域名标记为已迁走，等待中的域名删除记录；查不到时不做破坏性判断', async () => {
-    const cf = fakeCloudflare();
+  it('zone 被外部删除后：已生效的域名间隔复核后标记为已迁走，等待中的域名删除记录；查不到时不做破坏性判断', async () => {
     const f = await fixture();
+    // 账户里另有 zone：判定不存在前的可见性自检能列出账户 zone
+    const cf = fakeCloudflare({ existing: [f.domain('elsewhere')] });
     const owner = await f.actor('owner');
     const active = await activeDomain(cf, owner, f.domain('a'));
     cf.zones.delete(cf.zoneByName(f.domain('a'))!.id);
+    await syncHostedDomain(runtime, active.id);
+    expect((await db.select().from(hostedDomains).where(eq(hostedDomains.id, active.id)).get())!.status).toBe('error');
+    await db.update(hostedDomains).set({ zoneMissingAt: new Date(Date.now() - 26 * 60_000) }).where(eq(hostedDomains.id, active.id));
     await syncHostedDomain(runtime, active.id);
     expect((await db.select().from(hostedDomains).where(eq(hostedDomains.id, active.id)).get())!.status).toBe('moved');
 

@@ -18,7 +18,10 @@ function stubZone(zone: { id: string; name: string; created_on: string } | null)
     if (method === 'GET' && url.pathname.endsWith(`/zones/${zone?.id ?? 'gone'}`) && zone) {
       return json({ success: true, errors: [], result: { ...zone, status: 'active' } });
     }
-    if (method === 'GET' && url.pathname.endsWith('/zones')) return json({ success: true, errors: [], result: [] });
+    // 按名称列不到；不带名称时（可见性自检）账户里还有别的 zone
+    if (method === 'GET' && url.pathname.endsWith('/zones')) {
+      return json({ success: true, errors: [], result: [], result_info: { total_count: url.searchParams.has('name') ? 0 : 3 } });
+    }
     if (method === 'DELETE') return json({ success: true, errors: [], result: { id: zone?.id } });
     return json({ success: false, errors: [{ code: 7003, message: 'Could not route' }], result: null }, 404);
   }));
@@ -53,6 +56,6 @@ describe('删除 zone 前核对身份', () => {
   it('zone 已不存在视为删除成功', async () => {
     const calls = stubZone(null);
     await deleteZone(creds, 'gone', 'gone.example');
-    expect(calls).toEqual(['GET /zones/gone', 'GET /zones']);
+    expect(calls).toEqual(['GET /zones/gone', 'GET /zones', 'GET /zones']);
   });
 });

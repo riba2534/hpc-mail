@@ -4,7 +4,7 @@ import {
 import { Hono, type Context } from 'hono';
 import { clientIp, execCtx, ok, parseBody, parseId, parseRecordId } from '../../lib/http.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
-import { checkHostedDomain, createHostedDomain, getHostedDomain, listMyHostedDomains } from '../../services/hosted-domain.js';
+import { checkHostedDomain, createHostedDomain, getHostedDomain, listMyHostedDomains, reconnectHostedDomain } from '../../services/hosted-domain.js';
 import { checkHostedDomains, createHostedDomains } from '../../services/hosted-domain-batch.js';
 import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../../services/hosted-dns.js';
 import type { AppContext, AuthUser } from '../../types.js';
@@ -12,7 +12,7 @@ import type { AppContext, AuthUser } from '../../types.js';
 type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
 
 /**
- * 托管域名（API Key）：查看、添加（含批量）、立即检测（含批量）与 DNS 解析，与 /api 同名接口共用 service，权限、额度、限流与审计一致。
+ * 托管域名（API Key）：查看、添加（含批量）、立即检测（含批量）、重新接入与 DNS 解析，与 /api 同名接口共用 service，权限、额度、限流与审计一致。
  * 删除（永久删除该域全部邮件）、改成员上限、成员管理与过户只能用 JWT，这里不挂载。
  */
 const app = new Hono<AppContext>();
@@ -62,7 +62,12 @@ app.get('/:id', async (c) => {
 
 app.post('/:id/check', async (c) => {
   requireScope(c, 'domain.write');
-  return ok(c, await checkHostedDomain(c.env, keyViewer(c), parseId(c.req.param('id'))));
+  return ok(c, await checkHostedDomain(c.env, keyViewer(c), parseId(c.req.param('id')), execCtx(c)));
+});
+
+app.post('/:id/reconnect', async (c) => {
+  requireScope(c, 'domain.write');
+  return ok(c, await reconnectHostedDomain(c.env, await keyActor(c), parseId(c.req.param('id')), execCtx(c), clientIp(c)));
 });
 
 app.get('/:id/dns-records', async (c) => {

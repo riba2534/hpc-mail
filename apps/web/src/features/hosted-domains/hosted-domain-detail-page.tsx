@@ -41,6 +41,7 @@ import {
 import { HostedDomainMembersSection } from './hosted-domain-members';
 import { HostedDnsSection } from './hosted-dns-section';
 import { hostedDomainApi } from './hosted-domains-api';
+import { ReconnectHostedDomainSection } from './reconnect-hosted-domain-section';
 import { TransferHostedDomainDialog } from './transfer-hosted-domain-dialog';
 import { forgetHostedDomain, storeHostedDomain, useHostedDomainQuery } from './use-hosted-domains';
 
@@ -456,6 +457,7 @@ export function HostedDomainDetailPage() {
       <SummarySection domain={domain} />
 
       <ProgressSection domain={domain} canManage={canManage} />
+      {canManage && domain.status === 'moved' && <ReconnectHostedDomainSection domain={domain} />}
       {canManage && active && <NameServerSection domain={domain} />}
       {canManage && active && <HostedDnsSection domain={domain} />}
       {canManage && active && <HostedDomainMembersSection domain={domain} />}
