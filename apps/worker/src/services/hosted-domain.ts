@@ -15,7 +15,7 @@ import {
   type CloudflareCredentials,
 } from './cloudflare.js';
 import { hasDnssec } from './domain-check.js';
-import { systemDomainListedSql } from './domain-occupancy.js';
+import { onboardingActiveSql, SYSTEM_PENDING_ZONES_SQL, systemDomainListedSql } from './domain-occupancy.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
@@ -278,12 +278,12 @@ function createZoneError(error: unknown): AppError {
 async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: Settings['hosted_domains'], window: number): Promise<AppError> {
   const [hosted, listed, used, owned, pending, totalPending, user, site] = await env.db.batch([
     env.db.prepare('SELECT user_id FROM hosted_domains WHERE domain = ?').bind(domain),
-    env.db.prepare(`SELECT ${systemDomainListedSql('?1')} AS listed`).bind(domain),
+    env.db.prepare(`SELECT ${systemDomainListedSql('?1')} AS listed, ${onboardingActiveSql('?1')} AS onboarding`).bind(domain),
     env.db.prepare(`SELECT (EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
       OR EXISTS (SELECT 1 FROM messages WHERE domain = ?1)) AS used`).bind(domain),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status <> 'deleting'").bind(viewer.id),
     env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(viewer.id),
-    env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE status = 'pending'"),
+    env.db.prepare(`SELECT (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL} AS n`),
     env.db.prepare("SELECT 1 FROM users WHERE id = ? AND status = 'active'").bind(viewer.id),
     env.db.prepare(`SELECT count AS n FROM rate_counters WHERE scope = ? AND subject = 'all' AND "window" = ?`)
       .bind(HOSTED_DNS_SITE_RATE_SCOPE, window),
@@ -294,6 +294,7 @@ async function reservationError(env: Env, viewer: Viewer, domain: string, cfg: S
     return new AppError('conflict', Number(holder.user_id) === viewer.id ? '你已经添加过该域名' : '该域名已被其他用户托管');
   }
   if (Number(first<{ listed: number }>(listed)?.listed)) return new AppError('conflict', '该域名已是本站的系统域名');
+  if (Number(first<{ onboarding: number }>(listed)?.onboarding)) return new AppError('conflict', '该域名正在作为本站的系统域名接入');
   if (Number(first<{ used: number }>(used)?.used)) {
     return new AppError('conflict', '本站已有该域名的历史地址或邮件，不能作为托管域名添加');
   }
@@ -338,11 +339,12 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
       AND COALESCE((SELECT count FROM rate_counters WHERE scope = ?12 AND subject = 'all' AND "window" = ?9), 0) + ?13 <= ?14
       AND NOT EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ?1)
       AND NOT ${systemDomainListedSql('?1')}
+      AND NOT ${onboardingActiveSql('?1')}
       AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
       AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?1)
       AND (?3 = 1 OR ?4 = 0 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status <> 'deleting') < ?4)
       AND (?3 = 1 OR (SELECT COUNT(*) FROM hosted_domains WHERE user_id = ?2 AND status = 'pending') < ?5)
-      AND (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') < ?6
+      AND (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') + ${SYSTEM_PENDING_ZONES_SQL} < ?6
       AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active')
     RETURNING id`)
       .bind(domain, viewer.id, viewer.role === 'admin' ? 1 : 0, cfg.maxPerUser, cfg.maxPendingPerUser, cfg.maxPendingTotal,

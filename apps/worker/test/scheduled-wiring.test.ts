@@ -1,9 +1,15 @@
 import { env } from 'cloudflare:test';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE } from '../src/services/forwarding.js';
 import { bumpCounter, dayWindow, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { runScheduled } from '../src/services/scheduled.js';
 import { processStorageCleanup } from '../src/services/storage-cleanup.js';
+import { cfWindow, clearZoneCatalogCache, SYSTEM_DOMAIN_CF_SCOPE } from '../src/services/zone-catalog.js';
+import { cfRuntime, fakeCloudflare } from './support/fake-cloudflare.js';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('每日维护接入本期新增的清理', () => {
   it('孤儿附件行登记对象清理并删行；中转与登录失败计数的过期窗口被回收', async () => {
@@ -40,5 +46,30 @@ describe('每日维护接入本期新增的清理', () => {
     await env.db.prepare('INSERT OR IGNORE INTO storage_cleanup_jobs (r2_key) VALUES (?)').bind(key).run();
     await processStorageCleanup(env, 1000);
     expect(await env.r2.head(key)).toBeNull();
+  });
+});
+
+describe('系统域名接入的定时步骤', () => {
+  it('5 分钟任务处理到期的接入任务；每日维护按 5 分钟窗口回收过期的 system_domain_cf 计数', async () => {
+    clearZoneCatalogCache();
+    const cf = fakeCloudflare({ zones: [{ name: 'wiring-onboarding.test', status: 'pending' }] });
+    const zone = cf.zoneByName('wiring-onboarding.test')!;
+    const due = Date.now() - 1;
+    const { id } = (await env.db.prepare(`INSERT INTO system_domain_onboarding (domain, mode, state, account_id, zone_id, zone_origin, created_by, next_check_at)
+      VALUES ('wiring-onboarding.test', 'existing_zone', 'awaiting_ns', 'acct-test', ?, 'linked', 1, ?) RETURNING id`).bind(zone.id, due).first<{ id: number }>())!;
+    await runScheduled(cfRuntime(env), false);
+    const row = await env.db.prepare('SELECT state, zone_status, next_check_at FROM system_domain_onboarding WHERE id = ?').bind(id)
+      .first<{ state: string; zone_status: string; next_check_at: number }>();
+    expect(row).toMatchObject({ state: 'awaiting_ns', zone_status: 'pending' });
+    expect(row!.next_check_at).toBeGreaterThan(Date.now());
+    expect(cf.calls).toContain(`GET /zones/${zone.id}`);
+
+    const old = cfWindow() - 30;
+    await bumpCounter(env, SYSTEM_DOMAIN_CF_SCOPE, 'all', old);
+    await bumpCounter(env, SYSTEM_DOMAIN_CF_SCOPE, 'all', cfWindow(), 0);
+    const current = (await readCounter(env, SYSTEM_DOMAIN_CF_SCOPE, 'all', cfWindow())).count;
+    await runScheduled(env, true);
+    expect((await readCounter(env, SYSTEM_DOMAIN_CF_SCOPE, 'all', old)).count).toBe(0);
+    expect((await readCounter(env, SYSTEM_DOMAIN_CF_SCOPE, 'all', cfWindow())).count).toBe(current);
   });
 });
