@@ -10,6 +10,7 @@ import { chunk, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
+import { runDetached } from '../lib/http.js';
 import { logAdminAction } from './audit.js';
 import { subscribeHostedDomainEvents } from './event-subscriptions.js';
 import {
@@ -92,13 +93,6 @@ function requireCredentials(env: Env, settings: Pick<Settings, 'hosted_domains'>
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-/** 后台任务：有 ctx 放进 waitUntil，没有时（定时任务、单测）同步等待 */
-async function runDetached(ctx: ExecCtx | null | undefined, label: string, task: () => Promise<unknown>): Promise<void> {
-  const guarded = task().catch((error) => console.error(`${label}失败:`, error));
-  if (ctx) ctx.waitUntil(guarded);
-  else await guarded;
 }
 
 /** 删除 zone 前核对身份：不能是系统域名，创建时间不早于本站记录 */

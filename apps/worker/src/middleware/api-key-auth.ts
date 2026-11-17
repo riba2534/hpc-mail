@@ -8,7 +8,7 @@ import {
 import type { Context, MiddlewareHandler } from 'hono';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { bearerToken, clientIp, execCtx, routeLabel } from '../lib/http.js';
+import { bearerToken, clientIp, execCtx, routeLabel, runDetached } from '../lib/http.js';
 import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
 import { ipInAllowList } from '../lib/ip-allowlist.js';
 import { writeApiRequestLog } from '../services/api-request-log.js';
@@ -131,7 +131,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
     throw err;
   } finally {
     // 审计日志不阻塞响应；无 ExecutionContext（单测直调）时同步写入
-    const audit = writeApiRequestLog(c.env, admitted, {
+    await runDetached(execCtx(c), 'API 审计日志写入', () => writeApiRequestLog(c.env, admitted, {
       apiKeyId: row.id,
       requestId: c.get('requestId') ?? '',
       method: c.req.method,
@@ -140,10 +140,7 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
       statusCode,
       ip,
       durationMs: Math.max(0, Date.now() - startedAt),
-    }).catch((e: unknown) => console.error('api audit log failed:', e));
-    const ctx = execCtx(c);
-    if (ctx) ctx.waitUntil(audit);
-    else await audit;
+    }));
   }
 };
 
@@ -153,13 +150,9 @@ export const apiKeyAuth: MiddlewareHandler<AppContext> = async (c, next) => {
  */
 async function touchLastUsed(c: Context<AppContext>, record: ApiKeyRecord, ip: string, now: number): Promise<void> {
   if (record.last_used_at !== null && Number(record.last_used_at) >= now - LAST_USED_THROTTLE_MS) return;
-  const write = c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
+  await runDetached(execCtx(c), 'API Key last_used 更新', () => c.env.db.prepare(`UPDATE api_keys SET last_used_at = ?, last_used_ip = ?
     WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`)
-    .bind(now, ip, record.id, now - LAST_USED_THROTTLE_MS).run()
-    .then(() => undefined, (e: unknown) => console.error('api key last_used update failed:', e));
-  const ctx = execCtx(c);
-  if (ctx) ctx.waitUntil(write);
-  else await write;
+    .bind(now, ip, record.id, now - LAST_USED_THROTTLE_MS).run());
 }
 
 /** 校验 scope（v1 路由内调用） */

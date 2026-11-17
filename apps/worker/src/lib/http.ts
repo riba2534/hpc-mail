@@ -43,6 +43,13 @@ export function bearerToken(c: { req: { header: (name: string) => string | undef
   return (c.req.header('Authorization') || '').match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? '';
 }
 
+/** 后台任务：有 ctx 放进 waitUntil，不阻塞响应；没有时（定时任务、单测直调）同步等待。失败只记日志，不抛给调用方 */
+export async function runDetached(ctx: ExecCtx | null | undefined, label: string, task: () => Promise<unknown>): Promise<void> {
+  const guarded = task().catch((error: unknown) => console.error(`${label}失败:`, error));
+  if (ctx) ctx.waitUntil(guarded);
+  else await guarded;
+}
+
 /** 取客户端 IP（部署在 Cloudflare 后，仅信任 CF-Connecting-IP） */
 export function clientIp(c: Context<AppContext>): string {
   const value = c.req.header('CF-Connecting-IP') || '';
