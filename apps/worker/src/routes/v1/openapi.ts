@@ -105,7 +105,7 @@ export function buildOpenApiSpec(origin: string) {
     'x-relatedApis': [{ url: `${origin}/api/openapi.json`, description: 'JWT session and administration API' }],
     tags: [{ name: 'Mail', description: 'Mail, mailbox and hosted-domain operations. Required scopes are listed in x-required-scopes.' }],
     components: { securitySchemes: { apiKey: { type: 'http', scheme: 'bearer', bearerFormat: 'hpcm_ followed by 64 hexadecimal characters' } }, schemas: usedSchemas(described),
-      examples: usedExamples(described, origin) },
+      examples: usedExamples(described, origin, '/v1') },
     paths: described,
   };
 }

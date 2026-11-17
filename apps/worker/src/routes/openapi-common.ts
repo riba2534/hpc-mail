@@ -25,7 +25,7 @@ import {
   SYSTEM_DOMAIN_ZONE_CATEGORIES, SYSTEM_DOMAIN_ZONE_ORIGINS, cancelSystemDomainOnboardingRequestSchema, confirmSystemDomainOnboardingRequestSchema,
   createSystemDomainOnboardingRequestSchema, updateSystemDomainHiddenZonesRequestSchema,
 } from '@hpc-mail/shared';
-import { DEFAULT_ERROR_HINTS, REQUEST_ID_PATTERN } from '../middleware/error.js';
+import { defaultErrorHints, REQUEST_ID_PATTERN } from '../middleware/error.js';
 import {
   MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE, RECONNECT_CF_CALLS,
 } from '../services/hosted-domain.js';
@@ -967,8 +967,8 @@ export function registerSchemas(extra: Record<string, Schema>): void {
   }
 }
 
-/** components.examples：只输出 paths 引用到的失败示例；fix/docs 缺省时按错误码套用中间件的默认建议，docs 按 origin 补成绝对 URL */
-export function usedExamples(paths: Paths, origin: string): Record<string, Schema> {
+/** components.examples：只输出 paths 引用到的失败示例；fix/docs 缺省时按错误码与规格（/api 或 /v1）套用中间件的默认建议，docs 按 origin 补成绝对 URL */
+export function usedExamples(paths: Paths, origin: string, base: '/api' | '/v1'): Record<string, Schema> {
   const names = new Set<string>();
   JSON.stringify(paths, (key, value: unknown) => {
     if (key === '$ref' && typeof value === 'string' && value.startsWith('#/components/examples/')) names.add(value.slice('#/components/examples/'.length));
@@ -976,7 +976,7 @@ export function usedExamples(paths: Paths, origin: string): Record<string, Schem
   });
   return Object.fromEntries([...names].sort().map(name => {
     const example = errorExample(name)!;
-    const hints = DEFAULT_ERROR_HINTS[example.code] ?? {};
+    const hints = defaultErrorHints(example.code, base);
     const fix = example.fix ?? hints.fix;
     const docs = example.docs ?? hints.docs;
     return [name, { summary: `${example.code}: ${example.message}`, value: {

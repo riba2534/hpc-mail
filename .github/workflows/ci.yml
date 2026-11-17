@@ -25,7 +25,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
-      # 两份 OpenAPI 导出后按仓库根 .spectral.yaml 检查（固定版本、不跑安装脚本、env -i 隔离环境）
+      # 两份 OpenAPI 导出后按仓库根 .spectral.yaml 检查（固定版本、不跑安装脚本、env -i 隔离环境）。
+      # 只放在 PR CI：这里没有生产密钥；部署工作流不跑 npx 现装的第三方包
       - name: OpenAPI 规范检查（Spectral）
         run: bash scripts/check-openapi.sh "$RUNNER_TEMP/openapi"
       - run: node scripts/check-deploy-scripts.mjs
