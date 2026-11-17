@@ -438,7 +438,6 @@ export async function updateDraft(
   const prepared = await prepare(env, actor.userId, id, { content: row.content, text: current.bodyText, html: current.bodyHtml },
     input, status === 'scheduled', request);
   const db = createDb(env);
-  const scheduling = sendAt !== undefined;
   const update = db.update(drafts).set({
     status,
     content: prepared.content,
@@ -446,13 +445,13 @@ export async function updateDraft(
     version: sql`${drafts.version} + 1`,
     updatedAt: new Date(),
     origin: request.origin,
-    ...(scheduling ? {
-      sendAt: sendAt ?? null,
-      // 安排者与当时的账户安全版本：到点复核，Key 失效或改密后不再发出
-      scheduledByKeyId: sendAt ? actor.apiKeyId : null,
-      scheduledAuthVersion: sendAt ? sql`(select auth_version from users where id = ${actor.userId})` : null,
-      errorDetail: '',
-    } : {}),
+    ...(sendAt !== undefined ? { sendAt, errorDetail: '' } : {}),
+    // 安排者记的是最后一个让它保持定时的写入者（安排或改写内容都算）与当时的账户安全版本：到点按它复核，
+    // 别的 Key 改写已安排的草稿后，到点复核的就是改写者，不会沿用原安排者的权限
+    ...(status === 'scheduled' ? {
+      scheduledByKeyId: actor.apiKeyId,
+      scheduledAuthVersion: sql`(select auth_version from users where id = ${actor.userId})`,
+    } : status === 'draft' ? { scheduledByKeyId: null, scheduledAuthVersion: null } : {}),
   }).where(and(eq(drafts.id, id), eq(drafts.userId, actor.userId), eq(drafts.version, row.version), inArray(drafts.status, EDITABLE)))
     .returning({ id: drafts.id });
   let updated: { id: number }[];
@@ -630,6 +629,7 @@ export async function sendDraftNow(
 interface SchedulerKey {
   status: string;
   expiresAt: Date | null;
+  scopes: string[];
   mailboxIds: number[];
   domains: string[];
 }
@@ -651,6 +651,12 @@ function scheduleRevoked(
   if (row.scheduledByKeyId !== null && (!key || key.status !== 'active' || (key.expiresAt && key.expiresAt.getTime() <= now))) {
     return '安排定时发送的 API Key 已失效，定时发送已取消，请确认后重新安排';
   }
+  // 与直接发信同一套 scope：发信要 mail.send，引用原信（回复、转发附件）另需 mail.read
+  if (key && !key.scopes.includes('mail.send')) return '安排定时发送的 API Key 已没有 mail.send，定时发送已取消，请确认后重新安排';
+  const referencesSource = Boolean(row.content.replyToMessageId || row.content.forwardAttachmentsFrom);
+  if (key && referencesSource && !key.scopes.includes('mail.read')) {
+    return '安排定时发送的 API Key 已没有 mail.read（草稿引用了原邮件），定时发送已取消，请确认后重新安排';
+  }
   // Key 之后被收窄了范围：发件地址不在范围内就不发（与安排时的检查同一口径：域名在范围内或认领行在范围内）
   if (key && (key.mailboxIds.length || key.domains.length)) {
     const domain = sender.box?.domain ?? sender.domain;
@@ -658,6 +664,12 @@ function scheduleRevoked(
     if (!allowed) return '安排定时发送的 API Key 已不再覆盖这个发件地址，定时发送已取消，请确认后重新安排';
   }
   return null;
+}
+
+/** 定时发送的发信角色：网页会话安排的就是账户角色；Key 安排的按 apiKeyAuth 的规则，不会高于账户角色 */
+function schedulerRole(ownerRole: Role, key: SchedulerKey | undefined): Role {
+  if (!key) return ownerRole;
+  return ownerRole === 'admin' && key.scopes.includes('admin') ? 'admin' : 'user';
 }
 
 /**
@@ -715,7 +727,7 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
   const [owners, keys, boxes] = await env.db.batch<Record<string, unknown>>([
     env.db.prepare(`SELECT id, role, status, auth_version FROM users WHERE id IN (${list(ownerIds)})`).bind(...ownerIds),
     keyIds.length
-      ? env.db.prepare(`SELECT id, status, expires_at, allowed_mailbox_ids, allowed_domains FROM api_keys WHERE id IN (${list(keyIds)})`).bind(...keyIds)
+      ? env.db.prepare(`SELECT id, status, expires_at, scopes, allowed_mailbox_ids, allowed_domains FROM api_keys WHERE id IN (${list(keyIds)})`).bind(...keyIds)
       : env.db.prepare('SELECT NULL AS id WHERE 0'),
     boxIds.length || addresses.length
       ? env.db.prepare(`SELECT id, domain, address FROM mailboxes WHERE id IN (${list(boxIds) || 'NULL'}) OR address IN (${list(addresses) || 'NULL'})`)
@@ -736,18 +748,22 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
   }]));
   const keyById = new Map(keys!.results.map((key): [number, SchedulerKey] => [Number(key.id), {
     status: String(key.status), expiresAt: key.expires_at === null ? null : new Date(Number(key.expires_at)),
+    scopes: json(key.scopes).map(String),
     mailboxIds: json(key.allowed_mailbox_ids).map(Number), domains: json(key.allowed_domains).map(String),
   }]));
   await runLimited(due, DISPATCH_CONCURRENCY, async (row) => {
     try {
       const owner = ownerById.get(row.userId);
-      const revoked = scheduleRevoked(row, owner, row.scheduledByKeyId !== null ? keyById.get(row.scheduledByKeyId) : undefined, senderOf(row), now);
+      const key = row.scheduledByKeyId !== null ? keyById.get(row.scheduledByKeyId) : undefined;
+      const revoked = scheduleRevoked(row, owner, key, senderOf(row), now);
       if (revoked) {
         await settle(env, row, { status: 'failed', messageId: null, errorDetail: revoked });
         report.failed++;
         return;
       }
-      const sender = { userId: row.userId, role: owner!.role };
+      // 发信角色取账户角色与安排者有效角色中较低的一个：Key 安排的按 apiKeyAuth 的同一规则（管理员 Key 要带 admin scope
+      // 才是管理员），否则管理员名下的普通 Key 可以借定时发送冒用任意邮箱、绕过外发配额
+      const sender = { userId: row.userId, role: schedulerRole(owner!.role, key) };
       const summary = await performSend({ env, ctx, origin: env.site_origin ?? row.origin, selfHosts: [] }, row, sender, 'scheduled', 'scheduled');
       if (summary) report.sent++;
       else report.failed++;

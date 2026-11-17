@@ -452,3 +452,61 @@ describe('限定范围的 Key（PR4a）', () => {
     expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('不再覆盖这个发件地址') });
   });
 });
+
+describe('到点按安排者的有效权限发送（CR2/CR3/A23）', () => {
+  const setKeyScopes = (id: number, scopes: string[]) => db.update(apiKeys).set({ scopes: scopes as ApiScope[] }).where(eq(apiKeys.id, id));
+
+  it('CR2：管理员名下不带 admin scope 的 Key 安排的定时发送按普通用户身份，不能借此用别人的邮箱发信', async () => {
+    const admin = await account('sched-role-admin', USER_SCOPES, 'admin');
+    const victim = await account('sched-role-victim');
+    const [box] = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, victim.address));
+    // 直接发信时这把 Key 已按普通用户处理（403），定时发送不能绕过
+    expect((await failure(await call('/v1/messages', req(admin.key, 'POST', complete('ignored@hpc.email', 'x@hpc.email', { from: { mailboxId: box!.id } }))), 403)).code)
+      .toBe('forbidden');
+    const draft = await data<Draft>(await call('/v1/drafts', req(admin.key, 'POST',
+      complete('ignored@hpc.email', 'sched-role-to@hpc.email', { from: { mailboxId: box!.id }, sendAt: inMinutes(5) }))), 201);
+    await makeDue(draft.id);
+    await dispatch();
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', messageId: null });
+    expect(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.address, victim.address), eq(messages.direction, 'outbound'))))
+      .toEqual([]);
+    // 网页会话安排的仍按管理员身份
+    const web = await data<Draft>(await call('/api/drafts', req(admin.jwt, 'POST',
+      complete('ignored@hpc.email', 'sched-role-to2@hpc.email', { from: { mailboxId: box!.id }, sendAt: inMinutes(5) }))), 201);
+    await makeDue(web.id);
+    await dispatch();
+    expect(await row(web.id)).toMatchObject({ status: 'sent' });
+  });
+
+  it('CR3：到点时安排它的 Key 已没有 mail.send，或引用原信却没有 mail.read，就取消发送', async () => {
+    const me = await account('sched-scope');
+    const plain = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 'scope-a@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    const [source] = await db.insert(messages).values({ direction: 'inbound', address: me.address, domain: 'hpc.email', status: 'received',
+      fromAddress: 'peer@example.net', subject: 'hi', preview: 'p', messageId: '<src@example.net>' }).returning({ id: messages.id });
+    const reply = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST',
+      complete(me.address, 'scope-b@hpc.email', { replyToMessageId: source!.id, sendAt: inMinutes(5) }))), 201);
+    await setKeyScopes(me.keyId, ['mail.send']);
+    await makeDue(plain.id);
+    await makeDue(reply.id);
+    await dispatch();
+    expect(await row(reply.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('mail.read') });
+    expect(await row(plain.id)).toMatchObject({ status: 'sent' });
+
+    const another = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 'scope-c@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await setKeyScopes(me.keyId, ['mail.read']);
+    await makeDue(another.id);
+    await dispatch();
+    expect(await row(another.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('mail.send') });
+  });
+
+  it('A23：已安排的草稿被另一把 Key 改写后，到点复核的是最后改写它的 Key', async () => {
+    const me = await account('sched-rewrite');
+    const draft = await data<Draft>(await call('/api/drafts', req(me.jwt, 'POST', complete(me.address, 'rw-a@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await data(await call(`/v1/drafts/${draft.id}`, req(me.key, 'PATCH', { to: ['rw-b@hpc.email'] })));
+    expect(await row(draft.id)).toMatchObject({ status: 'scheduled', scheduledByKeyId: me.keyId });
+    await db.update(apiKeys).set({ status: 'revoked' }).where(eq(apiKeys.id, me.keyId));
+    await makeDue(draft.id);
+    await dispatch();
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('API Key 已失效') });
+  });
+});
