@@ -195,3 +195,48 @@ describe('托管域名墓碑', () => {
     expect(await tombstone(f.domain('alive'))).toBeUndefined();
   });
 });
+
+describe('修复轮 A20：回填墓碑按过户后的最后所有者判定', () => {
+  /** 迁移 0024 回填的墓碑：user_id 是最后一次添加该域名的人 */
+  async function backfilled(domain: string, creatorId: number) {
+    await db.insert(hostedDomainTombstones).values({ domain, userId: creatorId, nameServers: OURS, reason: 'backfill', deletedAt: new Date() });
+  }
+  const audit = (values: { actorId: number; action: string; target: string; detail: string }) => db.insert(adminAuditLogs).values(values);
+
+  it('添加后过户再删除：原创建者不再免检，最后的所有者免检', async () => {
+    const f = await fixture();
+    const creator = await f.actor('creator');
+    const middle = await f.actor('middle');
+    const last = await f.actor('last');
+    const domain = f.domain('moved');
+    await audit({ actorId: creator.id, action: 'hosted_domain.create', target: domain, detail: 'zone z，NS ada.ns.cloudflare.com / bob.ns.cloudflare.com' });
+    await audit({ actorId: creator.id, action: 'hosted_domain.transfer', target: domain,
+      detail: `${creator.username} (#${creator.id}) → ${middle.username} (#${middle.id})；地址连同历史一起过户` });
+    await audit({ actorId: middle.id, action: 'hosted_domain.transfer', target: domain,
+      detail: `${middle.username} (#${middle.id}) → ${last.username} (#${last.id})；原所有者保留已认领地址` });
+    await backfilled(domain, creator.id);
+    stubNetwork({ rdap: { [domain]: OURS } });
+    expect(await add(creator.jwt, domain)).toMatchObject({ status: 409, error: { message: expect.stringContaining('仍指向本站分配的地址') } });
+    expect((await add(middle.jwt, domain)).status).toBe(409);
+    expect((await add(last.jwt, domain)).status).toBe(201);
+  });
+
+  it('过户早于最后一次添加时仍以添加者为准；非回填的墓碑照旧按删除时的所有者', async () => {
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const other = await f.actor('other');
+    const readded = f.domain('readded');
+    // 早先过户给别人、之后被删，又由 owner 重新添加：最后一次添加之前的过户不算
+    await audit({ actorId: owner.id, action: 'hosted_domain.transfer', target: readded,
+      detail: `${owner.username} (#${owner.id}) → ${other.username} (#${other.id})；原所有者保留已认领地址` });
+    await audit({ actorId: owner.id, action: 'hosted_domain.create', target: readded, detail: 'zone z，NS ada.ns.cloudflare.com / bob.ns.cloudflare.com' });
+    await backfilled(readded, owner.id);
+    const deleted = f.domain('deleted');
+    await audit({ actorId: owner.id, action: 'hosted_domain.transfer', target: deleted,
+      detail: `${owner.username} (#${owner.id}) → ${other.username} (#${other.id})；原所有者保留已认领地址` });
+    await bury(deleted, owner.id);
+    stubNetwork({ rdap: { [readded]: OURS, [deleted]: OURS } });
+    expect((await add(owner.jwt, readded)).status).toBe(201);
+    expect((await add(owner.jwt, deleted)).status).toBe(201);
+  });
+});
