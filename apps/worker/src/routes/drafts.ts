@@ -60,7 +60,7 @@ export function createDraftRoutes(authentication: MiddlewareHandler<AppContext>)
 
   app.post('/', async (c) => {
     requireWrite(c);
-    assertRequestSize(c);
+    await assertRequestSize(c);
     const input = await parseBody(c, draftInputSchema);
     await authorizeSendContent(c, input);
     const result = await createDraft(c.env, actorOf(c), input, sendEnvironment(c), c.req.header('Idempotency-Key'));
@@ -74,7 +74,7 @@ export function createDraftRoutes(authentication: MiddlewareHandler<AppContext>)
 
   app.patch('/:id', async (c) => {
     requireWrite(c);
-    assertRequestSize(c);
+    await assertRequestSize(c);
     const id = parseId(c.req.param('id'));
     const input = await parseBody(c, draftInputSchema);
     return ok(c, await updateDraft(c.env, actorOf(c), id, input, sendEnvironment(c), contentGuard(c)));

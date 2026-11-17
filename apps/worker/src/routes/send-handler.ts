@@ -10,8 +10,8 @@ import {
   type SendFrom,
 } from '@hpc-mail/shared';
 import type { Context } from 'hono';
-import { AppError } from '../lib/errors.js';
 import { ok, parseBody } from '../lib/http.js';
+import { readBodyWithLimit } from '../lib/request-body.js';
 import { assertKeyCanUseAddress, assertKeyCanUseSender, keyRestriction, requireScope } from '../middleware/api-key-auth.js';
 import type { IdempotencyActor } from '../services/idempotency.js';
 import { loadSourceMessage } from '../services/message.js';
@@ -33,11 +33,12 @@ function selfHostsOf(c: Context<AppContext>): string[] {
   return hosts;
 }
 
-/** 解析前拦下超大请求体：JSON 解析、幂等哈希、base64 解码会同时持有好几份内容 */
-export function assertRequestSize(c: Context<AppContext>): void {
-  if (Number(c.req.header('Content-Length')) > MAX_SEND_REQUEST_BYTES) {
-    throw new AppError('payload_too_large', `发信请求体超过 ${MAX_SEND_REQUEST_BYTES / 1024 / 1024}MB 上限`);
-  }
+/**
+ * 解析前拦下超大请求体：JSON 解析、幂等哈希、base64 解码会同时持有好几份内容。按流读取，
+ * 没有 Content-Length 的 chunked 请求同样在超限时中止；读到的内容由随后的 parseBody 复用。
+ */
+export async function assertRequestSize(c: Context<AppContext>): Promise<void> {
+  await readBodyWithLimit(c, MAX_SEND_REQUEST_BYTES, `发信请求体超过 ${MAX_SEND_REQUEST_BYTES / 1024 / 1024}MB 上限`);
 }
 
 /**
@@ -99,7 +100,7 @@ export function sendOne(
 
 /** /api/messages/send 与 POST /v1/messages 共用的发信处理：解析出请求后、占用幂等键前做 Key 授权 */
 export async function handleSend(c: Context<AppContext>, actor: IdempotencyActor, sender: Sender): Promise<Response> {
-  assertRequestSize(c);
+  await assertRequestSize(c);
   const req = await parseBody(c, internalSendMailSchema);
   await authorizeSendContent(c, req);
   return runSend(c, actor, sender, sendRequestFingerprint(req), async () => planOf(req));
@@ -116,7 +117,7 @@ export async function handleCompose(
   op: 'reply' | 'forward',
   sourceId: number,
 ): Promise<Response> {
-  assertRequestSize(c);
+  await assertRequestSize(c);
   if (op === 'reply') {
     const req = await parseBody(c, replyMessageRequestSchema);
     return runSend(c, actor, sender, composeRequestFingerprint(op, sourceId, req), async () =>

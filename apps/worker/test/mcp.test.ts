@@ -7,6 +7,7 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { apiKeys, apiRequestLogs, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
+import { DETAILED_BODY_CHARS, TOOLS, truncate, type Rest, type RestRequest } from '../src/routes/mcp/tools.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
@@ -160,7 +161,7 @@ describe('MCP 传输与握手', () => {
       expect(await response.json()).toMatchObject({ id: null, error: { code: -32001, data: { code: 'unauthorized', docs: 'http://localhost/references/mcp.md' } } });
     }
     const unknown = await rpc(`hpcm_${'0'.repeat(64)}`, 'initialize', {}, 401);
-    expect(unknown).toMatchObject({ id: rpcId, error: { code: -32001, message: 'API Key 无效', data: { code: 'unauthorized' } } });
+    expect(unknown).toMatchObject({ id: null, error: { code: -32001, message: 'API Key 无效', data: { code: 'unauthorized' } } });
 
     const before = await db.select().from(apiRequestLogs).where(eq(apiRequestLogs.apiKeyId, user.keyId)).all();
     await rpc(user.key, 'initialize', { protocolVersion: '2025-11-25' });
@@ -342,7 +343,7 @@ describe('MCP 权限与错误：与 REST 端点一致', () => {
     expect((await rpc(user.key, 'tools/call', {})).error).toMatchObject({ code: -32602 });
   });
 
-  it('工具调用只经内部 /v1 请求鉴权一次：审计是对应的 /v1 路径，没有 /mcp 行，限流计数加一', async () => {
+  it('工具调用只在 /mcp 上鉴权、计一次限流：内部 /v1 请求沿用同一 Key，审计同时记 /mcp 与 /v1 路径', async () => {
     const user = await actor('mcp-once');
     const logs = async () => db.select().from(apiRequestLogs).where(eq(apiRequestLogs.apiKeyId, user.keyId)).all();
     const { env: target, fakes } = fakeRateLimits();
@@ -350,11 +351,13 @@ describe('MCP 权限与错误：与 REST 端点一致', () => {
     const called = await post(user.key, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'search_messages', arguments: { limit: 1 } } }, {}, target);
     expect(((await called.json()) as { result?: { isError?: boolean } }).result?.isError).toBeUndefined();
     const added = (await logs()).slice(beforeLogs);
-    expect(added.map((row) => `${row.method} ${row.path} ${row.statusCode}`)).toEqual(['GET /v1/messages 200']);
+    expect(added.map((row) => `${row.method} ${row.path} ${row.statusCode}`).sort()).toEqual(['GET /v1/messages 200', 'POST /mcp 200']);
     expect(fakes.rl_api_user.counts.get(String(user.id))).toBe(1);
-    const outer = await post(user.key, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_me' } }, { 'X-Request-ID': 'mcp-trace-1' });
-    expect(outer.headers.get('X-Request-ID')).toBe('mcp-trace-1');
-    expect((await logs()).slice(-2).map((row) => row.requestId)).toEqual(['mcp-trace-1', 'mcp-trace-1']);
+    // get_me 发两个内部请求，仍只计一次
+    await post(user.key, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_me' } }, { 'X-Request-ID': 'mcp-trace-1' }, target);
+    expect(fakes.rl_api_user.counts.get(String(user.id))).toBe(2);
+    const traced = (await logs()).filter((row) => row.requestId === 'mcp-trace-1');
+    expect(traced.map((row) => row.path).sort()).toEqual(['/mcp', '/v1/domains', '/v1/me']);
   });
 
   it('Key 被吊销或禁用后调用工具返回 HTTP 401', async () => {
@@ -362,9 +365,95 @@ describe('MCP 权限与错误：与 REST 端点一致', () => {
     await db.update(apiKeys).set({ status: 'disabled' }).where(eq(apiKeys.id, user.keyId));
     const disabled = await post(user.key, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'get_me' } });
     expect(disabled.status).toBe(401);
-    expect(await disabled.json()).toMatchObject({ id: 9, error: { code: -32001, message: 'API Key 已禁用', data: { code: 'unauthorized' } } });
+    expect(await disabled.json()).toMatchObject({ id: null, error: { code: -32001, message: 'API Key 已禁用', data: { code: 'unauthorized' } } });
     await db.update(apiKeys).set({ status: 'revoked' }).where(eq(apiKeys.id, user.keyId));
     expect((await post(user.key, { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'list_mailboxes' } })).status).toBe(401);
+  });
+});
+
+describe('MCP 大邮件与大列表（A7、A10）', () => {
+  it('truncate 只遍历需要的前缀：不把整段正文展开，按码点截断不切开代理对', () => {
+    const iterator = String.prototype[Symbol.iterator];
+    let yielded = 0;
+    String.prototype[Symbol.iterator] = function* counted(this: string) {
+      for (const char of iterator.call(this) as Iterable<string>) { yielded++; yield char; }
+    } as unknown as typeof iterator;
+    try {
+      const big = '中'.repeat(300_000);
+      expect(truncate(big, 2000)).toEqual({ text: '中'.repeat(2000), truncated: true });
+      expect(yielded).toBeLessThanOrEqual(2001);
+    } finally {
+      String.prototype[Symbol.iterator] = iterator;
+    }
+    expect(truncate('😀😀😀', 2)).toEqual({ text: '😀😀', truncated: true });
+    expect(truncate('😀😀', 2)).toEqual({ text: '😀😀', truncated: false });
+    expect(truncate('abc', 5)).toEqual({ text: 'abc', truncated: false });
+  });
+
+  it('get_message 与 wait_for_message 的 detailed 正文各自超过上限时截断，并提示用 raw 下载；不超过时原样返回', async () => {
+    const user = await actor('mcp-big');
+    const box = await ok<{ address: string }>(user.key, 'claim_mailbox', { localPart: 'mcp-big', domain: DOMAIN });
+    const baseline = await inbound(box.address, { subject: 'small', bodyText: 'tiny', bodyHtml: '<p>tiny</p>' });
+    const long = 'x'.repeat(DETAILED_BODY_CHARS + 500);
+    const big = await inbound(box.address, { subject: 'big', bodyText: long, bodyHtml: `<p>${long}</p>` });
+
+    const concise = await ok<{ text: string; textTruncated: boolean }>(user.key, 'get_message', { messageId: big });
+    expect(concise).toMatchObject({ text: 'x'.repeat(2000), textTruncated: true });
+    const detailed = await ok<{ bodyText: string; bodyHtml: string; bodyTruncated: boolean; hint: string; id: number }>(user.key, 'get_message',
+      { messageId: big, response_format: 'detailed' });
+    expect(detailed.bodyText).toHaveLength(DETAILED_BODY_CHARS);
+    expect(detailed.bodyHtml).toHaveLength(DETAILED_BODY_CHARS);
+    expect(detailed).toMatchObject({ id: big, bodyTruncated: true, hint: expect.stringContaining(`/v1/messages/${big}/raw`) });
+    const small = await ok<Record<string, unknown>>(user.key, 'get_message', { messageId: baseline, response_format: 'detailed' });
+    expect(small).toMatchObject({ bodyText: 'tiny', bodyHtml: '<p>tiny</p>' });
+    expect(small).not.toHaveProperty('bodyTruncated');
+
+    const waited = await ok<{ message: { id: number; bodyText: string; bodyTruncated: boolean } }>(user.key, 'wait_for_message',
+      { address: box.address, afterId: baseline, timeout: 1, response_format: 'detailed' });
+    expect(waited.message).toMatchObject({ id: big, bodyTruncated: true });
+    expect(waited.message.bodyText).toHaveLength(DETAILED_BODY_CHARS);
+  });
+
+  it('list_mailboxes 始终分页：limit/cursor 翻页，q 与 domain 过滤', async () => {
+    const user = await actor('mcp-pages');
+    const ids: number[] = [];
+    for (const localPart of ['mcp-pages-a', 'mcp-pages-b', 'mcp-pages-c']) {
+      ids.push((await ok<{ id: number }>(user.key, 'claim_mailbox', { localPart, domain: DOMAIN })).id);
+    }
+    const first = await ok<{ mailboxes: Array<{ id: number }>; nextCursor: string | null }>(user.key, 'list_mailboxes', { limit: 2 });
+    expect(first.mailboxes.map((box) => box.id)).toEqual([ids[2], ids[1]]);
+    expect(first.nextCursor).toEqual(expect.any(String));
+    const second = await ok<{ mailboxes: Array<{ id: number }>; nextCursor: string | null }>(user.key, 'list_mailboxes',
+      { limit: 2, cursor: first.nextCursor });
+    expect(second).toEqual({ mailboxes: [expect.objectContaining({ id: ids[0] })], nextCursor: null });
+    const filtered = await ok<{ mailboxes: Array<{ address: string }> }>(user.key, 'list_mailboxes', { q: 'PAGES-B', domain: DOMAIN });
+    expect(filtered.mailboxes.map((box) => box.address)).toEqual([`mcp-pages-b@${DOMAIN}`]);
+    expect(await toolError(user.key, 'list_mailboxes', { limit: 201 })).toMatchObject({ code: 'validation_failed' });
+  });
+
+  it('list_mailboxes 与 release_mailbox(address) 只发带 limit 的过滤查询，不拉全量；地址按子串命中后逐条比对', async () => {
+    const calls: RestRequest[] = [];
+    const pages = [
+      { items: [{ id: 9, address: 'xbob@hpc.email' }], nextCursor: 'c1' },
+      { items: [{ id: 7, address: 'bob@hpc.email' }], nextCursor: 'c2' },
+    ];
+    const rest = (async (req: RestRequest) => {
+      calls.push(req);
+      if (req.method === 'DELETE') return { success: true, deletedMessages: 0 };
+      return pages[calls.filter((call) => call.method === 'GET').length - 1];
+    }) as Rest;
+    const released = await TOOLS.release_mailbox.run(rest, { address: 'bob@hpc.email', deleteHistory: false }, {});
+    expect(released).toEqual({ mailboxId: 7, success: true, deletedMessages: 0 });
+    expect(calls.map((call) => [call.method, call.path, call.query])).toEqual([
+      ['GET', '/v1/mailboxes', { limit: '50', q: 'bob@hpc.email', domain: 'hpc.email' }],
+      ['GET', '/v1/mailboxes', { limit: '50', q: 'bob@hpc.email', domain: 'hpc.email', cursor: 'c1' }],
+      ['DELETE', '/v1/mailboxes/7', { deleteHistory: '0' }],
+    ]);
+
+    calls.length = 0;
+    const listed = await TOOLS.list_mailboxes.run(rest, { response_format: 'concise' }, {});
+    expect(calls[0]!.query).toEqual({ limit: '50' });
+    expect(listed).toMatchObject({ nextCursor: 'c1' });
   });
 });
 
