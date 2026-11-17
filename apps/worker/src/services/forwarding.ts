@@ -5,7 +5,7 @@ import { attachments } from '../db/schema.js';
 import { hmacSha256Base64 } from '../lib/crypto.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
-import { htmlToText, type MailText } from '../lib/text.js';
+import { convertHtmlToText, type MailText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { counterResult, counterStatement, dayWindow } from './rate-counter.js';
 import { retainExternalAttachments } from './external-attachment.js';
@@ -28,6 +28,7 @@ const HTML_ESCAPES: Record<string, string> = {
   "'": '&#39;',
 };
 const escapeHtml = (s: string): string => s.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
+const RELAY_TEXT_TRUNCATED = '（正文过长，纯文本版本只包含开头部分，完整内容请查看 HTML 版本）';
 
 export interface ForwardMail {
   messageId: number;
@@ -90,7 +91,11 @@ async function relayForward(env: Env, target: string, mail: ForwardMail): Promis
   }
 
   // 附件改为下载链接时正文已改写，只能重新转换
-  const plainText = mail.mailText && text === mail.text && html === mail.html ? mail.mailText.plain : text || htmlToText(html);
+  const reused = mail.mailText && text === mail.text && html === mail.html ? mail.mailText : null;
+  const converted = reused ? { text: reused.plain, truncated: reused.plainTruncated }
+    : text ? { text, truncated: false } : convertHtmlToText(html);
+  // HTML 超长时纯文本只转换了开头，HTML 部分仍完整转发
+  const plainText = converted.truncated ? `${converted.text}\n\n${RELAY_TEXT_TRUNCATED}` : converted.text;
   const msg = createMimeMessage();
   msg.setSender({ name: `${mail.fromName || mail.fromAddress} (via HPC Mail)`, addr: sender });
   msg.setRecipient(target);

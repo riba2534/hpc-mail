@@ -161,6 +161,8 @@ export function makePreview(
 export interface MailText {
   /** 纯文本优先、缺失时回落 HTML 转换结果（提码、AI 兜底、通知与转发正文的口径） */
   readonly plain: string;
+  /** plain 来自 HTML 转换且超长只转换了开头 */
+  readonly plainTruncated: boolean;
   /** 与 makePreview 相同的摘要 */
   preview(limit?: number): string;
 }
@@ -170,10 +172,11 @@ export interface MailText {
  * 提码、预览、AI 兜底、通知与中转转发共用这一份结果。
  */
 export function mailText(text: string, html: string): MailText {
-  let converted: string | undefined;
-  const htmlText = () => (converted ??= htmlToText(html));
+  let converted: HtmlText | undefined;
+  const htmlText = () => (converted ??= convertHtmlToText(html));
   return {
-    get plain() { return text || htmlText(); },
-    preview: (limit = PREVIEW_LIMIT) => previewOf((text && text.trim()) || htmlText(), limit),
+    get plain() { return text || htmlText().text; },
+    get plainTruncated() { return !text && htmlText().truncated; },
+    preview: (limit = PREVIEW_LIMIT) => previewOf((text && text.trim()) || htmlText().text, limit),
   };
 }
