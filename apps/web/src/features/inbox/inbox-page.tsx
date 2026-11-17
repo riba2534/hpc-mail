@@ -34,7 +34,7 @@ const byAddress = (a: { address: string }, b: { address: string }) => compareTex
 export function InboxPage() {
   const { filters, setDomain, setAddress, setUnread, setQuery, clearFacets, reset } = useInboxFilters();
   const { data: visibleDomains } = useDomains();
-  const ownedQuery = useMailboxesQuery(false);
+  const ownedQuery = useMailboxesQuery();
   const sharedQuery = useSharedMailboxesQuery();
   const { data: mailboxes } = ownedQuery;
   const { data: sharedMailboxes } = sharedQuery;

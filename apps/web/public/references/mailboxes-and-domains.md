@@ -9,7 +9,7 @@
 - [域名新增、关闭公开和删除](#域名新增关闭公开和删除)：管理员维护系统域名
 - [用户托管域名](#用户托管域名)：把自己的域名接入本站，[用 API Key 接入](#用-api-key-接入)、[批量添加与立即检测](#批量添加与立即检测)，以及[托管域名的 DNS 解析](#托管域名的-dns-解析)
 
-shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发件身份与批量认领在 JWT `/api` 与 Key `/v1` 均可用；共享管理只用 JWT `/api`；用户托管域名的查看、添加、检测与 DNS 解析两者均可用（Key 需 `domain.read`/`domain.write`），删除、成员上限、成员与过户只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
+shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发件身份与批量认领在 JWT `/api` 与 Key `/v1` 均可用；自己邮箱的共享管理两者均可用（Key 需 `mailbox.share`，没有用户搜索）；用户托管域名的查看、添加、检测与 DNS 解析两者均可用（Key 需 `domain.read`/`domain.write`），删除、成员上限、成员与过户只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
 
 ## 发现域名与邮箱
 
@@ -28,7 +28,7 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发�
 | `PUT /mailboxes/:id` | `{displayName}` → 邮箱 | 同左，`mailbox.write` |
 | `DELETE /mailboxes/:id` | `{success:true,deletedMessages}` | 同左，`mailbox.write` |
 
-`GET /mailboxes` 按邮箱 id 倒序，可加 `q`（地址或所有者用户名的子串，不区分大小写，按字面匹配）与 `domain`（精确）。不带 `cursor` 和 `limit` 时返回完整数组（旧行为）；只要出现其中一个（值可为空）就返回 `{items,nextCursor}`，`limit` 1–200、缺省 50，`nextCursor` 原样传回取下一页，为 `null` 即末页，无效游标返回 400。全站邮箱可能有数千个，管理员脚本应带 `all=1&limit=200` 翻页，或用 `q`、`domain` 缩小范围。
+`GET /mailboxes` 按邮箱 id 倒序，可加 `q`（地址或所有者用户名的子串，不区分大小写，按字面匹配）与 `domain`（精确）。不带 `cursor` 和 `limit` 时返回完整数组；只要出现其中一个（值可为空）就返回 `{items,nextCursor}`，`limit` 1–200、缺省 50，`nextCursor` 原样传回取下一页，为 `null` 即末页，无效游标返回 400。全站邮箱可能有数千个，管理员脚本应带 `all=1&limit=200` 翻页，或用 `q`、`domain` 缩小范围。
 
 邮箱字段 `id,address,domain,userId,displayName,messageCount,createdAt,canSend`；管理员全站列表还有 `ownerUsername`。`canSend` 只反映该邮箱的域名当前能否发信（系统域名恒为 true，托管域名要求域名可用且发信已开通），不代表调用者有权用它发信。共享视图字段为 `mailboxId,address,domain,displayName,ownerUsername`，其 mailboxId 不是自己的发件权限。`messageCount` 包括地址下历史与软删除记录，不应作为是否删除历史的唯一依据。
 
@@ -73,8 +73,7 @@ hpc '/identities' | jq '.data'
 - `identities` 先列自己认领的邮箱（`kind=owned`），再列共享给自己的邮箱（`kind=shared`），各按地址排序。
 - `canSend=true` 的项可以作为发信的 `from`：写 `{mailboxId}`、地址字符串（可加显示名 `"Alice <alice@example.org>"`）或 `{address,name}`，见[邮件参考](mail.md#发件身份)。
 - `canSend=false` 时 `reason` 说明原因：`hosted_sending_not_ready`（托管域名的发信尚未开通，等域名进度里 `steps.sending` 变成 ready）、`hosted_domain_unavailable`（托管域名被暂停、NS 已移走或删除中）、`shared_readonly`（共享邮箱只读，普通用户不能用它发信；管理员可用 `mailboxId` 发任何邮箱，所以管理员看到的共享项按域名状态给出 `canSend`）。用这些地址发信分别返回 400 和 403。
-- `domains` 列出可以用任意前缀发信的域名（`anyLocalPart:true`），与实际放行规则一致。管理员得到全部可用域名：`kind:"system"` 系统域名（按设置顺序）、`kind:"hosted"` 状态可用且发信已就绪的托管域名、`kind:"legacy"` 已移出系统列表但仍有存量邮箱的旧域名。普通用户只得到自己作为**所有者**、发信就绪的托管域名（`kind:"hosted"`）：`from` 写 `{localPart,domain}` 或 `"Name <任意前缀@该域>"`，未认领的地址发出时自动认领给所有者（不占全站每人认领上限），发件记录和之后的回信都在他名下；地址已被别人（例如域名成员）认领时返回 403。域名成员与共享邮箱不会得到这些项。
-- 管理员凭 `mailboxId` 使用他人邮箱发信的能力不变，但这些邮箱不在 `identities` 里。仍有存量邮箱的旧域名、他人托管域名上的地址写法只对管理员开放，不能推断任意外部域名可用。
+- `domains` 列出可以用任意前缀发信的域名（`anyLocalPart:true`），与实际放行规则一致。管理员得到全部可用域名：`kind:"system"` 系统域名（按设置顺序）、`kind:"hosted"` 状态可用且发信已就绪的托管域名、`kind:"legacy"` 已移出系统列表但仍有存量邮箱的旧域名。普通用户只得到自己作为**所有者**、发信就绪的托管域名（`kind:"hosted"`），域名成员与共享邮箱不会得到这些项。用这些域名发信时的自动认领、管理员凭 `mailboxId` 使用他人邮箱（不列在 `identities` 里）等规则见[邮件参考](mail.md#发件身份)。
 
 ## 批量认领
 
@@ -105,7 +104,7 @@ hpc '/mailboxes/batch' -X POST -H 'Content-Type: application/json' --data-binary
 
 | 方法与 `/api` 路径 | 契约 |
 |---|---|
-| `GET /mailboxes/shares` | 当前用户自有邮箱与共享名单，包含尚未共享邮箱；JWT 专用 |
+| `GET /mailboxes/shares` | 当前用户自有邮箱与共享名单，包含尚未共享邮箱 |
 | `PUT /mailboxes/shares` | `{mailboxId,userIds:[...],expectedOwnerId?}` 整体替换自己邮箱的名单；管理员通过此入口也只能修改自己邮箱 |
 | `POST /mailboxes/shares/batch` | `{mailboxIds:[...],userIds:[...]}`（各 1–100 个）把自己的多只邮箱一次**追加**共享给同一批用户：已在名单的保留原授权时间，不移除任何人，重复调用幂等；每只邮箱追加后最多 100 人。出错时整单不写入任何邮箱：任一邮箱不归自己（管理员也一样）返回 403；用户含自己、不存在或已禁用，或追加后某只邮箱会超过 100 人，返回 400；校验通过后、写入前状态被并发改变返回 409，例如邮箱被过户或释放、被分享人被禁用或删除、并发写入使某只邮箱超过 100 人。并发的追加或替换共享本身不报错，按先后合并（已在名单的按主键跳过）。返回各邮箱本次写入后的完整名单，按去重后的 `mailboxIds` 顺序，重复 id 只返回一次 |
 | `DELETE /mailboxes/shares/:mailboxId/grantees/:userId` | 所有者撤销一个成员；`{success:true}` |
@@ -167,7 +166,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - 权限：所有者与管理员可查看进度、管理成员、过户、删除；管理员还能在任何人的托管域名下认领地址，并像其他邮箱一样用 `/admin/mailboxes/:id/transfer`、`/admin/mailbox-shares` 过户或共享其中的地址（含自动认领给所有者的地址）；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；自动认领默认不限数量（`hosted_domains.autoClaimLimit` 为 0），管理员设了正数上限时，域内地址达到上限后未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
 - 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。发信就绪后所有者可用本域**任意前缀**发信（`/identities` 的 `domains` 里 `kind:"hosted"`），未认领的地址发出时自动认领给所有者；成员只能用自己认领的地址，见[发件身份](#发件身份)。
-- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。托管域名删除或到期删除后，本站保留前所有者与分配过的 NS 90 天；普通用户添加前会查该域名在注册局的公开 NS 委派（RDAP，查不到再用 DNS）：仍指向本站分配过的 NS 时返回 409 `conflict`（防止前所有者没改回 NS 时被他人接管来信），先在注册商把 NS 改到其他服务商再添加；委派暂时查不到、而该域名 90 天内由他人托管过时也是 409，稍后重试。前所有者重新添加与管理员不受此限。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；全站 Cloudflare 调用额度见下文 DNS 解析的限流说明：添加时占位计 2 次（额度不足直接 429），开通前的后台预配置再计 5 次；删除计 3 次（撤发信接入、核对 zone 身份、删 zone），只计数不会因额度被拒。删除前会核对 zone 的名称与创建时间，与记录不符或是系统域名时不删并在 `lastError` 说明。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
+- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。托管域名删除或到期删除后，本站保留前所有者与分配过的 NS 90 天；普通用户添加前会查该域名在注册局的公开 NS 委派（RDAP，查不到再用 DNS）：仍指向本站分配过的 NS 时返回 409 `conflict`（防止前所有者没改回 NS 时被他人接管来信），先在注册商把 NS 改到其他服务商再添加；委派暂时查不到、而该域名 90 天内由他人托管过时也是 409，稍后重试。前所有者重新添加与管理员不受此限。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；添加、检测、重新接入与删除占用的全站 Cloudflare 调用额度见下文 [DNS 解析](#托管域名的-dns-解析)的「上限与限流」。删除前会核对 zone 的名称与创建时间，与记录不符或是系统域名时不删并在 `lastError` 说明。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
 
 ### 用 API Key 接入
 
@@ -177,7 +176,7 @@ Key `/v1` 开放托管域名的查看、添加、立即检测与 DNS 解析，�
 |---|---|
 | `GET /hosted-domains`、`GET /hosted-domains/:id` | `domain.read` |
 | `GET /hosted-domains/:id/dns-records` | `domain.read` |
-| `POST /hosted-domains`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/:id/reconnect` | `domain.write` |
+| `POST /hosted-domains`、`POST /hosted-domains/batch`、`POST /hosted-domains/:id/check`、`POST /hosted-domains/batch-check`、`POST /hosted-domains/:id/reconnect` | `domain.write` |
 | `POST /hosted-domains/:id/dns-records`、`PUT /hosted-domains/:id/dns-records/:recordId`、`DELETE /hosted-domains/:id/dns-records/:recordId` | `domain.write` |
 
 - 缺 scope 返回 403 `forbidden`，`fix` 写明缺哪个；scope 在解析请求体和任何计数之前检查，不占用限流与 Cloudflare 额度。已有的 Key 不会自动获得这两个 scope，由用户在网页 API Key 页面勾选（或用 JWT `PUT /api/api-keys/:id` 修改 `scopes`）。
@@ -244,6 +243,6 @@ done
 
 - 受保护的记录：根域 MX、根域 SPF（`v=spf1` 开头的 TXT）、`_dmarc`、`_domainkey` 及其子域、`cf-bounce` 及其子域上的任何记录，以及根域 CNAME（与收件需要的 MX、TXT 不能共存，改用 A/AAAA）。新增或改成这些都会在写入 Cloudflare 之前返回 400；其他名称上的 SPF、MX（如 `mail` 子域）不受限制。
 - 权限与状态：所有者与管理员可用，成员 403，其他用户 404。等待改 NS（`pending`）时也能读写，便于先补好网站记录；`suspended` 时所有者只读，管理员仍可修改；`deleting` 或 zone 还在创建中返回 409。只要求本站配置了 Cloudflare 凭据，不受管理员托管开关影响；未配置时 403。
-- 上限与限流：每个域名最多 100 条非邮箱记录（只读记录也计入），达到后新增返回 403；四个接口共用每人每分钟 30 次（管理员同样计数）。所有域名共用站长的 Cloudflare Token，用户操作全站合计每分钟最多 150 次 Cloudflare 调用，由 DNS 解析与托管域名的添加（占位 2 次、后台预配置 5 次）、立即检测（4 次）、删除（2 次，只计数不拒绝）共用：解析列表计 1 次，新增、修改、删除各计 2 次，只计能真正调用 Cloudflare 的请求（超出个人限额、无权访问、删除中或创建中的不计）。任一超出返回 429，稍后重试。
+- 上限与限流：每个域名最多 100 条非邮箱记录（只读记录也计入），达到后新增返回 403；四个接口共用每人每分钟 30 次（管理员同样计数）。所有域名共用站长的 Cloudflare Token，用户操作全站合计每分钟最多 150 次 Cloudflare 调用，由 DNS 解析与托管域名的添加（占位 2 次，额度不足直接 429；开通前的后台预配置再计 5 次）、立即检测（4 次）、重新接入（6 次，新建 zone 后另计后台预配置 5 次）、删除（3 次：撤发信接入、核对 zone 身份、删 zone，只计数不拒绝）共用：解析列表计 1 次，新增、修改、删除各计 2 次，只计能真正调用 Cloudflare 的请求（超出个人限额、无权访问、删除中或创建中的不计）。任一超出返回 429，稍后重试。
 - 常见错误：请求体不合法、修改类型、与邮箱冲突、Cloudflare 拒绝记录值返回 400，message 为具体原因；修改或删除 `mail`/`readonly` 记录返回 403，message 为 `lockedReason`；记录不存在或 `recordId` 格式不对返回 404；同名下已有相同或不能共存的记录返回 409；Cloudflare 中的 zone 已不可用返回 409，需联系管理员；Cloudflare 繁忙返回 429；超时、5xx 或响应读不出来返回 500「Cloudflare 没有返回明确结果，请刷新列表确认是否已生效」，写操作可能已经生效，先重新列出记录再决定是否重试。
 

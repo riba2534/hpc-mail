@@ -2,10 +2,11 @@ import { queryOptions, useQuery } from '@tanstack/react-query';
 import { queryKeys } from '@/api/query-keys';
 import { mailboxApi } from '@/api/resources';
 
-export const mailboxesQueryOptions = (all = false) =>
+/** 自己认领的邮箱（管理员的全站分页见 features/admin/addresses/admin-mailboxes.ts） */
+export const mailboxesQueryOptions = () =>
   queryOptions({
-    queryKey: queryKeys.mailboxes.list(all ? 'all' : 'mine'),
-    queryFn: () => mailboxApi.list(all),
+    queryKey: queryKeys.mailboxes.list('mine'),
+    queryFn: () => mailboxApi.list(),
   });
 
 /** 分享给我的邮箱。只用于收件筛选，不进入发件身份。 */
@@ -15,8 +16,8 @@ export const sharedMailboxesQueryOptions = () =>
     queryFn: () => mailboxApi.shared(),
   });
 
-export function useMailboxesQuery(all = false) {
-  return useQuery(mailboxesQueryOptions(all));
+export function useMailboxesQuery() {
+  return useQuery(mailboxesQueryOptions());
 }
 
 export function useSharedMailboxesQuery() {

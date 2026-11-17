@@ -54,8 +54,7 @@ const STEP_STATES: Record<HostedDomainStepState, { label: string; icon: LucideIc
   error: { label: '异常', icon: CircleAlert, className: 'text-critical' },
 };
 
-const isGone = (error: unknown) =>
-  error instanceof ApiError && (error.httpStatus === 404 || error.httpStatus === 403 || error.code === 'not_found');
+const isGone = (error: unknown) => error instanceof ApiError && (error.notFound || error.httpStatus === 403);
 
 function Section({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
   return (

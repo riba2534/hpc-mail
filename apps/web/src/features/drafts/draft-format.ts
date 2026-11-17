@@ -1,4 +1,5 @@
 import type { DraftStatus, DraftSummary, Mailbox, MailAddress, SendFrom } from '@hpc-mail/shared';
+import { formatMailAddress } from '@hpc-mail/shared/mail-address';
 import type { BadgeTone } from '@/components/ui/badge';
 import { formatDateTime } from '@/lib/format';
 
@@ -9,6 +10,11 @@ export const DRAFT_STATUS_META: Record<DraftStatus, { label: string; tone: Badge
   sent: { label: '已发送', tone: 'positive' },
   failed: { label: '发送失败', tone: 'critical' },
 };
+
+/** 还能编辑、发送或删除的状态（发送中与已发送只能查看） */
+export function isDraftEditable(status: DraftStatus): boolean {
+  return status === 'draft' || status === 'scheduled' || status === 'failed';
+}
 
 /** 状态标签：定时的带上发送时间 */
 export function draftStatusLabel(draft: Pick<DraftSummary, 'status' | 'sendAt'>): string {
@@ -45,6 +51,11 @@ export function addressInputText(value: MailAddress): string {
   if (!value.name) return value.address;
   const name = value.name.includes('"') ? `"${value.name.replace(/(["\\])/g, '\\$1')}"` : value.name;
   return `${name} <${value.address}>`;
+}
+
+/** 审阅时的完整收件人列表：`名称 <地址>` 或纯地址，顿号分隔 */
+export function formatAddressList(items: MailAddress[]): string {
+  return items.map(formatMailAddress).join('、');
 }
 
 /** 列表里的收件人摘要：最多列出前三个，其余计数 */

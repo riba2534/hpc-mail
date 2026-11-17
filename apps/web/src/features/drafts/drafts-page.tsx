@@ -1,9 +1,10 @@
 import { useInfiniteQuery } from '@tanstack/react-query';
-import type { Draft, DraftStatus, DraftSummary, MailAddress, Mailbox } from '@hpc-mail/shared';
+import type { Draft, DraftStatus, DraftSummary, Mailbox } from '@hpc-mail/shared';
 import { Clock, FilePen, MoreHorizontal, PenLine, Send, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { PageHeader } from '@/components/page-header';
+import { LoadMoreFooter } from '@/components/load-more-footer';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -24,7 +25,9 @@ import { formatDateTime, formatRelativeTime } from '@/lib/format';
 import { useMailboxesQuery } from '@/features/mailboxes/use-mailboxes';
 import type { ComposeInitial } from '@/features/compose/compose-init';
 import { DraftReviewDialog } from './draft-review-dialog';
-import { DRAFT_STATUS_META, draftFromLabel, draftSourceLabel, draftStatusLabel, recipientsSummary } from './draft-format';
+import {
+  DRAFT_STATUS_META, draftFromLabel, draftSourceLabel, draftStatusLabel, formatAddressList, isDraftEditable, recipientsSummary,
+} from './draft-format';
 import { draftKeys, draftsApi } from './drafts-api';
 import { useDraftActions } from './use-draft-actions';
 
@@ -43,11 +46,8 @@ function parseFilter(value: string | null): Filter {
   return FILTERS.find((option) => option.value === value)?.value ?? 'all';
 }
 
-const EDITABLE = new Set<DraftStatus>(['draft', 'scheduled', 'failed']);
 /** 有定时或发送中的草稿时定期刷新：到点后服务器发出，状态会变 */
 const PENDING_REFRESH_MS = 30_000;
-
-const addressList = (items: MailAddress[]) => items.map((item) => (item.name ? `${item.name} <${item.address}>` : item.address)).join('、');
 
 /** 发送确认（人审的最后一步）：写明从哪个地址发给谁，定时的说明会立即发出 */
 function SendConfirmation({ draft, mailboxes }: { draft: DraftSummary | Draft; mailboxes: Mailbox[] | undefined }) {
@@ -57,9 +57,9 @@ function SendConfirmation({ draft, mailboxes }: { draft: DraftSummary | Draft; m
       <dl className="flex flex-col gap-1">
         {([
           ['发件地址', from ?? '未设置'],
-          ['收件人', addressList(draft.to) || '（未填写）'],
-          ['抄送', addressList(draft.cc)],
-          ['密送', addressList(draft.bcc)],
+          ['收件人', formatAddressList(draft.to) || '（未填写）'],
+          ['抄送', formatAddressList(draft.cc)],
+          ['密送', formatAddressList(draft.bcc)],
           ['主题', draft.subject || '（无主题）'],
           ['附件', draft.attachmentCount ? `${draft.attachmentCount} 个` : ''],
         ] as const).filter(([, value]) => value).map(([label, value]) => (
@@ -87,7 +87,7 @@ export function DraftsPage() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const statusFilter = parseFilter(params.get('status'));
-  const { data: mailboxes } = useMailboxesQuery(false);
+  const { data: mailboxes } = useMailboxesQuery();
   const { data, isLoading, isError, error, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
     queryKey: draftKeys.list(statusFilter),
     queryFn: ({ pageParam, signal }) =>
@@ -160,7 +160,7 @@ export function DraftsPage() {
           <CardList>
             {drafts.map((draft) => {
               const meta = DRAFT_STATUS_META[draft.status];
-              const editable = EDITABLE.has(draft.status);
+              const editable = isDraftEditable(draft.status);
               return (
                 <CardListItem
                   key={draft.id}
@@ -238,13 +238,7 @@ export function DraftsPage() {
               );
             })}
           </CardList>
-          {hasNextPage && (
-            <div className="mt-3 text-center">
-              <Button variant="secondary" size="sm" loading={isFetchingNextPage} onClick={() => fetchNextPage()}>
-                加载更多
-              </Button>
-            </div>
-          )}
+          <LoadMoreFooter auto={false} hasNextPage={hasNextPage} isFetchingNextPage={isFetchingNextPage} onLoadMore={() => void fetchNextPage()} />
         </>
       )}
 

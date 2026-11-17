@@ -35,6 +35,15 @@ export class ApiError extends Error {
   get forbidden(): boolean {
     return this.httpStatus === 403 || this.code === 'forbidden';
   }
+
+  get notFound(): boolean {
+    return this.httpStatus === 404 || this.code === 'not_found';
+  }
+}
+
+/** 服务端给出的原因；不是 ApiError（如渲染或解析异常）时用调用方的兜底文案 */
+export function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof ApiError ? error.message : fallback;
 }
 
 export const NETWORK_ERROR_MESSAGE = '网络连接失败，请检查网络后重试';

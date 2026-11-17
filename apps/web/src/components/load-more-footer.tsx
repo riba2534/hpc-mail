@@ -8,13 +8,15 @@ interface LoadMoreFooterProps {
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
   onLoadMore: () => void;
+  /** false：只在点击按钮时加载（草稿箱、审计日志） */
+  auto?: boolean;
 }
 
 /**
- * 分页列表的末尾：滚动接近时自动加载下一页，按钮作为手动兜底（无 IntersectionObserver 或键盘操作时）。
+ * 分页列表的末尾：auto 时滚动接近即自动加载下一页，按钮作为手动兜底（无 IntersectionObserver 或键盘操作时）。
  * 加载完成后若末尾仍在视口附近（一页不够填满屏幕），观察器重建时会立即再触发一次。
  */
-export function LoadMoreFooter({ hasNextPage, isFetchingNextPage, onLoadMore }: LoadMoreFooterProps) {
+export function LoadMoreFooter({ hasNextPage, isFetchingNextPage, onLoadMore, auto = true }: LoadMoreFooterProps) {
   const footer = useRef<HTMLDivElement>(null);
   const latest = useRef(onLoadMore);
   useEffect(() => {
@@ -22,7 +24,7 @@ export function LoadMoreFooter({ hasNextPage, isFetchingNextPage, onLoadMore }: 
   });
   useEffect(() => {
     const node = footer.current;
-    if (!node || !hasNextPage || isFetchingNextPage || typeof IntersectionObserver === 'undefined') return;
+    if (!auto || !node || !hasNextPage || isFetchingNextPage || typeof IntersectionObserver === 'undefined') return;
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) latest.current();
@@ -31,7 +33,7 @@ export function LoadMoreFooter({ hasNextPage, isFetchingNextPage, onLoadMore }: 
     );
     observer.observe(node);
     return () => observer.disconnect();
-  }, [hasNextPage, isFetchingNextPage]);
+  }, [auto, hasNextPage, isFetchingNextPage]);
 
   if (!hasNextPage) return null;
   return (

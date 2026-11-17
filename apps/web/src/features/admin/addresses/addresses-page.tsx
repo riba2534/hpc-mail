@@ -34,10 +34,11 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
 import { useIsMobile } from '@/lib/use-media-query';
-import { LoadMoreFooter } from '../load-more-footer';
+import { LoadMoreFooter } from '@/components/load-more-footer';
 import { adminMailboxesQueryOptions } from './admin-mailboxes';
 import { TransferMailboxDialog } from './transfer-mailbox-dialog';
 import { AddressShareDialog } from './address-share-dialog';
+import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 /** 搜索词停止输入这么久后才请求服务端 */
 const SEARCH_DEBOUNCE_MS = 300;
@@ -361,11 +362,7 @@ const AddressCards = memo(function AddressCards({ mailboxes, total, actions }: A
 export function AddressesPage() {
   const isMobile = useIsMobile();
   const [q, setQ] = useState('');
-  const [debouncedQ, setDebouncedQ] = useState('');
-  useEffect(() => {
-    const timer = globalThis.setTimeout(() => setDebouncedQ(q.trim().toLowerCase()), SEARCH_DEBOUNCE_MS);
-    return () => globalThis.clearTimeout(timer);
-  }, [q]);
+  const debouncedQ = useDebouncedValue(q.trim().toLowerCase(), SEARCH_DEBOUNCE_MS);
   const {
     data, isLoading, isError, error, refetch, hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage,
   } = useInfiniteQuery({

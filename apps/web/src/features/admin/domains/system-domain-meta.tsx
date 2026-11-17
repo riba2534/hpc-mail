@@ -8,6 +8,7 @@ import type {
   SystemDomainStepState,
 } from '@hpc-mail/shared';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
+import { CopyButton } from '@/components/ui/copy-button';
 import { cn } from '@/lib/cn';
 
 export const ONBOARDING_STATE_META: Record<SystemDomainOnboardingState, { label: string; tone: BadgeTone }> = {
@@ -39,7 +40,8 @@ export const DNSSEC_LABEL: Record<DnssecState, string> = {
   unknown: 'DNSSEC 检测失败（不等于未开启），改 NS 前请在注册商确认已关闭',
 };
 
-const STEP_ICON: Record<SystemDomainStepState, { icon: LucideIcon; className: string; label: string }> = {
+/** 接入步骤的状态：行内进度用图标，详情页用文字 */
+export const STEP_STATE_META: Record<SystemDomainStepState, { icon: LucideIcon; className: string; label: string }> = {
   ready: { icon: CircleCheck, className: 'text-positive', label: '已就绪' },
   waiting: { icon: CircleDashed, className: 'text-ink-tertiary', label: '等待中' },
   missing: { icon: CircleDashed, className: 'text-ink-tertiary', label: '待写入' },
@@ -62,7 +64,7 @@ export function OnboardingProgress({ task }: { task: Pick<SystemDomainOnboarding
   return (
     <ol aria-label="接入进度" className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-ink-secondary">
       {items.map((item, index) => {
-        const meta = STEP_ICON[item.state];
+        const meta = STEP_STATE_META[item.state];
         const spinning = running && item.state !== 'ready' && items.slice(0, index).every((prev) => prev.state === 'ready');
         const Icon = spinning ? Loader2 : meta.icon;
         return (
@@ -114,5 +116,19 @@ export function CheckDetail({ check }: { check: SystemDomainCheck }) {
         </ul>
       )}
     </div>
+  );
+}
+
+/** Cloudflare 分配的名称服务器：逐个可复制（添加外部域名弹窗与接入详情共用） */
+export function NameServerList({ nameServers }: { nameServers: readonly string[] }) {
+  return (
+    <ul className="flex flex-col gap-1.5">
+      {nameServers.map((ns) => (
+        <li key={ns} className="flex items-center gap-2">
+          <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">{ns}</code>
+          <CopyButton value={ns} label={`复制 ${ns}`} size="sm" />
+        </li>
+      ))}
+    </ul>
   );
 }

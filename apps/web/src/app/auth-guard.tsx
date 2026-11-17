@@ -1,13 +1,15 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertCircle, LogOut, RefreshCw } from 'lucide-react';
+import { useState } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 import { ApiError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
-import { clearAuthToken } from '@/lib/auth-token';
+import { readTokenClaims } from '@/lib/token-claims';
 import { CurrentUserContext, useAuthToken, useSessionQuery } from '@/lib/use-session';
 import { lazyWithReload } from './chunk-reload';
 import { FullScreenLoader } from './page-loader';
 import { loadAppShell } from './route-modules';
+import { signOut } from './user-local-data';
 
 // 外壳不进登录页入口；已登录启动时 boot-prefetch 会与 /auth/me 并行预取它，通常此时已可同步渲染
 const AppShell = lazyWithReload(loadAppShell, (m) => m.AppShell, <FullScreenLoader />);
@@ -17,6 +19,7 @@ export function AuthGuard() {
   const location = useLocation();
   const queryClient = useQueryClient();
   const { data: user, isLoading, isFetching, isError, error, refetch } = useSessionQuery();
+  const [signingOut, setSigningOut] = useState(false);
 
   if (!token) return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />;
   if (isLoading) return <FullScreenLoader />;
@@ -25,9 +28,10 @@ export function AuthGuard() {
   const rejected = isError && error instanceof ApiError && error.forbidden;
   if (!user || rejected) {
     const disabled = error instanceof ApiError && error.code === 'user_disabled';
+    // 与外壳菜单的退出同一条路径：吊销会话并删除本机为该账户保存的数据；没有用户数据时按 token 里的账户清理
     const logout = () => {
-      clearAuthToken();
-      queryClient.clear();
+      setSigningOut(true);
+      void signOut(queryClient, user?.id ?? readTokenClaims(token)?.sub);
     };
     return (
       <main className="grid min-h-dvh place-items-center bg-canvas px-4 py-10">
@@ -53,7 +57,7 @@ export function AuthGuard() {
                 重新加载
               </Button>
             )}
-            <Button variant={disabled ? 'danger' : 'ghost'} onClick={logout}>
+            <Button variant={disabled ? 'danger' : 'ghost'} loading={signingOut} onClick={logout}>
               <LogOut className="size-4" />
               退出登录
             </Button>
