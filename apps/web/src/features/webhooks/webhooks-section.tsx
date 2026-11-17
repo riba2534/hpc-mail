@@ -9,7 +9,7 @@ import {
   type WebhookEndpoint,
   type WebhookEventType,
 } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { errorMessage } from '@/api/errors';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -35,7 +35,6 @@ export const EVENT_LABELS: Record<WebhookEventType, string> = {
 };
 
 const splitList = (text: string) => text.split(/[\s,，]+/).map((item) => item.trim()).filter(Boolean);
-const errorText = (err: unknown, fallback: string) => (err instanceof ApiError ? err.message : fallback);
 
 /** 新建端点：成功后只在这里显示一次签名密钥 */
 function CreateEndpointDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
@@ -55,7 +54,7 @@ function CreateEndpointDialog({ open, onOpenChange }: { open: boolean; onOpenCha
       setCreated(data);
       void queryClient.invalidateQueries({ queryKey: webhookKeys.list });
     },
-    onError: (err) => setError(errorText(err, '创建失败，请重试')),
+    onError: (err) => setError(errorMessage(err, '创建失败，请重试')),
   });
 
   const close = () => {
@@ -155,7 +154,7 @@ function Deliveries({ endpoint }: { endpoint: WebhookEndpoint }) {
       void queryClient.invalidateQueries({ queryKey: webhookKeys.deliveries(endpoint.id) });
       void queryClient.invalidateQueries({ queryKey: webhookKeys.list });
     },
-    onError: (err) => toast({ title: errorText(err, '重试失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '重试失败'), variant: 'error' }),
   });
   if (deliveries.isLoading) return <Skeleton className="h-16 w-full rounded-md" />;
   if (deliveries.isError) return <QueryErrorState error={deliveries.error} onRetry={() => void deliveries.refetch()} />;
@@ -191,14 +190,14 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
   const toggle = useMutation({
     mutationFn: () => webhookApi.update(endpoint.id, { enabled: endpoint.status !== 'active' }),
     onSuccess: () => void refresh(),
-    onError: (err) => toast({ title: errorText(err, '操作失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '操作失败'), variant: 'error' }),
   });
   const test = useMutation({
     mutationFn: () => webhookApi.test(endpoint.id),
     onSuccess: (result) => toast(result.ok
       ? { title: `测试事件已送达（HTTP ${result.httpStatus}）`, variant: 'success' }
       : { title: '测试事件发送失败', description: result.error, variant: 'error' }),
-    onError: (err) => toast({ title: errorText(err, '发送失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '发送失败'), variant: 'error' }),
   });
   const rotate = useMutation({
     mutationFn: () => webhookApi.rotateSecret(endpoint.id),
@@ -206,7 +205,7 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
       setRotated(data.secret);
       void refresh();
     },
-    onError: (err) => toast({ title: errorText(err, '轮换失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '轮换失败'), variant: 'error' }),
   });
   const remove = useMutation({
     mutationFn: () => webhookApi.remove(endpoint.id),
@@ -214,7 +213,7 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
       toast({ title: '端点已删除', variant: 'success' });
       void refresh();
     },
-    onError: (err) => toast({ title: errorText(err, '删除失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '删除失败'), variant: 'error' }),
   });
 
   const filters = [...endpoint.addresses, ...endpoint.domains];

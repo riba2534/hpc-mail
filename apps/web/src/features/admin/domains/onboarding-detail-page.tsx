@@ -9,7 +9,7 @@ import {
   type SystemDomainOnboardingState,
   type SystemDomainPrecheck,
 } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { ApiError, errorMessage } from '@/api/errors';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
@@ -33,7 +33,6 @@ const CHANGE_STATUS: Record<string, string> = { started: '进行中', done: '完
 
 /** 只有 404 当作不存在；403 是权限或凭据问题，要提示而不是跳走 */
 const isGone = (error: unknown) => error instanceof ApiError && error.notFound;
-const errorMessage = (error: unknown, fallback: string) => (error instanceof ApiError ? error.message : fallback);
 
 function Section({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
   return (
