@@ -373,6 +373,34 @@ describe('htmlToText', () => {
     }
   });
 
+  it('数百万字符的 data: URI 与属性值不抛错（不在全量输入上用正则量词），重叠的 data: 起点保持线性', () => {
+    // 正则 `[^"]{4096,}` 在约 600 万字符的单个属性值上会回溯栈溢出抛 RangeError，只有 HTML 的来信收件失败
+    const huge = (size: number) => 'A'.repeat(size);
+    const started = Date.now();
+    for (const html of [
+      `<img src="data:image/png;base64,${huge(6e6)}"><p>Your code is 913472</p>`,
+      `<img src=data:image/png;base64,${huge(10 * 1024 * 1024)}><p>Your code is 913472</p>`,
+      `<style>.a{background:url(data:image/png;base64,${huge(10 * 1024 * 1024)})}</style><p>Your code is 913472</p>`,
+      `<div style="${huge(6e6)}">Your code is 913472</div>`,
+    ]) {
+      expect(convertHtmlToText(html)).toEqual({ text: 'Your code is 913472', truncated: false });
+    }
+    // 每 1KB 一个 data: 起点（载荷都不够长、不去掉）与连续的 data:data:…，共 10MB
+    expect(convertHtmlToText(`${`data:${'A'.repeat(1019)} `.repeat(10 * 1024)}<p>x</p>`).truncated).toBe(true);
+    expect(convertHtmlToText('data:'.repeat(2 * 1024 * 1024)).text).toBe('data:');
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  it('正文里的 =" 不当属性值：清理超长属性值只在标签内生效', () => {
+    const prose = `a = "${'word '.repeat(2000)}`;
+    const text = htmlToText(`<p>${prose}</p><p>code 913472 "end</p>`);
+    expect(text).toContain(prose.trim());
+    expect(text).toContain('code 913472 "end');
+    // 引号没闭合、吞进了后面的正文：不当属性值
+    const swallowed = htmlToText(`<a href="https://example.com/x>Click</a><p>${'word '.repeat(2000)}code 913472</p><a href="y">z</a>`);
+    expect(swallowed).toContain('code 913472');
+  });
+
   it('截断落在标签中间时丢掉残缺的标签；截断与实体留下的孤立代理字符去掉', () => {
     const cut = convertHtmlToText(`<p>start</p><div ${'a="x" '.repeat(100_000)}>tail</div>`);
     expect(cut).toEqual({ text: 'start', truncated: true });
