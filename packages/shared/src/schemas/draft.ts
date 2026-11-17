@@ -8,6 +8,7 @@ import {
   MAX_REPLY_TO,
   type DraftStatus,
 } from '../constants.js';
+import type { IssueErrorParams } from '../envelope.js';
 import type { MailAddress } from '../mail-address.js';
 import {
   attachmentTokenRefSchema,
@@ -33,24 +34,52 @@ import {
  * sendAt：ISO 8601（带时区），最早 1 分钟后、最晚 30 天内（sendAtProblem）；给出即安排定时发送（status=scheduled），
  * 此时草稿必须已是完整、合法的发信请求。null 取消定时（回到 draft）。expectedVersion 只用于修改：与当前 version 不同返回 409。
  */
+/** 常见的写错字段 → 正确字段（未知字段报错时提示） */
+const DRAFT_FIELD_ALIASES: Record<string, string> = {
+  scheduledAt: 'sendAt', scheduleAt: 'sendAt', scheduled_at: 'sendAt', send_at: 'sendAt', sendTime: 'sendAt', sendDate: 'sendAt',
+  deliverAt: 'sendAt', schedule: 'sendAt', body: 'text 或 html', content: 'text 或 html', bodyText: 'text', bodyHtml: 'html',
+  attachmentToken: 'attachmentTokens', tokens: 'attachmentTokens', reply_to: 'replyTo', replyToId: 'replyToMessageId',
+  inReplyTo: 'replyToMessageId', forwardFrom: 'forwardAttachmentsFrom', version: 'expectedVersion', recipients: 'to/cc/bcc',
+};
+
+const draftInputShape = {
+  from: sendFromSchema.nullable().optional(),
+  to: z.array(mailAddressSchema('收件人')).optional(),
+  cc: z.array(mailAddressSchema('抄送')).optional(),
+  bcc: z.array(mailAddressSchema('密送')).optional(),
+  replyTo: z.array(mailAddressSchema('replyTo ')).max(MAX_REPLY_TO).optional(),
+  subject: z.string().trim().max(998).optional(),
+  text: z.string().max(MAX_BODY_BYTES).optional(),
+  html: z.string().max(MAX_BODY_BYTES).optional(),
+  replyToMessageId: z.number().int().positive().nullable().optional(),
+  forwardAttachmentsFrom: z.number().int().positive().nullable().optional(),
+  headers: customHeadersSchema.optional(),
+  attachments: z.array(sendAttachmentItemSchema).max(MAX_ATTACHMENTS).optional(),
+  attachmentTokens: z.array(attachmentTokenRefSchema).max(MAX_ATTACHMENTS).optional(),
+  sendAt: isoTimeSchema.nullable().optional(),
+  expectedVersion: z.number().int().positive().optional(),
+};
+const DRAFT_FIELDS = Object.keys(draftInputShape);
+
+/**
+ * 未知字段报 400（与 /v1 回复、转发一致），不静默忽略：例如把 sendAt 写成 scheduledAt 时草稿会被当成普通草稿保存、
+ * 永远不会发出。fix 里给出最可能的正确字段名与全部可用字段。
+ */
+function rejectUnknownDraftFields(value: Record<string, unknown>, ctx: z.RefinementCtx): void {
+  const unknown = Object.keys(value).filter((key) => !DRAFT_FIELDS.includes(key));
+  if (!unknown.length) return;
+  const hints = unknown.flatMap((key) => (DRAFT_FIELD_ALIASES[key] ? [`${key} 应写成 ${DRAFT_FIELD_ALIASES[key]}`] : []));
+  const params: IssueErrorParams = {
+    fix: `${hints.length ? `${hints.join('；')}。` : ''}草稿可用的字段：${DRAFT_FIELDS.join(', ')}`,
+    docs: '/references/drafts.md#保存草稿',
+  };
+  ctx.addIssue({ code: 'custom', message: `草稿不接受字段：${unknown.join(', ')}`, path: [unknown[0]!], params });
+}
+
 export const draftInputSchema = z
-  .object({
-    from: sendFromSchema.nullable().optional(),
-    to: z.array(mailAddressSchema('收件人')).optional(),
-    cc: z.array(mailAddressSchema('抄送')).optional(),
-    bcc: z.array(mailAddressSchema('密送')).optional(),
-    replyTo: z.array(mailAddressSchema('replyTo ')).max(MAX_REPLY_TO).optional(),
-    subject: z.string().trim().max(998).optional(),
-    text: z.string().max(MAX_BODY_BYTES).optional(),
-    html: z.string().max(MAX_BODY_BYTES).optional(),
-    replyToMessageId: z.number().int().positive().nullable().optional(),
-    forwardAttachmentsFrom: z.number().int().positive().nullable().optional(),
-    headers: customHeadersSchema.optional(),
-    attachments: z.array(sendAttachmentItemSchema).max(MAX_ATTACHMENTS).optional(),
-    attachmentTokens: z.array(attachmentTokenRefSchema).max(MAX_ATTACHMENTS).optional(),
-    sendAt: isoTimeSchema.nullable().optional(),
-    expectedVersion: z.number().int().positive().optional(),
-  })
+  .looseObject(draftInputShape)
+  .superRefine((v, ctx) => rejectUnknownDraftFields(v, ctx))
+  .transform((v) => v as { [K in keyof typeof draftInputShape]: z.infer<(typeof draftInputShape)[K]> })
   .superRefine((v, ctx) => validateSendParts({
     to: v.to ?? [], cc: v.cc ?? [], bcc: v.bcc ?? [], text: v.text, html: v.html,
     replyToMessageId: v.replyToMessageId, headers: v.headers,

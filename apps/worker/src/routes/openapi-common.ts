@@ -364,6 +364,8 @@ function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
 /** 服务端草稿：请求体与发信相同、字段都可暂缺；响应按 shared 的 DraftSummary / Draft */
 const draftInput = fromZod(draftInputSchema);
 {
+  // 未知字段返回 400（schema 用 looseObject 收下再逐个报错，好在 fix 里提示正确字段名）
+  draftInput.additionalProperties = false;
   const fields = draftInput.properties as Record<string, Schema>;
   const sendFields = sendProperties;
   for (const name of ['to', 'cc', 'bcc', 'replyTo', 'headers', 'attachmentTokens', 'attachments']) {
@@ -373,7 +375,7 @@ const draftInput = fromZod(draftInputSchema);
   fields.sendAt = { anyOf: [{ type: 'string', maxLength: 40 }, { type: 'null' }], examples: ['2026-11-18T09:00:00+08:00'],
     description: 'ISO 8601 with a time zone (or a date, meaning UTC midnight), at least 1 minute and at most 30 days ahead by server time. Setting it schedules the draft (status scheduled) and requires a complete send request; null cancels the schedule (status draft).' };
   fields.expectedVersion = { ...fields.expectedVersion, description: 'PATCH only: the version you read. A different current version returns 409 draft_state_conflict.' };
-  draftInput.description = `Every field is optional. POST: omitted fields start empty. PATCH: omitted fields keep their value, null clears from/replyToMessageId/forwardAttachmentsFrom/sendAt. attachments (base64 or {url}) are stored as uploads when saved and the draft keeps only tokens; when attachments or attachmentTokens is present the attachment set is replaced by the newly stored ones followed by attachmentTokens, so list existing tokens in attachmentTokens to keep them. Draft attachments count toward the per-user pending-upload quota and do not expire while referenced. At most ${MAX_DRAFTS_PER_USER} unsent drafts per user (409 draft_limit_reached).`;
+  draftInput.description = `Every field is optional. POST: omitted fields start empty. PATCH: omitted fields keep their value, null clears from/replyToMessageId/forwardAttachmentsFrom/sendAt. Unknown fields (for example scheduledAt instead of sendAt) return 400 validation_failed whose fix names the right field. attachments (base64 or {url}) are stored as uploads when saved and the draft keeps only tokens; when attachments or attachmentTokens is present the attachment set is replaced by the newly stored ones followed by attachmentTokens, so list existing tokens in attachmentTokens to keep them. Draft attachments count toward the per-user pending-upload quota and do not expire while referenced. At most ${MAX_DRAFTS_PER_USER} unsent drafts per user (409 draft_limit_reached).`;
 }
 const draftStatus: Schema = { type: 'string', enum: DRAFT_STATUSES,
   description: 'draft: editable; scheduled: will be sent by the per-minute cron at sendAt; sending: in progress, cannot be changed or deleted; sent: a send ran, see messageId for its result (partial failure or unknown included); failed: nobody received it, edit and send again.' };

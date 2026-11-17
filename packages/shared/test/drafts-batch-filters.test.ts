@@ -101,6 +101,17 @@ describe('服务端草稿', () => {
     expect(firstMessage(internalSendMailSchema, draftSendInput(content, '', ''))).toBe('正文不能为空');
   });
 
+  it('未知字段报错并提示正确字段名（E2：scheduledAt 不能被静默忽略）', () => {
+    const result = draftInputSchema.safeParse({ subject: 's', scheduledAt: '2026-11-18T09:00:00Z' });
+    expect(result.success).toBe(false);
+    const issue = result.error!.issues[0]! as { message: string; params?: { fix?: string } };
+    expect(issue.message).toBe('草稿不接受字段：scheduledAt');
+    expect(issue.params?.fix).toContain('scheduledAt 应写成 sendAt');
+    expect(issue.params?.fix).toContain('草稿可用的字段：from, to');
+    expect(firstMessage(draftInputSchema, { foo: 1, bar: 2 })).toBe('草稿不接受字段：foo, bar');
+    expect(draftInputSchema.parse({ subject: 's', sendAt: null })).toEqual({ subject: 's', sendAt: null });
+  });
+
   it('sendAt 最早 1 分钟后、最晚 30 天内', () => {
     const now = Date.UTC(2026, 10, 17);
     expect(sendAtProblem(now + 59_000, now)).toContain('1 分钟');

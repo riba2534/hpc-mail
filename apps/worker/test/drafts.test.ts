@@ -510,3 +510,17 @@ describe('到点按安排者的有效权限发送（CR2/CR3/A23）', () => {
     expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('API Key 已失效') });
   });
 });
+
+describe('草稿接口的未知字段（E2）', () => {
+  it('创建与修改带未知字段返回 400，fix 给出正确字段名，什么也不保存', async () => {
+    const me = await account('draft-strict');
+    const created = await failure(await call('/v1/drafts', req(me.key, 'POST', { ...complete(me.address, 's1@hpc.email'), scheduledAt: inMinutes(5) })), 400);
+    expect(created).toMatchObject({ code: 'validation_failed', message: '草稿不接受字段：scheduledAt' });
+    expect(created.fix).toContain('scheduledAt 应写成 sendAt');
+    expect(await db.select({ id: drafts.id }).from(drafts).where(eq(drafts.userId, me.id))).toEqual([]);
+    const draft = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 's1@hpc.email'))), 201);
+    const patched = await failure(await call(`/v1/drafts/${draft.id}`, req(me.key, 'PATCH', { body: 'x' })), 400);
+    expect(patched.fix).toContain('body 应写成 text 或 html');
+    expect(await row(draft.id)).toMatchObject({ version: 1 });
+  });
+});
