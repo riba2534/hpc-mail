@@ -27,7 +27,7 @@ import { runLimited } from '../lib/concurrency.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, toPage } from '../lib/pagination.js';
-import { makePreview } from '../lib/text.js';
+import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { normalizeIdempotencyKey, type IdempotencyActor } from './idempotency.js';
 import { readMailBody, storeMailBody } from './mail-body.js';
@@ -285,10 +285,8 @@ function bodyCleanupStatement(env: Env, key: string | null): D1PreparedStatement
 
 interface Prepared {
   content: StoredDraftContent;
-  text: string;
-  html: string;
-  /** 正文有改动时为新写入的正文列 */
-  body: Awaited<ReturnType<typeof storeMailBody>> | null;
+  /** 正文有改动时为新写入的正文列与摘要 */
+  body: (Awaited<ReturnType<typeof storeMailBody>> & { preview: string }) | null;
   /** 本次新转存的附件（保存失败时要释放） */
   created: AttachmentTokenRef[];
   replacesAttachments: boolean;
@@ -316,12 +314,14 @@ async function prepare(
   }
   let body: Prepared['body'] = null;
   if (input.text !== undefined || input.html !== undefined) {
-    try { body = await storeMailBody(env, text, html); }
+    // 摘要与 D1 搜索文本共用一次 HTML → 纯文本转换
+    const view = mailText(text, html);
+    try { body = { ...await storeMailBody(env, text, html, undefined, view), preview: view.preview() }; }
     catch (error) { await releaseUrlAttachments(env, userId, created); throw error; }
   }
   // 新转存的排在前面，与发信时 attachments 在 attachmentTokens 之前的顺序一致
   const attachmentTokens = replacesAttachments ? [...created, ...kept] : content.attachmentTokens;
-  return { content: { ...content, attachmentTokens }, text, html, body, created, replacesAttachments };
+  return { content: { ...content, attachmentTokens }, body, created, replacesAttachments };
 }
 
 /** 保存失败：释放本次转存的附件与写入的正文对象 */
@@ -380,7 +380,7 @@ export async function createDraft(
   }
   const sendAt = sendAtOf(input);
   const prepared = await prepare(env, actor.userId, null, { content: EMPTY_CONTENT, text: '', html: '' }, input, Boolean(sendAt), request);
-  const body = prepared.body ?? { bodyText: '', bodyHtml: '', bodyR2Key: null };
+  const body = prepared.body ?? { bodyText: '', bodyHtml: '', bodyR2Key: null, preview: '' };
   const now = Date.now();
   let id: number;
   try {
@@ -392,7 +392,7 @@ export async function createDraft(
       WHERE (SELECT COUNT(*) FROM drafts WHERE user_id = ? AND status <> 'sent') < ?
       RETURNING id`).bind(
       actor.userId, sendAt ? 'scheduled' : 'draft', JSON.stringify(prepared.content), body.bodyText, body.bodyHtml, body.bodyR2Key,
-      makePreview(prepared.text, prepared.html), sendAt ? sendAt.getTime() : null, actor.via, actor.apiKeyId,
+      body.preview, sendAt ? sendAt.getTime() : null, actor.via, actor.apiKeyId,
       sendAt ? actor.apiKeyId : null, sendAt ? 1 : 0, actor.userId, request.origin, storedKey, requestHash, now, now,
       actor.userId, MAX_DRAFTS_PER_USER,
     ).first<{ id: number }>();
@@ -442,7 +442,7 @@ export async function updateDraft(
   const update = db.update(drafts).set({
     status,
     content: prepared.content,
-    ...(prepared.body ? { ...prepared.body, preview: makePreview(prepared.text, prepared.html) } : {}),
+    ...prepared.body,
     version: sql`${drafts.version} + 1`,
     updatedAt: new Date(),
     origin: request.origin,

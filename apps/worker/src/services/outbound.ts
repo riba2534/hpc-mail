@@ -40,7 +40,7 @@ import {
   sanitizeFilename,
   sanitizeMimeType,
 } from '../lib/mime.js';
-import { makePreview } from '../lib/text.js';
+import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
@@ -768,7 +768,9 @@ export async function sendMail(
     ...customHeaders,
   ];
   const outgoingMessageId = `<${crypto.randomUUID()}@${from.domain}>`;
-  const preview = makePreview(text, html);
+  // 摘要与各份正文的 D1 搜索文本共用一次 HTML → 纯文本转换
+  const view = mailText(text, html);
+  const preview = view.preview();
   const size = bodyBytes(text, html) + totalAttachmentBytes;
   const code = settings.code_extract.enabled ? extractCodeByRegex(req.subject, text) : '';
   // 只写站内收件副本；发件记录本身不是「收到的验证邮件」
@@ -782,7 +784,7 @@ export async function sendMail(
   let outbound: typeof messages.$inferSelect | undefined;
   let storedBody: Awaited<ReturnType<typeof storeMailBody>> | undefined;
   try {
-    storedBody = await storeMailBody(env, text, html);
+    storedBody = await storeMailBody(env, text, html, undefined, view);
     outbound = await db.insert(messages).values({
       direction: 'outbound', address: from.address, domain: from.domain,
       fromAddress: from.address, fromName: from.displayName, recipients,
@@ -886,7 +888,7 @@ export async function sendMail(
           const recipient = await resolveDeliveryOwners(env, target);
           if (recipient.rejected) throw new Error(recipient.rejected);
           ownerIds = recipient.ownerIds;
-          body = await storeMailBody(env, text, html);
+          body = await storeMailBody(env, text, html, undefined, view);
           const insertMessage = db.insert(messages).values({
             direction: 'inbound', address: target, domain: getEmailDomain(target),
             fromAddress: from.address, fromName: from.displayName,
