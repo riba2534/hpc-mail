@@ -1,12 +1,10 @@
 import { z } from 'zod';
 import {
-  DEFAULT_PAGE_SIZE,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_FILE_BYTES,
   MAX_BODY_BYTES,
   MAX_DISPLAY_NAME_LENGTH,
   MAX_INLINE_ATTACHMENT_TOTAL_BYTES,
-  MAX_PAGE_SIZE,
   MAX_RECIPIENTS,
   MAX_REPLY_TO,
   MAX_TRANSLATE_BATCH_CHARS,
@@ -19,36 +17,21 @@ import {
 } from '../constants.js';
 import type { ApiErrorBody, IssueErrorParams, Page } from '../envelope.js';
 import { MAX_MAIL_ADDRESS_INPUT_LENGTH, parseMailAddress, type MailAddress } from '../mail-address.js';
-import { checkCustomHeaders } from '../mail-headers.js';
+import { checkCustomHeaders, hasThreadingHeaders, utf8ByteLength } from '../mail-headers.js';
 import { domainSchema, localPartSchema } from './mailbox.js';
+import { boolFlag, emptyAsUndefined, pageQueryShape } from './query.js';
 import type { DeliveryEventType } from './delivery-events.js';
+
+/** 宽松的完整地址形状（本地部分@域名.顶级域），与 `@域名` 形状一起用于过滤参数 */
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const AT_DOMAIN_SHAPE = /^@[a-z0-9.-]+\.[a-z]{2,}$/;
 
 export const emailAddressSchema = z
   .string()
   .trim()
   .toLowerCase()
   .max(254)
-  .regex(/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/, '邮箱地址格式非法');
-
-/**
- * 查询参数里的空串按「没传」处理。skill.md 教的就是 `?cursor=&limit=` 这种形状，
- * 而 z.coerce.number() 会把 '' 转成 0 再被 min(1) 拒掉——外部调用方照文档拼串直接 400。
- * 前端不受影响（api/client.ts 本来就跳过空串），纯粹是外部调用方的陷阱。
- */
-function emptyAsUndefined<T extends z.ZodTypeAny>(schema: T) {
-  return z.preprocess((v) => (v === '' ? undefined : v), schema.optional());
-}
-
-/** 布尔开关参数：接受 1/true/0/false，空串等同未传 */
-function boolFlag() {
-  return z.preprocess(
-    (v) => (v === '' ? undefined : v),
-    z
-      .union([z.literal('1'), z.literal('true'), z.literal('0'), z.literal('false')])
-      .transform((v) => v === '1' || v === 'true')
-      .optional(),
-  );
-}
+  .regex(EMAIL_SHAPE, '邮箱地址格式非法');
 
 /**
  * 时间参数：ISO 8601，日期（按 UTC 零点）或带时区的日期时间（Z 或 ±HH:MM），输出 Unix 毫秒。
@@ -67,7 +50,7 @@ function addressFilterSchema(label: string) {
     .trim()
     .toLowerCase()
     .max(254)
-    .refine((v) => /^@[a-z0-9.-]+\.[a-z]{2,}$/.test(v) || /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v), `${label}需为完整地址或 @域名`);
+    .refine((v) => AT_DOMAIN_SHAPE.test(v) || EMAIL_SHAPE.test(v), `${label}需为完整地址或 @域名`);
 }
 
 export const listMessagesQuerySchema = z.object({
@@ -101,10 +84,7 @@ export const listMessagesQuerySchema = z.object({
   hasCode: boolFlag(),
   /** 只看带附件的邮件（正文内联图不算，口径同 hasAttachments）；0/false 与不传相同 */
   hasAttachments: boolFlag(),
-  cursor: emptyAsUndefined(z.string().max(128)),
-  limit: emptyAsUndefined(z.coerce.number().int().min(1).max(MAX_PAGE_SIZE)).default(
-    DEFAULT_PAGE_SIZE,
-  ),
+  ...pageQueryShape,
 })
   .superRefine((q, ctx) => {
     if (q.scope === 'user' && q.userId === undefined) {
@@ -129,12 +109,7 @@ export const messageViewQuerySchema = z.object({
 });
 
 /** 发件人过滤：完整地址，或 `@域名` 匹配该域全部发件人 */
-const senderFilterSchema = z
-  .string()
-  .trim()
-  .toLowerCase()
-  .max(254)
-  .refine((v) => /^@[a-z0-9.-]+\.[a-z]{2,}$/.test(v) || /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v), '发件人需为完整地址或 @域名');
+const senderFilterSchema = addressFilterSchema('发件人');
 
 /**
  * wait 的地址过滤：逗号分隔（路由会把重复的 address 参数先用逗号合并），去重后最多 MAX_WAIT_ADDRESSES 个。
@@ -196,9 +171,17 @@ export const contentIdSchema = z.preprocess(
 export const attachmentDispositionSchema = z.enum(['attachment', 'inline']);
 export type AttachmentDisposition = z.infer<typeof attachmentDispositionSchema>;
 
+/** 附件与上传的 MIME 类型 */
+const mimeTypeSchema = z.string().trim().min(3).max(128);
+/** 内联参数：base64 附件、URL 附件与上传 token 引用都可以带 */
+const inlinePartShape = {
+  contentId: contentIdSchema.optional(),
+  disposition: attachmentDispositionSchema.optional(),
+};
+
 export const sendAttachmentSchema = z.object({
   filename: attachmentFilenameSchema,
-  contentType: z.string().trim().min(3).max(128),
+  contentType: mimeTypeSchema,
   /**
    * base64 编码内容。允许含空白：`base64 file.pdf`、Python `base64.encodebytes()`、
    * `openssl base64` 产出的都是 76 字符折行的多行 base64，直接拒掉等于逼调用方
@@ -210,8 +193,7 @@ export const sendAttachmentSchema = z.object({
     .transform((v) => v.replace(/\s+/g, ''))
     .refine((v) => /^[A-Za-z0-9+/]+={0,2}$/.test(v) && v.length % 4 !== 1 &&
       (!v.endsWith('=') || v.length % 4 === 0), '附件需为合法 base64'),
-  contentId: contentIdSchema.optional(),
-  disposition: attachmentDispositionSchema.optional(),
+  ...inlinePartShape,
   /** 与 url 互斥：带 url 的项是 URL 附件 */
   url: z.never().optional(),
 });
@@ -225,9 +207,8 @@ export const urlAttachmentSchema = z.object({
   // 这里只看形状；完整解析与 SSRF 检查在服务端拉取前做
   url: z.string().trim().max(2048).regex(/^https:\/\/[^\s/?#@]+(?:[/?#]\S*)?$/i, 'url 必须是 https:// 开头的完整地址'),
   filename: attachmentFilenameSchema.optional(),
-  contentType: z.string().trim().min(3).max(128).optional(),
-  contentId: contentIdSchema.optional(),
-  disposition: attachmentDispositionSchema.optional(),
+  contentType: mimeTypeSchema.optional(),
+  ...inlinePartShape,
   /** 与 content 互斥 */
   content: z.never().optional(),
 });
@@ -253,8 +234,7 @@ export const attachmentTokenRefSchema = z.union([
   z.string().min(1).max(128),
   z.object({
     token: z.string().min(1).max(128),
-    contentId: contentIdSchema.optional(),
-    disposition: attachmentDispositionSchema.optional(),
+    ...inlinePartShape,
   }),
 ]).transform((value) => (typeof value === 'string' ? { token: value } : value));
 export type AttachmentTokenRef = z.infer<typeof attachmentTokenRefSchema>;
@@ -435,16 +415,9 @@ function validateAttachmentRefs(
   }
 }
 
-/** 正文 UTF-8 字节数 */
-function utf8Length(value: string): number {
-  let bytes = 0;
-  for (const char of value) { const cp = char.codePointAt(0)!; bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4; }
-  return bytes;
-}
-
 /** 正文合计不超上限；complete 时还要求非空 */
 function validateBody(v: { text?: string; html?: string }, ctx: z.RefinementCtx, complete = true): void {
-  if (utf8Length(v.text ?? '') + utf8Length(v.html ?? '') > MAX_BODY_BYTES) {
+  if (utf8ByteLength(v.text ?? '') + utf8ByteLength(v.html ?? '') > MAX_BODY_BYTES) {
     ctx.addIssue({ code: 'custom', message: '正文 UTF-8 字节合计超过上限', path: ['body'] });
   }
   if (complete && (v.text ?? '').length === 0 && (v.html ?? '').length === 0) {
@@ -458,28 +431,22 @@ function validateBody(v: { text?: string; html?: string }, ctx: z.RefinementCtx,
  */
 export function validateSendParts(v: SendCommonShape, ctx: z.RefinementCtx, complete: boolean): void {
   validateAttachmentRefs(v, ctx);
-  if (v.replyToMessageId !== undefined && v.replyToMessageId !== null && v.headers &&
-    Object.keys(v.headers).some((name) => name === 'In-Reply-To' || name === 'References')) {
+  if (v.replyToMessageId !== undefined && v.replyToMessageId !== null && hasThreadingHeaders(v.headers)) {
     ctx.addIssue({
       code: 'custom',
       message: 'replyToMessageId 与 headers 里的 In-Reply-To/References 不能同时提供：回复站内邮件只用 replyToMessageId',
       path: ['headers'],
     });
   }
-  if (complete && v.to.length + v.cc.length + v.bcc.length === 0) ctx.addIssue({ code: 'custom', message: '至少需要一个收件人', path: ['to'] });
-  if (v.to.length + v.cc.length + v.bcc.length > MAX_RECIPIENTS) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: `收件人合计不能超过 ${MAX_RECIPIENTS} 个`,
-      path: ['to'],
-    });
-  }
+  validateRecipientCount(v, ctx, complete);
   validateBody(v, ctx, complete);
 }
 
-/** 收件人上限、正文非空、内联附件、头部与回复参数的组合约束（base64 与 token 两种发送共用） */
-function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
-  validateSendParts(v, ctx, true);
+/** To/Cc/Bcc 合计不超上限；requireOne 时还要求至少一个 */
+function validateRecipientCount(v: { to: unknown[]; cc: unknown[]; bcc: unknown[] }, ctx: z.RefinementCtx, requireOne: boolean): void {
+  const total = v.to.length + v.cc.length + v.bcc.length;
+  if (requireOne && total === 0) ctx.addIssue({ code: 'custom', message: '至少需要一个收件人', path: ['to'] });
+  if (total > MAX_RECIPIENTS) ctx.addIssue({ code: 'custom', message: `收件人合计不能超过 ${MAX_RECIPIENTS} 个`, path: ['to'] });
 }
 
 /**
@@ -491,7 +458,7 @@ export const sendMailRequestSchema = z
     ...sendMailBaseShape,
     attachments: z.array(sendAttachmentSchema).max(MAX_ATTACHMENTS).default([]),
   })
-  .superRefine((v, ctx) => validateSendCommon(v, ctx));
+  .superRefine((v, ctx) => validateSendParts(v, ctx, true));
 export type SendMailRequest = z.infer<typeof sendMailRequestSchema>;
 
 /**
@@ -509,11 +476,10 @@ export const internalSendMailSchema = z
   })
   .superRefine((v, ctx) => {
     // 这里只能校验 base64 那路的体积；token 那路的真实大小要查库，由 sendMail 统一兜底
-    validateSendCommon(v, ctx);
+    validateSendParts(v, ctx, true);
   });
 export type InternalSendMailRequest = z.infer<typeof internalSendMailSchema>;
 /** 请求体的输入形状（地址可写字符串或对象、token 可写字符串）；构造请求时用它，服务端拿到的是 InternalSendMailRequest */
-export type InternalSendMailInput = z.input<typeof internalSendMailSchema>;
 
 const strictFields = (endpoint: string, hint: string) => ({
   error: (issue: { code: string; keys?: string[] }) => issue.code === 'unrecognized_keys'
@@ -538,12 +504,11 @@ export const replyMessageRequestSchema = z
   .superRefine((v, ctx) => {
     validateAttachmentRefs(v, ctx);
     validateBody(v, ctx);
-    if (v.headers && Object.keys(v.headers).some((name) => name === 'In-Reply-To' || name === 'References')) {
+    if (hasThreadingHeaders(v.headers)) {
       ctx.addIssue({ code: 'custom', message: '回复的 In-Reply-To/References 由服务端按原信生成，headers 里不能再给', path: ['headers'] });
     }
   });
 export type ReplyMessageRequest = z.infer<typeof replyMessageRequestSchema>;
-export type ReplyMessageInput = z.input<typeof replyMessageRequestSchema>;
 
 /**
  * POST /v1/messages/:id/forward：主题加 Fwd:，note 在前，includeOriginal 默认附上原文；原邮件附件始终带上。
@@ -559,15 +524,12 @@ export const forwardMessageRequestSchema = z
     from: sendFromSchema.optional(),
   }, strictFields('转发', '主题与正文由服务端按原信生成，自己的话写在 note；要完全自定义请用 POST /v1/messages 并带 forwardAttachmentsFrom'))
   .superRefine((v, ctx) => {
-    const total = v.to.length + v.cc.length + v.bcc.length;
-    if (total === 0) ctx.addIssue({ code: 'custom', message: '至少需要一个收件人', path: ['to'] });
-    if (total > MAX_RECIPIENTS) ctx.addIssue({ code: 'custom', message: `收件人合计不能超过 ${MAX_RECIPIENTS} 个`, path: ['to'] });
+    validateRecipientCount(v, ctx, true);
     if (!v.includeOriginal && !(v.note ?? '').trim()) {
       ctx.addIssue({ code: 'custom', message: 'includeOriginal 为 false 时 note 不能为空', path: ['note'] });
     }
   });
 export type ForwardMessageRequest = z.infer<typeof forwardMessageRequestSchema>;
-export type ForwardMessageInput = z.input<typeof forwardMessageRequestSchema>;
 
 /** 回复/转发的幂等指纹：操作、来源邮件与解析后的请求（与 POST /v1/messages 的指纹天然不同，同 Key 混用即 mismatch） */
 export function composeRequestFingerprint(
@@ -634,7 +596,7 @@ export interface BatchSendResult {
 /** 大文件分片上传：初始化（创建 R2 multipart upload） */
 export const initMultipartUploadSchema = z.object({
   filename: attachmentFilenameSchema,
-  mimeType: z.string().trim().min(3).max(128),
+  mimeType: mimeTypeSchema,
   size: z.number().int().positive().max(MAX_ATTACHMENT_FILE_BYTES, '单文件超过上限'),
 });
 export type InitMultipartUploadRequest = z.infer<typeof initMultipartUploadSchema>;
@@ -674,12 +636,6 @@ export interface MultipartPartResult {
 }
 export interface MultipartCompleteResult {
   token: string;
-  size: number;
-}
-export interface DraftAttachmentMeta {
-  token: string;
-  filename: string;
-  mimeType: string;
   size: number;
 }
 

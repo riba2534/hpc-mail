@@ -212,3 +212,44 @@ describe('POST /v1/messages/:id/forward', () => {
       .toBe('source_unavailable');
   });
 });
+
+describe('修复轮：回复/转发的主题上限与收件人上限', () => {
+  const utf8 = (value: string) => new TextEncoder().encode(value).byteLength;
+  const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  it('A9：原信主题很长时 Re:/Fwd: 加前缀后按 UTF-8 字节截到主题上限，不切坏字符', async () => {
+    const w = await world('rf10');
+    const ascii = await source({ address: w.mine.address, fromAddress: w.boss, subject: 'x'.repeat(2048) });
+    const reply = await result<MessageSummary>(await request(`/v1/messages/${ascii.id}/reply`, post(w.alice.key, { text: 'ok', quote: false })), 201);
+    expect(reply.subject.startsWith('Re: xxx')).toBe(true);
+    expect(utf8(reply.subject)).toBeLessThanOrEqual(998);
+    for (const op of ['reply', 'forward'] as const) {
+      // 4 字节的 emoji：按码元截断会留下半个代理对，按字符数截断会超出字节上限
+      const emoji = await source({ address: w.mine.address, fromAddress: w.boss, subject: `${'中'.repeat(3)}${'😀'.repeat(400)}` });
+      const sent = await result<MessageSummary>(await request(`/v1/messages/${emoji.id}/${op}`,
+        post(w.alice.key, op === 'reply' ? { text: 'ok', quote: false } : { to: [w.peer.address], note: 'fyi', includeOriginal: false })), 201);
+      expect(sent.subject.startsWith(op === 'reply' ? 'Re: 中中中😀' : 'Fwd: 中中中😀')).toBe(true);
+      expect(utf8(sent.subject)).toBeLessThanOrEqual(998);
+      expect(utf8(sent.subject)).toBeGreaterThan(990);
+      expect(sent.subject).not.toMatch(loneSurrogate);
+      expect(sent.subject.endsWith('😀')).toBe(true);
+    }
+  });
+
+  it('A22：回复算出的收件人超过单封上限时 400，与直接发信一致', async () => {
+    const w = await world('rf11');
+    const many = (prefix: string, count: number) => Array.from({ length: count }, (_, index) => `${prefix}${index}@outside.example`);
+    const flood = await source({ address: w.mine.address, fromAddress: w.boss, replyTo: many('rt', 101) });
+    const tooMany = await result<ErrorBody>(await request(`/v1/messages/${flood.id}/reply`, post(w.alice.key, { text: 'x', quote: false })), 400);
+    expect(tooMany).toMatchObject({ code: 'validation_failed', message: '收件人合计不能超过 100 个', fix: expect.stringContaining('POST /v1/messages') });
+    // 回复全部：To 60 个加 Cc 50 个，去重后超过上限
+    const all = await source({ address: w.mine.address, fromAddress: w.boss,
+      recipients: { to: [w.mine.address, ...many('to', 59)], cc: many('cc', 50), bcc: [] } });
+    expect((await result<ErrorBody>(await request(`/v1/messages/${all.id}/reply`,
+      post(w.alice.key, { text: 'x', quote: false, replyAll: true })), 400)).message).toBe('收件人合计不能超过 100 个');
+    // 不回复全部时只回给发件人，不受影响
+    const single = await result<MessageSummary>(await request(`/v1/messages/${all.id}/reply`, post(w.alice.key, { text: 'x', quote: false })), 201);
+    expect((await row(single.id)).recipients).toEqual({ to: [w.boss], cc: [], bcc: [] });
+    expect(await db.select().from(messages).where(eq(messages.inReplyTo, flood.messageId!)).all()).toEqual([]);
+  });
+});

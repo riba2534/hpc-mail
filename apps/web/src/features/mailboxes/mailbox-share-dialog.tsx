@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { Mailbox, MailboxShareGrant } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { ApiError, errorMessage } from '@/api/errors';
 import { invalidateMailboxOwnership, queryKeys } from '@/api/query-keys';
 import { adminApi, mailboxApi } from '@/api/resources';
 import { QueryErrorState } from '@/components/query-error-state';
@@ -11,10 +11,7 @@ import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@
 import { Input } from '@/components/ui/input';
 import { toast } from '@/components/ui/toast';
 import { compareText } from '@/lib/sort';
-
-function errorText(error: unknown, fallback: string): string {
-  return error instanceof ApiError ? error.message : fallback;
-}
+import { useDebouncedValue } from '@/lib/use-debounced-value';
 
 export function MailboxShareDialog({
   grant,
@@ -39,11 +36,7 @@ export function MailboxShareDialog({
     [grants],
   );
   const normalized = userQuery.trim().toLowerCase();
-  const [debounced, setDebounced] = useState('');
-  useEffect(() => {
-    const timer = globalThis.setTimeout(() => setDebounced(normalized), 250);
-    return () => globalThis.clearTimeout(timer);
-  }, [normalized]);
+  const debounced = useDebouncedValue(normalized, 250);
   const matches = useQuery({
     queryKey: queryKeys.mailboxes.shareUsers(debounced, current?.ownerUserId),
     queryFn: ({ signal }) => mailboxApi.searchShareUsers(debounced, current?.ownerUserId, signal),
@@ -90,7 +83,7 @@ export function MailboxShareDialog({
       onClose();
     },
     onError: (error) => {
-      toast({ title: errorText(error, '保存失败，请重试'), variant: 'error' });
+      toast({ title: errorMessage(error, '保存失败，请重试'), variant: 'error' });
       if (error instanceof ApiError && error.code === 'conflict') {
         invalidateMailboxOwnership(queryClient);
         onClose();
@@ -173,7 +166,7 @@ export function MailboxShareDialog({
           {!admin && matches.data?.hasMore && normalized === debounced && <p className="text-xs text-ink-tertiary">已显示前 20 位匹配用户，请输入更完整的用户名。</p>}
           <p className="text-xs text-ink-tertiary">已选 {selected.length}/100 人。保存后会替换这只邮箱当前的共享名单；取消所有选择可撤销全部共享。</p>
           {invalidSelected && <p role="alert" className="text-sm text-critical">请取消已失效的成员后再保存。</p>}
-          {save.isError && <p role="alert" className="text-sm text-critical">{errorText(save.error, '保存失败，请重试')}</p>}
+          {save.isError && <p role="alert" className="text-sm text-critical">{errorMessage(save.error, '保存失败，请重试')}</p>}
         </DialogBody>
         <DialogFooter>
           <Button type="button" variant="secondary" disabled={save.isPending} onClick={onClose}>

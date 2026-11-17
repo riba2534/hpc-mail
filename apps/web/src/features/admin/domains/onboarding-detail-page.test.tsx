@@ -117,6 +117,11 @@ describe('接入详情页', () => {
     expect((await screen.findByText(/该域名暂时收不到信/)).closest('p')).toHaveClass('text-critical');
     expect(screen.getByText(/原值：.*smtp.example.net/)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /在 Cloudflare 控制台查看/ })).toHaveAttribute('href', 'https://dash.cloudflare.com/acct/mail.test');
+    // A17：这种状态下取消，对话框要说清楚域名会一直收不到信，而不是「来信继续进入本站」
+    fireEvent.click(screen.getByRole('button', { name: '取消接入' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/取消后不再重试开启路由，该域名会一直收不到信/)).toHaveClass('text-critical');
+    expect(within(dialog).queryByText(/来信会继续按「未认领」进入本站/)).toBeNull();
     client.clear();
   });
 });

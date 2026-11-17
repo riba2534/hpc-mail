@@ -3,16 +3,17 @@ import { AlertTriangle, ArrowLeft, ExternalLink, RefreshCw } from 'lucide-react'
 import { type ReactNode, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
+  SYSTEM_DOMAIN_ONBOARDING_TERMINAL_STATES,
   SYSTEM_DOMAIN_STEP_KEYS,
   type SystemDomainOnboarding,
+  type SystemDomainOnboardingState,
   type SystemDomainPrecheck,
 } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { ApiError, errorMessage } from '@/api/errors';
 import { PageHeader } from '@/components/page-header';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { CopyButton } from '@/components/ui/copy-button';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -20,18 +21,10 @@ import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/cn';
 import { formatDateTime, formatRelativeTime } from '@/lib/format';
 import { OnboardConfirmDialog } from './onboard-confirm-dialog';
-import { CheckDetail, DNSSEC_LABEL, OnboardingStateBadge, STEP_LABEL } from './system-domain-meta';
+import { CheckDetail, DNSSEC_LABEL, NameServerList, OnboardingStateBadge, STEP_LABEL, STEP_STATE_META } from './system-domain-meta';
 import { storeOnboarding, systemDomainApi, systemDomainKeys, useSystemDomainOnboarding } from './system-domains-api';
 
-const TERMINAL = new Set(['completed', 'cancelled', 'failed']);
-const STEP_STATE_LABEL: Record<string, { label: string; className: string }> = {
-  ready: { label: '已就绪', className: 'text-positive' },
-  waiting: { label: '等待中', className: 'text-ink-tertiary' },
-  missing: { label: '待写入', className: 'text-ink-tertiary' },
-  unknown: { label: '未知', className: 'text-ink-tertiary' },
-  conflict: { label: '有冲突', className: 'text-caution' },
-  error: { label: '失败', className: 'text-critical' },
-};
+const TERMINAL: ReadonlySet<SystemDomainOnboardingState> = new Set(SYSTEM_DOMAIN_ONBOARDING_TERMINAL_STATES);
 const CHANGE_LABEL: Record<string, string> = {
   'zone.create': '创建 zone', 'zone.delete': '删除 zone', 'spf.merge': '合并 SPF', 'catchAll.put': '配置 catch-all',
   'mx.delete': '删除第三方 MX', 'routing.enable': '开启收件路由', 'sending.create': '接入发信', 'sending.repair': '补写发信记录',
@@ -39,8 +32,7 @@ const CHANGE_LABEL: Record<string, string> = {
 const CHANGE_STATUS: Record<string, string> = { started: '进行中', done: '完成', unknown: '结果不明', failed: '失败' };
 
 /** 只有 404 当作不存在；403 是权限或凭据问题，要提示而不是跳走 */
-const isGone = (error: unknown) => error instanceof ApiError && (error.httpStatus === 404 || error.code === 'not_found');
-const errorMessage = (error: unknown, fallback: string) => (error instanceof ApiError ? error.message : fallback);
+const isGone = (error: unknown) => error instanceof ApiError && error.notFound;
 
 function Section({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
   return (
@@ -74,7 +66,9 @@ function CancelDialog({ task, open, onOpenChange }: { task: SystemDomainOnboardi
         <DialogHeader title={`取消接入 ${task.domain}？`} />
         <DialogBody className="flex flex-col gap-3 text-sm text-ink-secondary">
           <p>取消后不再检测或写入 Cloudflare。已经做过的修改不会自动回滚，原值见下方变更台账。</p>
-          {touched && (
+          {task.errorCode === 'mx_removed_routing_pending' ? (
+            <p className="text-critical">第三方 MX 已删除、收件路由还没开启：取消后不再重试开启路由，该域名会一直收不到信。建议先「立即检测」重试，或在 Cloudflare 开启 Email Routing、按台账恢复原 MX。</p>
+          ) : touched && (
             <p className="text-caution">catch-all 若已指向本站，这个域名的来信会继续按「未认领」进入本站；如需停止，请在 Cloudflare 恢复原规则。</p>
           )}
           {task.canDeleteZone && (
@@ -174,14 +168,7 @@ export function OnboardingDetailPage() {
           {task.nameServers.length > 0 ? (
             <>
               <p className="text-[13px] text-ink-secondary">到注册商把 {task.domain} 的 NS 改为：</p>
-              <ul className="flex flex-col gap-1.5">
-                {task.nameServers.map((ns) => (
-                  <li key={ns} className="flex items-center gap-2">
-                    <code className="rounded-sm bg-surface-active px-2 py-1 font-mono text-xs text-ink">{ns}</code>
-                    <CopyButton value={ns} label={`复制 ${ns}`} size="sm" />
-                  </li>
-                ))}
-              </ul>
+              <NameServerList nameServers={task.nameServers} />
               {task.originalNameServers.length > 0 && (
                 <p className="text-xs text-ink-tertiary">原 NS：{task.originalNameServers.join(' / ')}{task.originalRegistrar ? `（${task.originalRegistrar}）` : ''}</p>
               )}
@@ -206,7 +193,7 @@ export function OnboardingDetailPage() {
         <ul className="flex flex-col gap-2">
           {SYSTEM_DOMAIN_STEP_KEYS.map((key) => {
             const step = task.steps[key];
-            const meta = STEP_STATE_LABEL[step.state] ?? STEP_STATE_LABEL.unknown!;
+            const meta = STEP_STATE_META[step.state];
             return (
               <li key={key} className="flex flex-wrap items-baseline gap-2 text-[13px]">
                 <span className="w-20 shrink-0 text-ink">{STEP_LABEL[key]}</span>

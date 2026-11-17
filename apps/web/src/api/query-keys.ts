@@ -7,11 +7,6 @@ export const queryKeys = {
   domains: ['domains', 'visible'] as const,
   notifyPrefs: ['notify-prefs'] as const,
   notificationHealth: ['notification-health'] as const,
-  webhooks: {
-    root: ['webhooks'] as const,
-    list: ['webhooks', 'list'] as const,
-    deliveries: (id: number) => ['webhooks', 'deliveries', id] as const,
-  },
   session: ['session'] as const,
   sessionForRevision: (revision: number) => ['session', revision] as const,
 

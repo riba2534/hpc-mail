@@ -26,8 +26,6 @@ import {
 } from 'lucide-react';
 import { type MouseEvent, Suspense, useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation, useMatches, useNavigate } from 'react-router-dom';
-import { clearAuthToken } from '@/lib/auth-token';
-import { authApi } from '@/api/resources';
 import logoUrl from '@/assets/logo.webp';
 import {
   DropdownMenu,
@@ -54,7 +52,7 @@ import { PageLoader } from './page-loader';
 import { preloadable } from './route-modules';
 import type { RouteHandle } from './router';
 import { ShortcutsHelpDialog } from './shortcuts-help-dialog';
-import { clearUserLocalData } from './user-local-data';
+import { signOut } from './user-local-data';
 
 // 只在外壳主内容区渲染的路由组件随外壳 chunk 下发（router 经 loadAppShell 取用）
 export { AdminGuard } from './admin-guard';
@@ -271,15 +269,7 @@ function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
 
   const logout = async () => {
     setLoggingOut(true);
-    try {
-      await authApi.logout();
-    } catch {
-      // 忽略：本地清理照常进行
-    }
-    // 主动退出：清掉本机为该账户保存的草稿、发送凭据、信任的发件人等（会话过期不清，草稿留到重新登录）
-    clearUserLocalData(user.id);
-    clearAuthToken();
-    queryClient.clear();
+    await signOut(queryClient, user.id);
     navigate('/login', { replace: true });
   };
 

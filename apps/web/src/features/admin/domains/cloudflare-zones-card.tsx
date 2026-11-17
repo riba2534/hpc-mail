@@ -9,7 +9,7 @@ import type {
   SystemDomainZone,
   SystemDomainZonesView,
 } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
+import { ApiError, errorMessage } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
@@ -22,7 +22,6 @@ import { OnboardConfirmDialog } from './onboard-confirm-dialog';
 import { OnboardingProgress, OnboardingStateBadge, registrarLabel } from './system-domain-meta';
 import { storeOnboarding, systemDomainApi, systemDomainKeys, useActiveOnboardingsPolling, useSystemDomainZones } from './system-domains-api';
 
-const errorMessage = (error: unknown, fallback: string) => (error instanceof ApiError ? error.message : fallback);
 
 /** 接入失败或被阻断时的说明；删除 MX 后路由未开启要红字提示 */
 function TaskError({ task }: { task: SystemDomainOnboardingSummary }) {

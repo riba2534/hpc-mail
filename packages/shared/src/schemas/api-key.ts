@@ -7,10 +7,10 @@ import {
   MAX_API_RATE_LIMIT,
   MAX_KEY_ALLOWED_DOMAINS,
   MAX_KEY_ALLOWED_MAILBOXES,
-  PASSWORD_MAX_LENGTH,
   type ApiKeyStatus,
   type ApiScope,
 } from '../constants.js';
+import { currentPasswordSchema } from './auth.js';
 import { domainSchema } from './mailbox.js';
 
 const ipOrCidrSchema = z
@@ -58,7 +58,7 @@ export const createApiKeyRequestSchema = z.object({
   /** 只允许访问这些域名下的地址；与 allowedMailboxIds 都为空表示不限 */
   allowedDomains: allowedDomainsSchema.default([]),
   /** 当前登录密码：创建 Key 前重新验证（缺失 403 reauth_required，错误 403 reauth_failed） */
-  password: z.string().min(1).max(PASSWORD_MAX_LENGTH),
+  password: currentPasswordSchema,
 }).superRefine((value, ctx) => {
   for (const issue of adminKeyIssues(value)) ctx.addIssue({ code: 'custom', path: [issue.path], message: issue.message });
 });

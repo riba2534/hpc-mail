@@ -34,8 +34,7 @@ function BackToAddresses() {
   );
 }
 
-const isNotFound = (error: unknown) =>
-  error instanceof ApiError && (error.httpStatus === 404 || error.code === 'not_found');
+const isNotFound = (error: unknown) => error instanceof ApiError && error.notFound;
 
 /** 按 id 只读这一个邮箱；从全站地址列表进来时先用列表缓存里的这一行渲染，不必等请求返回 */
 function useAdminMailbox(mailboxId: number, enabled: boolean) {

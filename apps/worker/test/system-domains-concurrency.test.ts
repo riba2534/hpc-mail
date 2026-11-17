@@ -1,11 +1,11 @@
-import { env } from 'cloudflare:test';
+import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SystemDomainOnboarding, SystemDomainPrecheck } from '@hpc-mail/shared';
 import { syncDueOnboarding } from '../src/services/system-domain.js';
 import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
 import { fakeCloudflare, type FakeCloudflare } from './support/fake-cloudflare.js';
 import {
-  actor, auditActions, beforeStatement, call, data, errorOf, insertTask, onboardExisting, onboardNewZone, resetSystemDomains, runtime,
+  actor, app, auditActions, beforeStatement, call, data, errorOf, insertTask, onboardExisting, onboardNewZone, resetSystemDomains, runtime,
   systemList, task,
 } from './support/system-domains.js';
 
@@ -282,6 +282,54 @@ describe('租约', () => {
     expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
     expect((await task(id)).state).toBe('completed');
     expect(writeKinds(cf, zoneId).filter((c) => c.includes('catch_all'))).toHaveLength(1);
+  });
+
+  /**
+   * 模拟后台处理被截断（waitUntil 超时、isolate 被回收）：第一次写 catch-all 的请求挂住，接口先返回；
+   * 再把租约改成已过期（相当于过了 2 分钟），看定时任务能否接手。最后放开挂住的请求，旧处理器的租约已丢，不再写入。
+   */
+  async function truncatedBackground(path: string, body: unknown, check: (id: number) => Promise<void>) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    cf!.onCall({ method: 'PUT', path: /\/catch_all$/ }, () => gate);
+    const admin = await actor('cc-admin');
+    const ctx = createExecutionContext();
+    const response = await app.request(`/api${BASE}${path}`, {
+      method: 'POST', headers: { Authorization: `Bearer ${admin.jwt}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }, runtime, ctx);
+    expect(response.status).toBeLessThan(300);
+    const { id } = (await response.json() as { data: SystemDomainOnboarding }).data;
+    expect((await task(id)).state).toBe('configuring');
+    await env.db.prepare('UPDATE system_domain_onboarding SET lease_until = ?1 WHERE id = ?2').bind(Date.now() - 1, id).run();
+    expect(await syncDueOnboarding(runtime)).toBe(1);
+    await check(id);
+    release();
+    await waitOnExecutionContext(ctx);
+    expect((await task(id)).state).toBe('completed');
+  }
+
+  it('A18 已激活 zone 一键接入的后台处理被截断：租约过期后定时任务接手并完成', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('cut');
+    cf = fakeCloudflare({ zones: [{ name: domain }] });
+    const zoneId = cf.zoneByName(domain)!.id;
+    await truncatedBackground('/onboardings', { mode: 'existing_zone', zoneId }, async (id) => {
+      expect((await task(id)).state).toBe('completed');
+      expect((await systemList()).domains.map((entry) => entry.domain)).toContain(domain);
+    });
+  });
+
+  it('A18 确认后的后台处理被截断：租约过期后定时任务接手并完成', async () => {
+    const f = await resetSystemDomains();
+    const domain = f.domain('cut2');
+    cf = fakeCloudflare({ zones: [{ name: domain, catchAll: { enabled: true, actions: [{ type: 'worker', value: ['legacy-worker'] }] } }] });
+    const zoneId = cf.zoneByName(domain)!.id;
+    const owner = await actor('cc-admin');
+    const id = await insertTask({ domain, createdBy: owner.id, state: 'needs_confirmation', zoneId, zoneStatus: 'active', nextCheckAt: null });
+    const precheck = await data<SystemDomainPrecheck>(await call('GET', `${BASE}/precheck?mode=existing_zone&zoneId=${zoneId}`, owner.jwt));
+    await truncatedBackground(`/onboardings/${id}/confirm`, { fingerprint: precheck.fingerprint, accept: precheck.requiredAcks }, async () => {
+      expect((await task(id)).state).toBe('completed');
+    });
   });
 
   it('每轮最多处理 3 条；全局 429 退避期内跳过整轮', async () => {

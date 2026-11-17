@@ -18,10 +18,11 @@ import { loadSourceMessage } from '../services/message.js';
 import type { Sender } from '../services/outbound.js';
 import { composeForward, composeReply, type ComposedSend } from '../services/reply-forward.js';
 import { deliverSend, planOf, settledResult, type SendEnvironment, type SendPlan } from '../services/send-flow.js';
+import { newUrlBufferBudget } from '../services/url-fetch-budget.js';
 import type { AppContext } from '../types.js';
 
 export function sendEnvironment(c: Context<AppContext>): SendEnvironment {
-  return { env: c.env, ctx: c.executionCtx, origin: new URL(c.req.url).origin, selfHosts: selfHostsOf(c) };
+  return { env: c.env, ctx: c.executionCtx, origin: new URL(c.req.url).origin, selfHosts: selfHostsOf(c), urlBuffer: newUrlBufferBudget() };
 }
 
 /** 本站自身的主机名：请求主机与 env.site_origin 的主机 */

@@ -16,12 +16,6 @@ import type {
   ClaimPlanStrategy,
   CompleteMultipartUploadRequest,
   ConfirmForwardResult,
-  CreateWebhookEndpointInput,
-  CreatedWebhookEndpoint,
-  UpdateWebhookEndpointRequest,
-  WebhookDelivery,
-  WebhookEndpoint,
-  WebhookTestResult,
   CreateApiKeyInput,
   CreatedApiKey,
   NotifyPrefsView,
@@ -120,7 +114,7 @@ export const notifyPrefsApi = {
 
 // ---- 邮箱 ----
 export const mailboxApi = {
-  list: (all = false) => api.get<Mailbox[]>('/mailboxes', { query: { all: all ? 1 : undefined } }),
+  list: () => api.get<Mailbox[]>('/mailboxes'),
   claim: (body: ClaimMailboxRequest) => api.post<Mailbox, ClaimMailboxRequest>('/mailboxes', body),
   update: (id: number, body: UpdateMailboxRequest) =>
     api.put<Mailbox, UpdateMailboxRequest>(`/mailboxes/${id}`, body),
@@ -237,19 +231,6 @@ export const uploadsApi = {
     ),
   /** 删除草稿附件（取消上传 / 移除已上传） */
   remove: (token: string) => api.delete<{ success: boolean }>(`/uploads/${token}`),
-};
-
-// ---- Webhook v2 端点 ----
-export const webhookApi = {
-  list: () => api.get<WebhookEndpoint[]>('/webhooks'),
-  create: (body: CreateWebhookEndpointInput) => api.post<CreatedWebhookEndpoint, CreateWebhookEndpointInput>('/webhooks', body),
-  update: (id: number, body: UpdateWebhookEndpointRequest) =>
-    api.put<WebhookEndpoint, UpdateWebhookEndpointRequest>(`/webhooks/${id}`, body),
-  remove: (id: number) => api.delete<{ success: boolean }>(`/webhooks/${id}`),
-  rotateSecret: (id: number) => api.post<CreatedWebhookEndpoint>(`/webhooks/${id}/rotate-secret`),
-  test: (id: number) => api.post<WebhookTestResult>(`/webhooks/${id}/test`),
-  deliveries: (id: number) => api.get<Page<WebhookDelivery>>(`/webhooks/${id}/deliveries`, { query: { limit: 20 } }),
-  retry: (id: number, deliveryId: number) => api.post<WebhookDelivery>(`/webhooks/${id}/deliveries/${deliveryId}/retry`),
 };
 
 // ---- API Keys（自助） ----
