@@ -156,9 +156,10 @@ export interface SendIdentity {
 }
 
 /**
- * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"）：目前只对管理员列出，
- * 与管理员发信的实际放行规则一致——system 系统域名；hosted 发信已就绪的托管域名；
- * legacy 已从系统列表移除、但仍有存量邮箱的旧域名。
+ * 可用任意前缀发信的域名（from 写 localPart+domain 或 "Name <任意前缀@域名>"），与发信的实际放行规则一致：
+ * 管理员得到 system 系统域名、hosted 发信已就绪的托管域名、legacy 已从系统列表移除但仍有存量邮箱的旧域名；
+ * 普通用户只得到自己作为所有者、已生效且发信就绪的托管域名（hosted），发出时自动把该地址认领给所有者
+ * （不占全站每人认领上限），成员与共享不适用。
  */
 export interface SendIdentityDomain {
   domain: string;

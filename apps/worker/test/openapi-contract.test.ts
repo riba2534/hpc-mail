@@ -753,17 +753,59 @@ describe('Agent docs reference only real endpoints and anchors', () => {
   });
 });
 
+describe('PR4b：回复/转发接口与托管域名任意前缀在 OpenAPI 与文档中一致', () => {
+  it('/v1 有 reply/forward，需要 mail.send+mail.read，请求体严格、错误含 from_required；/api 没有', () => {
+    for (const op of ['reply', 'forward'] as const) {
+      const operation = specs.v1.paths[`/messages/{id}/${op}`]!.post!;
+      expect(operation['x-required-scopes']).toEqual(['mail.send', 'mail.read']);
+      const request = (operation.requestBody as { content: Record<string, { schema: Schema }> }).content['application/json']!.schema;
+      const schema = specs.v1.components.schemas[(request.$ref as string).split('/').pop()!]!;
+      expect(schema.additionalProperties).toBe(false);
+      expect(Object.keys(schema.properties as object)).toEqual(op === 'reply'
+        ? ['replyAll', 'text', 'html', 'quote', 'from', 'attachments', 'attachmentTokens', 'headers']
+        : ['to', 'cc', 'bcc', 'note', 'includeOriginal', 'from']);
+      const responses = operation.responses as Record<string, { description: string }>;
+      expect(responses['400']!.description).toContain('from_required');
+      expect(responses['404']!.description).toContain('source_unavailable');
+      expect(responses).toHaveProperty('201');
+      expect(responses).toHaveProperty('422');
+      expect(specs.api.paths).not.toHaveProperty(`/messages/{id}/${op}`);
+    }
+    const reply = specs.v1.components.schemas.ReplyMessageRequest!.properties as Record<string, Schema>;
+    expect(reply.quote!.default).toBe(true);
+    expect(reply.replyAll!.default).toBe(false);
+    expect((specs.v1.components.schemas.ForwardMessageRequest!.properties as Record<string, Schema>).includeOriginal!.default).toBe(true);
+    const errorCode = ((specs.v1.components.schemas.Error!.properties as Record<string, Schema>).error!.properties as Record<string, Schema>).code!;
+    expect(errorCode.enum).toContain('from_required');
+  });
+
+  it('identities 的 domains 有 kind=hosted，发信说明写明托管所有者任意前缀；文档同步', () => {
+    for (const spec of Object.values(specs)) {
+      const domains = (spec.components.schemas.SendIdentities!.properties as Record<string, Schema>).domains!;
+      expect(((domains.items as Schema).properties as Record<string, Schema>).kind!.enum).toEqual(['system', 'hosted', 'legacy']);
+      expect(spec.components.schemas.SendMailRequest!.description).toContain('owner of a hosted domain');
+    }
+    expect(mailDoc).toContain('POST /v1/messages/:id/reply');
+    expect(mailDoc).toContain('POST /v1/messages/:id/forward');
+    expect(mailDoc).toContain('kind:"hosted"');
+    expect(errorsDoc).toMatch(/^## from_required$/m);
+    expect(skillDoc).toContain('/reply');
+    expect(mailboxesDoc).toContain('kind:"hosted"');
+  });
+});
+
 describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文档', () => {
-  /** /v1 只开放这八个托管域名操作，读写分别要求 domain.read / domain.write */
+  /** /v1 只开放这九个托管域名操作，读写分别要求 domain.read / domain.write */
   const keyOperations: Record<string, Record<string, string>> = {
     '/hosted-domains': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}': { get: 'domain.read' },
     '/hosted-domains/{id}/check': { post: 'domain.write' },
+    '/hosted-domains/{id}/reconnect': { post: 'domain.write' },
     '/hosted-domains/{id}/dns-records': { get: 'domain.read', post: 'domain.write' },
     '/hosted-domains/{id}/dns-records/{recordId}': { put: 'domain.write', delete: 'domain.write' },
   };
 
-  it('八个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
+  it('九个操作按读写声明 scope，请求体、响应与参数和 /api 同名操作相同', () => {
     let checked = 0;
     for (const [path, scopes] of Object.entries(keyOperations)) {
       expect(specs.v1.paths[path]!.parameters, path).toEqual(specs.api.paths[path]!.parameters);
@@ -779,7 +821,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
         checked++;
       }
     }
-    expect(checked).toBe(8);
+    expect(checked).toBe(9);
   });
 
   it('删除、成员上限、成员与过户只在 JWT：/v1 不描述这些操作，也没有管理员路径', () => {
@@ -796,7 +838,7 @@ describe('开放 API 接入自有域名：/v1 托管域名的规格与 Agent 文
     // 两份规格只在认证相关措辞上不同：/v1 写明管理员 Key 的范围与审计记法，/api 保持原说明
     expect(specs.v1.paths['/hosted-domains']!.get!.description).toContain('/api/admin/hosted-domains');
     expect(specs.v1.paths['/hosted-domains/{id}']!.get!.description).toContain('JWT-only');
-    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
+    for (const [path, method] of [['/hosted-domains', 'post'], ['/hosted-domains/{id}/reconnect', 'post'], ['/hosted-domains/{id}/dns-records', 'post'],
       ['/hosted-domains/{id}/dns-records/{recordId}', 'put'], ['/hosted-domains/{id}/dns-records/{recordId}', 'delete']] as const) {
       expect(specs.v1.paths[path]![method]!.description, `${method} ${path}`).toContain('API Key #id');
       expect(specs.api.paths[path]![method]!.description, `${method} ${path}`).not.toContain('API Key');

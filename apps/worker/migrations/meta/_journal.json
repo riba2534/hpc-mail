@@ -157,6 +157,13 @@
       "breakpoints": true
     },
     {
+      "idx": 24,
+      "version": "6",
+      "when": 1795400000000,
+      "tag": "0024_hosted_domain_hardening",
+      "breakpoints": true
+    },
+    {
       "idx": 28,
       "version": "6",
       "when": 1795392000000,

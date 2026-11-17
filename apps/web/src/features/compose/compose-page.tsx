@@ -62,6 +62,7 @@ import {
 import { exceedsExternalLimit, hasExternalRecipient } from './compose-attachments';
 import { IdentityPicker } from './identity-picker';
 import { RecipientInput } from './recipient-input';
+import { useHostedSendDomains } from './use-send-identities';
 import {
   classifySendError, clearSendAttempt, hashSendPayload, missingSendSource, persistSendAttempt, readSendAttempt, type SendSource,
 } from './send-attempt';
@@ -228,6 +229,13 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   const isAdmin = user.role === 'admin';
   const { data: visibleDomains } = useDomains();
   const { data: mailboxes } = useMailboxesQuery(false);
+  const hostedDomains = useHostedSendDomains();
+  // 可用任意前缀的域名：管理员是系统域名加自己的托管域名，普通用户只有自己的托管域名
+  const customDomains = useMemo(
+    () => (isAdmin ? [...new Set([...(visibleDomains ?? []), ...(hostedDomains ?? [])])] : hostedDomains ?? []),
+    [isAdmin, visibleDomains, hostedDomains],
+  );
+  const customAllowed = isAdmin || customDomains.length > 0;
   const { data: contactsData } = useQuery({
     queryKey: queryKeys.messages.contacts,
     queryFn: () => messageApi.contacts(),
@@ -263,8 +271,9 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   }, []);
 
   const [mailboxId, setMailboxId] = useState<number | null>(null);
-  const [localPart, setLocalPart] = useState(() => (isAdmin ? initialIdentity.localPart || draft?.localPart || defaultIdentity?.localPart || lastIdentity?.localPart || '' : ''));
-  const [adminDomain, setAdminDomain] = useState(() => (isAdmin ? initialIdentity.domain || draft?.adminDomain || defaultIdentity?.domain || lastIdentity?.domain || '' : ''));
+  // 普通用户是否有托管域名要等身份接口返回，先按同样来源预填；没有可用域名时这两项不参与发信
+  const [localPart, setLocalPart] = useState(() => initialIdentity.localPart || draft?.localPart || defaultIdentity?.localPart || lastIdentity?.localPart || '');
+  const [adminDomain, setAdminDomain] = useState(() => initialIdentity.domain || draft?.adminDomain || defaultIdentity?.domain || lastIdentity?.domain || '');
   const [to, setTo] = useState<string[]>(initial.to ?? []);
   const [cc, setCc] = useState<string[]>(initial.cc ?? []);
   const [bcc, setBcc] = useState<string[]>(initial.bcc ?? []);
@@ -299,19 +308,20 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   const clearFieldError = (key: FieldKey) =>
     setFieldErrors((current) => (current[key] ? { ...current, [key]: undefined } : current));
 
-  // 发件身份：回复/转发固定用原邮件地址；否则依次取草稿 → 设为默认 → 上次使用 → 收件箱筛选地址 → 第一个已认领地址
+  // 发件身份：回复/转发固定用原邮件地址（不是自己的邮箱时留在自定义前缀，localPart/域名已预填）；
+  // 否则依次取草稿 → 设为默认 → 上次使用 → 收件箱筛选地址 → 第一个已认领地址
   useEffect(() => {
     if (!mailboxes || identityInitializedRef.current) return;
-    identityInitializedRef.current = true;
     const byId = (id: number | null | undefined) => (id ? mailboxes.find((box) => box.id === id) : undefined);
     const byAddress = (address: string | null | undefined) => (address ? mailboxes.find((box) => box.address === address) : undefined);
     if (initial.fromAddress && !draft) {
+      identityInitializedRef.current = true;
       const matching = byAddress(initial.fromAddress);
       if (matching) setMailboxId(matching.id);
       return;
     }
-    const sources: Array<SavedIdentity | { mailboxId?: number | null; localPart?: string; address?: string } | null> = [
-      draft ? { mailboxId: draft.mailboxId, localPart: draft.localPart, address: draft.fromAddress } : null,
+    const sources: Array<SavedIdentity | { mailboxId?: number | null; localPart?: string; domain?: string; address?: string } | null> = [
+      draft ? { mailboxId: draft.mailboxId, localPart: draft.localPart, domain: draft.adminDomain, address: draft.fromAddress } : null,
       defaultIdentity,
       lastIdentity,
     ];
@@ -319,18 +329,26 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       if (!source) continue;
       const box = byId(source.mailboxId) ?? byAddress('address' in source ? source.address : undefined);
       if (box) {
+        identityInitializedRef.current = true;
         setMailboxId(box.id);
         return;
       }
-      // 管理员自定义地址：localPart/域名已在初始状态里预填
-      if (isAdmin && source.mailboxId === null && source.localPart) return;
+      // 自定义地址：localPart/域名已在初始状态里预填。管理员恒可用；普通用户等托管域名读完，域名仍可用才沿用
+      if (source.mailboxId === null && source.localPart) {
+        if (!isAdmin && hostedDomains === undefined) return;
+        if (isAdmin || hostedDomains?.includes(source.domain ?? '')) {
+          identityInitializedRef.current = true;
+          return;
+        }
+      }
     }
+    identityInitializedRef.current = true;
     const fallback = byAddress(rememberedFilterAddress()) ?? mailboxes[0];
     if (fallback) setMailboxId(fallback.id);
-  }, [mailboxes, initial.fromAddress, draft, defaultIdentity, lastIdentity, isAdmin]);
+  }, [mailboxes, initial.fromAddress, draft, defaultIdentity, lastIdentity, isAdmin, hostedDomains]);
 
   const validMailbox = (mailboxes ?? []).some((box) => box.id === mailboxId);
-  const validCustomIdentity = isAdmin && Boolean(localPart) && (visibleDomains ?? []).includes(adminDomain);
+  const validCustomIdentity = Boolean(localPart) && customDomains.includes(adminDomain);
   const identityValid = validMailbox || validCustomIdentity;
   const currentIdentity = (): SavedIdentity => ({ mailboxId: validMailbox ? mailboxId : null, localPart, domain: adminDomain });
   const saveDefaultIdentity = () => {
@@ -360,7 +378,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       ...initial,
       replyToMessageId,
       forwardAttachmentsFrom,
-      fromAddress: validMailbox ? mailboxes?.find((box) => box.id === mailboxId)?.address : isAdmin ? `${localPart}@${adminDomain}` : undefined,
+      fromAddress: validMailbox ? mailboxes?.find((box) => box.id === mailboxId)?.address : customAllowed ? `${localPart}@${adminDomain}` : undefined,
       to, cc, bcc, subject, body, isHtml, mailboxId, localPart, adminDomain, attachments: savedAttachments, savedAt: Date.now(),
     });
   };
@@ -470,6 +488,11 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       }
       clearDraft(draftKey);
       const owned = new Set((mailboxes ?? []).map((box) => box.address.toLowerCase()));
+      // 普通用户用托管域名的新前缀发信时，服务端已把这个地址认领给自己
+      const { localPart: sentLocalPart, domain: sentDomain } = payload.from;
+      if (!isAdmin && sentLocalPart && sentDomain && !owned.has(`${sentLocalPart}@${sentDomain}`)) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.mailboxes.root });
+      }
       syncSentMessage(queryClient, {
         sourceIds: [payload.replyToMessageId, payload.forwardAttachmentsFrom, initial.sourceMessageId].filter((id) => id !== undefined),
         selfDelivered: [...payload.to, ...payload.cc, ...payload.bcc].some((recipient) => owned.has(recipient.address)),
@@ -640,7 +663,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
 
     const errors: FieldErrors = {};
     if (!identityValid) {
-      errors.identity = !isAdmin && (mailboxes ?? []).length === 0 ? '请先认领一个邮箱地址' : '请选择有效的发件地址';
+      errors.identity = !customAllowed && (mailboxes ?? []).length === 0 ? '请先认领一个邮箱地址' : '请选择有效的发件地址';
     }
     if (to.length + cc.length + bcc.length === 0) errors.to = '至少需要一个收件人';
     if (!subject.trim()) errors.subject = '请填写主题';
@@ -776,9 +799,12 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
           error={fieldErrors.identity}
           isAdmin={isAdmin}
           mailboxes={mailboxes ?? []}
-          domains={visibleDomains ?? []}
+          domains={customDomains}
+          hostedDomains={hostedDomains}
           mailboxId={mailboxId}
           onMailboxId={(id) => {
+            // 托管域名还没读完时用户已手动选择，之后不再自动改选
+            identityInitializedRef.current = true;
             setMailboxId(id);
             clearFieldError('identity');
           }}

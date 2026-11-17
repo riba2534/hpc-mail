@@ -7,7 +7,7 @@
 - [增量同步](#增量同步)：`afterId` 拉新邮件，避免重复读取详情
 - [等待本次验证码](#等待本次验证码)：`/v1/messages/wait` 的过滤、多地址、`include=body` 与游标、Python 示例
 - [维护状态与回收站](#维护状态与回收站)：已读、全部已读、星标、删除、恢复、永久删除
-- [发送](#发送)：请求字段，[发件身份](#发件身份)、[收件人与显示名](#收件人与显示名)、[自定义邮件头](#自定义邮件头)、[结果与状态](#结果与状态)、[幂等与重试](#幂等与重试)、[回复和转发](#回复和转发)（含回复站外邮件）、[部分失败补发](#部分失败补发)
+- [发送](#发送)：请求字段，[发件身份](#发件身份)、[收件人与显示名](#收件人与显示名)、[自定义邮件头](#自定义邮件头)、[结果与状态](#结果与状态)、[幂等与重试](#幂等与重试)、[回复和转发](#回复和转发)（`/v1` 回复与转发接口、回复站外邮件）、[部分失败补发](#部分失败补发)
 
 shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`API`、`AUTH`。邮件读/维护路径在 `/api` 与 `/v1` 相同；JWT 无 Key scope，Key 需下面的 scope。唯有发送是 `/api/messages/send` 对应 `/v1/messages`，长轮询仅 `/v1`。
 
@@ -234,7 +234,7 @@ if not matched:
 hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,address,displayName}'
 ```
 
-- 普通用户只能用自己认领的邮箱：`mailboxId` 属于自己，或地址是自己认领的。用本站别人的地址返回 403 `forbidden`（`fix` 指向 `/v1/identities`，`docs` 指向[错误说明](errors.md#forbidden-sender)）；域名不属于本站返回 400 `validation_failed`。`kind=shared` 的共享邮箱对普通用户恒为 `canSend:false`、`reason:"shared_readonly"`，不能发信。
+- 普通用户能用自己认领的邮箱：`mailboxId` 属于自己，或地址是自己认领的。另外，自己作为**所有者**的托管域名在已生效且发信就绪时可用任意前缀：identities 的 `domains` 列出这些域名（`{domain,kind:"hosted",anyLocalPart:true}`），`from` 写 `{localPart,domain}` 或 `"Name <任意前缀@该域>"`，未认领的地址在发出时自动认领给你（不占全站每人认领上限），之后的回信也在你名下；该地址已被别人（例如域名成员）认领时仍是 403。域名成员、共享都不适用。用本站别人的地址返回 403 `forbidden`（`fix` 指向 `/v1/identities`，`docs` 指向[错误说明](errors.md#forbidden-sender)）；域名不属于本站返回 400 `validation_failed`。`kind=shared` 的共享邮箱对普通用户恒为 `canSend:false`、`reason:"shared_readonly"`，不能发信。
 - 托管域名上的地址（无论谁发）都要求该域发信已开通，否则 400 `validation_failed`。identities 里对应 `reason` 为 `hosted_sending_not_ready`（发信尚未就绪）或 `hosted_domain_unavailable`（域名暂停、NS 已移走或删除中）。系统域名不受此限；`/mailboxes` 每项的 `canSend` 同样只反映域名状态。
 - 管理员可用任何已认领邮箱的 `mailboxId`（别人的邮箱不列在 identities 里；共享给管理员的邮箱列为 `kind=shared`，按域名状态给出 `canSend`）。用地址写法时，可用的域名就是 identities 的 `domains`（`anyLocalPart:true`）：`kind=system` 系统域名、`kind=hosted` 发信已就绪的托管域名、`kind=legacy` 已移出系统列表但仍有存量邮箱的旧域名；不检查该地址是否被认领。不能推断任意外部域名可用。
 - 显示名：写了显示名（`"Name <a@b>"`、`{address,name}`、`displayName`）就用它；没写时，发件地址有邮箱记录的用邮箱设置的显示名，否则用前缀。
@@ -379,9 +379,26 @@ hpc "$SEND_PATH" -X POST -H 'Content-Type: application/json' \
 
 ### 回复和转发
 
-没有 `/messages/:id/reply` 之类的端点，`POST /messages/:id` 返回 404；回复和转发都是带额外字段的普通发送。
+Key（`/v1`）可直接调用回复与转发接口，由服务器按原信算收件人、主题、引用与线程头；网页会话（`/api`）没有这两个接口，用普通发送带 `replyToMessageId`/`forwardAttachmentsFrom`（见下文）。两个接口都需要 `mail.send` 与 `mail.read`，成功 201 返回发件摘要；结果、部分失败、422 `delivery_failed`、`Idempotency-Key` 重放与 409 都与 `POST /v1/messages` 相同（同 Key 重放时不再读取原信，原信之后被删也返回首次结果）。请求体不接受列出之外的字段（400），要自定义收件人或主题就改用普通发送。
 
-回复先读详情，收件人优先 `replyTo` 非空数组，否则用 `fromAddress`，并检查它是否为本人地址、可疑来源或用户意图。选自己有权发件的身份，填 `replyToMessageId`、`Re:` 主题与用户确认正文。简单回复不会自动带回原 CC/BCC；回复全部需重新计算 To/CC、排除自己的地址，不能把原 BCC 泄露出去。共享给你的来信可以作为回复来源，但发件身份仍须是自己认领的地址，不能借共享邮箱的地址回复。
+**`POST /v1/messages/:id/reply`** `{replyAll?,text?,html?,quote?,from?,attachments?,attachmentTokens?,headers?}`：
+
+- 收件人：来信回给它的 `replyTo`（非空时），否则回给发件人；回复自己发出的信则回给原 To。`replyAll:true` 另把原 To/Cc 里的其他人放进 Cc，去掉你自己的地址（本次发件地址、原收件地址与你认领的地址），**从不带原 Bcc**。没有任何可回复的人时 400。
+- 主题自动加 `Re: `（已有则不重复）；In-Reply-To/References 由服务器按原信生成，`headers` 里再给这两个头返回 400。
+- `text`/`html` 至少一个非空。`quote` 默认 `true`：正文后附「----- 原始邮件 -----」、发件人、时间（UTC）、主题与 `> ` 引用的原文；给了 `html` 时另在 HTML 里用 blockquote 引用原 HTML。原文过长会截断并注明，不报错。
+- `from` 缺省用原信的收件地址（回复自己发出的信则是原发件地址），写法同普通发送。原信在共享给你的邮箱里时这个地址不是你的发件身份，返回 400 `from_required`，改在 `from` 指定自己的地址（见[错误说明](errors.md#from_required)）。
+
+**`POST /v1/messages/:id/forward`** `{to,cc?,bcc?,note?,includeOriginal?,from?}`：收件人写法同普通发送（合计 1–100 个）；主题加 `Fwd: `；`note` 是写在最前面的纯文本；`includeOriginal` 默认 `true`，附上「---------- 转发的邮件 ----------」头部（发件人、时间、主题、收件人、抄送）与原文 text 和 HTML。原信的全部附件（含内嵌图）总会带上，规则同 `forwardAttachmentsFrom`，附件已丢失返回 404 `source_unavailable`。`includeOriginal:false` 时 `note` 不能为空。`from` 规则同回复。
+
+```bash
+# HPC_MSG_ID 为原信 ID；回复正文、转发目标与说明都须由用户确认。Idempotency-Key 按「幂等与重试」持久化
+hpc "/messages/$HPC_MSG_ID/reply" -X POST -H "Idempotency-Key: $HPC_SEND_KEY" -H 'Content-Type: application/json' \
+  --data "$(jq -n --arg text "$HPC_REPLY_TEXT" '{text:$text,replyAll:false}')"
+hpc "/messages/$HPC_MSG_ID/forward" -X POST -H "Idempotency-Key: $HPC_SEND_KEY2" -H 'Content-Type: application/json' \
+  --data "$(jq -n --arg to "$HPC_FORWARD_TO" --arg note "$HPC_NOTE" '{to:[$to],note:$note}')"
+```
+
+**用普通发送回复或转发**（`/api` 只能这样；`/v1` 需要完全控制收件人、主题或正文时也用它）：回复先读详情，收件人优先 `replyTo` 非空数组，否则用 `fromAddress`，并检查它是否为本人地址、可疑来源或用户意图。选自己有权发件的身份，填 `replyToMessageId`、`Re:` 主题与用户确认正文。简单回复不会自动带回原 CC/BCC；回复全部需重新计算 To/CC、排除自己的地址，不能把原 BCC 泄露出去。共享给你的来信可以作为回复来源，但发件身份仍须是自己认领的地址，不能借共享邮箱的地址回复。
 
 ```bash
 # 已读取详情到私有 message.json，HPC_FROM 为自己的发件地址（可带显示名），HPC_REPLY_TEXT 为回复正文

@@ -25,6 +25,9 @@ export const hostedDomainApi = {
   get: (id: number) => api.get<HostedDomain>(`/hosted-domains/${id}`),
   /** 立即向 Cloudflare 检测并推进开通 */
   check: (id: number) => api.post<HostedDomain>(`/hosted-domains/${id}/check`, undefined, { timeoutMs: CHECK_TIMEOUT_MS }),
+  /** NS 已改走的域名重新接入：zone 已被删除时重建并分配新的名称服务器 */
+  reconnect: (id: number) =>
+    api.post<HostedDomain>(`/hosted-domains/${id}/reconnect`, undefined, { timeoutMs: CHECK_TIMEOUT_MS }),
   update: (id: number, body: UpdateHostedDomainRequest) =>
     api.put<HostedDomain, UpdateHostedDomainRequest>(`/hosted-domains/${id}`, body),
   remove: (id: number) => api.delete<{ success: boolean }>(`/hosted-domains/${id}`),

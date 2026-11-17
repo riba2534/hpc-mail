@@ -31,7 +31,7 @@ import {
   markMessages,
   type Viewer,
 } from '../../services/message.js';
-import { handleSend } from '../send-handler.js';
+import { handleCompose, handleSend } from '../send-handler.js';
 import { getObject } from '../../services/storage.js';
 import type { AppContext } from '../../types.js';
 import { bumpCounter, minuteWindow } from '../../services/rate-counter.js';
@@ -55,6 +55,19 @@ app.post('/', (c) => {
     if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
   });
 });
+
+/**
+ * 回复与转发：服务端按原信算收件人、主题、引用与线程头，from 缺省用原信的收件地址。
+ * 会读出原信内容，与 POST / 引用来源邮件一样同时需要 mail.send 与 mail.read。
+ */
+for (const op of ['reply', 'forward'] as const) {
+  app.post(`/:id/${op}`, (c) => {
+    requireScope(c, 'mail.send');
+    requireScope(c, 'mail.read');
+    const key = c.get('apiKey')!;
+    return handleCompose(c, { type: 'api_key', id: key.id }, { userId: key.userId, role: key.role }, op, parseId(c.req.param('id')));
+  });
+}
 
 /** 标记已读/未读——Agent 处理完邮件后维护状态用（需 mail.write） */
 app.post('/read', async (c) => {

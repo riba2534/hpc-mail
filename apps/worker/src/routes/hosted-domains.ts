@@ -7,7 +7,7 @@ import { clientIp, execCtx, ok, parseBody, parseId, parseRecordId } from '../lib
 import { requireAuth } from '../middleware/auth.js';
 import {
   checkHostedDomain, createHostedDomain, deleteHostedDomain, getHostedDomain, listHostedDomainMembers, listMyHostedDomains,
-  removeHostedDomainMember, replaceHostedDomainMembers, transferHostedDomain, updateHostedDomain,
+  reconnectHostedDomain, removeHostedDomainMember, replaceHostedDomainMembers, transferHostedDomain, updateHostedDomain,
 } from '../services/hosted-domain.js';
 import { checkHostedDomains, createHostedDomains } from '../services/hosted-domain-batch.js';
 import { createHostedDnsRecord, deleteHostedDnsRecord, listHostedDnsRecords, updateHostedDnsRecord } from '../services/hosted-dns.js';
@@ -37,7 +37,11 @@ app.post('/batch-check', async (c) => {
 
 app.get('/:id', async (c) => ok(c, await getHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')))));
 
-app.post('/:id/check', async (c) => ok(c, await checkHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')))));
+app.post('/:id/check', async (c) => ok(c, await checkHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')), execCtx(c))));
+
+// 已迁走的域名重新接入：zone 仍在时复查 NS，已被删除时重建 zone 并分配新的名称服务器，地址与历史保留
+app.post('/:id/reconnect', async (c) =>
+  ok(c, await reconnectHostedDomain(c.env, c.get('user')!, parseId(c.req.param('id')), execCtx(c), clientIp(c))));
 
 app.put('/:id', async (c) => {
   const req = await parseBody(c, updateHostedDomainRequestSchema);

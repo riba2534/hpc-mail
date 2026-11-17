@@ -77,6 +77,8 @@ export const ERROR_CODES = [
   'delivery_failed',
   /** 全部收件人都在本站抑制名单里（此前退信或投诉）：422，没有发信也不占配额，details.suppressed 列出原因与解除时间 */
   'recipient_suppressed',
+  /** 回复/转发没给 from，而原信的收件地址不是调用者可用的发件身份（如共享给你的邮箱）：400，在 from 指定自己的地址 */
+  'from_required',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -103,5 +105,6 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   header_not_allowed: 400,
   delivery_failed: 422,
   recipient_suppressed: 422,
+  from_required: 400,
   internal: 500,
 };

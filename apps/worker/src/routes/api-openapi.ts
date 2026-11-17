@@ -39,7 +39,7 @@ export function buildSessionOpenApiSpec(origin: string) {
       ...hosted['/hosted-domains/{id}'],
       put: operation('Set the per-member claim limit', ref('HostedDomain'), { request: 'UpdateHostedDomainRequest', description: 'Owner or administrator.' }),
       delete: operation('Stop hosting and delete the domain', success, {
-        description: 'Owner or administrator. Irreversible: the domain enters deleting, rejects mail immediately, then every message on the domain is permanently deleted, all its addresses are released and the Cloudflare zone is removed. Restore the original nameservers at the registrar first or the domain stops resolving. The teardown counts 2 calls toward the site-wide Cloudflare budget but is never refused for it.' }),
+        description: 'Owner or administrator. Irreversible: the domain enters deleting, rejects mail immediately, then every message on the domain is permanently deleted, all its addresses are released and the Cloudflare zone is removed. Restore the original nameservers at the registrar first or the domain stops resolving. Before deleting, the zone is read back and must match this domain and not predate the record (a mismatch or a system domain is never deleted and shows in lastError). The teardown counts 3 calls toward the site-wide Cloudflare budget but is never refused for it.' }),
     },
     '/hosted-domains/{id}/members': {
       get: operation('List members of a hosted domain', array(ref('HostedDomainMember')), { description: 'Owner or administrator.' }),
