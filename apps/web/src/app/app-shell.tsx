@@ -55,6 +55,10 @@ const ChangePasswordDialog = lazyWithReload(
   preloadable(() => import('./change-password-dialog')),
   (m) => m.ChangePasswordDialog,
 );
+const TwoFactorSection = lazyWithReload(
+  preloadable(() => import('@/features/profile/two-factor-section')),
+  (m) => m.TwoFactorSection,
+);
 
 interface NavEntry {
   to: string;
@@ -316,7 +320,10 @@ function UserMenu({ onShowShortcuts }: { onShowShortcuts: () => void }) {
 export function AppShell() {
   const user = useCurrentUser();
   const { data: config } = usePublicConfig();
-  const { data: unread } = useUnreadCount();
+  // 站点强制两步验证而本账号未绑定：除绑定所需接口外后端都返回 403，只渲染绑定引导，停掉全局轮询
+  const twoFactorBlocked = config?.require2fa === true && !user.twoFactorEnabled;
+  // 配置读到之前不知道是否被拦，先不发未读数请求（配置在启动时已并行预取）
+  const { data: unread } = useUnreadCount(config !== undefined && !twoFactorBlocked);
   const { pathname } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -392,25 +399,23 @@ export function AppShell() {
               : 'pb-[calc(6rem+env(safe-area-inset-bottom))]',
           )}
         >
-          {config?.require2fa && !user.twoFactorEnabled ? (
+          {twoFactorBlocked ? (
             // 后端此时会对除 2FA 绑定以外的接口返回 totp_setup_required(403)，
-            // 继续渲染常规页面只会满屏报错——直接换成阻塞式引导
-            <div className="mx-auto mb-4 max-w-4xl rounded-lg border border-caution/40 bg-caution-soft/40 px-4 py-4 text-sm">
-              <p className="font-medium text-ink">本站要求所有账户开启两步验证</p>
-              <p className="mt-1 text-ink-secondary">
-                完成绑定后才能继续使用邮箱功能。绑定入口在「个人设置 - 安全」。
-              </p>
-              <NavLink
-                to="/profile"
-                className="mt-3 inline-block rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-on-accent hover:bg-accent-hover"
-              >
-                去绑定两步验证
-              </NavLink>
+            // 渲染常规页面只会满屏报错——任何路由都只显示引导与绑定区块，绑定后会话刷新即恢复
+            <div className="mx-auto flex max-w-2xl flex-col gap-4">
+              <div className="rounded-lg border border-caution/40 bg-caution-soft/40 px-4 py-4 text-sm">
+                <p className="font-medium text-ink">本站要求所有账户开启两步验证</p>
+                <p className="mt-1 text-ink-secondary">完成下面的绑定后才能继续使用邮箱功能。</p>
+              </div>
+              <Suspense fallback={<PageLoader />}>
+                <TwoFactorSection />
+              </Suspense>
             </div>
-          ) : null}
-          <Suspense fallback={<PageLoader />}>
-            <Outlet />
-          </Suspense>
+          ) : (
+            <Suspense fallback={<PageLoader />}>
+              <Outlet />
+            </Suspense>
+          )}
         </main>
       </div>
 

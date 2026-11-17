@@ -17,6 +17,8 @@ const key: ApiKeySummary = {
   expiresAt: null,
   lastUsedAt: null,
   createdAt: '2026-10-10T00:00:00Z',
+  allowedMailboxIds: [],
+  allowedDomains: [],
 };
 vi.mock('@/api/resources', () => ({ apiKeyApi: { list: async () => [key], listAll: async () => [] } }));
 vi.mock('@/components/ui/toast', () => ({ toast: vi.fn() }));

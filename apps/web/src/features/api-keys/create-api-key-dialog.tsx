@@ -1,12 +1,13 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ExternalLink, KeyRound } from 'lucide-react';
 import { type FormEvent, useState } from 'react';
 import {
   API_SCOPES,
   type ApiScope,
-  type CreateApiKeyRequest,
+  type CreateApiKeyInput,
   type CreatedApiKey,
   DEFAULT_API_RATE_LIMIT,
+  MAX_ADMIN_KEY_TTL_DAYS,
   MAX_API_RATE_LIMIT,
   createApiKeyRequestSchema,
 } from '@hpc-mail/shared';
@@ -23,6 +24,9 @@ import { Input } from '@/components/ui/input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
+import { useCurrentUser } from '@/lib/use-session';
+import { mailboxesQueryOptions } from '@/features/mailboxes/use-mailboxes';
+import { PasswordInput } from '@/components/ui/password-input';
 
 const SCOPE_LABELS: Record<ApiScope, string> = {
   'mail.read': '读取邮件',
@@ -144,8 +148,37 @@ function CreatedKeyGuide({ created }: { created: CreatedApiKey }) {
   );
 }
 
+/** 限定邮箱：从自己认领的邮箱里勾选；多的时候先按地址筛 */
+function MailboxScopePicker({ selected, onChange }: { selected: number[]; onChange: (ids: number[]) => void }) {
+  const mailboxes = useQuery(mailboxesQueryOptions());
+  const [filter, setFilter] = useState('');
+  const list = (mailboxes.data ?? []).filter((box) => box.address.includes(filter.trim().toLowerCase()));
+  if (mailboxes.isLoading) return <p className="text-xs text-ink-tertiary">正在读取邮箱…</p>;
+  if (!mailboxes.data?.length) return <p className="text-xs text-ink-tertiary">你还没有认领邮箱。</p>;
+  return (
+    <div className="flex flex-col gap-2">
+      <Input aria-label="筛选邮箱" placeholder="按地址筛选" value={filter} onChange={(event) => setFilter(event.target.value)} />
+      <div role="group" aria-label="限定邮箱" className="flex max-h-40 flex-col gap-1 overflow-y-auto rounded-md border border-line p-2">
+        {list.map((box) => (
+          <label key={box.id} className="flex items-center gap-2 text-sm text-ink">
+            <Checkbox
+              checked={selected.includes(box.id)}
+              onCheckedChange={() => onChange(selected.includes(box.id) ? selected.filter((id) => id !== box.id) : [...selected, box.id])}
+            />
+            <span className="truncate">{box.address}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const queryClient = useQueryClient();
+  const isAdmin = useCurrentUser().role === 'admin';
+  const [allowedMailboxIds, setAllowedMailboxIds] = useState<number[]>([]);
+  const [allowedDomainsText, setAllowedDomainsText] = useState('');
+  const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [scopes, setScopes] = useState<ApiScope[]>([...DEFAULT_SCOPES]);
   // 点「自定义」后即便勾选恰好等于某预设也保持自定义高亮，直到再次勾选
@@ -159,7 +192,7 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
   const [confirmClose, setConfirmClose] = useState(false);
 
   const create = useMutation({
-    mutationFn: (payload: CreateApiKeyRequest) => apiKeyApi.create(payload),
+    mutationFn: (payload: CreateApiKeyInput) => apiKeyApi.create(payload),
     onSuccess: (data) => {
       setCreated(data);
       void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.root });
@@ -175,6 +208,9 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
     setAllowedIpsText('');
     setExpiryPreset('never');
     setExpiresAt('');
+    setAllowedMailboxIds([]);
+    setAllowedDomainsText('');
+    setPassword('');
     setError(null);
     setCreated(null);
     setConfirmClose(false);
@@ -220,18 +256,23 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
         return;
       }
     }
-    const parsed = createApiKeyRequestSchema.safeParse({
+    const allowedDomains = allowedDomainsText.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
+    const payload: CreateApiKeyInput = {
       name,
       scopes,
       rateLimit,
       allowedIps,
       expiresAt: expiryFromPreset(expiryPreset, expiresAt),
-    });
+      allowedMailboxIds,
+      allowedDomains,
+      password,
+    };
+    const parsed = createApiKeyRequestSchema.safeParse(payload);
     if (!parsed.success) {
       setError(parsed.error.issues[0]?.message ?? '请检查输入');
       return;
     }
-    create.mutate(parsed.data);
+    create.mutate(payload);
   };
 
   return (
@@ -287,7 +328,8 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
                       className="w-full [&>button]:flex-1 [&>button]:justify-center [&>button]:px-2"
                     />
                     <div className="grid grid-cols-2 gap-2">
-                      {API_SCOPES.map((scope) => (
+                      {/* admin 只有管理员能授予 */}
+                      {API_SCOPES.filter((scope) => scope !== 'admin' || isAdmin).map((scope) => (
                         <label
                           key={scope}
                           className="flex items-center gap-2 rounded-md border border-line px-3 py-2 text-sm text-ink"
@@ -302,7 +344,32 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
                         {domainNote.text}
                       </p>
                     )}
+                    {scopes.includes('admin') && (
+                      <p className="text-xs text-caution">
+                        「管理员能力」让这把密钥能看全站邮件、用任意邮箱发信。必须设置 IP 白名单，有效期不超过 {MAX_ADMIN_KEY_TTL_DAYS} 天。
+                        不勾选时，你的密钥与普通用户的权限相同。
+                      </p>
+                    )}
                   </div>
+                  <details className="rounded-md border border-line px-3 py-2">
+                    <summary className="cursor-pointer text-sm font-medium text-ink">限定邮箱或域名（可选）</summary>
+                    <div className="mt-3 flex flex-col gap-3">
+                      <p className="text-xs text-ink-tertiary">
+                        都不选表示不限。选了之后这把密钥只能读写、发信、等待这些邮箱或域名下的邮件；只选邮箱时不能认领新地址。
+                      </p>
+                      <MailboxScopePicker selected={allowedMailboxIds} onChange={setAllowedMailboxIds} />
+                      <FormField label="限定域名" description="逗号分隔；域名下的全部地址（含之后新认领的）都可用">
+                        {(field) => (
+                          <Input
+                            {...field}
+                            placeholder="example.com"
+                            value={allowedDomainsText}
+                            onChange={(event) => setAllowedDomainsText(event.target.value)}
+                          />
+                        )}
+                      </FormField>
+                    </div>
+                  </details>
                   <FormField label="速率限制" description="每分钟最大请求数">
                     {(field) => (
                       <Input
@@ -347,13 +414,23 @@ export function CreateApiKeyDialog({ open, onOpenChange }: { open: boolean; onOp
                       </p>
                     )}
                   </div>
+                  <FormField label="当前密码" required description="创建密钥前需要确认是你本人">
+                    {(field) => (
+                      <PasswordInput
+                        {...field}
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={(event) => setPassword(event.target.value)}
+                      />
+                    )}
+                  </FormField>
                   {error && <p role="alert" className="text-sm text-critical">{error}</p>}
                 </DialogBody>
                 <DialogFooter>
                   <Button type="button" variant="secondary" onClick={requestClose}>
                     取消
                   </Button>
-                  <Button type="submit" loading={create.isPending} disabled={scopes.length === 0}>
+                  <Button type="submit" loading={create.isPending} disabled={scopes.length === 0 || !password}>
                     创建
                   </Button>
                 </DialogFooter>

@@ -61,16 +61,16 @@ export async function updatePrefsWithForwardConfirmation(
   const desired = [...new Set(patch.forward.addresses.map(normalizeEmail).filter(Boolean))];
   const keep = desired.filter((address) => confirmed.has(address));
   const added = desired.filter((address) => !confirmed.has(address));
-  if (added.length || (patch.forward.enabled && !current.forward.enabled)) {
-    await verifyReauthPassword(env, user.id, patch.password);
-  }
-
   const now = Date.now();
   const { results: existing } = await env.db.prepare('SELECT address, expires_at FROM forward_confirmations WHERE user_id = ?')
     .bind(user.id).all<{ address: string; expires_at: number }>();
   const stillPending = new Set(existing.filter((row) => Number(row.expires_at) > now).map((row) => row.address));
   // 已在等待确认且未过期的不重发；过期或新加的重新生成 token 并发信
   const toSend = added.filter((address) => !stillPending.has(address));
+  // 要发新确认信，或把转发从关改为开时重新验证密码；只是保留已在等待确认的地址不需要
+  if (toSend.length || (patch.forward.enabled && !current.forward.enabled)) {
+    await verifyReauthPassword(env, user.id, patch.password);
+  }
   if (toSend.length) {
     const window = dayWindow();
     const counted = await bumpCounter(env, FORWARD_CONFIRM_SCOPE, String(user.id), window, toSend.length);

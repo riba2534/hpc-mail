@@ -134,9 +134,10 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
     expect(mail.text).toContain(user.username);
     const token = tokenOf(mail.text)!;
     expect(token).toBeTruthy();
-    // 再保存同样的列表不重发、不要密码之外的东西变化
+    // 再保存同样的列表（地址仍在等待确认）不重发，也不需要密码
     const sentBefore = captured.length;
-    await data(await request('/api/me/notify-prefs', json(user.jwt, { ...body, password: TEST_PASSWORD }, 'PUT')));
+    expect((await data<NotifyPrefsView>(await request('/api/me/notify-prefs', json(user.jwt, body, 'PUT')))).forwardPending.map((item) => item.address))
+      .toEqual([target]);
     expect(captured.length).toBe(sentBefore);
 
     expect((await data<{ address: string }>(await request('/api/forward-confirmations/confirm', json('', { token })))).address).toBe(target);

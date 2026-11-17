@@ -66,11 +66,22 @@ const AdminAddressMailPage = page(
   (m) => m.AdminAddressMailPage,
 );
 
+const ForwardConfirmPage = page(
+  preloadable(() => import('@/features/forward-confirm/forward-confirm-page')),
+  (m) => m.ForwardConfirmPage,
+);
+
 export const router = createBrowserRouter([
   {
     path: '/login',
     // 登录页静态打进入口：未登录首屏不再多一跳 chunk 请求
     element: <LoginPage />,
+    errorElement: <RouteErrorPage />,
+  },
+  {
+    // 转发目标确认（公开，目标邮箱的主人多半没有本站账号）
+    path: '/forward/confirm',
+    element: <ForwardConfirmPage />,
     errorElement: <RouteErrorPage />,
   },
   {
