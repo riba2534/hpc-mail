@@ -4,10 +4,12 @@ import { onError, requestId } from './middleware/error.js';
 import adminApiKeys from './routes/admin/api-keys.js';
 import adminHostedDomains from './routes/admin/hosted-domains.js';
 import adminAudit from './routes/admin/audit.js';
+import adminDeliveryEvents from './routes/admin/delivery-events.js';
 import adminInvites from './routes/admin/invites.js';
 import adminMailboxShares from './routes/admin/mailbox-shares.js';
 import adminMailboxes from './routes/admin/mailboxes.js';
 import adminSettings from './routes/admin/settings.js';
+import adminSuppressions from './routes/admin/suppressions.js';
 import adminUsers from './routes/admin/users.js';
 import apiKeys from './routes/api-keys.js';
 import attachments from './routes/attachments.js';
@@ -58,6 +60,8 @@ export function createApp() {
   api.route('/admin/invites', adminInvites);
   api.route('/admin/api-keys', adminApiKeys);
   api.route('/admin/audit-logs', adminAudit);
+  api.route('/admin/suppressions', adminSuppressions);
+  api.route('/admin/delivery-events', adminDeliveryEvents);
 
   app.route('/api', api);
   app.route('/v1', v1);
