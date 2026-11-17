@@ -36,6 +36,8 @@ export const ERROR_CODES = [
   'idempotency_mismatch',
   /** 同一 Idempotency-Key 的发送正在处理或结果待确认：先查询原结果，不要换 Key 重发 */
   'send_in_progress',
+  /** 回复或转发引用的原邮件不存在、不可见，或其附件已不可用（404）：去掉引用后可作为新邮件发送 */
+  'source_unavailable',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -58,5 +60,6 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   payload_too_large: 413,
   idempotency_mismatch: 409,
   send_in_progress: 409,
+  source_unavailable: 404,
   internal: 500,
 };
