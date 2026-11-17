@@ -1,5 +1,5 @@
 import {
-  API_SCOPES, ERROR_CODES, MAX_BATCH_CLAIM, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
+  API_SCOPES, ERROR_CODES, ROLES, USER_STATUSES, MAX_BATCH_CLAIM, MAX_BODY_BYTES, MAX_RECIPIENTS, MAX_ATTACHMENTS, SINGLE_UPLOAD_THRESHOLD_BYTES, MULTIPART_PART_BYTES,
   SETTING_SCHEMAS, batchMailboxRequestSchema, claimMailboxRequestSchema, updateMailboxRequestSchema, transferMailboxRequestSchema,
   adminBatchClaimRequestSchema, adminBatchReleaseRequestSchema, adminBatchTransferRequestSchema, adminBatchShareRequestSchema,
   internalSendMailSchema, apiMarkReadRequestSchema, markReadRequestSchema, markAllReadRequestSchema, deleteMessagesRequestSchema, starMessagesRequestSchema,
@@ -54,6 +54,11 @@ export const str: Schema = { type: 'string' };
 export const int: Schema = { type: 'integer', minimum: 0 };
 export const positiveId: Schema = { type: 'integer', minimum: 1 };
 export const bool: Schema = { type: 'boolean' };
+/** 查询参数里的开关：1/true 与 0/false */
+export const boolFlag: Schema = { type: 'string', enum: ['1', 'true', '0', 'false'] };
+export const roleEnum: Schema = { type: 'string', enum: [...ROLES] };
+const userStatusEnum: Schema = { type: 'string', enum: [...USER_STATUSES] };
+const errorCode: Schema = { type: 'string', enum: ERROR_CODES };
 export const date: Schema = { type: 'string', format: 'date-time' };
 export const domainName: Schema = { type: 'string', minLength: 1, maxLength: 253,
   pattern: '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$',
@@ -262,7 +267,7 @@ const mailbox = object({ id: positiveId, address: str, domain: str, userId: posi
 ['ownerUsername', 'canSend']);
 const sendIdentityReason = { type: 'string', enum: ['hosted_sending_not_ready', 'hosted_domain_unavailable', 'shared_readonly'],
   description: 'hosted_sending_not_ready: the hosted domain’s sending is not ready yet; hosted_domain_unavailable: the hosted domain is suspended, moved or being deleted; shared_readonly: a mailbox shared with the caller is read-only and can never send.' };
-const user = object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'] }, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
+const user = object({ id: positiveId, username: str, role: roleEnum, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
 const { twoFactorEnabled: _twoFactorEnabled, ...adminUserProperties } = user.properties as Record<string, Schema>;
 const keyScopes: Schema = { ...array({ type: 'string', enum: API_SCOPES }),
   description: 'admin is a capability flag: only administrators can grant it, it requires allowedIps and an expiry at most 90 days ahead, and only with it does an administrator key act as administrator (cross-user scopes, all=1, any mailboxId as sender, outbound-quota exemption). Without it an administrator key acts as an ordinary user.' };
@@ -352,7 +357,7 @@ function systemDomainSchemas(): Record<string, Schema> {
 
 /** 批量托管域名的结果：items 与请求顺序一一对应，每项成功带最新视图，失败带与错误信封相同的 code/message/fix */
 function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
-  const error = object({ code: { type: 'string', enum: ERROR_CODES }, message: str, fix: str, docs: str }, ['fix', 'docs']);
+  const error = object({ code: errorCode, message: str, fix: str, docs: str }, ['fix', 'docs']);
   return object({
     items: { ...array({ anyOf: [
       object({ ...key, ok: { type: 'boolean', const: true }, hostedDomain: ref('HostedDomain') }),
@@ -395,7 +400,7 @@ const draft = object({ ...draftSummaryProperties, replyTo: array(ref('MailAddres
     disposition: { type: 'string', enum: ['attachment', 'inline'] } })) });
 
 /** 错误信封里的 error 对象：统一错误信封与批量发送的逐项结果共用 */
-const errorObjectSchema: Schema = object({ code: { type: 'string', enum: ERROR_CODES,
+const errorObjectSchema: Schema = object({ code: { ...errorCode,
     description: 'Stable machine-readable code; branch on it, not on message. header_not_allowed (400): headers contains a name that cannot be set; details.headers lists every rejected name. payload_too_large (413): the request or attachments exceed a limit; upload large files and use attachmentTokens. idempotency_mismatch (409): this Idempotency-Key was already used for different send content; check the original send, then use a new key for new content. send_in_progress (409): the send for this key is still processing or its result is unconfirmed; check the outbox and retry later with the same key, never a fresh one. source_unavailable (404): the message referenced by replyToMessageId or forwardAttachmentsFrom does not exist or is not visible, or a forwarded attachment is lost; details.source says which (reply or forward), so remove only that reference to send a new message. delivery_failed (422): every recipient definitely failed and nothing was delivered (the provider rejected each one, or the server failed before delivery started); details.messageId is the recorded outbound message and details.recipientOutcomes the reasons; the same key replays the same 422. Recipients whose result is uncertain (provider timeout, network error) are not failures: that response is 201 with status unknown. recipient_suppressed (422): every recipient is on this site’s suppression list for the sender’s domain after an earlier bounce or spam complaint; nothing was sent, no outbound message was recorded, no quota was used and the Idempotency-Key is released; details.suppressed lists each address with its reason and expiry. attachment_url_forbidden (400): a URL attachment points to a disallowed address (not https, credentials, non-443 port, private/loopback/link-local/metadata/reserved IP or a hostname resolving to one, or this site); details.url names it. attachment_url_fetch_failed (422): fetching a URL attachment failed (DNS, timeout, non-2xx, too many redirects, empty or length mismatch); details.url names it. draft_state_conflict (409): the draft status does not allow the operation (sending cannot be changed or deleted, sent cannot be changed) or expectedVersion is stale; details.draftStatus and details.draftVersion give the current state. draft_limit_reached (409): too many unsent drafts; send or delete some first.' },
     message: { ...str, description: 'Human-readable Chinese explanation; wording may change.' },
     fix: { ...str, description: 'Optional: one actionable correction, e.g. which scope to add or which endpoint to call first.' },
@@ -433,9 +438,9 @@ export const schemas: Record<string, Schema> = {
   BatchClaimMailboxResult: object({ claimed: array(ref('Mailbox')),
     taken: { ...array(ref('ClaimMailboxRequest')), description: 'Skipped because the address is already claimed; request order.' },
     notAttempted: { ...array(ref('ClaimMailboxRequest')), description: 'Not attempted after stoppedBy, including the item that stopped the batch; request order.' },
-    stoppedBy: nullable(object({ code: { type: 'string', enum: ERROR_CODES }, message: str })) }),
+    stoppedBy: nullable(object({ code: errorCode, message: str })) }),
   UserSearchResults: object({ items: array(object({ id: positiveId, username: str,
-    role: { type: 'string', enum: ['admin', 'user'], description: 'Only in the administrator user search.' } }, ['role'])), hasMore: bool }),
+    role: { ...roleEnum, description: 'Only in the administrator user search.' } }, ['role'])), hasMore: bool }),
   MailboxTransferResult: object({ mailbox: ref('Mailbox'), previousUserId: positiveId, transferred: bool, revokedShares: int }),
   AdminBatchClaimRequest: fromZod(adminBatchClaimRequestSchema), AdminBatchReleaseRequest: fromZod(adminBatchReleaseRequestSchema),
   AdminBatchTransferRequest: fromZod(adminBatchTransferRequestSchema), AdminBatchShareRequest: fromZod(adminBatchShareRequestSchema),
@@ -443,7 +448,7 @@ export const schemas: Record<string, Schema> = {
     results: { ...array(object({ address: str,
       status: { type: 'string', enum: ['done', 'unchanged', 'failed'], description: 'done: applied; unchanged: already in the requested state (already owned by the target user, or every user already in or already absent from the list); failed: not applied, see error.' },
       mailboxId: nullable(positiveId), ownerId: { ...nullable(positiveId), description: 'Owner before this request; null when the mailbox does not exist.' },
-      error: { ...nullable(object({ code: { type: 'string', enum: ERROR_CODES }, message: str })),
+      error: { ...nullable(object({ code: errorCode, message: str })),
         description: 'Only for failed: not_found (no such claimed mailbox), conflict (the owner differs from expectedOwnerId), forbidden or validation_failed (not allowed for the target user, or the share list is full).' },
       deletedMessages: { ...int, description: 'release: history messages deleted (0 unless deleteHistory).' },
       revokedShares: { ...int, description: 'release and transfer: shares revoked; unshare: users removed.' },
@@ -469,8 +474,8 @@ export const schemas: Record<string, Schema> = {
     key: object({ id: positiveId, name: str, keyPrefix: str, keySuffix: str, scopes: keyScopes,
       rateLimit: { ...positiveId, description: 'Requests per minute for this key.' }, allowedIps: array(str), expiresAt: nullable(date), createdAt: date,
       ...keyRestriction,
-      effectiveRole: { type: 'string', enum: ['admin', 'user'], description: 'The role this key acts with: admin only when the owner is an administrator and the key has the admin scope.' } }),
-    user: object({ id: positiveId, username: str, role: { type: 'string', enum: ['admin', 'user'], description: 'The owner account role; see key.effectiveRole for what this key may do.' } }),
+      effectiveRole: { ...roleEnum, description: 'The role this key acts with: admin only when the owner is an administrator and the key has the admin scope.' } }),
+    user: object({ id: positiveId, username: str, role: { ...roleEnum, description: 'The owner account role; see key.effectiveRole for what this key may do.' } }),
     limits: object({
       userRequestsPerMinute: { ...positiveId, description: 'Requests per minute across all keys of this user.' },
       waitPollsPerMinute: { ...positiveId, description: 'GET /messages/wait polls per user per minute.' },
@@ -484,7 +489,7 @@ export const schemas: Record<string, Schema> = {
   }),
   MailboxShareGrant: object({ mailboxId: positiveId, address: str, domain: str, displayName: str,
     ownerUserId: positiveId, ownerUsername: str,
-    grantees: array(object({ userId: positiveId, username: str, grantedAt: date, status: { type: 'string', enum: ['active', 'disabled'] } })) }),
+    grantees: array(object({ userId: positiveId, username: str, grantedAt: date, status: userStatusEnum })) }),
   ClaimPlan: object({
     strategy: { type: 'string', enum: ['uniform', 'claude'] },
     items: { ...array(object({ domain: str, suspended: { ...int, description: 'Addresses on this domain that received a Claude suspension email, judged from historical official mail.' } })),
@@ -506,7 +511,7 @@ export const schemas: Record<string, Schema> = {
   LoginResponse: object({ token: { ...str, description: 'Bearer JWT session token; store securely and never include it in published logs.' }, user: ref('SessionUser') }),
   ChangePasswordResponse: object({ token: { ...str, description: 'Replacement JWT session token; previous sessions of this user are invalid.' }, user: ref('SessionUser'),
     revokedApiKeys: { ...int, description: 'API keys revoked by this change; 0 when revokeApiKeys was false or none were active.' } }),
-  AdminUser: object({ ...adminUserProperties, status: { type: 'string', enum: ['active', 'disabled'] },
+  AdminUser: object({ ...adminUserProperties, status: userStatusEnum,
     mailboxCount: int, mailboxes: array(str), mailboxPolicy: nullable(fromZod(userMailboxPolicySchema)), mailboxPolicyRevision: int,
     apiKeyCount: int, lastLoginAt: nullable(date) }),
   ApiKeySummary: apiKey,
@@ -564,7 +569,7 @@ export const schemas: Record<string, Schema> = {
       expiresAt: { ...nullable(date), description: 'While pending, the domain is deleted automatically if the nameservers are not changed by this time.' },
     });
   })(),
-  HostedDomainMember: object({ userId: positiveId, username: str, status: { type: 'string', enum: ['active', 'disabled'] }, grantedAt: date,
+  HostedDomainMember: object({ userId: positiveId, username: str, status: userStatusEnum, grantedAt: date,
     mailboxCount: { ...int, description: 'Addresses this member claimed on the domain.' } }),
   HostedDomainTransferResult: object({ domain: ref('HostedDomain'), previousUserId: positiveId, transferred: bool,
     movedMailboxes: { ...int, description: 'Mailboxes of the previous owner moved with the domain when includeMailboxes was true.' } }),
@@ -702,11 +707,11 @@ const listFilterQuery = [
   query('until', isoTimeQuery, 'Only mail with createdAt before this time (exclusive). With since, since must be earlier.'),
   query('from', addressFilterQuery, 'Sender filter, case-insensitive: a full address matches fromAddress exactly; @domain matches that exact domain (subdomains excluded).'),
   query('to', addressFilterQuery, 'Recipient filter with the same address/@domain rule: outbound mail matches To/Cc/Bcc; inbound mail matches the receiving address or the original To/Cc.'),
-  query('hasCode', { type: 'string', enum: ['1', 'true', '0', 'false'] }, '1/true: only mail with a verification code recognized when it was received (the stored code). 0/false applies no filter.'),
-  query('hasAttachments', { type: 'string', enum: ['1', 'true', '0', 'false'] }, '1/true: only mail with attachments, same rule as hasAttachments in summaries (inline body images do not count). 0/false applies no filter.'),
+  query('hasCode', boolFlag, '1/true: only mail with a verification code recognized when it was received (the stored code). 0/false applies no filter.'),
+  query('hasAttachments', boolFlag, '1/true: only mail with attachments, same rule as hasAttachments in summaries (inline body images do not count). 0/false applies no filter.'),
 ];
 export const listQuery = [query('direction', { type: 'string', enum: ['inbound', 'outbound'] }), query('domain', str), query('address', str),
-  ...['unread', 'starred', 'trash'].map(name => query(name, { type: 'string', enum: ['1', 'true', '0', 'false'] })),
+  ...['unread', 'starred', 'trash'].map(name => query(name, boolFlag)),
   query('q', { type: 'string', maxLength: 256 }, 'Case-insensitive literal substring of subject, sender address/name, recipients and the first 4 KB of the body text (HTML-only mail: its text content); Unicode is supported. Text further into the body is not searched.'),
   ...scopeQuery, query('afterId', int, 'Only IDs greater than this value; 0 starts from the beginning. Never advance past unprocessed messages.'),
   ...listFilterQuery, ...pageQuery];
