@@ -13,7 +13,8 @@ import {
   claimSettingsStatement, mailboxPolicyUserFromResult, mailboxPolicyUserStatement, resolveMailboxPolicy,
   type ClaimSettings, type MailboxPolicyUser,
 } from './mailbox-policy.js';
-import { hostedSendBlock } from './domain.js';
+import { hostedSendBlock, USABLE_HOSTED_SQL } from './domain.js';
+import { systemDomainListedSql } from './domain-occupancy.js';
 import { getSettingsFresh, mergeSettingRows } from './setting.js';
 import { purgeStatements } from './message-lifecycle.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
@@ -179,7 +180,7 @@ function hostedAccessFromResult(result: D1Result | undefined): Map<string, Hoste
  * 绑定顺序：域名、角色、用户 id、用户 id。
  */
 const HOSTED_CLAIM_GUARD_SQL = `EXISTS (SELECT 1 FROM hosted_domains h WHERE h.domain = ?
-  AND h.status IN (${HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ')})
+  AND h.status IN (${USABLE_HOSTED_SQL})
   AND (? = 'admin' OR h.user_id = ? OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?)))`;
 
 const CLAUDE_SUSPENDED_MESSAGE = '该域名有 Claude 封号记录，不能在 Claude 0 封号模式下认领';
@@ -350,10 +351,7 @@ async function claimWithContext(env: Env, context: ClaimContext, req: ClaimMailb
              AND (? = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE user_id = ? AND domain = ?) < ?)
              AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ?
              AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND role = ? AND mailbox_policy_revision = ?)
-             AND EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
-               WHERE settings.key = 'domains'
-                 AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
-                   ELSE json_extract(configured.value, '$.domain') END)) = ?)
+             AND ${systemDomainListedSql('?')}
              AND (? = 0 OR NOT EXISTS (SELECT 1 FROM claude_address_facts WHERE domain = ? AND suspended > 0))
            ${returning}`,
         )
@@ -492,11 +490,9 @@ const BATCH_CLAIM_PLAN_SQL = `WITH
         OR (hosted = 0 AND COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) != ?4)
         OR NOT EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active' AND role = ?5
           AND (counted.hosted = 1 OR mailbox_policy_revision = ?6))
-        OR (hosted = 0 AND NOT EXISTS (SELECT 1 FROM settings, json_each(settings.value, '$.list') AS configured
-          WHERE settings.key = 'domains' AND lower(trim(CASE WHEN configured.type = 'text' THEN configured.value
-            ELSE json_extract(configured.value, '$.domain') END)) = counted.domain))
+        OR (hosted = 0 AND NOT ${systemDomainListedSql('counted.domain')})
         OR (hosted = 1 AND NOT EXISTS (SELECT 1 FROM hosted_domains h WHERE h.domain = counted.domain
-          AND h.status IN (${HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ')})
+          AND h.status IN (${USABLE_HOSTED_SQL})
           AND (?5 = 'admin' OR h.user_id = ?2
             OR EXISTS (SELECT 1 FROM hosted_domain_members m WHERE m.domain_id = h.id AND m.user_id = ?2))))
       ) THEN 'guard'
@@ -857,7 +853,6 @@ export async function resolveNotifyOwnerIds(env: Env, address: string): Promise<
   return rows.results.map((row) => Number(row.id));
 }
 
-const USABLE_HOSTED_SQL = HOSTED_DOMAIN_USABLE_STATUSES.map((status) => `'${status}'`).join(', ');
 
 /**
  * 托管域名收件（?1 = 收件地址，?2 = 域名）：未认领的地址先认领给域名所有者，邮件随即出现在他的收件箱。
