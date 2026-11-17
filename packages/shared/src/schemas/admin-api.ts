@@ -145,9 +145,14 @@ export interface ClaudeAddressFacts {
   paid: boolean;
   suspended: boolean;
   suspendedAt: string | null;
-  /** Anthropic 登录链接邮件（含回收站）的数量与最近一封的时间 */
-  loginMails: number;
-  lastLoginAt: string | null;
+  /**
+   * 收到的 Anthropic / Claude 邮件数（发件域为 anthropic.com、claude.com 及其子域，含回收站，不含已永久删除的），
+   * 以及最近一封的时间。cmu 运维说的「有登录记录」即 anthropicMails > 0
+   */
+  anthropicMails: number;
+  lastAnthropicMailAt: string | null;
+  /** 其中登录链接邮件（主题以 `Secure link to log in to Claude` 或 `Your secure link to Claude` 开头）的数量 */
+  loginLinkMails: number;
   /** 按收到时间升序 */
   receipts: ClaudeReceipt[];
   /** 最近一张能识别金额的收据对应的档位 */
