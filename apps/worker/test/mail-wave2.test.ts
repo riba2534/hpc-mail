@@ -321,7 +321,7 @@ describe('wait 过滤与 scannedThroughId', () => {
     const m2 = await mail(address, { fromAddress: 'noreply@github.com', subject: 'Welcome aboard', preview: 'hello there' });
     const m3 = await mail(address, { fromAddress: 'security@github.com', subject: '[GitHub] Verify sign in', preview: 'Your verification code is 482913', verificationCode: '482913' });
     const m4 = await mail(address, { fromAddress: 'login@other.example', subject: 'Login code', preview: 'Your login code: 774411', verificationCode: '774411' });
-    const next = (filters: Parameters<typeof findNextMessage>[2]) => findNextMessage(env, viewer, { address, ...filters });
+    const next = (filters: Parameters<typeof findNextMessage>[2]) => findNextMessage(env, viewer, { address: [address], ...filters });
 
     expect(await next({ afterId: base })).toMatchObject({ message: { id: m1 }, scannedThroughId: m1 });
     expect(await next({ afterId: base, from: '@github.com' })).toMatchObject({ message: { id: m2 }, scannedThroughId: m2 });
@@ -360,14 +360,14 @@ describe('wait 过滤与 scannedThroughId', () => {
     const base = await maxMessageId();
     const fresh = await mail(address, { subject: 'Sign in to Example', preview: 'Use the code below' });
     const later = await mail(address, { subject: 'Your code', preview: 'Your verification code is 135790', verificationCode: '135790' });
-    expect(await findNextMessage(env, viewer, { afterId: base, address, hasCode: true })).toEqual({ message: null, scannedThroughId: base });
+    expect(await findNextMessage(env, viewer, { afterId: base, address: [address], hasCode: true })).toEqual({ message: null, scannedThroughId: base });
     await createDb(env).update(messages).set({ createdAt: new Date(Date.now() - 60_000) }).where(eq(messages.id, fresh));
-    expect(await findNextMessage(env, viewer, { afterId: base, address, hasCode: true })).toMatchObject({ message: { id: later }, scannedThroughId: later });
+    expect(await findNextMessage(env, viewer, { afterId: base, address: [address], hasCode: true })).toMatchObject({ message: { id: later }, scannedThroughId: later });
 
     await baseSettings({ code_extract: { enabled: true, aiEnabled: true }, ai_model: { baseUrl: '', apiKey: '', model: '' } });
     await mail(address, { subject: 'Sign in again', preview: 'Use the code below' });
     const coded = await mail(address, { subject: 'Your code', preview: 'Your verification code is 246813', verificationCode: '246813' });
-    expect(await findNextMessage(env, viewer, { afterId: later, address, hasCode: true })).toMatchObject({ message: { id: coded }, scannedThroughId: coded });
+    expect(await findNextMessage(env, viewer, { afterId: later, address: [address], hasCode: true })).toMatchObject({ message: { id: coded }, scannedThroughId: coded });
     await baseSettings();
   });
 });

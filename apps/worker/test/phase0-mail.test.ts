@@ -183,7 +183,7 @@ describe('X03 wait 不越过附件未就绪的收件', () => {
     const base = await maxMessageId();
     const pending = await mail(owner.address, { fromAddress: 'billing@vendor.example', subject: 'Invoice attached', status: 'pending' });
     const later = await mail(owner.address, { fromAddress: 'login@other.example', subject: 'Your code', preview: 'Your verification code is 135790', verificationCode: '135790' });
-    const next = (filters: Omit<Parameters<typeof findNextMessage>[2], 'address'>) => findNextMessage(env, viewer, { address: owner.address, ...filters });
+    const next = (filters: Omit<Parameters<typeof findNextMessage>[2], 'address'>) => findNextMessage(env, viewer, { address: [owner.address], ...filters });
 
     expect(await next({ afterId: base })).toEqual({ message: null, scannedThroughId: base });
     expect(await next({ afterId: base, from: '@vendor.example' })).toEqual({ message: null, scannedThroughId: base });

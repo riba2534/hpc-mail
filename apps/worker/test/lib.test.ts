@@ -80,11 +80,12 @@ describe('pagination', () => {
   it('编解码往返', () => {
     expect(decodeCursor(encodeCursor(42))).toBe(42);
   });
-  it('非法游标返回 null', () => {
+  it('没传为首页，传了但非法报 validation_failed', () => {
     expect(decodeCursor(undefined)).toBeNull();
-    expect(decodeCursor('!!!not base64!!!')).toBeNull();
-    expect(decodeCursor(btoa('-3'))).toBeNull();
-    expect(decodeCursor(btoa('abc'))).toBeNull();
+    expect(decodeCursor('')).toBeNull();
+    for (const bad of ['!!!not base64!!!', btoa('-3'), btoa('abc'), btoa('0'), btoa('1.5')]) {
+      expect(() => decodeCursor(bad), bad).toThrow(expect.objectContaining({ code: 'validation_failed' }));
+    }
   });
 });
 
