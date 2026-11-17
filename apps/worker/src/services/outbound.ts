@@ -36,7 +36,7 @@ import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
 import { assertHostedSendable, getRoutableDomains } from './domain.js';
-import { resolveDeliveryOwners } from './mailbox.js';
+import { HOSTED_SEND_CLAIM_SQL, resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { bumpCounter, dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
@@ -257,12 +257,13 @@ async function resolveFrom(
     throw new AppError('validation_failed', '发件域名不在系统域名列表内');
   }
   if (sender.role !== 'admin') {
-    const owned = await db
-      .select({ id: mailboxes.id })
-      .from(mailboxes)
-      .where(and(eq(mailboxes.address, address), eq(mailboxes.userId, sender.userId)))
-      .get();
-    if (!owned) throw new AppError('forbidden', '只能使用自己认领的地址发件', FORBIDDEN_SENDER);
+    // 托管域名所有者可用本域任意前缀：未认领的地址先认领给他（成员与共享不适用），与归属查询同一次往返
+    const [, owner] = await env.db.batch([
+      env.db.prepare(HOSTED_SEND_CLAIM_SQL).bind(address, domain, sender.userId),
+      env.db.prepare('SELECT user_id FROM mailboxes WHERE address = ?').bind(address),
+    ]);
+    const ownerId = (owner?.results?.[0] as { user_id: number } | undefined)?.user_id;
+    if (Number(ownerId) !== sender.userId) throw new AppError('forbidden', '只能使用自己认领的地址发件', FORBIDDEN_SENDER);
   }
   const displayName = (req.from.displayName || req.from.localPart!).trim();
   assertNoHeaderInjection(displayName);
