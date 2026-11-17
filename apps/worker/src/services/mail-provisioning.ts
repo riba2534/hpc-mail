@@ -144,11 +144,17 @@ function readFailure(key: SystemDomainCheckKey, label: string, error: unknown): 
   return check(key, 'unknown', 'blocker', title, { current: errorText(error), impact });
 }
 
-function check(
+export function check(
   key: SystemDomainCheckKey, state: SystemDomainCheckState, severity: SystemDomainSeverity, title: string,
   extra: Partial<Omit<SystemDomainCheck, 'key' | 'state' | 'severity' | 'title'>> = {},
 ): SystemDomainCheck {
   return { key, state, severity, ack: null, danger: false, title, current: null, proposed: null, impact: '', records: [], ...extra };
+}
+
+/** inspect 的全部 Cloudflare 读取（zone 未激活时跳过的为 null） */
+export function inspectionReads(inspection: MailInspection): (CfRead<unknown> | null)[] {
+  return [inspection.routing, inspection.catchAll, inspection.rules, inspection.apex, inspection.dmarc, inspection.dkim,
+    inspection.bounce, inspection.sending];
 }
 
 /** 分页读取：失败或未取全都按读取失败处理 */
@@ -277,8 +283,7 @@ export async function planMailChanges(inspection: MailInspection, policy: Provis
   }
 
   // token：任一读取 401 说明凭据失效
-  const reads = [inspection.routing, inspection.catchAll, inspection.rules, inspection.apex, inspection.dmarc, inspection.dkim, inspection.bounce, inspection.sending];
-  const unauthorized = reads.find((r) => r && !r.ok && apiError(r.error)?.status === 401);
+  const unauthorized = inspectionReads(inspection).find((r) => r && !r.ok && apiError(r.error)?.status === 401);
   checks.push(unauthorized && !unauthorized.ok
     ? check('token', 'conflict', 'blocker', '本站 Cloudflare 凭据已失效', { current: errorText(unauthorized.error), impact: '站长需要更新 Worker 的 Cloudflare 凭据（CF_HOSTED_DOMAINS_TOKEN）后重新检测' })
     : check('token', 'ok', 'none', 'Cloudflare 凭据可用'));

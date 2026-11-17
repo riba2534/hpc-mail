@@ -6,7 +6,7 @@
  */
 import {
   DEFAULT_SETTINGS, SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_ZONE_CATEGORIES, domainSchema,
-  type DnssecState, type SystemDomainAck, type SystemDomainCheck, type SystemDomainCheckKey, type SystemDomainCheckState,
+  type DnssecState, type SystemDomainAck, type SystemDomainCheck, type SystemDomainCheckKey,
   type SystemDomainHiddenZones, type SystemDomainOnboardingMode, type SystemDomainOnboardingSummary, type SystemDomainPrecheck,
   type SystemDomainRegistrar, type SystemDomainSeverity, type SystemDomainVerdict, type SystemDomainZone, type SystemDomainZoneCategory,
   type SystemDomainZoneOrigin, type SystemDomainZoneReadiness, type SystemDomainZonesQuery, type SystemDomainZonesView,
@@ -31,7 +31,8 @@ import {
   systemDomainListedSql,
 } from './domain-occupancy.js';
 import {
-  dnssecState, fingerprintOf, INSPECT_CF_CALLS, inspectMailConfig, lookupRegistrar, planMailChanges, type MailInspection, type MailPlan,
+  check, dnssecState, fingerprintOf, INSPECT_CF_CALLS, inspectionReads, inspectMailConfig, lookupRegistrar, planMailChanges,
+  type MailInspection, type MailPlan,
 } from './mail-provisioning.js';
 import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
 import { mergeSettingRows } from './setting.js';
@@ -209,8 +210,7 @@ export async function occupancyFacts(env: Env, domain: string, excludeId = 0): P
 export function makeCheck(
   key: SystemDomainCheckKey, severity: SystemDomainSeverity, title: string, extra: Partial<SystemDomainCheck> = {},
 ): SystemDomainCheck {
-  const state: SystemDomainCheckState = severity === 'blocker' ? 'conflict' : 'ok';
-  return { key, state, severity, ack: null, danger: false, title, current: null, proposed: null, impact: '', records: [], ...extra };
+  return { ...check(key, severity === 'blocker' ? 'conflict' : 'ok', severity, title), ...extra };
 }
 
 /** 三方占用与列表容量（new_zone 另看等待 NS 的 zone 配额，与托管共用 hosted_domains.maxPendingTotal） */
@@ -301,8 +301,7 @@ function assemble(parts: EvaluationParts, inspection: MailInspection | null, pla
 
 /** inspect 中读取失败的错误（用来发现 429） */
 function inspectionErrors(inspection: MailInspection): unknown[] {
-  return [inspection.routing, inspection.catchAll, inspection.rules, inspection.apex, inspection.dmarc, inspection.dkim,
-    inspection.bounce, inspection.sending].flatMap((read) => (read && !read.ok ? [read.error] : []));
+  return inspectionReads(inspection).flatMap((read) => (read && !read.ok ? [read.error] : []));
 }
 
 /**

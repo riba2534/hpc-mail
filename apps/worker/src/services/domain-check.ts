@@ -1,8 +1,8 @@
 import type { DomainOnboardingStatus } from '@hpc-mail/shared';
 import { dohAnswers, dohQuery, rdapDomain, RR } from '../lib/public-dns.js';
+import { CF_SPF_INCLUDE } from '../lib/spf.js';
 
 const CF_MX_SUFFIX = '.mx.cloudflare.net';
-const CF_SPF_INCLUDE = '_spf.mx.cloudflare.net';
 
 /** MX 记录 data 形如 "10 route1.mx.cloudflare.net."，取末段 exchange 主机名（去优先级、去末尾点） */
 function parseMxHost(data: string): string {
