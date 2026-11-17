@@ -1,5 +1,5 @@
 import { focusManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MessageDetail } from '@hpc-mail/shared';
@@ -68,7 +68,7 @@ beforeEach(() => {
   vi.mocked(messageApi.detail).mockClear();
   clicked.length = 0;
   fetchMock.mockReset();
-  fetchMock.mockResolvedValue(new Response(new Blob(['%PDF']), { status: 200 }));
+  fetchMock.mockImplementation(async () => new Response(new Blob(['%PDF']), { status: 200 }));
   vi.stubGlobal('fetch', fetchMock);
   URL.createObjectURL = vi.fn(() => 'blob:attachment');
   URL.revokeObjectURL = vi.fn();
@@ -171,6 +171,41 @@ describe('MessagePage attachment preview', () => {
     fireEvent.click(await attachmentButton());
     await waitFor(() => expect(clicked).toHaveLength(1));
     expect(open).not.toHaveBeenCalled();
+    client.clear();
+  });
+
+  it('downloads PDFs and images with a spliced HTML type under their original names, never in a tab', async () => {
+    mocks.overrides.push({ attachments: [
+      { id: 11, filename: '合同.pdf', mimeType: 'application/pdf', size: 10, contentId: '', disposition: 'attachment', url: '' },
+      { id: 12, filename: 'x.png', mimeType: 'image/png,text/html', size: 10, contentId: '', disposition: 'attachment', url: '' },
+    ] });
+    const open = vi.spyOn(window, 'open');
+    const client = show();
+    fireEvent.click(await screen.findByRole('button', { name: /合同\.pdf/ }));
+    await waitFor(() => expect(clicked).toHaveLength(1));
+    fireEvent.click(screen.getByRole('button', { name: /x\.png/ }));
+    await waitFor(() => expect(clicked).toHaveLength(2));
+    expect(clicked.map((item) => item.download)).toEqual(['合同.pdf', 'x.png']);
+    expect(open).not.toHaveBeenCalled();
+    client.clear();
+  });
+
+  it('leaving the page aborts an in-flight attachment: no toast, no download, the opened tab is closed', async () => {
+    const tab = fakeTab();
+    vi.spyOn(window, 'open').mockReturnValue(tab);
+    fetchMock.mockImplementationOnce((_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    }));
+    const client = show();
+    fireEvent.click(await imageButton());
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    cleanup();
+    await waitFor(() => expect(tab.close).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0]![1]?.signal?.aborted).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mocks.toast).not.toHaveBeenCalled();
+    expect(clicked).toEqual([]);
+    expect(tab.location.href).toBe('');
     client.clear();
   });
 });

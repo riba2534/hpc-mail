@@ -133,6 +133,13 @@ export function MessagePage() {
   const [htmlRoot, setHtmlRoot] = useState<HTMLElement | null>(null);
   const [downloadingId, setDownloadingId] = useState<number | null>(null);
   const markedRef = useRef<number | null>(null);
+  // 离开页面时中止进行中的下载：不再在别的页面弹出下载或打开标签页
+  const unmountRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    unmountRef.current = controller;
+    return () => controller.abort();
+  }, []);
 
   const { data: ownedMailboxes } = useMailboxesQuery(false);
   const { data: message, isLoading, isError, error: detailError, refetch } = useQuery({
@@ -227,25 +234,28 @@ export function MessagePage() {
   const withView = (path: string) => (viewQuery ? `${path}?${viewQuery}` : path);
 
   const downloadEml = async () => {
+    const signal = unmountRef.current?.signal;
     try {
-      await downloadWithAuth(withView(`/api/messages/${messageId}/raw`), `message-${messageId}.eml`);
+      await downloadWithAuth(withView(`/api/messages/${messageId}/raw`), `message-${messageId}.eml`, signal);
     } catch (error) {
-      toast({ title: '下载失败', description: (error as Error).message, variant: 'error' });
+      if (!signal?.aborted) toast({ title: '下载失败', description: (error as Error).message, variant: 'error' });
     }
   };
 
-  // 附件不用签名 URL（只留给正文内嵌图）：图片与 PDF 在新标签页打开，其余下载
+  // 附件不用签名 URL（只留给正文内嵌图）：白名单图片在新标签页打开，其余按原文件名下载
   const openAttachment = async (attachment: MessageDetail['attachments'][number]) => {
     if (downloadingId !== null) return;
     setDownloadingId(attachment.id);
+    const signal = unmountRef.current?.signal;
     try {
       await openOrDownloadWithAuth(
         withView(`/api/attachments/${attachment.id}`),
         attachment.filename || `attachment-${attachment.id}`,
         attachment.mimeType,
+        signal,
       );
     } catch (error) {
-      toast({ title: '附件下载失败', description: (error as Error).message, variant: 'error' });
+      if (!signal?.aborted) toast({ title: '附件下载失败', description: (error as Error).message, variant: 'error' });
     } finally {
       setDownloadingId(null);
     }
