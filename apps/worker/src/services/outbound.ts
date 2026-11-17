@@ -8,7 +8,7 @@ import {
 } from '@hpc-mail/shared';
 import { and, eq, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
-import { attachments as attachmentsTable, deliveryObjectLeases, idempotencyRecords, mailboxes, messages, storageCleanupJobs } from '../db/schema.js';
+import { attachments as attachmentsTable, deliveryObjectLeases, mailboxes, messages, storageCleanupJobs } from '../db/schema.js';
 import {
   assertNoHeaderInjection,
   getEmailDomain,
@@ -31,7 +31,7 @@ import { assertSendBodySize, bodyBytes, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
 import { enqueueMailNotifications, processNotificationJobs } from './notification-jobs.js';
 import { retainExternalAttachments } from './external-attachment.js';
-import type { IdempotencyHandle } from './idempotency.js';
+import { bindIdempotentSend, type IdempotencyHandle } from './idempotency.js';
 import { injectAttachmentLinks, type AttachmentLink } from './attachment-links.js';
 export { injectAttachmentLinks } from './attachment-links.js';
 
@@ -522,16 +522,8 @@ export async function sendMail(
       errorDetail: '', isRead: true, size, createdAt: new Date(),
     }).returning().get();
     if (!outbound) throw new AppError('internal', '发送记录创建失败');
-    if (handle) {
-      const bound = await db.update(idempotencyRecords)
-        .set({ messageId: outbound.id, updatedAt: new Date() })
-        .where(and(
-          eq(idempotencyRecords.actorType, handle.actor.type), eq(idempotencyRecords.actorId, handle.actor.id),
-          eq(idempotencyRecords.key, handle.key), eq(idempotencyRecords.requestHash, handle.requestHash),
-          eq(idempotencyRecords.status, 'pending'),
-        )).returning({ messageId: idempotencyRecords.messageId }).get();
-      if (!bound) throw new AppError('conflict', '发送幂等状态已变化，请查询发送记录');
-    }
+    // 绑定失败（幂等状态已变化）时同批把发件行标 failed，不留永久 pending
+    await bindIdempotentSend(env, handle, outbound.id);
   } catch (error) {
     await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
     if (!outbound && storedBody?.bodyR2Key) await queueObjectCleanup(env, [storedBody.bodyR2Key]);
