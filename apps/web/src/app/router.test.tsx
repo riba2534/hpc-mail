@@ -59,17 +59,17 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('外壳内页面的错误边界', () => {
-  it('页面渲染异常只替换主内容区，侧边栏与导航保留；重试后恢复', async () => {
+  it('页面渲染异常只替换主内容区，侧边栏与导航保留；离开再回来即恢复', async () => {
     const { client } = renderApp('/inbox');
     expect(await screen.findByRole('heading', { name: '页面出错了' })).toBeInTheDocument();
     expect(screen.getByRole('main')).toHaveTextContent('列表渲染异常');
     expect(screen.getByRole('navigation', { name: '主导航', hidden: true })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: /星标/ }).length).toBeGreaterThan(0);
-    expect(screen.queryByRole('button', { name: '刷新页面' })).toBeNull();
-    expect(screen.getByRole('link', { name: '返回收件箱' })).toHaveAttribute('href', '/inbox');
+    expect(screen.getByRole('button', { name: '刷新页面' })).toBeInTheDocument();
 
+    // 错误边界随导航重置：外壳不重挂，页面重新渲染
     pages.inboxFails = false;
-    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    fireEvent.click(screen.getByRole('link', { name: '返回收件箱' }));
     expect(await screen.findByText('收件列表')).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '页面出错了' })).toBeNull();
     client.clear();
@@ -81,9 +81,7 @@ describe('外壳内页面的错误边界', () => {
     const { client, router } = renderApp('/sent');
     expect(await screen.findByRole('heading', { name: '页面资源加载失败' })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: /星标/ }).length).toBeGreaterThan(0);
-    // 同一文档里重新 import 拿不到新版本：给整页刷新而不是原地重试
     expect(screen.getByRole('button', { name: '刷新页面' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
     // 导航到其他页面照常可用
     pages.inboxFails = false;
     fireEvent.click(screen.getByRole('link', { name: '返回收件箱' }));

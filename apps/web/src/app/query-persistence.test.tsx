@@ -6,6 +6,7 @@ import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import type { MessageListData } from '@/features/inbox/message-cache';
 import { clearAuthToken, getAuthRevision, setAuthToken } from '@/lib/auth-token';
+import { readTokenClaims } from '@/lib/token-claims';
 import {
   defaultInboxListKey,
   installQueryPersistence,
@@ -13,7 +14,6 @@ import {
   QUERY_CACHE_MAX_BYTES,
   QUERY_CACHE_WRITE_DELAY_MS,
   queryCacheStorageKey,
-  readTokenClaims,
   restoreQueryCache,
   useRestoredQueryRefreshing,
   writeQueryCache,

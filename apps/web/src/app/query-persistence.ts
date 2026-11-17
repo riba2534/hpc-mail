@@ -7,8 +7,6 @@ import type { MessageListData } from '@/features/inbox/message-cache';
 import { getAuthRevision, getAuthToken, subscribeAuthToken } from '@/lib/auth-token';
 import { isObject, readTokenClaims } from '@/lib/token-claims';
 
-export { readTokenClaims };
-
 /**
  * 首屏查询的按用户持久化：再次打开时先用上次的数据渲染外壳与收件箱，挂载后照常在后台刷新。
  * 只存首屏必需的少量查询；邮件详情、正文、附件链接与管理视图一律不落盘。
