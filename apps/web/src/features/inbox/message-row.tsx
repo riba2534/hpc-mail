@@ -98,8 +98,12 @@ export const MessageRow = memo(function MessageRow({
   const primary = outbound ? outboundRecipientLabel(message) : message.fromName || message.fromAddress;
   const subject = message.subject || '（无主题）';
   const status = OUTBOUND_STATUS[message.status as OutboundStatus];
-  // 待确认（投递中断）的外发不算失败：徽标显示「待确认」，说明用提醒色
-  const unconfirmed = outbound && message.status === 'unknown';
+  // 待确认（投递中断、结果不明）的外发不算失败：徽标显示「待确认」，说明用提醒色。
+  // 部分目标已送达、其余只是结果未确认（没有明确失败）时同样按待确认提示，不报成部分失败
+  const outcomes = message.recipientOutcomes ?? [];
+  const partlyUnconfirmed = outbound && message.status !== 'unknown'
+    && outcomes.some((outcome) => outcome.status === 'unknown') && !outcomes.some((outcome) => outcome.status === 'failed');
+  const unconfirmed = outbound && (message.status === 'unknown' || partlyUnconfirmed);
   const failed = outbound && !unconfirmed && message.status !== 'pending'
     && Boolean(message.errorDetail || message.status === 'failed' || message.status === 'bounced');
   // 验证链接：与发件域一致才允许在列表里直接打开；不一致只做警示，点击进入详情页核对
@@ -208,8 +212,8 @@ export const MessageRow = memo(function MessageRow({
               </Badge>
             )}
             {outbound && status && (
-              <Badge tone={failed ? 'critical' : status.tone} className="shrink-0">
-                {failed && message.status !== 'failed' && message.status !== 'bounced' ? '部分失败' : status.label}
+              <Badge tone={failed ? 'critical' : partlyUnconfirmed ? 'caution' : status.tone} className="shrink-0">
+                {failed && message.status !== 'failed' && message.status !== 'bounced' ? '部分失败' : partlyUnconfirmed ? '部分待确认' : status.label}
               </Badge>
             )}
             {!outbound && (message.status === 'degraded' || message.errorDetail) && <Badge tone="caution">内容异常</Badge>}

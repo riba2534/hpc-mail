@@ -1,22 +1,9 @@
-import {
-  DEFAULT_SETTINGS,
-  MAX_AUTH_GLOBAL_REQUESTS_PER_MINUTE,
-  MAX_AUTH_USER_REQUESTS_PER_MINUTE,
-  SETTING_SCHEMAS,
-} from '@hpc-mail/shared';
+import { DEFAULT_SETTINGS, SETTING_SCHEMAS } from '@hpc-mail/shared';
 import type { Context, MiddlewareHandler } from 'hono';
 import { AppError } from '../lib/errors.js';
 import { verifyToken, type JwtClaims } from '../lib/jwt.js';
-import {
-  andGuards,
-  bumpCounter,
-  counterResult,
-  counterStatement,
-  counterWithinGuard,
-  minuteWindow,
-  type CounterValue,
-} from '../services/rate-counter.js';
-import type { AppContext, AuthUser } from '../types.js';
+import { limitSessionRequest } from '../services/rate-limit.js';
+import type { AppContext, AuthUser, Env } from '../types.js';
 
 function bearer(c: { req: { header: (k: string) => string | undefined } }): string | null {
   const header = c.req.header('Authorization') || '';
@@ -42,9 +29,9 @@ interface AuthRow {
 /**
  * JWT + D1 会话 + 用户代 + 每请求查 users 单行验状态。
  *
- * 快路径把「会话行、用户行、security 设置、两条限流计数」合进一个 D1 batch（单次往返）。
- * 计数语句带守卫：只有会话有效、用户启用且鉴权版本一致时才递增，与原先「校验通过后再计数」等价。
- * 全站桶另加「该用户本窗口未超限」：单个用户超限后的请求只推高自己的桶，不会把全站打满。
+ * 快路径把「会话行、用户行、security 设置」合进一个只读 D1 batch（单次往返）。
+ * 校验通过后才过限流（Rate Limiting binding，不写 D1）：失效会话、禁用账号的请求不计数；
+ * 用户桶拒绝的请求不再进全站桶，单个用户超限打不满全站。
  * 不缓存会话或用户状态：改密/禁用仍即时生效。
  */
 export const requireAuth: MiddlewareHandler<AppContext> = async (c, next) => {
@@ -61,22 +48,9 @@ export const requireAuth: MiddlewareHandler<AppContext> = async (c, next) => {
   await next();
 };
 
-/**
- * 全站桶的递增守卫：本用户本窗口未超限才计入。须排在同一 batch 里 auth-user 递增之后，
- * 读到的才是含本次请求的值。
- */
-function userWithinGuard(userId: number, minute: number) {
-  return counterWithinGuard('auth-user', String(userId), minute, MAX_AUTH_USER_REQUESTS_PER_MINUTE);
-}
-
-/** 全站桶为 null 表示守卫未通过（本用户已超限，未计入全站），此时已由用户桶判定拒绝 */
-function assertWithinRate(userRate: CounterValue, globalRate: CounterValue | null): void {
-  if (
-    userRate.count > MAX_AUTH_USER_REQUESTS_PER_MINUTE ||
-    (globalRate?.count ?? 0) > MAX_AUTH_GLOBAL_REQUESTS_PER_MINUTE
-  ) {
-    throw new AppError('rate_limited', '请求过于频繁，请稍后重试');
-  }
+/** 用户每分钟上限与全站上限（services/rate-limit.ts）；须在会话与用户校验通过之后调用 */
+async function assertWithinRate(env: Env, userId: number): Promise<void> {
+  if (await limitSessionRequest(env, userId)) throw new AppError('rate_limited', '请求过于频繁，请稍后重试');
 }
 
 function parseRequire2fa(raw: string | undefined): boolean {
@@ -89,25 +63,16 @@ function parseRequire2fa(raw: string | undefined): boolean {
   }
 }
 
-/** 单次 batch 完成鉴权：会话只认 D1，且必须属于令牌声明的用户 */
+/** 单次只读 batch 完成鉴权：会话只认 D1，且必须属于令牌声明的用户 */
 async function fastAuth(c: Context<AppContext>, claims: JwtClaims): Promise<AuthUser> {
   const db = c.env.db;
   const now = Date.now();
-  const minute = minuteWindow(1, now);
-  const guard = {
-    sql: `EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.id = ?
-      WHERE s.id = ? AND s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > ?
-        AND u.status = 'active' AND u.auth_version = ?)`,
-    params: [claims.sub, claims.sid, now, claims.uepoch],
-  };
-  const [authResult, securityResult, userRateResult, globalRateResult] = await db.batch([
+  const [authResult, securityResult] = await db.batch([
     // 用户按 claims.sub 取（与原先「先验会话、再按 sub 查用户」一致），LEFT JOIN 以区分用户缺失
     db.prepare(`SELECT s.user_id AS session_user_id, s.revoked_at, s.expires_at, u.id, u.username, u.role, u.status, u.auth_version,
         u.created_at, u.avatar_key, u.totp_enabled_at
       FROM sessions s LEFT JOIN users u ON u.id = ? WHERE s.id = ?`).bind(claims.sub, claims.sid),
     db.prepare(`SELECT value FROM settings WHERE key = 'security'`),
-    counterStatement(c.env, 'auth-user', String(claims.sub), minute, 1, 0, guard),
-    counterStatement(c.env, 'auth-global', 'instance', minute, 1, 0, andGuards(guard, userWithinGuard(claims.sub, minute))),
   ]);
   const row = authResult?.results?.[0] as AuthRow | undefined;
   if (!row) throw new AppError('unauthorized', '会话已失效');
@@ -119,12 +84,7 @@ async function fastAuth(c: Context<AppContext>, claims: JwtClaims): Promise<Auth
   if (row.id === null) throw new AppError('unauthorized', '用户不存在');
   if (row.status !== 'active') throw new AppError('user_disabled', '账号已被禁用');
   if (claims.uepoch !== Number(row.auth_version)) throw new AppError('unauthorized', '会话已失效');
-
-  // 守卫与读取同处一个事务，用户桶正常必有返回；防御性兜底按原路径单独计数。
-  // 全站桶无返回只可能是本用户已超限，不再补计，否则超限请求又会推高全站桶
-  const userRate = counterResult(userRateResult)
-    ?? (await bumpCounter(c.env, 'auth-user', String(row.id), minuteWindow(1)));
-  assertWithinRate(userRate, counterResult(globalRateResult));
+  await assertWithinRate(c.env, row.id);
 
   const authUser: AuthUser = {
     id: row.id,

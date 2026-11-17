@@ -55,6 +55,7 @@ import { formatBytes, formatDateTime } from '@/lib/format';
 import { extractOtp } from '@/lib/otp';
 import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
+import { SenderAuthBanner, senderAuthFailed } from './sender-auth-banner';
 import { TranslationBar } from './translation/translation-bar';
 import { useMessageTranslation } from './translation/use-message-translation';
 import { inspectVerificationLink } from './verification-link';
@@ -91,11 +92,13 @@ function RecipientLine({ label, addresses }: { label: string; addresses: string[
 function VerificationLinkBanner({ message }: { message: MessageDetail }) {
   const link = inspectVerificationLink(message.verificationLink, message.fromAddress);
   if (!link) return null;
+  const unverifiedSender = senderAuthFailed(message.auth);
+  const caution = link.mismatch || unverifiedSender;
   return (
     <div
       className={cn(
         'flex flex-col gap-2 rounded-lg border px-4 py-3',
-        link.mismatch ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
+        caution ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
       )}
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -103,7 +106,7 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
           <p className="text-xs font-medium text-ink-secondary">验证链接</p>
           <p className="truncate text-sm text-ink" title={link.href}>{link.hostname}</p>
         </div>
-        <Button asChild size="sm" variant={link.mismatch ? 'secondary' : 'primary'}>
+        <Button asChild size="sm" variant={caution ? 'secondary' : 'primary'}>
           <a href={link.href} target="_blank" rel="noopener noreferrer">
             <ExternalLink className="size-4" />
             打开验证链接
@@ -114,6 +117,12 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
         <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           链接域名与发件人不一致，请确认后再打开
+        </p>
+      )}
+      {!link.mismatch && unverifiedSender && (
+        <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          发件人未通过验证，请确认后再打开
         </p>
       )}
     </div>
@@ -497,6 +506,7 @@ export function MessagePage() {
         </header>
 
         <div className="flex flex-col gap-4 px-4 py-5 sm:px-5">
+          {!outbound && <SenderAuthBanner auth={message.auth} fromAddress={message.fromAddress} />}
           {translation.translated && <TranslationBar translation={translation} />}
           {deliveryPending && (
             <p role="status" className="rounded-md border border-line bg-canvas px-3 py-2.5 text-sm text-ink-secondary">投递中，结果尚未回填</p>

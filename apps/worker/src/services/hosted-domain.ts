@@ -54,10 +54,10 @@ export const MAX_HOSTED_CHECKS_PER_MINUTE = 10;
  * 计入全站额度的 Cloudflare 调用数（按调用序列基准用例核实）：添加先按名称查 zone 再创建 2 次，建好后后台预配置
  * catch-all 与发信 5 次；删除撤发信接入、删 zone 2 次；检测在等待 NS 时 2 次，生效后补齐配置约 4 次。
  */
-const CREATE_CF_CALLS = 2;
+export const CREATE_CF_CALLS = 2;
 const PRECONFIGURE_CF_CALLS = 5;
 const TEARDOWN_CF_CALLS = 2;
-const CHECK_CF_CALLS = 4;
+export const CHECK_CF_CALLS = 4;
 const SITE_BUSY = '当前域名操作较多，请稍后再试';
 
 /** 功能可用：设置总开关打开且 Worker 配置了 Cloudflare 凭据 */
