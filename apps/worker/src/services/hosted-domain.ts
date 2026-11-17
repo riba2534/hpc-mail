@@ -17,6 +17,7 @@ import {
 import { hasDnssec } from './domain-check.js';
 import { systemDomainListedSql } from './domain-occupancy.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
+import { counterResult, counterStatement, minuteWindow } from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
 
 type HostedRow = typeof hostedDomains.$inferSelect;
@@ -35,6 +36,23 @@ const RESERVATION_STALE_MS = 10 * MINUTE;
 const TEARDOWN_PURGE_MS = 8_000;
 
 const SYSTEM_ACTOR = { id: 0, username: 'system' };
+
+/**
+ * 全站每分钟由用户操作发出的 Cloudflare 调用数：DNS 解析、添加域名与立即检测共用这份额度（scope 名沿用最早只计解析时的）。
+ * 所有托管域名共用站长的 Token（全局 1200 次/5 分钟），这里限 150 次/分钟（5 分钟 750 次），给定时开通、巡检和控制台留出余量；
+ * 只有能走到 Cloudflare 的请求才计入，按实际调用次数加权。
+ */
+export const HOSTED_DNS_SITE_RATE_SCOPE = 'hosted_dns_site';
+export const MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE = 150;
+/** 每位用户每分钟的添加与立即检测次数（管理员也计）；添加只计走到占位这一步的请求，检测计全部请求 */
+export const HOSTED_CREATE_RATE_SCOPE = 'hosted_create';
+export const HOSTED_CHECK_RATE_SCOPE = 'hosted_check';
+export const MAX_HOSTED_CREATES_PER_MINUTE = 5;
+export const MAX_HOSTED_CHECKS_PER_MINUTE = 10;
+/** 计入全站额度的 Cloudflare 调用数：添加先按名称查 zone 再创建；检测在等待 NS 时 2 次，生效后补齐配置约 4 次 */
+const CREATE_CF_CALLS = 2;
+const CHECK_CF_CALLS = 4;
+const SITE_BUSY = '当前域名操作较多，请稍后再试';
 
 /** 功能可用：设置总开关打开且 Worker 配置了 Cloudflare 凭据 */
 export function hostedDomainsAvailable(env: Env, settings: Pick<Settings, 'hosted_domains'>): boolean {
@@ -256,9 +274,14 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
     throw new AppError('conflict', '该域名已是本站的系统域名');
   }
   const cfg = settings.hosted_domains;
-  const reserved = await env.db.prepare(`INSERT INTO hosted_domains (domain, user_id, status)
+  // 个人计数与占位同一个 batch：超过个人上限的请求不占位，也不会走到 Cloudflare
+  const window = minuteWindow(1);
+  const [userCount, reservation] = await env.db.batch([
+    counterStatement(env, HOSTED_CREATE_RATE_SCOPE, String(viewer.id), window),
+    env.db.prepare(`INSERT INTO hosted_domains (domain, user_id, status)
     SELECT ?1, ?2, 'pending'
-    WHERE NOT EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ?1)
+    WHERE (SELECT count FROM rate_counters WHERE scope = ?7 AND subject = ?8 AND "window" = ?9) <= ?10
+      AND NOT EXISTS (SELECT 1 FROM hosted_domains WHERE domain = ?1)
       AND NOT ${systemDomainListedSql('?1')}
       AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE domain = ?1)
       AND NOT EXISTS (SELECT 1 FROM messages WHERE domain = ?1)
@@ -267,10 +290,23 @@ export async function createHostedDomain(env: Env, viewer: Viewer, domain: strin
       AND (SELECT COUNT(*) FROM hosted_domains WHERE status = 'pending') < ?6
       AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active')
     RETURNING id`)
-    .bind(domain, viewer.id, viewer.role === 'admin' ? 1 : 0, cfg.maxPerUser, cfg.maxPendingPerUser, cfg.maxPendingTotal)
-    .first<{ id: number }>();
+      .bind(domain, viewer.id, viewer.role === 'admin' ? 1 : 0, cfg.maxPerUser, cfg.maxPendingPerUser, cfg.maxPendingTotal,
+        HOSTED_CREATE_RATE_SCOPE, String(viewer.id), window, MAX_HOSTED_CREATES_PER_MINUTE),
+  ]);
+  if ((counterResult(userCount)?.count ?? 1) > MAX_HOSTED_CREATES_PER_MINUTE) {
+    throw new AppError('rate_limited', '添加域名过于频繁，请稍后再试');
+  }
+  const reserved = reservation?.results?.[0] as { id: number } | undefined;
   if (!reserved) throw await reservationError(env, viewer, domain, cfg);
   const id = Number(reserved.id);
+  // 占好位才计入全站额度（占位仍在才计）；超限时释放占位
+  const site = counterResult(await counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, CREATE_CF_CALLS, 0, {
+    sql: "EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND zone_id IS NULL AND status = 'pending')", params: [id],
+  }).all());
+  if ((site?.count ?? 0) > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) {
+    await env.db.prepare('DELETE FROM hosted_domains WHERE id = ? AND zone_id IS NULL').bind(id).run();
+    throw new AppError('rate_limited', SITE_BUSY);
+  }
 
   let zone;
   try {
@@ -545,9 +581,35 @@ export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number
   return due.results.length;
 }
 
+/**
+ * 「立即检测」的计数：个人按请求数，全站按 Cloudflare 调用次数，合成一个 batch。全站计数的守卫与下面
+ * 实际触发核对的条件一致（个人未超限、所有者或管理员、未暂停或删除、过了节流间隔），被拒或被节流的请求不占全站额度。
+ */
+async function countCheck(env: Env, viewer: Viewer, id: number): Promise<{ user: number; site: number }> {
+  const window = minuteWindow(1);
+  const subject = String(viewer.id);
+  const [user, site] = await env.db.batch([
+    counterStatement(env, HOSTED_CHECK_RATE_SCOPE, subject, window),
+    counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, CHECK_CF_CALLS, 0, {
+      sql: `(SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?) <= ?
+        AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
+          AND status NOT IN ('suspended', 'deleting') AND COALESCE(checked_at, 0) <= ?)`,
+      params: [HOSTED_CHECK_RATE_SCOPE, subject, window, MAX_HOSTED_CHECKS_PER_MINUTE,
+        id, viewer.id, viewer.role === 'admin' ? 1 : 0, Date.now() - CHECK_THROTTLE_MS],
+    }),
+  ]);
+  return { user: counterResult(user)?.count ?? 1, site: counterResult(site)?.count ?? 0 };
+}
+
 /** 用户点「立即检测」：等待 NS 时请 Cloudflare 立即复查，再核对并推进开通 */
 export async function checkHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
-  const { row, access } = await loadAccess(env, viewer, id);
+  // 计数和读取域名并行；无权访问的请求同样计入个人限额
+  const [counted, loaded] = await Promise.allSettled([countCheck(env, viewer, id), loadAccess(env, viewer, id)]);
+  if (counted.status === 'rejected') throw counted.reason;
+  if (counted.value.user > MAX_HOSTED_CHECKS_PER_MINUTE) throw new AppError('rate_limited', '检测过于频繁，请稍后再试');
+  if (counted.value.site > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) throw new AppError('rate_limited', SITE_BUSY);
+  if (loaded.status === 'rejected') throw loaded.reason;
+  const { row, access } = loaded.value;
   requireManage(access);
   requireCredentials(env, await getSettings(env));
   const recent = row.checkedAt && Date.now() - row.checkedAt.getTime() < CHECK_THROTTLE_MS;

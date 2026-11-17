@@ -15,8 +15,10 @@ import { dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
-import { syncDueHostedDomains } from './hosted-domain.js';
-import { HOSTED_DNS_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE } from './hosted-dns.js';
+import {
+  HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, syncDueHostedDomains,
+} from './hosted-domain.js';
+import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
 import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
@@ -245,6 +247,8 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     await purgeCounters(env, 'auth-global', minuteWindow(1) - 120);
     await purgeCounters(env, HOSTED_DNS_RATE_SCOPE, minuteWindow(1) - 120);
     await purgeCounters(env, HOSTED_DNS_SITE_RATE_SCOPE, minuteWindow(1) - 120);
+    await purgeCounters(env, HOSTED_CREATE_RATE_SCOPE, minuteWindow(1) - 120);
+    await purgeCounters(env, HOSTED_CHECK_RATE_SCOPE, minuteWindow(1) - 120);
     await purgeCounters(env, 'ai-extract', dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, TRANSLATE_CHARS_SCOPE, dayWindow(new Date(Date.now() - 3 * DAY_MS)));
     await purgeCounters(env, TRANSLATE_REQUESTS_SCOPE, minuteWindow(1) - 120);

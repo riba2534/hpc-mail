@@ -1,12 +1,16 @@
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HostedDomain, HostedDomainMember, HostedDomainTransferResult, Mailbox } from '@hpc-mail/shared';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { adminAuditLogs, hostedDomainMembers, hostedDomains, mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
-import { syncDueHostedDomains, syncHostedDomain } from '../src/services/hosted-domain.js';
+import {
+  HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_DNS_SITE_RATE_SCOPE, MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE,
+  MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE, syncDueHostedDomains, syncHostedDomain,
+} from '../src/services/hosted-domain.js';
+import { bumpCounter, minuteWindow, readCounter } from '../src/services/rate-counter.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { sendMail } from '../src/services/outbound.js';
 import { createSession } from '../src/services/session.js';
@@ -174,29 +178,50 @@ async function receive(address: string, label: string, runtimeEnv: Env = runtime
   return { rejected, stored };
 }
 
-/** 在第一条匹配 pattern 的 SQL 执行前插入并发写入，用来确定性地复现交错 */
+/** 在第一条匹配 pattern 的 SQL 执行前（在 batch 里时为整个 batch 执行前）插入并发写入，用来确定性地复现交错 */
 function beforeStatement(base: Env, pattern: RegExp, hook: () => Promise<void>): Env {
   let triggered = false;
-  const wrap = (statement: D1PreparedStatement, intercept: boolean): D1PreparedStatement => new Proxy(statement, {
-    get(target, property) {
-      if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args), intercept);
-      const method = Reflect.get(target, property);
-      if (typeof method !== 'function') return method;
-      return async (...args: unknown[]) => {
-        if (intercept && !triggered && ['first', 'all', 'run', 'raw'].includes(String(property))) {
-          triggered = true;
-          await hook();
-        }
-        return method.apply(target, args);
-      };
-    },
-  });
+  const fire = async () => {
+    if (triggered) return;
+    triggered = true;
+    await hook();
+  };
+  const intercepted = new WeakSet<D1PreparedStatement>();
+  const wrap = (statement: D1PreparedStatement, intercept: boolean): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === 'bind') return (...args: unknown[]) => wrap(target.bind(...args), intercept);
+        const method = Reflect.get(target, property);
+        if (typeof method !== 'function') return method;
+        return async (...args: unknown[]) => {
+          if (intercept && ['first', 'all', 'run', 'raw'].includes(String(property))) await fire();
+          return method.apply(target, args);
+        };
+      },
+    });
+    if (intercept) intercepted.add(proxy);
+    return proxy;
+  };
   return { ...base, db: new Proxy(base.db, { get(target, property) {
     if (property === 'prepare') return (query: string) => wrap(target.prepare(query), pattern.test(query));
+    if (property === 'batch') {
+      return async (statements: D1PreparedStatement[]) => {
+        if (statements.some((statement) => intercepted.has(statement))) await fire();
+        return target.batch(statements);
+      };
+    }
     const method = Reflect.get(target, property);
     return typeof method === 'function' ? method.bind(target) : method;
   } }) };
 }
+
+const siteCalls = async () => (await readCounter(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', minuteWindow(1))).count;
+
+// 同一文件的用例共享 D1，且都在同一分钟内跑完：每个用例从空的分钟计数开始，避免累计到上限
+beforeEach(async () => {
+  await env.db.prepare('DELETE FROM rate_counters WHERE scope IN (?, ?, ?)')
+    .bind(HOSTED_DNS_SITE_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE).run();
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -681,6 +706,87 @@ describe('托管域名的过户与删除', () => {
     cf.fetchMock.mockImplementation(original);
     await syncDueHostedDomains(runtime);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.id, hosted.id)).get()).toBeUndefined();
+  });
+});
+
+describe('添加与立即检测的 Cloudflare 调用额度', () => {
+  it(`每人每分钟最多添加 ${MAX_HOSTED_CREATES_PER_MINUTE} 次，失败的也计；超出后 429，不再调用 Cloudflare`, async () => {
+    // Cloudflare 拒绝建 zone 时会释放占位，没有个人上限就能无限重试，每次消耗两次调用
+    const cf = fakeCloudflare({ createError: 1099 });
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    for (let i = 0; i < MAX_HOSTED_CREATES_PER_MINUTE; i++) {
+      await errorOf(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain(`try${i}`) }), 400);
+    }
+    expect(cf.calls).toHaveLength(MAX_HOSTED_CREATES_PER_MINUTE * 2);
+    expect(await siteCalls()).toBe(MAX_HOSTED_CREATES_PER_MINUTE * 2);
+    const limited = await errorOf(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain('more') }), 429);
+    expect(limited).toMatchObject({ code: 'rate_limited' });
+    expect(cf.calls).toHaveLength(MAX_HOSTED_CREATES_PER_MINUTE * 2);
+    expect(await siteCalls()).toBe(MAX_HOSTED_CREATES_PER_MINUTE * 2);
+    expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, f.domain('more'))).get()).toBeUndefined();
+    // 其他用户不受影响
+    const other = await f.actor('other');
+    await errorOf(await call('POST', '/hosted-domains', other.jwt, { domain: f.domain('other') }), 400);
+    expect(cf.calls).toHaveLength(MAX_HOSTED_CREATES_PER_MINUTE * 2 + 2);
+  });
+
+  it('添加：占位被拒的请求不占全站额度；全站额度用尽时 429 并释放占位，不调用 Cloudflare', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const rival = await f.actor('rival');
+    const taken = await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain('taken') }), 201);
+    expect(taken.status).toBe('pending');
+    const afterCreate = await siteCalls();
+    expect(afterCreate).toBe(2);
+
+    await errorOf(await call('POST', '/hosted-domains', rival.jwt, { domain: f.domain('taken') }), 409);
+    expect(await siteCalls()).toBe(afterCreate);
+
+    await bumpCounter(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', minuteWindow(1), MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - afterCreate - 1);
+    const callsBefore = cf.calls.length;
+    const busy = await errorOf(await call('POST', '/hosted-domains', rival.jwt, { domain: f.domain('busy') }), 429);
+    expect(busy).toMatchObject({ code: 'rate_limited' });
+    expect(cf.calls).toHaveLength(callsBefore);
+    expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, f.domain('busy'))).get()).toBeUndefined();
+  });
+
+  it(`立即检测：每人每分钟 ${MAX_HOSTED_CHECKS_PER_MINUTE} 次（被节流、无权限的也计）；只有真正核对的才占全站额度`, async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const stranger = await f.actor('stranger');
+    const created = await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain('check') }), 201);
+    await db.update(hostedDomains).set({ checkedAt: new Date(Date.now() - 60_000) }).where(eq(hostedDomains.id, created.id));
+    const base = await siteCalls();
+
+    // 无关用户：404，计入他自己的个人次数，不占全站额度
+    await errorOf(await call('POST', `/hosted-domains/${created.id}/check`, stranger.jwt), 404);
+    expect(await siteCalls()).toBe(base);
+
+    // 第一次过了节流间隔，真正核对；之后 15 秒内的都被节流，不再调用 Cloudflare
+    const callsBefore = cf.calls.length;
+    await data(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt));
+    const checkCalls = cf.calls.length - callsBefore;
+    expect(checkCalls).toBeGreaterThan(0);
+    expect(await siteCalls()).toBe(base + 4);
+    for (let i = 1; i < MAX_HOSTED_CHECKS_PER_MINUTE; i++) await data(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt));
+    expect(cf.calls.length - callsBefore).toBe(checkCalls);
+    expect(await siteCalls()).toBe(base + 4);
+    expect(await errorOf(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt), 429)).toMatchObject({ code: 'rate_limited' });
+  });
+
+  it('立即检测：全站额度用尽时 429，不调用 Cloudflare', async () => {
+    const cf = fakeCloudflare();
+    const f = await fixture();
+    const owner = await f.actor('owner');
+    const created = await data<HostedDomain>(await call('POST', '/hosted-domains', owner.jwt, { domain: f.domain('busy-check') }), 201);
+    await db.update(hostedDomains).set({ checkedAt: new Date(Date.now() - 60_000) }).where(eq(hostedDomains.id, created.id));
+    await bumpCounter(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', minuteWindow(1), MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE - (await siteCalls()) - 1);
+    const callsBefore = cf.calls.length;
+    expect(await errorOf(await call('POST', `/hosted-domains/${created.id}/check`, owner.jwt), 429)).toMatchObject({ code: 'rate_limited' });
+    expect(cf.calls).toHaveLength(callsBefore);
   });
 });
 

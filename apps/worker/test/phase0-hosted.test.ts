@@ -3,6 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../src/db/client.js';
 import { idempotencyRecords, messages, rateCounters, users } from '../src/db/schema.js';
+import { HOSTED_CHECK_RATE_SCOPE, HOSTED_CREATE_RATE_SCOPE } from '../src/services/hosted-domain.js';
 import { minuteWindow } from '../src/services/rate-counter.js';
 import { runScheduled } from '../src/services/scheduled.js';
 
@@ -74,15 +75,15 @@ describe('每日维护的清理规则', () => {
       'pending-recently-bound', 'pending-still-sending', 'pending-unbound']);
   });
 
-  it('按 Key 计的被拒请求计数（api-reject）随其他分钟级计数一起回收', async () => {
+  it.each(['api-reject', HOSTED_CREATE_RATE_SCOPE, HOSTED_CHECK_RATE_SCOPE])('分钟级计数 %s 随其他分钟级计数一起回收', async (scope) => {
     const now = minuteWindow(1);
     await db.insert(rateCounters).values([
-      { scope: 'api-reject', subject: 'phase0-key', window: now - 200, count: 3 },
-      { scope: 'api-reject', subject: 'phase0-key', window: now, count: 1 },
+      { scope, subject: 'phase0-subject', window: now - 200, count: 3 },
+      { scope, subject: 'phase0-subject', window: now, count: 1 },
     ]);
     await runScheduled(env, true);
     const windows = (await db.select({ window: rateCounters.window }).from(rateCounters)
-      .where(and(eq(rateCounters.scope, 'api-reject'), eq(rateCounters.subject, 'phase0-key'))).all()).map((row) => row.window);
+      .where(and(eq(rateCounters.scope, scope), eq(rateCounters.subject, 'phase0-subject'))).all()).map((row) => row.window);
     expect(windows).toEqual([now]);
   });
 });
