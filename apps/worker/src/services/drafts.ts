@@ -700,6 +700,12 @@ async function recoverStale(env: Env, row: DraftRow): Promise<void> {
   await settle(env, row, outcome);
 }
 
+/** 到期认领：走 idx_drafts_due（status='scheduled' 的部分索引，按 send_at），空闲时读 0 行（导出供 EXPLAIN 回归） */
+export const DUE_DRAFTS_CLAIM_SQL = `UPDATE drafts SET status = 'sending', attempt = attempt + 1, claimed_at = ?, version = version + 1,
+  updated_at = ? WHERE id IN (SELECT id FROM drafts WHERE status = 'scheduled' AND send_at <= ? ORDER BY send_at LIMIT ?) RETURNING id`;
+/** 租约到期：走 idx_drafts_sending（status='sending' 的部分索引，按 claimed_at） */
+export const STALE_DRAFTS_SQL = `SELECT id FROM drafts WHERE status = 'sending' AND claimed_at < ? LIMIT ?`;
+
 export interface DispatchReport {
   sent: number;
   failed: number;
@@ -714,10 +720,8 @@ export async function dispatchDueDrafts(env: Env, ctx: ExecCtx, now = Date.now()
   const db = createDb(env);
   const report: DispatchReport = { sent: 0, failed: 0, recovered: 0 };
   const [claimed, stale] = await env.db.batch<{ id: number }>([
-    env.db.prepare(`UPDATE drafts SET status = 'sending', attempt = attempt + 1, claimed_at = ?, version = version + 1, updated_at = ?
-      WHERE id IN (SELECT id FROM drafts WHERE status = 'scheduled' AND send_at <= ? ORDER BY send_at LIMIT ?) RETURNING id`)
-      .bind(now, now, now, DISPATCH_BATCH),
-    env.db.prepare(`SELECT id FROM drafts WHERE status = 'sending' AND claimed_at < ? LIMIT ?`).bind(now - DRAFT_SENDING_LEASE_MS, DISPATCH_BATCH),
+    env.db.prepare(DUE_DRAFTS_CLAIM_SQL).bind(now, now, now, DISPATCH_BATCH),
+    env.db.prepare(STALE_DRAFTS_SQL).bind(now - DRAFT_SENDING_LEASE_MS, DISPATCH_BATCH),
   ]);
   const claimedIds = claimed!.results.map((item) => item.id);
   const staleIds = stale!.results.map((item) => item.id).filter((id) => !claimedIds.includes(id));

@@ -7,6 +7,8 @@ import { mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { encodeCursor } from '../src/lib/pagination.js';
 import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
 import { purgeStatements } from '../src/services/message-lifecycle.js';
+import { DUE_DRAFTS_CLAIM_SQL, STALE_DRAFTS_SQL } from '../src/services/drafts.js';
+import { CLEANUP_JOBS_SQL } from '../src/services/storage-cleanup.js';
 import {
   countUnread, findNextMessage, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
 } from '../src/services/message.js';
@@ -509,5 +511,26 @@ describe('执行计划回归：列表筛选（since/until/from/to/hasCode/hasAtt
       expect(page!.items, JSON.stringify(query)).toHaveLength(3);
       expect(statement!.rowsRead, JSON.stringify(query)).toBeLessThan(100);
     }
+  });
+});
+
+describe('执行计划回归：草稿派发与对象清理', () => {
+  const plan = async (query: string, params: unknown[]) =>
+    (await env.db.prepare(`EXPLAIN QUERY PLAN ${query}`).bind(...params).all<{ detail: string }>()).results.map((row) => row.detail).join(' | ');
+
+  it('每分钟的到期认领与租约到期查询只走草稿表的部分索引，不扫全表', async () => {
+    const claim = await plan(DUE_DRAFTS_CLAIM_SQL, [1, 1, 1, 20]);
+    expect(claim).toContain('idx_drafts_due (send_at<?)');
+    expect(claim).not.toMatch(/SCAN drafts\b(?! USING)/);
+    const stale = await plan(STALE_DRAFTS_SQL, [1, 20]);
+    expect(stale).toContain('idx_drafts_sending (claimed_at<?)');
+    // 草稿列表按 (user_id, id) 倒序翻页
+    const list = await plan('SELECT id FROM drafts WHERE user_id = ? AND id < ? ORDER BY id DESC LIMIT 31', [1, 100]);
+    expect(list).toContain('idx_drafts_user (user_id=? AND id<?)');
+  });
+
+  it('对象清理判断草稿正文引用时走 idx_drafts_body_r2', async () => {
+    const cleanup = await plan(CLEANUP_JOBS_SQL, [Date.now(), 100]);
+    expect(cleanup).toMatch(/SEARCH drafts USING COVERING INDEX idx_drafts_body_r2 \(body_r2_key=\?\)/);
   });
 });
