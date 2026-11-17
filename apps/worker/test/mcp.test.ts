@@ -7,7 +7,6 @@ import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
 import { apiKeys, apiRequestLogs, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
-import { replyEnvelope } from '../src/routes/mcp/tools.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
@@ -257,11 +256,13 @@ describe('MCP 工具调用', () => {
     expect(await toolError(user.key, 'release_mailbox', { address: receiver.address })).toMatchObject({ code: 'not_found', fix: expect.stringContaining('list_mailboxes') });
   });
 
-  it('reply_email：回给发件人、Re: 主题、线程头；replyAll 抄送其余收件人；from 可改；HTML 邮件的 concise 正文转纯文本', async () => {
+  it('reply_email 走 POST /v1/messages/:id/reply：回给发件人、Re: 主题、线程头与引用；replyAll 去掉自己；from 可改；幂等重放不再读原信', async () => {
     const user = await actor('mcp-reply');
-    const claim = async (localPart: string) => ok<{ id: number; address: string }>(user.key, 'claim_mailbox', { localPart, domain: DOMAIN });
-    const [a, b, c, d] = await Promise.all(['mcp-reply-a', 'mcp-reply-b', 'mcp-reply-c', 'mcp-reply-d'].map(claim));
-    await ok(user.key, 'send_email', { from: a!.address, to: [b!.address, c!.address], cc: [d!.address], subject: 'Plan', text: 'original' });
+    const peer = await actor('mcp-reply-peer');
+    const claim = async (key: string, localPart: string) => ok<{ id: number; address: string }>(key, 'claim_mailbox', { localPart, domain: DOMAIN });
+    const [a, b, e] = await Promise.all(['mcp-reply-a', 'mcp-reply-b', 'mcp-reply-e'].map((localPart) => claim(user.key, localPart)));
+    const [c, d] = await Promise.all(['mcp-reply-c', 'mcp-reply-d'].map((localPart) => claim(peer.key, localPart)));
+    await ok(user.key, 'send_email', { from: a!.address, to: [b!.address, c!.address], cc: [d!.address, e!.address], subject: 'Plan', text: 'original' });
     const received = (await ok<{ items: Array<{ id: number }> }>(user.key, 'search_messages', { address: b!.address, direction: 'inbound' })).items[0]!;
 
     const reply = await ok<{ id: number; status: string; subject: string; recipientOutcomes: Array<{ address: string }> }>(user.key, 'reply_email',
@@ -271,27 +272,27 @@ describe('MCP 工具调用', () => {
     const replyCopy = delivered.find((row) => row.direction === 'inbound' && row.subject === 'Re: Plan')!;
     const original = await db.select().from(messages).where(eq(messages.id, received.id)).get();
     expect(replyCopy.inReplyTo).toBe(original!.messageId);
+    expect(replyCopy.bodyText).toMatch(/^reply body\n\n----- 原始邮件 -----\n[\s\S]*\n> original$/);
 
+    // 回复全部：去掉自己认领的地址（b、e），只抄送别人的 c、d
     const all = await ok<{ recipientOutcomes: Array<{ address: string }> }>(user.key, 'reply_email',
-      { messageId: received.id, text: 'to everyone', replyAll: true, response_format: 'detailed' });
+      { messageId: received.id, text: 'to everyone', replyAll: true, quote: false, response_format: 'detailed' });
     expect(all.recipientOutcomes.map((entry) => entry.address).sort()).toEqual([a!.address, c!.address, d!.address].sort());
     expect(all).toHaveProperty('size');
-    const fromOther = await ok<{ address: string }>(user.key, 'reply_email', { messageId: received.id, text: 'from c', from: c!.address });
-    expect(fromOther.address).toBe(c!.address);
+    const fromOther = await ok<{ address: string }>(user.key, 'reply_email', { messageId: received.id, text: 'from e', from: e!.address });
+    expect(fromOther.address).toBe(e!.address);
     expect(await toolError(user.key, 'reply_email', { messageId: received.id })).toMatchObject({ code: 'validation_failed' });
+    expect(await toolError(user.key, 'reply_email', { messageId: received.id, text: 'x', cc: [c!.address] }))
+      .toMatchObject({ code: 'validation_failed', message: expect.stringContaining('cc') });
+
+    // 同一个 idempotencyKey 重放首次结果，原信删除后也一样
+    await db.delete(messages).where(eq(messages.id, received.id));
+    expect(await ok(user.key, 'reply_email', { messageId: received.id, text: 'reply body', idempotencyKey: 'mcp-reply-1' }))
+      .toMatchObject({ id: reply.id, status: 'delivered' });
 
     await ok(user.key, 'send_email', { from: a!.address, to: [b!.address], subject: 'Html only', html: '<p>Hello <b>HTML</b></p>' });
     const html = (await ok<{ items: Array<{ id: number }> }>(user.key, 'search_messages', { address: b!.address, q: 'Html only' })).items[0]!;
     expect(await ok(user.key, 'get_message', { messageId: html.id })).toMatchObject({ text: 'Hello HTML', textTruncated: false });
-  });
-
-  it('replyEnvelope：Reply-To 优先，自己发出的信回给原收件人，replyAll 去重且不带 Bcc', () => {
-    const base = { id: 1, direction: 'inbound', address: 'me@x.com', fromAddress: 'boss@y.com', fromName: 'Boss', subject: 'RE: Hi', replyTo: [],
-      recipients: { to: ['me@x.com', 'Peer <peer@y.com>'], cc: ['boss@y.com', 'cc@y.com'], bcc: ['hidden@y.com'] } } as unknown as MessageDetail;
-    expect(replyEnvelope(base, false)).toEqual({ to: [{ address: 'boss@y.com', name: 'Boss' }], cc: [], subject: 'RE: Hi' });
-    expect(replyEnvelope(base, true).cc).toEqual(['Peer <peer@y.com>', 'cc@y.com']);
-    expect(replyEnvelope({ ...base, replyTo: ['desk@y.com'], subject: 'Hi' }, false)).toMatchObject({ to: ['desk@y.com'], subject: 'Re: Hi' });
-    expect(replyEnvelope({ ...base, direction: 'outbound' }, false).to).toEqual(['me@x.com', 'Peer <peer@y.com>']);
   });
 
   it('wait_for_message：按 hasCode/from/subjectContains 跳过不匹配的新邮件，超时返回 null 与 scannedThroughId', async () => {

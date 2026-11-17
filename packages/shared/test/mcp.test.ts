@@ -4,6 +4,7 @@ import {
   batchCheckHostedDomainsRequestSchema,
   batchCreateHostedDomainsRequestSchema,
   listMessagesQuerySchema,
+  replyMessageRequestSchema,
   waitMessagesQuerySchema,
 } from '../src/index.js';
 import { MCP_TOOL_NAMES, mcpSearchQuery, mcpToolInputSchemas, mcpWaitQuery } from '../src/schemas/mcp.js';
@@ -28,6 +29,16 @@ describe('MCP 工具参数', () => {
       'replyToMessageId', 'forwardAttachmentsFrom', 'replyTo', 'headers', 'attachments', 'attachmentTokens', 'idempotencyKey', 'response_format']));
     expect(schema.required).toEqual(['from', 'to', 'subject']);
     expect(mcpToolInputSchemas.send_email.safeParse({ from: 'a@b.com', to: ['c@d.com'], subject: 's', idempotencyKey: 'has space' }).success).toBe(false);
+  });
+
+  it('reply_email 与 POST /v1/messages/:id/reply 的请求体同一组字段，另加 messageId、idempotencyKey 与 response_format', () => {
+    const schema = mcpToolInputSchemas.reply_email.toJSONSchema({ io: 'input', unrepresentable: 'any' }) as {
+      properties: Record<string, unknown>; required: string[];
+    };
+    const restFields = Object.keys(replyMessageRequestSchema.shape);
+    expect(Object.keys(schema.properties).sort()).toEqual([...restFields, 'messageId', 'idempotencyKey', 'response_format'].sort());
+    expect(schema.required).toEqual(['messageId']);
+    expect(mcpToolInputSchemas.reply_email.parse({ messageId: 1 })).toMatchObject({ replyAll: false, quote: true });
   });
 
   it('search_messages 转成的查询串被 GET /v1/messages 的 schema 原样接受', () => {
