@@ -25,7 +25,8 @@ app.get('/', async (c) => {
 app.post('/', async (c) => {
   const user = c.get('user')!;
   const req = await parseBody(c, createApiKeyRequestSchema);
-  return ok(c, await createApiKey(c.env, user.id, req), 201);
+  // 带上令牌的鉴权版本：改密后仍在途的旧令牌请求不能再插入新 Key
+  return ok(c, await createApiKey(c.env, user.id, req, c.get('authEpoch')), 201);
 });
 
 app.get('/:id', async (c) => {
