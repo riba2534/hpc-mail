@@ -24,11 +24,12 @@ import messages from './routes/messages.js';
 import notifyPrefs from './routes/notify-prefs.js';
 import v1 from './routes/v1/index.js';
 import { buildSessionOpenApiSpec } from './routes/api-openapi.js';
+import { createMcpRoutes } from './routes/mcp/index.js';
 import type { AppContext } from './types.js';
 
-/** 只认 `/api`、`/v1` 本身或其子路径；`/api-keys` 之类前端路由仍交给 SPA */
+/** 只认 `/api`、`/v1` 本身或其子路径与 `/mcp`；`/api-keys` 之类前端路由仍交给 SPA */
 export function isApiPath(pathname: string): boolean {
-  return pathname === '/api' || pathname.startsWith('/api/') || pathname === '/v1' || pathname.startsWith('/v1/');
+  return pathname === '/api' || pathname.startsWith('/api/') || pathname === '/v1' || pathname.startsWith('/v1/') || pathname === '/mcp';
 }
 
 export function createApp() {
@@ -64,6 +65,8 @@ export function createApp() {
 
   app.route('/api', api);
   app.route('/v1', v1);
+  // MCP 工具转成对 /v1 的内部请求，进入这个 app 本身
+  app.route('/mcp', createMcpRoutes((request, env, ctx) => app.fetch(request, env, ctx)));
 
   return app;
 }

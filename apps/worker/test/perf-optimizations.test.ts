@@ -236,8 +236,8 @@ describe('/v1 鉴权写入合并', () => {
 
 describe('入口路由与可观测性', () => {
   it('/api、/v1 只匹配精确路径或子路径', () => {
-    for (const path of ['/api', '/api/', '/api/config', '/v1', '/v1/status']) expect(isApiPath(path)).toBe(true);
-    for (const path of ['/api-keys', '/apis', '/v1beta', '/v10/status', '/inbox']) expect(isApiPath(path)).toBe(false);
+    for (const path of ['/api', '/api/', '/api/config', '/v1', '/v1/status', '/mcp']) expect(isApiPath(path)).toBe(true);
+    for (const path of ['/api-keys', '/apis', '/v1beta', '/v10/status', '/inbox', '/mcpx', '/mcp/x']) expect(isApiPath(path)).toBe(false);
   });
 
   it('/api-keys 前端路由交给静态资源；API 响应带 Server-Timing', async () => {
