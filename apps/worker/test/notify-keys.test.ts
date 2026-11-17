@@ -11,6 +11,7 @@ import { createApiKey } from '../src/services/api-key.js';
 import { bumpCounter, dayWindow } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { confirmForward } from '../src/services/forward-confirm.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import type { Env } from '../src/types.js';
 import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
@@ -169,6 +170,40 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
       .toEqual({ enabled: false, addresses: [target] });
     // 重新打开需要密码
     expect((await request('/api/me/notify-prefs', json(user.jwt, { forward: { enabled: true, addresses: [target] } }, 'PUT'))).status).toBe(403);
+  });
+
+  it('撤销与确认同时发生：撤销先落库时确认失败，地址不会写回转发目标（A16）', async () => {
+    const user = await account('forward-race');
+    const target = `nk-race-${seq}@example.net`;
+    await data(await request('/api/me/notify-prefs', json(user.jwt, { forward: { enabled: true, addresses: [target] }, password: TEST_PASSWORD }, 'PUT')));
+    const token = tokenOf(captured.filter((item) => item.to === target).at(-1)!.text)!;
+    // 确认方读完待确认记录与偏好之后、写入之前，用户撤销了这个地址（删除待确认记录，偏好内容不变）
+    let revoked = false;
+    const sqlOf = new WeakMap<D1PreparedStatement, string>();
+    const racing = new Proxy(runtime.db, { get(target_, property) {
+      if (property === 'prepare') return (query: string) => {
+        const statement = target_.prepare(query);
+        return new Proxy(statement, { get(stmt, key) {
+          if (key === 'bind') return (...args: unknown[]) => { const bound = stmt.bind(...args); sqlOf.set(bound, query); return bound; };
+          const value = Reflect.get(stmt, key);
+          return typeof value === 'function' ? value.bind(stmt) : value;
+        } });
+      };
+      if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
+        if (!revoked && statements.some((statement) => /^UPDATE users SET notify_prefs/.test(sqlOf.get(statement) ?? ''))) {
+          revoked = true;
+          await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ?').bind(user.id).run();
+        }
+        return target_.batch(statements);
+      };
+      const value = Reflect.get(target_, property);
+      return typeof value === 'function' ? value.bind(target_) : value;
+    } });
+    await expect(confirmForward({ ...runtime, db: racing }, token)).rejects.toMatchObject({ code: 'not_found' });
+    expect(revoked).toBe(true);
+    const after = await data<NotifyPrefsView>(await request('/api/me/notify-prefs', { headers: auth(user.jwt) }));
+    expect(after.forward.addresses).toEqual([]);
+    expect(after.forwardPending).toEqual([]);
   });
 
   it('从列表里去掉待确认的地址会撤销确认；每天的确认信有上限', async () => {

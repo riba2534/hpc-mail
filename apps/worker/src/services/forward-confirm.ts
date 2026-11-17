@@ -118,18 +118,25 @@ export async function updatePrefsWithForwardConfirmation(
 /**
  * 目标邮箱的主人确认接收转发（公开接口，凭确认信里的一次性 token）：把地址加进用户已确认的转发目标。
  * 偏好按原始 JSON 做条件写入，与用户同时修改偏好竞争时重读重试；写入与删除确认记录在同一事务。
+ * 写入还要求这条待确认记录仍在且未过期：用户撤销（删除待确认记录）与对方点击确认同时发生时，
+ * 撤销先落库则确认失败，不会把已撤销的地址写回已确认的转发目标。
  */
 export async function confirmForward(env: Env, token: string): Promise<ConfirmForwardResult> {
   const hash = await sha256Hex(token.trim());
-  const row = await env.db.prepare('SELECT id, user_id, address, expires_at FROM forward_confirmations WHERE token_hash = ?')
-    .bind(hash).first<{ id: number; user_id: number; address: string; expires_at: number }>();
-  if (!row || Number(row.expires_at) <= Date.now()) throw new AppError('not_found', '确认链接无效或已过期');
-  const userId = Number(row.user_id);
+  const invalid = () => new AppError('not_found', '确认链接无效或已过期');
   for (let attempt = 0; attempt < 3; attempt++) {
-    const raw = await env.db.prepare('SELECT notify_prefs FROM users WHERE id = ?').bind(userId).first<{ notify_prefs: string | null }>();
+    // 每轮重读待确认记录与原始偏好（同一往返）：重试时记录已被撤销就按无效链接处理
+    const [found, current] = await env.db.batch([
+      env.db.prepare('SELECT id, user_id, address, expires_at FROM forward_confirmations WHERE token_hash = ?').bind(hash),
+      env.db.prepare('SELECT notify_prefs FROM users WHERE id = (SELECT user_id FROM forward_confirmations WHERE token_hash = ?)').bind(hash),
+    ]);
+    const row = found?.results?.[0] as { id: number; user_id: number; address: string; expires_at: number } | undefined;
+    if (!row || Number(row.expires_at) <= Date.now()) throw invalid();
+    const userId = Number(row.user_id);
+    const raw = current?.results?.[0] as { notify_prefs: string | null } | undefined;
     if (!raw) {
       await env.db.prepare('DELETE FROM forward_confirmations WHERE id = ?').bind(row.id).run();
-      throw new AppError('not_found', '确认链接无效或已过期');
+      throw invalid();
     }
     const prefs = await getUserNotifyPrefs(env, userId);
     if (!prefs.forward.addresses.map(normalizeEmail).includes(row.address)) {
@@ -138,7 +145,9 @@ export async function confirmForward(env: Env, token: string): Promise<ConfirmFo
     }
     const next = JSON.stringify(prefs);
     const [updated] = await env.db.batch([
-      env.db.prepare('UPDATE users SET notify_prefs = ? WHERE id = ? AND notify_prefs IS ?').bind(next, userId, raw.notify_prefs),
+      env.db.prepare(`UPDATE users SET notify_prefs = ? WHERE id = ? AND notify_prefs IS ?
+        AND EXISTS (SELECT 1 FROM forward_confirmations WHERE id = ? AND token_hash = ? AND expires_at > ?)`)
+        .bind(next, userId, raw.notify_prefs, row.id, hash, Date.now()),
       env.db.prepare(`DELETE FROM forward_confirmations WHERE id = ? AND token_hash = ?
         AND EXISTS (SELECT 1 FROM users WHERE id = ? AND notify_prefs = ?)`).bind(row.id, hash, userId, next),
     ]);
