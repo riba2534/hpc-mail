@@ -32,17 +32,22 @@ export function purgeStatements(env: Env, token: string): D1PreparedStatement[] 
   ];
 }
 
-/** 传入 ctx 时 R2 清理放进 waitUntil，不阻塞响应；不传时同步完成（cron 等没有请求的路径）。 */
-export async function purgeMatchingMessages(env: Env, condition: SQL, limit = 1000, ctx?: ExecCtx | null): Promise<number> {
+/**
+ * 传入 ctx 时 R2 清理放进 waitUntil，不阻塞响应；不传时同步完成（cron 等没有请求的路径）。
+ * condition 可以是多条（调用方按 D1 绑定参数上限切的批），每条最多预订 limit 封，共用一个 purge token，
+ * 与删除语句合进同一次 batch。
+ */
+export async function purgeMatchingMessages(env: Env, condition: SQL | SQL[], limit = 1000, ctx?: ExecCtx | null): Promise<number> {
   const db = createDb(env);
   const token = crypto.randomUUID();
   // UPDATE re-evaluates ownership/retention/deleted state at the write boundary.
-  const reservation = db.update(messages).set({ purgeToken: token }).where(sql`${messages.id} IN
-    (SELECT id FROM ${messages} WHERE ${condition} LIMIT ${limit})`).toSQL();
-  const results = await env.db.batch([
-    env.db.prepare(reservation.sql).bind(...reservation.params), ...purgeStatements(env, token),
-  ]);
-  const deleted = results[1 + PURGE_MESSAGES_INDEX]?.meta.changes ?? 0;
+  const reservations = (Array.isArray(condition) ? condition : [condition]).map((cond) => {
+    const reservation = db.update(messages).set({ purgeToken: token }).where(sql`${messages.id} IN
+      (SELECT id FROM ${messages} WHERE ${cond} LIMIT ${limit})`).toSQL();
+    return env.db.prepare(reservation.sql).bind(...reservation.params);
+  });
+  const results = await env.db.batch([...reservations, ...purgeStatements(env, token)]);
+  const deleted = results[reservations.length + PURGE_MESSAGES_INDEX]?.meta.changes ?? 0;
   await scheduleStorageCleanup(env, ctx, 100);
   return deleted;
 }

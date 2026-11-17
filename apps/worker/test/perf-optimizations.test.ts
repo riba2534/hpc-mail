@@ -219,6 +219,37 @@ describe('/v1 鉴权写入合并', () => {
   });
 });
 
+describe('列表、sync、wait 的整请求 D1 往返（Server-Timing 计数）', () => {
+  /** 经 Worker 入口发请求，读 Server-Timing 里的 d1 往返数（鉴权与业务合计） */
+  async function d1Trips(path: string, token: string) {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request(`https://mail.example${path}`, bearer(token)), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status, path).toBe(200);
+    return Number(/d1;desc="n=(\d+)"/.exec(response.headers.get('Server-Timing') ?? '')?.[1]);
+  }
+
+  it('鉴权一次 + 业务一次：列表与 sync（含 domain/搜索分流）各 2 次；wait 命中只比列表多预占与退还两次', async () => {
+    const id = await seedUser('perf-trips');
+    const { jwt } = await tokenFor(id);
+    const created = await createApiKey(env, id, { name: 'trips', scopes: ['mail.read'], rateLimit: 120, allowedIps: [] });
+    await createDb(env).insert(mailboxes).values({ address: 'perf-trips@hpc.email', domain: 'hpc.email', userId: id });
+    const [hit] = await createDb(env).insert(messages)
+      .values({ direction: 'inbound', address: 'perf-trips@hpc.email', domain: 'hpc.email', status: 'received', subject: 'trip' })
+      .returning({ id: messages.id });
+    // 原先列表与 sync 取页后还要再查一次附件/星标标记（3 次）
+    for (const query of ['', 'direction=inbound', 'domain=hpc.email', 'q=trip']) {
+      expect(await d1Trips(`/api/messages?${query}`, jwt), query).toBe(2);
+      expect(await d1Trips(`/api/messages/sync?${query}`, jwt), query).toBe(2);
+    }
+    // /v1 的鉴权与请求日志另计：wait 命中与列表一样只查一次（摘要与标记同一条语句），另加预占与退还未用配额两次
+    // 先发一次请求：Key 的 last_used 每 60 秒只写一次，第一次请求多这一次写
+    await d1Trips('/v1/status', created.key);
+    const listed = await d1Trips('/v1/messages', created.key);
+    expect(await d1Trips(`/v1/messages/wait?timeout=1&afterId=${hit!.id - 1}`, created.key)).toBe(listed + 2);
+  });
+});
+
 describe('入口路由与可观测性', () => {
   it('/api、/v1 只匹配精确路径或子路径', () => {
     for (const path of ['/api', '/api/', '/api/config', '/v1', '/v1/status', '/mcp']) expect(isApiPath(path)).toBe(true);
