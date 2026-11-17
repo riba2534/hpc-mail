@@ -7,7 +7,7 @@
 - [批量认领](#批量认领)：随机后缀方案、批量可用性、批量认领
 - [释放、历史与共享边界](#释放历史与共享边界)：释放与清除历史、共享的权限范围与管理接口
 - [域名新增、关闭公开和删除](#域名新增关闭公开和删除)：管理员维护系统域名
-- [用户托管域名](#用户托管域名)：把自己的域名接入本站，以及[托管域名的 DNS 解析](#托管域名的-dns-解析)
+- [用户托管域名](#用户托管域名)：把自己的域名接入本站、[批量添加与立即检测](#批量添加与立即检测)，以及[托管域名的 DNS 解析](#托管域名的-dns-解析)
 
 shell 示例复用 [入口指南](../skill.md) 的 `hpc()`。邮箱 CRUD、发件身份与批量认领在 JWT `/api` 与 Key `/v1` 均可用；共享管理与用户托管域名只用 JWT `/api`；强制过户、全站共享和系统域名管理只用管理员 JWT `/api`，Key scopes 不提供管理权。
 
@@ -162,6 +162,22 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；自动认领默认不限数量（`hosted_domains.autoClaimLimit` 为 0），管理员设了正数上限时，域内地址达到上限后未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
 - 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
 - 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；全站 Cloudflare 调用额度见下文 DNS 解析的限流说明：添加时占位计 2 次（额度不足直接 429），开通前的后台预配置再计 5 次；删除计 2 次，只计数不会因额度被拒。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
+
+### 批量添加与立即检测
+
+一次添加或检测多个域名：`POST /api/hosted-domains/batch` 请求体 `{"domains":[…]}`，`POST /api/hosted-domains/batch-check` 请求体 `{"ids":[…]}`。API Key 用 `/v1` 下的同名路径，需要 `domain.write`。单次 1–20 项，不能重复（域名不分大小写），否则 400。
+
+- 逐项处理、逐项返回 `{items,succeeded,failed}`：`items` 与请求顺序一致，每项为 `{domain 或 id, ok:true, hostedDomain}` 或 `{domain 或 id, ok:false, error:{code,message,fix?}}`。HTTP 状态恒为 200，按 `items[].ok` 判断。每项的规则与单个添加、单个检测完全相同（权限、409 冲突、额度、审计）。
+- 额度先算后做：开始前读取本分钟的个人次数（添加 5 次、检测 10 次）与全站 Cloudflare 额度，额度外的项不执行、不计数、不调用 Cloudflare，返回 `rate_limited`，message 以「未处理：」开头。约 1 分钟后只重试这些项。
+- 遇到账户级错误即停止：添加遇到 `rate_limited`、`forbidden`（每人托管上限或同时等待生效数上限）、`user_disabled`，检测遇到 `rate_limited`、`user_disabled` 后，其余项不再尝试，返回同一 `code`，message 以「未处理：」开头。其他错误（如 409 已被托管、无权访问的 id 404、成员检测 403）只影响该项。普通用户默认只能有 1 个域名同时等待 NS 生效，批量添加多用于管理员或放宽了该上限的用户。
+- 托管功能关闭或站点缺少 Cloudflare 凭据时，整个请求 403，不逐项返回。
+
+```bash
+# API="$BASE/api"、AUTH 为 JWT；或 API="$BASE/v1"、AUTH 为带 domain.write 的 Key
+jq -n '{domains:["example.com","example.net"]}' |
+  hpc '/hosted-domains/batch' -X POST -H 'Content-Type: application/json' --data-binary @- |
+  jq '.data.items[] | {domain, ok, status:.hostedDomain.status, ns:.hostedDomain.nameServers, error:.error.message}'
+```
 
 ### 托管域名的 DNS 解析
 

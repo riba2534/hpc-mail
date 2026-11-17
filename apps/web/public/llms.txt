@@ -9,6 +9,7 @@
 - [Agent 技能说明](/skill.md)：30 秒上手（`/v1/me` 自查 Key、`/v1/identities` 选发件身份）、常用配方（等验证码、发信、回复转发、附件与内联图片、临时地址、增量同步）、权限模型、能力地图和参考文档入口。
 - [错误码说明](/references/errors.md)：错误信封的 `fix`/`docs`/`details`，以及每个错误码的含义与改正方法。
 - [API Key OpenAPI](/v1/openapi.json)：使用 hpcm_ 开头的 API Key，按 mail/mailbox scopes 操作邮箱。
+- [远程 MCP](/references/mcp.md)：MCP 客户端接入 `/mcp`（Streamable HTTP，hpcm_ API Key 认证），10 个收发与地址管理工具。
 - [会话 OpenAPI](/api/openapi.json)：用户名密码及可选 2FA 登录后，使用 JWT；包含账户、通知和管理员 API。
 
 从用户提供的凭据和任务选择认证方式；API Key 与 JWT 不能互换。首次接入时先读取技能说明。

@@ -1,6 +1,5 @@
-import {
-  API_SCOPES, MAX_SEND_REQUEST_BYTES, MCP_TOOL_NAMES, type ApiScope, type CreatedApiKey, type MessageDetail,
-} from '@hpc-mail/shared';
+import { API_SCOPES, MAX_SEND_REQUEST_BYTES, type ApiScope, type CreatedApiKey, type MessageDetail } from '@hpc-mail/shared';
+import { MCP_TOOL_NAMES } from '@hpc-mail/shared/mcp';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
@@ -14,6 +13,9 @@ import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 // @ts-expect-error Vite 的 ?raw 导入（只用于部署配置断言）
 import wranglerToml from '../wrangler.toml?raw';
+import skillDoc from '../../web/public/skill.md?raw';
+import llmsDoc from '../../web/public/llms.txt?raw';
+import mcpDoc from '../../web/public/references/mcp.md?raw';
 
 const app = createApp();
 const db = createDb(env);
@@ -360,9 +362,17 @@ describe('MCP 权限与错误：与 REST 端点一致', () => {
   });
 });
 
-describe('MCP 部署配置', () => {
+describe('MCP 部署配置与文档', () => {
   it('/mcp 走 Worker：run_worker_first 包含 /mcp', () => {
     const line = (wranglerToml as string).split('\n').find((entry) => entry.startsWith('run_worker_first'))!;
     expect(JSON.parse(line.slice(line.indexOf('[')))).toContain('/mcp');
+  });
+
+  it('references/mcp.md 列出全部工具，入口与 llms.txt 指向它', () => {
+    for (const name of MCP_TOOL_NAMES) expect(mcpDoc, name).toContain(`| \`${name}\` |`);
+    expect(mcpDoc).toContain('https://hpc.email/mcp');
+    expect(mcpDoc).toContain('Authorization: Bearer');
+    expect(skillDoc).toContain('(references/mcp.md)');
+    expect(llmsDoc).toContain('(/references/mcp.md)');
   });
 });
