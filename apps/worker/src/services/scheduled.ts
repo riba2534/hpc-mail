@@ -10,9 +10,8 @@ import {
   sessions,
 } from '../db/schema.js';
 import { chunk } from '../lib/d1.js';
-import { API_REJECT_SCOPE } from '../middleware/api-key-auth.js';
 import type { Env } from '../types.js';
-import { dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
+import { API_REJECT_SCOPE, dayWindow, minuteWindow, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
