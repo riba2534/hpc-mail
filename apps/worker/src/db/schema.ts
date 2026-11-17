@@ -55,7 +55,12 @@ export const mailboxes = sqliteTable(
     displayName: text('display_name').notNull().default(''),
     createdAt: createdAtColumn(),
   },
-  (t) => [index('idx_mailboxes_user').on(t.userId), index('idx_mailboxes_domain').on(t.domain)],
+  (t) => [
+    index('idx_mailboxes_user').on(t.userId),
+    index('idx_mailboxes_domain').on(t.domain),
+    // domain 视图把 domain 下推到认领地址子查询（user_id = ? AND domain = ?），按用户取某个域的地址不必回表
+    index('idx_mailboxes_user_domain').on(t.userId, t.domain),
+  ],
 );
 
 export const messages = sqliteTable(
