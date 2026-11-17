@@ -92,10 +92,10 @@ function RecipientLine({ label, addresses }: { label: string; addresses: string[
 }
 
 function VerificationLinkBanner({ message }: { message: MessageDetail }) {
-  const link = inspectVerificationLink(message.verificationLink, message.fromAddress);
+  const link = inspectVerificationLink(message.verificationLink);
   if (!link) return null;
   const unverifiedSender = senderAuthFailed(message.auth);
-  const caution = link.mismatch || unverifiedSender;
+  const caution = unverifiedSender;
   return (
     <div
       className={cn(
@@ -115,13 +115,7 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
           </a>
         </Button>
       </div>
-      {link.mismatch && (
-        <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
-          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
-          链接域名与发件人不一致，请确认后再打开
-        </p>
-      )}
-      {!link.mismatch && unverifiedSender && (
+      {unverifiedSender && (
         <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           发件人未通过验证，请确认后再打开
