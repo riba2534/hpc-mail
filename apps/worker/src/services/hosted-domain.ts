@@ -5,6 +5,7 @@ import type {
 import { and, desc, eq, inArray, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
+import { chunk, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
@@ -730,9 +731,12 @@ export async function replaceHostedDomainMembers(
   // 只校验新增的人：已被禁用的现有成员可以留在名单里，不妨碍添加其他人
   const added = unique.filter((userId) => !before.some((member) => member.userId === userId));
   if (added.length) {
-    const active = await createDb(env).select({ id: users.id }).from(users)
-      .where(and(inArray(users.id, added), eq(users.status, 'active'))).all();
-    if (active.length !== added.length) throw new AppError('validation_failed', '只能共享给启用中的用户');
+    // 一次最多新增 100 人，连同 status 超过 D1 的 100 个绑定参数：分批放进同一个 batch，仍是一次往返
+    const db = createDb(env);
+    const active = await env.db.batch(chunk(added).map((batch) => d1Statement(env,
+      db.select({ id: users.id }).from(users).where(and(inArray(users.id, batch), eq(users.status, 'active'))))));
+    const activeCount = active.reduce((total, part) => total + part.results.length, 0);
+    if (activeCount !== added.length) throw new AppError('validation_failed', '只能共享给启用中的用户');
   }
   const ids = JSON.stringify(unique);
   const ownerGuard = `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1 AND user_id = ?2 AND status <> 'deleting')`;
