@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 幂等 admin 引导：库内无 admin 时插入（CI 部署前执行；本地传 --local [--persist-to <目录>]）
-import { d1, hashPassword } from './seed-lib.mjs';
+import { RESERVED_USERNAMES, d1, hashPassword } from './seed-lib.mjs';
 
 const username = (process.env.ADMIN_USERNAME ?? '').trim().toLowerCase();
 const password = process.env.ADMIN_PASSWORD ?? '';
@@ -11,6 +11,10 @@ if (process.argv.includes('--if-env') && (!username || !password)) {
 }
 if (!/^[a-z0-9][a-z0-9_-]{2,31}$/.test(username)) {
   console.error('ADMIN_USERNAME 非法（3-32 位小写字母/数字/-_）');
+  process.exit(1);
+}
+if (RESERVED_USERNAMES.includes(username)) {
+  console.error(`ADMIN_USERNAME 不能使用系统保留用户名 ${username}（部署冒烟专用账号），请换一个管理员用户名`);
   process.exit(1);
 }
 if (password.length < 12 || password.length > 128) {

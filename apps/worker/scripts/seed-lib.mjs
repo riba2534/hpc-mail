@@ -6,6 +6,9 @@ import { webcrypto as crypto } from 'node:crypto';
 
 const ITERATIONS = 100000;
 
+/** 系统保留用户名，须与 packages/shared/src/constants.ts 的 RESERVED_USERNAMES 一致；ci-smoke 是部署冒烟专用账号 */
+export const RESERVED_USERNAMES = ['ci-smoke'];
+
 async function pbkdf2(password, salt) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
   const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: ITERATIONS }, key, 32 * 8);
