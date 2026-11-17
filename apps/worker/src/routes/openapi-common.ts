@@ -167,7 +167,7 @@ const composeFrom = { ...sendProperties.from,
   description: 'Optional, same four forms as POST /messages. Defaults to the address the source message was received at (for your own sent mail, the address it was sent from). When that address is not one you can send from, typically mail in a mailbox shared with you, the request fails with 400 from_required: pick an address from GET /identities.' };
 const replyRequest: Schema = {
   type: 'object', additionalProperties: false,
-  description: `Recipients, subject (Re: prefix) and the In-Reply-To/References thread headers are computed from the source message; unknown fields such as to or subject return 400 validation_failed (use POST /messages with replyToMessageId to customize them). At least one nonempty text/html; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes including the quote, which is truncated with a note when the original is too long. Attachments follow POST /messages.`,
+  description: `Recipients, subject (Re: prefix) and the In-Reply-To/References thread headers are computed from the source message; unknown fields such as to or subject return 400 validation_failed (use POST /messages with replyToMessageId to customize them). Line breaks and tabs in the original subject collapse to a space, and the prefixed subject is cut at 998 UTF-8 bytes on a character boundary. When the computed To+Cc exceed ${MAX_RECIPIENTS} addresses after deduplication (a source with many Reply-To or recipients), the reply returns 400 validation_failed; choose recipients yourself with POST /messages. At least one nonempty text/html; combined UTF-8 body maximum ${MAX_BODY_BYTES} bytes including the quote, which is truncated with a note when the original is too long. Attachments follow POST /messages.`,
   properties: {
     replyAll: { ...bool, default: false, description: 'false: reply to the source Reply-To addresses, else its sender (for your own sent mail, its To recipients). true: also Cc the other To/Cc recipients, excluding your own addresses; the original Bcc is never included.' },
     text: sendProperties.text, html: sendProperties.html,
@@ -180,7 +180,7 @@ const replyRequest: Schema = {
 };
 const forwardRequest: Schema = {
   type: 'object', additionalProperties: false, required: ['to'],
-  description: `Subject gets a Fwd: prefix; the note comes first, then (includeOriginal) a forwarded-message header and the original text and HTML. All attachments of the source, including inline CID images, are always attached (same rules as forwardAttachmentsFrom: at most ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB, a lost attachment returns 404 source_unavailable). Unknown fields return 400 validation_failed; use POST /messages with forwardAttachmentsFrom for full control.`,
+  description: `Subject gets a Fwd: prefix (line breaks collapsed and cut at 998 UTF-8 bytes, as for replies); the note comes first, then (includeOriginal) a forwarded-message header and the original text and HTML. All attachments of the source, including inline CID images, are always attached (same rules as forwardAttachmentsFrom: at most ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB, a lost attachment returns 404 source_unavailable). Unknown fields return 400 validation_failed; use POST /messages with forwardAttachmentsFrom for full control.`,
   properties: {
     to: { ...array(ref('MailAddress')), description: `to+cc+bcc hold 1–${MAX_RECIPIENTS} addresses in total.` },
     cc: { ...array(ref('MailAddress')), default: [] },

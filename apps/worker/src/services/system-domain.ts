@@ -14,7 +14,7 @@ import {
   type SystemDomainStep, type SystemDomainStepKey, type SystemDomainStepState, type SystemDomainZonesQuery, type SystemDomainZonesView,
   type SystemDomainZoneOrigin,
 } from '@hpc-mail/shared';
-import { and, desc, eq, getTableColumns, sql } from 'drizzle-orm';
+import { and, desc, eq, getTableColumns, sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { systemDomainOnboarding, users, type OnboardingAcceptance, type OnboardingChangeEvent } from '../db/schema.js';
 import { AppError, errorText } from '../lib/errors.js';
@@ -41,7 +41,8 @@ import {
 } from './zone-catalog.js';
 
 type OnboardingRow = typeof systemDomainOnboarding.$inferSelect;
-type OnboardingFields = Partial<typeof systemDomainOnboarding.$inferInsert>;
+/** 写回字段；next_check_at 可以是 SQL 表达式（按同一行的取消标记决定） */
+type OnboardingFields = Omit<Partial<typeof systemDomainOnboarding.$inferInsert>, 'nextCheckAt'> & { nextCheckAt?: Date | null | SQL };
 type Actor = Pick<AuthUser, 'id' | 'username'>;
 
 const MINUTE = 60_000;
@@ -506,6 +507,13 @@ const evaluationFields = (ev: Evaluation, row: OnboardingRow): OnboardingFields 
 
 const BLOCKER_CODES: Partial<Record<string, string>> = { occupancy: 'occupied', capacity: 'list_full', token: 'cf_auth' };
 
+/**
+ * 待确认不自动推进（next_check_at 置空），但处理期间已请求取消时保留到期时间，定时任务照常收尾取消。
+ * 判断写在同一条 UPDATE 里：取消标记可能在本次处理读取之后才写入
+ */
+const idleUnlessCancelled = (): SQL =>
+  sql`CASE WHEN ${systemDomainOnboarding.cancelRequestedAt} IS NOT NULL THEN ${Date.now()} ELSE NULL END`;
+
 /** 写前门禁的结论写回：blocked / needs_confirmation 释放租约；finalizing / configuring 续租 */
 async function decide(run: Run, ev: Evaluation): Promise<SystemDomainOnboardingState | null> {
   const { row } = run;
@@ -522,7 +530,7 @@ async function decide(run: Run, ev: Evaluation): Promise<SystemDomainOnboardingS
   if (gate.unconfirmed.length) {
     await save(run, {
       ...base, state: 'needs_confirmation', attempts: 0, errorCode: 'needs_confirmation',
-      lastError: `需要确认 ${gate.unconfirmed.length} 项变更`, nextCheckAt: null,
+      lastError: `需要确认 ${gate.unconfirmed.length} 项变更`, nextCheckAt: idleUnlessCancelled(),
     });
     return null;
   }
@@ -583,7 +591,7 @@ async function apply(run: Run, ev: Evaluation): Promise<Step> {
       }
       return 'stop';
     case 'needs_confirmation':
-      await save(run, { ...fields, state: 'needs_confirmation', errorCode: result.errorCode, lastError: result.error, nextCheckAt: null });
+      await save(run, { ...fields, state: 'needs_confirmation', errorCode: result.errorCode, lastError: result.error, nextCheckAt: idleUnlessCancelled() });
       return 'stop';
     case 'blocked':
       await save(run, {
@@ -691,6 +699,8 @@ const MX_GAP_ON_CANCEL = '取消时第三方 MX 已删除、收件路由尚未�
 
 /** 台账里删过第三方 MX，之后没有成功开启 Routing */
 function mxRemovedWithoutRouting(row: OnboardingRow): boolean {
+  // 最近一次预检或写后复读已看到 Routing 就绪（例如管理员在 Cloudflare 手动开启）：没有缺口
+  if (row.routingState === 'ready') return false;
   if (row.errorCode === 'mx_removed_routing_pending') return true;
   const lastMx = row.changes.filter((event) => event.kind === 'mx.delete' && event.status === 'done')
     .reduce((max, event) => Math.max(max, event.seq), 0);

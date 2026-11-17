@@ -54,9 +54,13 @@ function clipUtf8(value: string, maxBytes: number): string {
   return value.slice(0, end);
 }
 
-/** 主题前缀：已带同类前缀不重复加；加上前缀后超出主题上限时截断（原信主题最长可到 2048 字符） */
+/**
+ * 主题前缀：已带同类前缀不重复加；加上前缀后超出主题上限时截断（原信主题最长可到 2048 字符）。
+ * 旧版解析器会把编码字里的换行原样落库，带 CR/LF 的主题过不了发信的头部检查，调用方又改不了主题：
+ * 先把 CR/LF/TAB（连同两侧空格）折叠成一个空格
+ */
 function prefixed(subject: string, prefix: 'Re' | 'Fwd'): string {
-  const trimmed = subject.trim() || '(无主题)';
+  const trimmed = subject.replace(/ *[\r\n\t][\r\n\t ]*/g, ' ').trim() || '(无主题)';
   const pattern = prefix === 'Re' ? /^re:/i : /^(fwd?|转发):/i;
   return clipUtf8(pattern.test(trimmed) ? trimmed : `${prefix}: ${trimmed}`, MAX_SUBJECT_BYTES).trimEnd();
 }

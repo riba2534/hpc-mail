@@ -1,5 +1,5 @@
 import { API_SCOPES, MAX_SEND_REQUEST_BYTES, type ApiScope, type CreatedApiKey, type MessageDetail } from '@hpc-mail/shared';
-import { MCP_TOOL_NAMES } from '@hpc-mail/shared/mcp';
+import { MCP_TOOL_NAMES, mcpToolInputSchemas } from '@hpc-mail/shared/mcp';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
@@ -390,12 +390,13 @@ describe('MCP 大邮件与大列表（A7、A10）', () => {
     expect(truncate('abc', 5)).toEqual({ text: 'abc', truncated: false });
   });
 
-  it('get_message 与 wait_for_message 的 detailed 正文各自超过上限时截断，并提示用 raw 下载；不超过时原样返回', async () => {
+  it('get_message 与 wait_for_message 的 detailed 正文各自超过上限时截断，按有无原始存档提示完整内容的取法；不超过时原样返回', async () => {
     const user = await actor('mcp-big');
     const box = await ok<{ address: string }>(user.key, 'claim_mailbox', { localPart: 'mcp-big', domain: DOMAIN });
     const baseline = await inbound(box.address, { subject: 'small', bodyText: 'tiny', bodyHtml: '<p>tiny</p>' });
     const long = 'x'.repeat(DETAILED_BODY_CHARS + 500);
-    const big = await inbound(box.address, { subject: 'big', bodyText: long, bodyHtml: `<p>${long}</p>` });
+    const big = await inbound(box.address, { subject: 'big', bodyText: long, bodyHtml: `<p>${long}</p>`, rawR2Key: 'raw/mcp-big.eml' });
+    const sent = await inbound(box.address, { direction: 'outbound', subject: 'sent big', bodyText: long, status: 'sent' });
 
     const concise = await ok<{ text: string; textTruncated: boolean }>(user.key, 'get_message', { messageId: big });
     expect(concise).toMatchObject({ text: 'x'.repeat(2000), textTruncated: true });
@@ -403,7 +404,13 @@ describe('MCP 大邮件与大列表（A7、A10）', () => {
       { messageId: big, response_format: 'detailed' });
     expect(detailed.bodyText).toHaveLength(DETAILED_BODY_CHARS);
     expect(detailed.bodyHtml).toHaveLength(DETAILED_BODY_CHARS);
-    expect(detailed).toMatchObject({ id: big, bodyTruncated: true, hint: expect.stringContaining(`/v1/messages/${big}/raw`) });
+    expect(detailed).toMatchObject({ id: big, bodyTruncated: true, hint: expect.stringContaining(`GET /v1/messages/${big}/raw`) });
+    expect(detailed.hint).toContain(`GET /v1/messages/${big} `);
+    // 发出的邮件没有原始存档（/raw 会 404）：只指向不截断的 REST 详情
+    const outbound = await ok<{ bodyTruncated: boolean; hint: string }>(user.key, 'get_message', { messageId: sent, response_format: 'detailed' });
+    expect(outbound.bodyTruncated).toBe(true);
+    expect(outbound.hint).toContain(`GET /v1/messages/${sent} `);
+    expect(outbound.hint).not.toContain('/raw');
     const small = await ok<Record<string, unknown>>(user.key, 'get_message', { messageId: baseline, response_format: 'detailed' });
     expect(small).toMatchObject({ bodyText: 'tiny', bodyHtml: '<p>tiny</p>' });
     expect(small).not.toHaveProperty('bodyTruncated');
@@ -431,6 +438,32 @@ describe('MCP 大邮件与大列表（A7、A10）', () => {
     expect(await toolError(user.key, 'list_mailboxes', { limit: 201 })).toMatchObject({ code: 'validation_failed' });
   });
 
+  it('release_mailbox(address) 每页 200 条按地址过滤，翻到精确命中或翻完全部页，不因前面有大量子串命中而误报 404', async () => {
+    const pageCount = 7;
+    const calls: RestRequest[] = [];
+    const rest = (async (req: RestRequest) => {
+      calls.push(req);
+      if (req.method === 'DELETE') return { success: true, deletedMessages: 0 };
+      const index = calls.filter((call) => call.method === 'GET').length;
+      const last = index === pageCount;
+      return { items: [{ id: 1000 - index, address: last ? 'a@owner.example' : `x${index}a@owner.example` }], nextCursor: last ? null : `c${index}` };
+    }) as Rest;
+    expect(await TOOLS.release_mailbox.run(rest, { address: 'a@owner.example', deleteHistory: false }, {}))
+      .toEqual({ mailboxId: 1000 - pageCount, success: true, deletedMessages: 0 });
+    const gets = calls.filter((call) => call.method === 'GET');
+    expect(gets).toHaveLength(pageCount);
+    expect(gets.every((call) => call.query?.limit === '200' && call.query?.q === 'a@owner.example' && call.query?.domain === 'owner.example')).toBe(true);
+
+    calls.length = 0;
+    const missing = (async (req: RestRequest) => {
+      calls.push(req);
+      const index = calls.length;
+      return { items: [{ id: index, address: `x${index}a@owner.example` }], nextCursor: index < 9 ? `c${index}` : null };
+    }) as Rest;
+    await expect(TOOLS.release_mailbox.run(missing, { address: 'a@owner.example', deleteHistory: false }, {})).rejects.toMatchObject({ status: 404 });
+    expect(calls).toHaveLength(9);
+  });
+
   it('list_mailboxes 与 release_mailbox(address) 只发带 limit 的过滤查询，不拉全量；地址按子串命中后逐条比对', async () => {
     const calls: RestRequest[] = [];
     const pages = [
@@ -445,8 +478,8 @@ describe('MCP 大邮件与大列表（A7、A10）', () => {
     const released = await TOOLS.release_mailbox.run(rest, { address: 'bob@hpc.email', deleteHistory: false }, {});
     expect(released).toEqual({ mailboxId: 7, success: true, deletedMessages: 0 });
     expect(calls.map((call) => [call.method, call.path, call.query])).toEqual([
-      ['GET', '/v1/mailboxes', { limit: '50', q: 'bob@hpc.email', domain: 'hpc.email' }],
-      ['GET', '/v1/mailboxes', { limit: '50', q: 'bob@hpc.email', domain: 'hpc.email', cursor: 'c1' }],
+      ['GET', '/v1/mailboxes', { limit: '200', q: 'bob@hpc.email', domain: 'hpc.email' }],
+      ['GET', '/v1/mailboxes', { limit: '200', q: 'bob@hpc.email', domain: 'hpc.email', cursor: 'c1' }],
       ['DELETE', '/v1/mailboxes/7', { deleteHistory: '0' }],
     ]);
 
@@ -454,6 +487,50 @@ describe('MCP 大邮件与大列表（A7、A10）', () => {
     const listed = await TOOLS.list_mailboxes.run(rest, { response_format: 'concise' }, {});
     expect(calls[0]!.query).toEqual({ limit: '50' });
     expect(listed).toMatchObject({ nextCursor: 'c1' });
+  });
+});
+
+describe('list_identities 分页（A7+A10 第二轮）', () => {
+  const identity = (index: number, kind: 'owned' | 'shared' = 'owned') => ({ kind, mailboxId: index, address: `id${index}@hpc.email`,
+    domain: 'hpc.email', displayName: '', canSend: kind === 'owned', reason: kind === 'owned' ? null : 'shared_readonly' });
+
+  it('/v1/identities 不分页：工具按 limit/cursor 切页，写明 total 与是否截断；q 按地址子串过滤；domains 最多 200 个并给出总数', async () => {
+    const all = [identity(1), identity(2), identity(3), identity(4), identity(5, 'shared')];
+    const domains = Array.from({ length: 205 }, (_, index) => ({ domain: `d${index}.example`, kind: 'hosted', anyLocalPart: true }));
+    const rest = (async () => ({ identities: all, domains })) as Rest;
+    const run = (args: Record<string, unknown>) => TOOLS.list_identities.run(rest,
+      mcpToolInputSchemas.list_identities.parse(args) as never, {}) as Promise<Record<string, unknown>>;
+
+    const first = await run({ limit: 2 });
+    expect(first).toMatchObject({ total: 5, truncated: true, nextCursor: expect.any(String) });
+    expect((first.identities as Array<{ mailboxId: number }>).map((item) => item.mailboxId)).toEqual([1, 2]);
+    expect(first.domains).toHaveLength(200);
+    expect(first).toMatchObject({ domainsTotal: 205, domainsTruncated: true });
+    const second = await run({ limit: 2, cursor: first.nextCursor });
+    expect((second.identities as Array<{ mailboxId: number }>).map((item) => item.mailboxId)).toEqual([3, 4]);
+    const last = await run({ limit: 2, cursor: second.nextCursor });
+    expect(last).toMatchObject({ total: 5, truncated: false, nextCursor: null });
+    expect((last.identities as Array<{ kind: string }>)).toEqual([expect.objectContaining({ mailboxId: 5, kind: 'shared', canSend: false })]);
+
+    const filtered = await run({ q: 'ID3@' });
+    expect(filtered).toMatchObject({ total: 1, truncated: false, nextCursor: null });
+    const defaults = await run({});
+    expect(defaults).toMatchObject({ total: 5, truncated: false });
+    expect(mcpToolInputSchemas.list_identities.safeParse({ limit: 201 }).success).toBe(false);
+    expect(mcpToolInputSchemas.list_identities.safeParse({ cursor: 'abc' }).success).toBe(false);
+  });
+
+  it('经 /mcp 调用：默认每页 50 条，nextCursor 翻页', async () => {
+    const user = await actor('mcp-ids');
+    for (const localPart of ['mcp-ids-a', 'mcp-ids-b', 'mcp-ids-c']) await ok(user.key, 'claim_mailbox', { localPart, domain: DOMAIN });
+    const first = await ok<{ identities: Array<{ address: string }>; total: number; truncated: boolean; nextCursor: string | null }>(user.key,
+      'list_identities', { limit: 2 });
+    expect(first).toMatchObject({ total: 3, truncated: true });
+    expect(first.identities.map((item) => item.address)).toEqual([`mcp-ids-a@${DOMAIN}`, `mcp-ids-b@${DOMAIN}`]);
+    const rest = await ok<{ identities: Array<{ address: string }>; nextCursor: string | null }>(user.key, 'list_identities',
+      { limit: 2, cursor: first.nextCursor, response_format: 'detailed' });
+    expect(rest).toMatchObject({ nextCursor: null, identities: [expect.objectContaining({ address: `mcp-ids-c@${DOMAIN}`, domain: DOMAIN })] });
+    expect(await toolError(user.key, 'list_identities', { cursor: 'nope' })).toMatchObject({ code: 'validation_failed' });
   });
 });
 
@@ -465,6 +542,8 @@ describe('MCP 部署配置与文档', () => {
 
   it('references/mcp.md 列出全部工具，入口与 llms.txt 指向它', () => {
     for (const name of MCP_TOOL_NAMES) expect(mcpDoc, name).toContain(`| \`${name}\` |`);
+    // reply_email 与回复接口同一套规则（mail.md「回复和转发」）：收件人上限与主题折叠、截断
+    for (const rule of ['去重后超过 100 个', '换行与制表符折叠成空格', '998 个 UTF-8 字节']) expect(mcpDoc, rule).toContain(rule);
     expect(mcpDoc).toContain('https://hpc.email/mcp');
     expect(mcpDoc).toContain('Authorization: Bearer');
     expect(skillDoc).toContain('(references/mcp.md)');

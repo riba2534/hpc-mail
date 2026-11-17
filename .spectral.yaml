@@ -1,4 +1,4 @@
-# 两份 OpenAPI（/api/openapi.json 与 /v1/openapi.json）的 Spectral 规则集，CI 与部署流水线以 --fail-severity=error 运行：
+# 两份 OpenAPI（/api/openapi.json 与 /v1/openapi.json）的 Spectral 规则集，只在 PR CI（ci.yml）以 --fail-severity=error 运行：
 #   bash scripts/check-openapi.sh [输出目录]（导出两份规范后用固定版本的 spectral-cli 检查）
 # 动词表与 apps/worker/src/routes/openapi-common.ts 的 OPERATION_VERBS 保持一致（openapi-quality 测试会核对）。
 extends: ["spectral:oas"]

@@ -34,7 +34,12 @@ const flag = (description: string) => z.boolean().optional().describe(descriptio
 
 export const mcpToolInputSchemas = {
   get_me: z.object({}).strict(),
-  list_identities: z.object({ response_format: responseFormat }),
+  list_identities: z.object({
+    q: z.string().trim().toLowerCase().max(254).optional().describe('只列地址包含该文本的身份（按字面匹配）'),
+    cursor: z.string().regex(/^\d{1,9}$/, 'cursor 无效：原样传回上一页返回的 nextCursor').optional().describe('上一页返回的 nextCursor，原样传回'),
+    limit: z.number().int().min(1).max(LIST_PAGE_MAX_LIMIT).optional().describe(`每页条数，默认 ${LIST_PAGE_DEFAULT_LIMIT}`),
+    response_format: responseFormat,
+  }),
   list_mailboxes: z.object({
     q: z.string().trim().toLowerCase().max(254).optional().describe('只列地址包含该文本的邮箱（按字面匹配）'),
     domain: domainSchema.optional().describe('只列这个域名下的邮箱'),
