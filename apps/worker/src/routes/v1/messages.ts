@@ -12,6 +12,7 @@ import { buildSecureHeaders } from '../../lib/attachment-security.js';
 import { messageViewer, mutationViewer } from '../../lib/message-viewer.js';
 import { V1_ATTACHMENT_TTL_SECONDS } from '../../lib/crypto.js';
 import { AppError } from '../../lib/errors.js';
+import { conditionalDetailResponse } from '../../lib/etag.js';
 import { execCtx, ok, parseBody, parseId, parseQuery } from '../../lib/http.js';
 import { apiKeyAuth, requireScope } from '../../middleware/api-key-auth.js';
 import {
@@ -25,7 +26,7 @@ import {
   restoreMessages,
   purgeMessages,
   findNextMessage,
-  getMessageDetail,
+  getMessageDetailConditional,
   listMessages,
   loadAttachmentForViewer,
   markMessages,
@@ -213,7 +214,10 @@ app.get('/:id', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
   const id = parseId(c.req.param('id'));
-  return ok(c, await getMessageDetail(c.env, messageViewer(c, key), id, V1_ATTACHMENT_TTL_SECONDS));
+  const ifNoneMatch = c.req.header('If-None-Match');
+  return conditionalDetailResponse(c, await getMessageDetailConditional(c.env, messageViewer(c, key), id, {
+    attachmentTtlSeconds: V1_ATTACHMENT_TTL_SECONDS, ifNoneMatch,
+  }));
 });
 
 app.get('/:id/attachments/:attId', async (c) => {

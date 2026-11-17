@@ -281,7 +281,7 @@ async function loadForwardedAttachments(
   alreadyCount: number,
   alreadyBytes: number,
 ): Promise<StoredAttachment[]> {
-  await loadSourceMessage(env, sender, sourceMessageId, '转发的原邮件不存在或不可见');
+  await loadSourceMessage(env, sender, sourceMessageId, '转发的原邮件不存在或不可见', 'forward');
   const rows = await db
     .select()
     .from(attachmentsTable)
@@ -295,7 +295,7 @@ async function loadForwardedAttachments(
   }
   const heads = await Promise.all(rows.map((row) => env.r2.head(row.r2Key)));
   const missing = rows.find((_, index) => !heads[index]);
-  if (missing) throw new AppError('source_unavailable', `附件「${missing.filename}」已丢失，无法完整转发`);
+  if (missing) throw new AppError('source_unavailable', `附件「${missing.filename}」已丢失，无法完整转发`, { details: { source: 'forward' } });
   // 保留原始 contentId/disposition：此前硬编码成 ''/attachment，转发一封带内嵌图片的
   // 富文本邮件时，HTML 里的 <img src="cid:xxx"> 在 MIME 里再也找不到对应 part，
   // 收件端图片全裂、还平白多出一堆附件
@@ -489,7 +489,7 @@ async function resolveReply(
   replyToMessageId: number | undefined,
 ): Promise<{ reply: ReplyContext | null; inReplyTo: string | null; references: string }> {
   if (!replyToMessageId) return { reply: null, inReplyTo: null, references: '' };
-  const orig = await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见');
+  const orig = await loadSourceMessage(env, sender, replyToMessageId, '回复的原邮件不存在或不可见', 'reply');
   if (!orig.messageId) return { reply: null, inReplyTo: null, references: '' };
   const references = [...new Set([orig.references, orig.inReplyTo, orig.messageId]
     .filter(Boolean).flatMap(value => value!.match(/<[^<>\s]+>/g) ?? []))].join(' ');

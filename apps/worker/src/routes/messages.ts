@@ -13,7 +13,7 @@ import { requireAuth } from '../middleware/auth.js';
 import {
   countUnread,
   deleteMessages,
-  getMessageDetail,
+  getMessageDetailConditional,
   getRawMessageObject,
   getRecentContacts,
   getThread,
@@ -29,6 +29,7 @@ import {
 } from '../services/message.js';
 import { messageViewer, mutationViewer } from '../lib/message-viewer.js';
 import { AppError } from '../lib/errors.js';
+import { conditionalDetailResponse } from '../lib/etag.js';
 import { pageHead } from '../lib/pagination.js';
 import { translateMessage } from '../services/translate.js';
 import { handleSend } from './send-handler.js';
@@ -169,7 +170,8 @@ app.get('/:id/raw', async (c) => {
 
 app.get('/:id', async (c) => {
   const id = parseId(c.req.param('id'));
-  return ok(c, await getMessageDetail(c.env, viewerOf(c), id));
+  const ifNoneMatch = c.req.header('If-None-Match');
+  return conditionalDetailResponse(c, await getMessageDetailConditional(c.env, viewerOf(c), id, { ifNoneMatch }));
 });
 
 export default app;

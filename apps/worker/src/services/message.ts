@@ -16,6 +16,7 @@ import {
   count,
   desc,
   eq,
+  getTableColumns,
   gt,
   gte,
   inArray,
@@ -32,7 +33,8 @@ import {
 import { union } from 'drizzle-orm/sqlite-core';
 import { createDb, type Db } from '../db/client.js';
 import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, stars, users } from '../db/schema.js';
-import { signAttachment } from '../lib/crypto.js';
+import { ATTACHMENT_BUCKET_SECONDS, sha256Hex, signAttachment } from '../lib/crypto.js';
+import { etagMatches } from '../lib/etag.js';
 import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
@@ -102,7 +104,8 @@ const threadSelection = {
   references: messages.references,
   deletedAt: messages.deletedAt,
 };
-type ThreadRow = MessageSummaryRow & Pick<MessageRow, 'messageId' | 'inReplyTo' | 'references' | 'deletedAt'>;
+type ThreadRow = MessageSummaryRow & Pick<MessageRow, 'messageId' | 'inReplyTo' | 'references' | 'deletedAt'>
+  & { hasAttachments: boolean; isStarred: boolean };
 
 /** 单封可见性判定所需的最少列 */
 type VisibilityRow = Pick<MessageRow, 'address' | 'direction' | 'deletedAt'>;
@@ -591,17 +594,21 @@ function normalizeSubject(subject: string): string {
  * 会话线程：同一归一化主题、可见范围内的邮件，按时间正序。
  * 每轮先用 message_id / in_reply_to 两条各自走索引的子查询 UNION 出候选 id，
  * 再套未删除与可见性条件；原先 OR 叠加可见性 OR 会让规划器放弃索引、每轮扫全表并读出正文。
+ * 目标邮件与可见性判定同一条语句；附件与星标标记随行取回，不再单独查一次。
  */
 export async function getThread(env: Env, viewer: Viewer, id: number): Promise<MessageSummary[]> {
   const db = createDb(env);
-  const target = await db.select(threadSelection).from(messages).where(eq(messages.id, id)).get();
-  if (!target) throw new AppError('not_found', '邮件不存在');
-  await assertVisible(db, viewer, target);
-  const summarizeRows = async (rows: ThreadRow[]) => {
-    const flags = await messageFlags(db, viewer.userId, rows.map((r) => r.id));
-    return rows.map((r) => summarize(r, flags.attachments.has(r.id), flags.starred.has(r.id)));
-  };
-  const scope = await threadScope(db, viewer, target);
+  const viewScope = resolveScope(viewer);
+  const columns = threadColumns(viewer.userId);
+  const target = await db
+    .select({ ...columns, ...visibilityColumns(viewer, viewScope) })
+    .from(messages)
+    .where(eq(messages.id, id))
+    .get();
+  if (!target || !isVisible(viewer, viewScope, target, target)) throw new AppError('not_found', '邮件不存在');
+  const summarizeRows = (rows: ThreadRow[]) => rows.map((r) => summarize(r, r.hasAttachments, r.isStarred));
+  // 线程跟目标邮件同一可见桶，避免 admin 裸开未认领信时线程掉回「自己认领」
+  const scope: Scope = viewer.role === 'admin' && viewer.scope === undefined && !target.claimed ? 'unclaimed' : viewScope;
   const access = shareAccess(viewer, scope);
   const related = new Map<number, ThreadRow>([[target.id, target]]);
   const messageKeys = new Set<string>();
@@ -613,33 +620,36 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
   addKeys(target);
 
   // 优先按标准邮件头构建连通分量，最多扩展 10 轮/100 封，避免同主题邮件误合并。
+  // 每轮只查上一轮新出现的键（查过的键再查只会得到已收录的邮件），同一轮的各批合进一个 batch。
   // 每批 40 个键在两条子查询里各绑定一次（80 个），加上可见性参数仍在 D1 的 100 个上限内。
-  for (let round = 0; round < 10 && messageKeys.size > 0 && related.size < 100; round++) {
+  const queried = new Set<string>();
+  for (let round = 0; round < 10 && related.size < 100; round++) {
+    const fresh = [...messageKeys].filter((key) => !queried.has(key));
+    if (fresh.length === 0) break;
+    for (const key of fresh) queried.add(key);
+    const [first, ...rest] = chunk(fresh, 40).map((keys) => db
+      .select(columns)
+      .from(messages)
+      .where(
+        and(
+          inArray(messages.id, union(
+            db.select({ id: messages.id }).from(messages).where(inArray(messages.messageId, keys)),
+            db.select({ id: messages.id }).from(messages).where(inArray(messages.inReplyTo, keys)),
+          )),
+          isNull(messages.deletedAt),
+          scopeCondition(db, scope, access),
+        ),
+      )
+      .orderBy(asc(messages.id))
+      .limit(100));
     let changed = false;
-    for (const keys of chunk([...messageKeys], 40)) {
-      const candidates = union(
-        db.select({ id: messages.id }).from(messages).where(inArray(messages.messageId, keys)),
-        db.select({ id: messages.id }).from(messages).where(inArray(messages.inReplyTo, keys)),
-      );
-      const rows = await db
-        .select(threadSelection)
-        .from(messages)
-        .where(
-          and(
-            inArray(messages.id, candidates),
-            isNull(messages.deletedAt),
-            scopeCondition(db, scope, access),
-          ),
-        )
-        .orderBy(asc(messages.id))
-        .limit(100)
-        .all();
+    for (const rows of await db.batch([first!, ...rest])) {
       for (const row of rows) {
+        if (related.size >= 100) break;
         if (related.has(row.id)) continue;
         related.set(row.id, row);
         addKeys(row);
         changed = true;
-        if (related.size >= 100) break;
       }
     }
     if (!changed) break;
@@ -654,7 +664,7 @@ export async function getThread(env: Env, viewer: Viewer, id: number): Promise<M
 
   const windowMs = 30 * 24 * 60 * 60 * 1000;
   const rows = await db
-    .select(threadSelection)
+    .select(columns)
     .from(messages)
     .where(
       and(
@@ -688,50 +698,47 @@ function hasCode(row: Pick<MessageRow, 'subject' | 'preview' | 'verificationCode
   }) !== '';
 }
 
-async function isAddressClaimed(db: Db, address: string): Promise<boolean> {
-  const row = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, address)).get();
-  return row !== undefined;
+/**
+ * 单封可见性所需的三个事实，写成相关子查询与取行放进同一条语句：
+ * owned = 地址属于范围所有者；shared = 地址共享给范围所有者且其认领人启用；claimed = 地址已被任何人认领。
+ * 原先取行后依次查自有、共享、已认领，详情要 3–5 次串行往返；三个 EXISTS 各自走 mailboxes 的地址索引，
+ * 用不上的那个也只是一次索引探测，换来详情、附件、原始邮件、线程、来源邮件都只需一次往返。
+ * 外层 FROM 必须含 messages（或 JOIN 了 messages）。单表查询里 drizzle 输出不带表名的列，
+ * 子查询里同名列会被解析成内层表（address = address 恒真），所以内外层一律写全限定名、内层用别名。
+ */
+function visibilityColumns(viewer: Viewer, scope: Scope) {
+  const ownerId = scope === 'unclaimed' ? viewer.userId : scope.ownerId;
+  return {
+    owned: sql<boolean>`EXISTS (SELECT 1 FROM mailboxes AS vis_owned
+      WHERE vis_owned.user_id = ${ownerId} AND vis_owned.address = "messages"."address")`.mapWith(Boolean),
+    shared: sql<boolean>`EXISTS (SELECT 1 FROM mailbox_shares AS vis_share
+      INNER JOIN mailboxes AS vis_mailbox ON vis_mailbox.id = vis_share.mailbox_id
+      INNER JOIN users AS vis_owner ON vis_owner.id = vis_mailbox.user_id
+      WHERE vis_share.user_id = ${ownerId} AND vis_mailbox.address = "messages"."address" AND vis_owner.status = 'active')`
+      .mapWith(Boolean),
+    claimed: sql<boolean>`EXISTS (SELECT 1 FROM mailboxes AS vis_claimed WHERE vis_claimed.address = "messages"."address")`
+      .mapWith(Boolean),
+  };
+}
+
+interface VisibilityFacts {
+  owned: boolean;
+  shared: boolean;
+  claimed: boolean;
 }
 
 /**
- * 单封可见性：
+ * 单封可见性（scope 由 resolveScope 解析）：
  * - scope=unclaimed → 仅未认领
  * - scope=user → 仅该用户认领
  * - 其余（含 admin 裸开无 query）→ 自己认领的地址，外加分享给自己的未删除收件
  * - admin 无 scope 时额外允许未认领
  */
-async function assertVisible(db: Db, viewer: Viewer, row: VisibilityRow): Promise<void> {
-  const scope = resolveScope(viewer);
-  if (scope === 'unclaimed') {
-    if (await isAddressClaimed(db, row.address)) throw new AppError('not_found', '邮件不存在');
-    return;
-  }
-  const owned = await db
-    .select({ id: mailboxes.id })
-    .from(mailboxes)
-    .where(and(eq(mailboxes.userId, scope.ownerId), eq(mailboxes.address, row.address)))
-    .get();
-  if (owned) return;
-  if (shareAccess(viewer, scope) === 'readable' && row.direction === 'inbound' && row.deletedAt === null) {
-    const shared = await db
-      .select({ id: mailboxShares.mailboxId })
-      .from(mailboxShares)
-      .innerJoin(mailboxes, eq(mailboxes.id, mailboxShares.mailboxId))
-      .innerJoin(users, eq(users.id, mailboxes.userId))
-      .where(
-        and(
-          eq(mailboxShares.userId, scope.ownerId),
-          eq(mailboxes.address, row.address),
-          eq(users.status, 'active'),
-        ),
-      )
-      .get();
-    if (shared) return;
-  }
-  if (viewer.role === 'admin' && viewer.scope === undefined && !(await isAddressClaimed(db, row.address))) {
-    return;
-  }
-  throw new AppError('not_found', '邮件不存在');
+function isVisible(viewer: Viewer, scope: Scope, row: VisibilityRow, facts: VisibilityFacts): boolean {
+  if (scope === 'unclaimed') return !facts.claimed;
+  if (facts.owned) return true;
+  if (shareAccess(viewer, scope) === 'readable' && row.direction === 'inbound' && row.deletedAt === null && facts.shared) return true;
+  return viewer.role === 'admin' && viewer.scope === undefined && !facts.claimed;
 }
 
 /**
@@ -739,14 +746,18 @@ async function assertVisible(db: Db, viewer: Viewer, row: VisibilityRow): Promis
  * （认领 + 共享来的未删除收件），管理员另含未认领地址；不按角色整体放行，管理员也拿不到
  * 其他用户的私有邮件。不可见与不存在同为 404 source_unavailable，不暴露 id 是否存在；
  * 与发件邮箱不存在等 not_found 区分开，调用方据此去掉引用后可作为新邮件发送。
+ * details.source 标明是哪一个引用不可用，同时带回复与转发时调用方据此只去掉对应的那个。
  */
 export async function loadSourceMessage(
   env: Env,
   sender: { userId: number; role: Role },
   id: number,
   unavailableMessage: string,
+  source: 'reply' | 'forward',
 ) {
   const db = createDb(env);
+  const viewer: Viewer = { userId: sender.userId, role: sender.role };
+  const scope = resolveScope(viewer);
   const row = await db
     .select({
       address: messages.address,
@@ -755,37 +766,54 @@ export async function loadSourceMessage(
       messageId: messages.messageId,
       inReplyTo: messages.inReplyTo,
       references: messages.references,
+      ...visibilityColumns(viewer, scope),
     })
     .from(messages)
     .where(eq(messages.id, id))
     .get();
-  if (!row) throw new AppError('source_unavailable', unavailableMessage);
-  try {
-    await assertVisible(db, { userId: sender.userId, role: sender.role }, row);
-  } catch (error) {
-    if (error instanceof AppError && error.code === 'not_found') throw new AppError('source_unavailable', unavailableMessage);
-    throw error;
+  if (!row || !isVisible(viewer, scope, row, row)) {
+    throw new AppError('source_unavailable', unavailableMessage, { details: { source } });
   }
-  return row;
+  return { address: row.address, direction: row.direction, deletedAt: row.deletedAt, messageId: row.messageId, inReplyTo: row.inReplyTo, references: row.references };
 }
 
-/** 详情需要完整行（含正文）；只做可见性判定的调用方用 assertVisible 并自选列 */
+const messageColumns = getTableColumns(messages);
+/** 除正文外的全部列：ETag 由它们计算，带 If-None-Match 的详情先只读这些，304 时不读正文 */
+const metaColumns = Object.fromEntries(
+  Object.entries(messageColumns).filter(([key]) => key !== 'bodyText' && key !== 'bodyHtml'),
+) as Omit<typeof messageColumns, 'bodyText' | 'bodyHtml'>;
+
+/** 当前用户是否星标该邮件（相关子查询，随行取回；全限定名的原因见 visibilityColumns） */
+function starredColumn(userId: number) {
+  return sql<boolean>`EXISTS (SELECT 1 FROM stars AS flag_star
+    WHERE flag_star.user_id = ${userId} AND flag_star.message_id = "messages"."id")`.mapWith(Boolean);
+}
+
+/** 线程行：摘要列 + 邮件头 + 附件与星标标记；附件口径同 COUNTS_AS_ATTACHMENT（内嵌图不算附件） */
+function threadColumns(userId: number) {
+  return {
+    ...threadSelection,
+    hasAttachments: sql<boolean>`EXISTS (SELECT 1 FROM attachments AS flag_att
+      WHERE flag_att.message_id = "messages"."id" AND NOT (flag_att.disposition = 'inline' AND flag_att.content_id <> ''))`
+      .mapWith(Boolean),
+    isStarred: starredColumn(userId),
+  };
+}
+
+/**
+ * 取一封可见邮件的整行（含正文）与可见性事实，一次往返；不可见与不存在同为 not_found。
+ * 翻译等只需要文字内容的读取用它。
+ */
 async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
   const db = createDb(env);
-  const row = await db.select().from(messages).where(eq(messages.id, id)).get();
-  if (!row) throw new AppError('not_found', '邮件不存在');
-  await assertVisible(db, viewer, row);
-  return row;
-}
-
-/** 详情线程跟目标邮件同一可见桶，避免 admin 裸开未认领信时线程掉回「自己认领」 */
-async function threadScope(db: Db, viewer: Viewer, target: { address: string }): Promise<Scope> {
   const scope = resolveScope(viewer);
-  if (scope === 'unclaimed') return 'unclaimed';
-  if (viewer.role === 'admin' && viewer.scope === undefined && !(await isAddressClaimed(db, target.address))) {
-    return 'unclaimed';
-  }
-  return scope;
+  const row = await db
+    .select({ ...messageColumns, ...visibilityColumns(viewer, scope) })
+    .from(messages)
+    .where(eq(messages.id, id))
+    .get();
+  if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
+  return row;
 }
 
 /**
@@ -877,57 +905,134 @@ async function buildDetail(
   };
 }
 
+/** /v1 详情的附件签名 URL 每次签发 5 分钟；ETag 按分钟分桶，304 复用的 URL 至少还剩 4 分钟 */
+const SHORT_TTL_ETAG_BUCKET_SECONDS = 60;
+
 /**
- * 邮件详情。attachmentTtlSeconds 不传时附件与 CID 内联图的签名按整点对齐（站内页面，1–2 小时）；
- * /v1 传短 TTL，签名 URL 不能比 Key 本身的有效期拖得更久。
+ * 详情的弱 ETag：除正文外的全部列（正文只随 status/body_r2_key 等列变化）、附件、当前用户星标、
+ * 查看者与范围（同一 URL 不同用户看到的星标与可见性不同）、构建号（提码等读取规则随版本变化）。
+ * 有附件时再加签名时间桶：站内签名按整点对齐，同一桶内 URL 不变；/v1 签名短，按分钟分桶。
  */
+async function detailEtag(
+  env: Env,
+  viewer: Viewer,
+  row: Record<string, unknown>,
+  attRows: (typeof attachmentsTable.$inferSelect)[],
+  starred: boolean,
+  attachmentTtlSeconds: number | undefined,
+): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  const bucket = attRows.length === 0
+    ? 0
+    : Math.floor(now / (attachmentTtlSeconds === undefined ? ATTACHMENT_BUCKET_SECONDS : SHORT_TTL_ETAG_BUCKET_SECONDS));
+  const meta = Object.keys(metaColumns).map((key) => row[key]);
+  const digest = await sha256Hex(JSON.stringify([
+    env.build_sha ?? 'local', viewer.userId, viewer.scope ?? '', viewer.targetUserId ?? 0, attachmentTtlSeconds ?? 0,
+    bucket, starred, meta, attRows,
+  ]));
+  return `W/"${digest.slice(0, 32)}"`;
+}
+
+export type ConditionalDetail = { etag: string; notModified: true } | { etag: string; notModified: false; detail: MessageDetail };
+
+/**
+ * 邮件详情（一次往返：整行、可见性、星标一条语句，附件一条，同一 batch）。
+ * attachmentTtlSeconds 不传时附件与 CID 内联图的签名按整点对齐（站内页面，1–2 小时）；
+ * /v1 传短 TTL，签名 URL 不能比 Key 本身的有效期拖得更久。
+ * 带 If-None-Match 时先不读正文：ETag 一致返回 notModified（仍是一次往返），不一致再补读正文。
+ */
+export async function getMessageDetailConditional(
+  env: Env,
+  viewer: Viewer,
+  id: number,
+  options: { attachmentTtlSeconds?: number; ifNoneMatch?: string | null } = {},
+): Promise<ConditionalDetail> {
+  const db = createDb(env);
+  const scope = resolveScope(viewer);
+  const withBody = !options.ifNoneMatch;
+  // CASE 的条件在执行时才求值，withBody=0 时正文列不会被读出
+  const bodyColumn = (column: Column) => sql<string | null>`CASE WHEN ${withBody ? 1 : 0} = 1 THEN ${column} END`;
+  const [[row], attRows] = await db.batch([
+    db.select({
+      ...metaColumns,
+      bodyText: bodyColumn(messages.bodyText),
+      bodyHtml: bodyColumn(messages.bodyHtml),
+      ...visibilityColumns(viewer, scope),
+      isStarred: starredColumn(viewer.userId),
+    }).from(messages).where(eq(messages.id, id)),
+    db.select().from(attachmentsTable).where(eq(attachmentsTable.messageId, id)).orderBy(asc(attachmentsTable.id)),
+  ]);
+  if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
+  const etag = await detailEtag(env, viewer, row, attRows, row.isStarred, options.attachmentTtlSeconds);
+  if (etagMatches(options.ifNoneMatch, etag)) return { etag, notModified: true };
+  let body = { bodyText: row.bodyText ?? '', bodyHtml: row.bodyHtml ?? '' };
+  if (!withBody) {
+    const fetched = await db.select({ bodyText: messages.bodyText, bodyHtml: messages.bodyHtml }).from(messages).where(eq(messages.id, id)).get();
+    // 两次读取之间被永久删除：与不存在一样
+    if (!fetched) throw new AppError('not_found', '邮件不存在');
+    body = fetched;
+  }
+  const detail = await buildDetail(env, { ...row, ...body }, attRows, row.isStarred, options.attachmentTtlSeconds);
+  return { etag, notModified: false, detail };
+}
+
+/** 无条件读取详情（内部调用与测试用）；路由走 getMessageDetailConditional 以支持 304 */
 export async function getMessageDetail(
   env: Env,
   viewer: Viewer,
   id: number,
   attachmentTtlSeconds?: number,
 ): Promise<MessageDetail> {
-  const db = createDb(env);
-  const row = await loadVisible(env, viewer, id);
-  const [attRows, starRows] = await db.batch(detailExtras(db, viewer.userId, id));
-  return buildDetail(env, row, attRows, starRows.length > 0, attachmentTtlSeconds);
+  const result = await getMessageDetailConditional(env, viewer, id, { attachmentTtlSeconds });
+  if (result.notModified) throw new Error('unreachable: 无条件读取不会返回 304');
+  return result.detail;
 }
 
-/** 取原始 .eml R2 对象（校验可见性）；无存档返回 null */
+/** 取原始 .eml R2 对象（校验可见性，一次往返）；无存档返回 null */
 export async function getRawMessageObject(
   env: Env,
   viewer: Viewer,
   id: number,
 ): Promise<R2ObjectBody | null> {
   const db = createDb(env);
+  const scope = resolveScope(viewer);
   const row = await db
-    .select({ address: messages.address, direction: messages.direction, deletedAt: messages.deletedAt, rawR2Key: messages.rawR2Key })
+    .select({
+      address: messages.address, direction: messages.direction, deletedAt: messages.deletedAt, rawR2Key: messages.rawR2Key,
+      ...visibilityColumns(viewer, scope),
+    })
     .from(messages)
     .where(eq(messages.id, id))
     .get();
-  if (!row) throw new AppError('not_found', '邮件不存在');
-  await assertVisible(db, viewer, row);
+  if (!row || !isVisible(viewer, scope, row, row)) throw new AppError('not_found', '邮件不存在');
   if (!row.rawR2Key) return null;
   return env.r2.get(row.rawR2Key);
 }
 
-/** 加载单条附件（校验可见性由调用方决定：签名 URL 或 JWT） */
+/** 加载单条附件并校验所属邮件对查看者可见：附件、所属邮件与可见性一条语句、一次往返 */
 export async function loadAttachmentForViewer(
   env: Env,
   viewer: Viewer,
   attId: number,
 ): Promise<typeof attachmentsTable.$inferSelect> {
   const db = createDb(env);
-  const att = await db.select().from(attachmentsTable).where(eq(attachmentsTable.id, attId)).get();
-  if (!att) throw new AppError('not_found', '附件不存在');
-  const owner = await db
-    .select({ address: messages.address, direction: messages.direction, deletedAt: messages.deletedAt })
-    .from(messages)
-    .where(eq(messages.id, att.messageId))
+  const scope = resolveScope(viewer);
+  const row = await db
+    .select({
+      attachment: getTableColumns(attachmentsTable),
+      address: messages.address, direction: messages.direction, deletedAt: messages.deletedAt,
+      ...visibilityColumns(viewer, scope),
+    })
+    .from(attachmentsTable)
+    .leftJoin(messages, eq(messages.id, attachmentsTable.messageId))
+    .where(eq(attachmentsTable.id, attId))
     .get();
-  if (!owner) throw new AppError('not_found', '邮件不存在');
-  await assertVisible(db, viewer, owner);
-  return att;
+  if (!row) throw new AppError('not_found', '附件不存在');
+  if (row.address === null || row.direction === null) throw new AppError('not_found', '邮件不存在');
+  if (!isVisible(viewer, scope, { address: row.address, direction: row.direction, deletedAt: row.deletedAt }, row)) {
+    throw new AppError('not_found', '邮件不存在');
+  }
+  return row.attachment;
 }
 
 export async function loadAttachmentById(
