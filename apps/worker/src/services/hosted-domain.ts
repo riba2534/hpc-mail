@@ -189,7 +189,7 @@ function toView(view: ViewRow, viewer: Viewer, pendingDays: number): HostedDomai
     activatedAt: iso(row.activatedAt),
     checkedAt: iso(row.checkedAt),
     // 重新接入后的 pending 保留生效时间，不按等待期限删除
-    expiresAt: row.status === 'pending' && !row.activatedAt ? new Date(row.createdAt.getTime() + pendingDays * DAY).toISOString() : null,
+    expiresAt: row.status === 'pending' ? new Date(row.createdAt.getTime() + pendingDays * DAY).toISOString() : null,
   };
 }
 
@@ -299,6 +299,15 @@ function createZoneError(error: unknown): AppError {
   if (rejection) return rejection;
   if (error.has(1118)) return new AppError('rate_limited', '站长的 Cloudflare 账户暂时不能添加更多域名，请稍后再试或联系管理员');
   return new AppError('internal', `Cloudflare 创建域名失败：${error.message}`);
+}
+
+/** 等待生效额度：所有者的 pending 数（管理员操作不受个人额度限制）与全站 pending 数（含系统域名接入） */
+function pendingQuotaError(cfg: Settings['hosted_domains'], isAdmin: boolean, ownerPending: number, totalPending: number): AppError | null {
+  if (!isAdmin && ownerPending >= cfg.maxPendingPerUser) {
+    return new AppError('forbidden', '你还有域名在等待 NS 生效，请先完成或删除后再操作');
+  }
+  if (totalPending >= cfg.maxPendingTotal) return new AppError('rate_limited', '当前等待生效的域名较多，请稍后再试');
+  return null;
 }
 
 /** 占位守卫未通过：读回各项条件，给出具体原因 */
@@ -757,6 +766,23 @@ async function zoneGone(env: Env, creds: CloudflareCredentials, claim: SyncClaim
 }
 
 /**
+ * 重新接入后到期仍未改 NS：撤回这次接入，删除新建的 zone 并回到 moved/missing，不再占等待额度；
+ * 地址、邮件与成员保留，可以再点「重新接入」。删除 zone 失败保留 pending 等下一轮
+ */
+async function expireReconnect(env: Env, creds: CloudflareCredentials, claim: SyncClaim, now: Date, pendingDays: number): Promise<boolean> {
+  const { row, lease } = claim;
+  try {
+    if (row.zoneId) await deleteZone(creds, row.zoneId, row.domain, await zoneGuard(env, row));
+  } catch (error) {
+    return saveChecked(env, row.id, { lastError: `撤回到期的重新接入失败：${errorText(error)}`, checkedAt: now }, lease);
+  }
+  return saveChecked(env, row.id, {
+    status: 'moved', zoneStatus: 'missing', zoneMissingAt: now, routingStatus: '', catchAllReady: false, sendingStatus: '', sendingTag: null,
+    lastError: `重新接入后 ${pendingDays} 天内未完成 NS 修改，已撤回；改好 NS 前可再次重新接入`, checkedAt: now,
+  }, lease);
+}
+
+/**
  * 持有租约时与 Cloudflare 核对一次并推进状态。zone 未激活：刷新 NS 与 DNSSEC，到期删除；
  * 已激活：补齐收发配置，全部就绪为 active，否则 provisioning（宽限期内）或 error。读到 zone 就清掉失踪记录。
  * 返回租约是否已随最后一次写入释放（或记录已删除）
@@ -779,9 +805,12 @@ async function syncClaimed(env: Env, creds: CloudflareCredentials, claim: SyncCl
   if (!zone) return zoneGone(env, creds, claim, now, opts.ctx);
   if (zone.status === 'pending' || zone.status === 'initializing') {
     const { hosted_domains: cfg } = await getSettings(env);
-    if (row.status === 'pending' && !row.activatedAt && now.getTime() > row.createdAt.getTime() + cfg.pendingDays * DAY) {
-      await dropPending(env, creds, row, `${cfg.pendingDays} 天内未完成 NS 修改，已自动删除`);
-      return false;
+    if (row.status === 'pending' && now.getTime() > row.createdAt.getTime() + cfg.pendingDays * DAY) {
+      if (!row.activatedAt) {
+        await dropPending(env, creds, row, `${cfg.pendingDays} 天内未完成 NS 修改，已自动删除`);
+        return false;
+      }
+      return expireReconnect(env, creds, claim, now, cfg.pendingDays);
     }
     if (opts.activationCheck) await requestActivationCheck(creds, zone.id);
     const dnssec = await hasDnssec(row.domain).catch(() => row.dnssec);
@@ -890,8 +919,11 @@ export async function checkHostedDomain(env: Env, viewer: Viewer, id: number, ct
  * 找不到就新建。回填后回到 pending，保留生效时间、地址、邮件与成员。返回租约是否已随回填释放
  */
 async function rebuildZone(
-  env: Env, creds: CloudflareCredentials, claim: SyncClaim, viewer: Viewer, protectedNames: string[], ctx?: ExecCtx | null, ip = '',
+  env: Env, creds: CloudflareCredentials, claim: SyncClaim, viewer: Viewer, settings: Settings, ctx?: ExecCtx | null, ip = '',
 ): Promise<boolean> {
+  const protectedNames = settings.domains.list.map((entry) => entry.domain);
+  const cfg = settings.hosted_domains;
+  const isAdmin = viewer.role === 'admin';
   const { row, lease } = claim;
   const db = createDb(env);
   const now = new Date();
@@ -904,11 +936,20 @@ async function rebuildZone(
   }
   let zone: CfZone | null;
   let created = false;
-  try {
-    zone = await findZone(creds, row.domain);
-  } catch (error) {
-    throw new AppError('internal', `查询 Cloudflare 失败，请稍后重试：${errorText(error)}`);
-  }
+  // 重建出的 zone 同样占等待生效额度（与添加同一口径）：先查额度再动 Cloudflare，回填时由守卫复核
+  const [found, quota] = await Promise.allSettled([
+    findZone(creds, row.domain),
+    env.db.batch([
+      env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(row.userId),
+      env.db.prepare(`SELECT ${PENDING_ZONES_TOTAL_SQL} AS n`),
+    ]),
+  ]);
+  if (quota.status === 'rejected') throw quota.reason;
+  const [ownerPending, totalPending] = quota.value.map((result) => Number((result.results?.[0] as { n: number } | undefined)?.n ?? 0));
+  const overQuota = pendingQuotaError(cfg, isAdmin, ownerPending!, totalPending!);
+  if (overQuota) throw overQuota;
+  if (found.status === 'rejected') throw new AppError('internal', `查询 Cloudflare 失败，请稍后重试：${errorText(found.reason)}`);
+  zone = found.value;
   if (zone && !zoneCreatedSince(zone, missingSince)) {
     throw new AppError('conflict', '站长账户中已有同名 zone，不能接管');
   }
@@ -937,16 +978,26 @@ async function rebuildZone(
     lastError: '',
     checkedAt: now,
     syncLeaseUntil: null,
+    // 重新接入从这个 zone 起算：等待 NS 的退避、到期撤回与 expiresAt 都按它（不早于 zone 的创建时间，删除核对身份时用）
+    createdAt: zone.created_on ? new Date(Math.min(now.getTime(), new Date(zone.created_on).getTime())) : now,
     updatedAt: now,
-  }).where(and(eq(hostedDomains.id, row.id), eq(hostedDomains.status, 'moved'), eq(hostedDomains.syncLeaseUntil, lease)))
+  }).where(and(eq(hostedDomains.id, row.id), eq(hostedDomains.status, 'moved'), eq(hostedDomains.syncLeaseUntil, lease),
+    // 查额度与回填之间可能有别的添加或重新接入：回填时按同样条件复核
+    sql`(${isAdmin ? 1 : 0} = 1 OR (SELECT COUNT(*) FROM hosted_domains p WHERE p.user_id = ${row.userId} AND p.status = 'pending') < ${cfg.maxPendingPerUser})`,
+    sql`${sql.raw(PENDING_ZONES_TOTAL_SQL)} < ${cfg.maxPendingTotal}`))
     .returning({ id: hostedDomains.id });
   if (!filled.length) {
-    // 期间被暂停、删除或租约超时被别人领走：不留下没有记录的 zone
+    // 期间被暂停、删除、租约超时被别人领走或额度被占满：不留下没有记录的 zone
     if (created) {
       await deleteZone(creds, zone.id, row.domain, { notBefore: now, protectedNames })
         .catch((error) => console.error('回收孤儿 zone 失败:', error));
     }
-    throw new AppError('conflict', '域名状态已改变，请刷新后重试');
+    const current = await env.db.batch([
+      env.db.prepare("SELECT COUNT(*) AS n FROM hosted_domains WHERE user_id = ? AND status = 'pending'").bind(row.userId),
+      env.db.prepare(`SELECT ${PENDING_ZONES_TOTAL_SQL} AS n`),
+    ]);
+    const [ownerNow, totalNow] = current.map((result) => Number((result.results?.[0] as { n: number } | undefined)?.n ?? 0));
+    throw pendingQuotaError(cfg, isAdmin, ownerNow!, totalNow!) ?? new AppError('conflict', '域名状态已改变，请刷新后重试');
   }
   await logAdminAction(env, viewer, 'hosted_domain.reconnect', row.domain,
     `zone ${zone.id}${created ? '' : '（采用上次中断时建出的）'}，NS ${(zone.name_servers ?? []).join(' / ')}`, ip);
@@ -995,7 +1046,7 @@ export async function reconnectHostedDomain(env: Env, viewer: Viewer, id: number
       await requestActivationCheck(creds, zone.id);
       released = await syncClaimed(env, creds, claim, { ctx });
     } else {
-      released = await rebuildZone(env, creds, claim, viewer, settings.domains.list.map((entry) => entry.domain), ctx, ip);
+      released = await rebuildZone(env, creds, claim, viewer, settings, ctx, ip);
     }
   } finally {
     if (!released) await releaseLeases(env, [id], claim.lease);

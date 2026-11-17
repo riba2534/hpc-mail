@@ -151,7 +151,7 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 | `POST /hosted-domains` | `{domain}`，填已注册的根域名 → 201，`status:"pending"`、`nameServers` 两条、`originalNameServers`、`warnings`（如需先关闭 DNSSEC）、`expiresAt`（到期未改 NS 自动删除） |
 | `GET /hosted-domains/:id` | 进度：`status` 与 `steps:{nameServers,routing,catchAll,sending}`（各为 waiting/ready/error）、`lastError`、`checkedAt` |
 | `POST /hosted-domains/:id/check` | 所有者或管理员：请 Cloudflare 立即复查 NS 并推进开通，15 秒内重复调用直接返回当前状态；每人每分钟最多 10 次（被节流、无权限的也计），超出或全站 Cloudflare 额度用完返回 429；真正触发复查时计 4 次全站额度，托管功能关闭或站点缺少 Cloudflare 凭据时不计 |
-| `POST /hosted-domains/:id/reconnect` | 所有者或管理员，只用于 `status:"moved"`（其他状态 409）：zone 还在时请 Cloudflare 复查 NS 并核对一次（NS 改回后恢复）；Cloudflare 已删除 zone（NS 改走约 7 天后）时新建 zone，域名回到 `pending` 并返回新的 `nameServers`，地址、历史邮件、成员保留，不设到期删除。站长账户里有别处建的同名 zone 时 409。与添加共用每人每分钟 5 次 |
+| `POST /hosted-domains/:id/reconnect` | 所有者或管理员，只用于 `status:"moved"`（其他状态 409）：zone 还在时请 Cloudflare 复查 NS 并核对一次（NS 改回后恢复）；Cloudflare 已删除 zone（NS 改走约 7 天后）时新建 zone，域名回到 `pending` 并返回新的 `nameServers`，地址、历史邮件、成员保留。重建与添加一样占等待生效额度：所有者的 `maxPendingPerUser` 已满时 403（管理员代为操作不受个人额度限制），全站 `maxPendingTotal` 已满时 429，都不会调用 Cloudflare；`expiresAt` 从重建起按 `pendingDays` 计，到期仍未改 NS 时删除新 zone、回到 `moved`（地址与历史保留），可以再次重新接入。站长账户里有别处建的同名 zone 时 409。与添加共用每人每分钟 5 次 |
 | `PUT /hosted-domains/:id` | `{memberLimit}`：每位成员在该域最多认领数，0 不限 |
 | `GET` / `PUT /hosted-domains/:id/members` | 成员名单；PUT `{userIds,expectedOwnerId}` 整体替换（已禁用的现有成员可保留，新增的须为启用中的用户），选人用 `GET /mailboxes/share-users` |
 | `DELETE /hosted-domains/:id/members/:userId` | 移除成员；成员传自己的 id 即退出共享。已认领的地址保留 |
