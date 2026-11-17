@@ -17,7 +17,7 @@ import {
 import { hasDnssec } from './domain-check.js';
 import { systemDomainListedSql } from './domain-occupancy.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
-import { counterResult, counterStatement, minuteWindow } from './rate-counter.js';
+import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
 
 type HostedRow = typeof hostedDomains.$inferSelect;
@@ -183,6 +183,41 @@ export async function loadAccess(env: Env, viewer: Viewer, id: number): Promise<
 
 export function requireManage(access: Exclude<Access, null>): void {
   if (access === 'member') throw new AppError('forbidden', '只有域名所有者或管理员可以执行此操作');
+}
+
+interface MeterOptions {
+  /** 个人计数的 scope 与每分钟上限 */
+  scope: string;
+  limit: number;
+  /** 计入全站额度的 Cloudflare 调用次数 */
+  calls: number;
+  /** 能走到 Cloudflare 的条件；不成立的请求不占全站额度 */
+  eligible: CounterGuard;
+  userBusy: string;
+  siteBusy: string;
+}
+
+/**
+ * 立即检测与 DNS 解析共用的计数：个人按请求数，全站按 Cloudflare 调用次数，合成一个 batch，与读取域名并行。
+ * 全站计数的守卫是个人未超限且 eligible 成立；无权访问的请求同样计入个人限额。先判个人与全站超限，再抛读取域名的错误。
+ */
+export async function meterHostedCall(env: Env, viewer: Viewer, id: number, opts: MeterOptions): Promise<Awaited<ReturnType<typeof loadAccess>>> {
+  const window = minuteWindow(1);
+  const subject = String(viewer.id);
+  const [counted, loaded] = await Promise.allSettled([
+    env.db.batch([
+      counterStatement(env, opts.scope, subject, window),
+      counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, opts.calls, 0,
+        andGuards(counterWithinGuard(opts.scope, subject, window, opts.limit), opts.eligible)),
+    ]),
+    loadAccess(env, viewer, id),
+  ]);
+  if (counted.status === 'rejected') throw counted.reason;
+  const [user, site] = counted.value;
+  if ((counterResult(user)?.count ?? 1) > opts.limit) throw new AppError('rate_limited', opts.userBusy);
+  if ((counterResult(site)?.count ?? 0) > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) throw new AppError('rate_limited', opts.siteBusy);
+  if (loaded.status === 'rejected') throw loaded.reason;
+  return loaded.value;
 }
 
 export async function getHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
@@ -581,35 +616,19 @@ export async function syncDueHostedDomains(env: Env, limit = 10): Promise<number
   return due.results.length;
 }
 
-/**
- * 「立即检测」的计数：个人按请求数，全站按 Cloudflare 调用次数，合成一个 batch。全站计数的守卫与下面
- * 实际触发核对的条件一致（个人未超限、所有者或管理员、未暂停或删除、过了节流间隔），被拒或被节流的请求不占全站额度。
- */
-async function countCheck(env: Env, viewer: Viewer, id: number): Promise<{ user: number; site: number }> {
-  const window = minuteWindow(1);
-  const subject = String(viewer.id);
-  const [user, site] = await env.db.batch([
-    counterStatement(env, HOSTED_CHECK_RATE_SCOPE, subject, window),
-    counterStatement(env, HOSTED_DNS_SITE_RATE_SCOPE, 'all', window, CHECK_CF_CALLS, 0, {
-      sql: `(SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?) <= ?
-        AND EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
-          AND status NOT IN ('suspended', 'deleting') AND COALESCE(checked_at, 0) <= ?)`,
-      params: [HOSTED_CHECK_RATE_SCOPE, subject, window, MAX_HOSTED_CHECKS_PER_MINUTE,
-        id, viewer.id, viewer.role === 'admin' ? 1 : 0, Date.now() - CHECK_THROTTLE_MS],
-    }),
-  ]);
-  return { user: counterResult(user)?.count ?? 1, site: counterResult(site)?.count ?? 0 };
-}
-
 /** 用户点「立即检测」：等待 NS 时请 Cloudflare 立即复查，再核对并推进开通 */
 export async function checkHostedDomain(env: Env, viewer: Viewer, id: number): Promise<HostedDomain> {
-  // 计数和读取域名并行；无权访问的请求同样计入个人限额
-  const [counted, loaded] = await Promise.allSettled([countCheck(env, viewer, id), loadAccess(env, viewer, id)]);
-  if (counted.status === 'rejected') throw counted.reason;
-  if (counted.value.user > MAX_HOSTED_CHECKS_PER_MINUTE) throw new AppError('rate_limited', '检测过于频繁，请稍后再试');
-  if (counted.value.site > MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE) throw new AppError('rate_limited', SITE_BUSY);
-  if (loaded.status === 'rejected') throw loaded.reason;
-  const { row, access } = loaded.value;
+  // 全站计数的条件与下面实际触发核对的一致：所有者或管理员、未暂停或删除、过了节流间隔
+  const { row, access } = await meterHostedCall(env, viewer, id, {
+    scope: HOSTED_CHECK_RATE_SCOPE, limit: MAX_HOSTED_CHECKS_PER_MINUTE, calls: CHECK_CF_CALLS,
+    eligible: {
+      sql: `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ? AND (user_id = ? OR ? = 1)
+        AND status NOT IN ('suspended', 'deleting') AND COALESCE(checked_at, 0) <= ?)`,
+      params: [id, viewer.id, viewer.role === 'admin' ? 1 : 0, Date.now() - CHECK_THROTTLE_MS],
+    },
+    userBusy: '检测过于频繁，请稍后再试',
+    siteBusy: SITE_BUSY,
+  });
   requireManage(access);
   requireCredentials(env, await getSettings(env));
   const recent = row.checkedAt && Date.now() - row.checkedAt.getTime() < CHECK_THROTTLE_MS;
