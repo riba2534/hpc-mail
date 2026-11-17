@@ -10,7 +10,7 @@ import { AppError } from '../lib/errors.js';
 import { sameSecretTarget } from '../lib/http.js';
 import { createDb } from '../db/client.js';
 import { isAiModelConfigured } from './ai-provider.js';
-import { anyHostedSql } from './domain-occupancy.js';
+import { anyHostedSql, anyOnboardingSql, ONBOARDING_TERMINAL_SQL } from './domain-occupancy.js';
 import { settings as settingsTable } from '../db/schema.js';
 import type { Env, ExecCtx } from '../types.js';
 
@@ -121,14 +121,34 @@ export function resolveMaskedAiKey(saved: Settings['ai_model'], baseUrl: string,
   return saved.apiKey;
 }
 
-/** domains 的 CAS 没有写入：区分「被用户托管」和「revision 已变化」，给出可操作的原因 */
+/** domains 的 CAS 没有写入：区分「被用户托管」「正在自动接入」和「revision 已变化」，给出可操作的原因（只在失败时多读一次） */
 async function domainsWriteConflict(env: Env, listed: string): Promise<AppError> {
-  const hosted = await env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))')
-    .bind(listed).all<{ domain: string }>();
-  if (hosted.results.length) {
-    return new AppError('conflict', `${hosted.results.map((row) => row.domain).join('、')} 已被用户托管，不能加为系统域名`);
+  const [hosted, onboarding] = await env.db.batch([
+    env.db.prepare('SELECT domain FROM hosted_domains WHERE domain IN (SELECT value FROM json_each(?))').bind(listed),
+    env.db.prepare(`SELECT domain, id FROM system_domain_onboarding
+      WHERE domain IN (SELECT value FROM json_each(?)) AND state NOT IN ${ONBOARDING_TERMINAL_SQL}`).bind(listed),
+  ]);
+  const hostedRows = (hosted?.results ?? []) as { domain: string }[];
+  if (hostedRows.length) {
+    return new AppError('conflict', `${hostedRows.map((row) => row.domain).join('、')} 已被用户托管，不能加为系统域名`);
+  }
+  const tasks = (onboarding?.results ?? []) as { domain: string; id: number }[];
+  if (tasks.length) {
+    return new AppError('conflict', `${tasks.map((row) => `${row.domain} 正在自动接入（任务 #${row.id}）`).join('、')}，请在接入完成或取消后再修改`);
   }
   return new AppError('conflict', '域名配置已被其他请求修改，请刷新后重试');
+}
+
+/**
+ * domains 的 revision CAS：?1 新值，?2 期望的 revision，guard 为附加守卫（其绑定从 ?3 起）。没有写入时不返回行。
+ * 守卫与 revision 比较在同一条语句里，D1 串行执行写入，检查与写入之间不会插进别的写入。
+ */
+export function domainsCasSql(guard: string): string {
+  return `INSERT INTO settings (key, value)
+      SELECT 'domains', ?1 WHERE ?2 = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
+        AND ${guard}
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ?2 RETURNING key`;
 }
 
 /** 写设置：逐 key 校验后落库并失效缓存 */
@@ -170,13 +190,9 @@ export async function updateSettings(env: Env, patch: UpdateSettingsRequest, ctx
     }
   }
   if (domains) {
-    // 用户托管的域名由其所有者管理，不能同时登记为系统域名。检查写在这条 CAS 里，
-    // 与托管域名创建（hosted-domain.ts）互相守卫，两边交错时只有先执行的一方写入成功
-    const result = await env.db.prepare(`INSERT INTO settings (key, value)
-      SELECT 'domains', ?1 WHERE ?2 = COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)
-        AND NOT ${anyHostedSql('?3')}
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      WHERE COALESCE(json_extract(settings.value, '$.revision'), 0) = ?2 RETURNING key`)
+    // 用户托管的域名由其所有者管理、正在自动接入的域名由接入任务在完成时写入，都不能同时登记为系统域名。
+    // 检查写在这条 CAS 里，与托管域名创建（hosted-domain.ts）、接入任务占位（system-domain.ts）互相守卫，交错时只有先执行的一方成功
+    const result = await env.db.prepare(domainsCasSql(`NOT ${anyHostedSql('?3')} AND NOT ${anyOnboardingSql('?3')}`))
       .bind(domains.value, domains.expected, domains.listed).first();
     if (!result) throw await domainsWriteConflict(env, domains.listed);
   }
