@@ -66,6 +66,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 - **发件认证结果**（`lib/auth-results.ts` → `messages.auth`）：只信 Cloudflare 加在最上方、authserv-id 为 `mx.cloudflare.net` 的 Authentication-Results，最上方那条不是它就不往下找；ARC-Authentication-Results 不采信。NULL 是「未知」（历史邮件、站内互投、没带头），不是失败。Claude 账号事实（`claude-facts.ts`）只认 DKIM 通过、签名域等于或为白名单发件域的父域、`aligned`（From/To/Subject 头不重复）且收件地址在 To 头里的来信，防伪造和正版信重投；2026-11 之前按旧口径归纳的事实不回溯。收件详情的 `extractedText`、`risk`（`lib/agent-text.ts`）在读取时由完整正文惰性计算，不落库、不进收件链路。
 - **AI 只走管理后台配置的 OpenAI 兼容模型**（`settings.ai_model`，如 DeepSeek），不再使用 Workers AI binding。验证码兜底（仅在命中验证码关键词且正则未识别时调用）与邮件翻译共用 `services/ai-provider.ts`；DeepSeek 必须带 `thinking: {type: 'disabled'}`（否则慢且贵）；workerd 的 fetch 不支持 `redirect: 'error'`，用 `manual` 并把 3xx 当失败。apiKey 回显为 `SECRET_MASK`，审计不记录。译文缓存在 `message_translations`，必须随 `purgeStatements` 一起删除（永久删除、保留期清理、释放并清空历史共用这条路径）。
 - **`cloudflare:email` 和 `mimetext` 必须在 `outbound.ts` 里动态 `import()`**（静态 import 会让 vitest 的 workerd 加载即崩）；mimetext 用 `mimetext/browser` 入口（避免 nodejs_compat 依赖）。
+- **服务端草稿与定时发送（`services/drafts.ts`，`/api|/v1/drafts`）**：发送一律经 `sendMail`，按 `(actor_type='draft', actor_id=草稿 id, key=attempt)` 占幂等记录，发件行在外发前绑定；`sending` 超过 15 分钟由每分钟 cron（`* * * * *`，只派发草稿、不写 cron 心跳）按记录判定：已绑定看发件行，未绑定才重排（最多 3 次），绝不自动重发。到点复核安排者的 Key 仍有效、所有者 `auth_version` 未变。草稿正文与邮件同口径落 R2（`drafts.body_r2_key` 计入对象清理的引用）；被草稿引用的上传附件写 `draft_attachments.draft_id`，豁免 24h 过期、不能直接发信或 `DELETE /uploads`。URL 附件（`services/url-attachment.ts`）只允许 https/443，IP 字面量与 DoH 解析结果都过禁止网段检查，手动重定向逐跳复查。
 
 ## 前端约定
 
