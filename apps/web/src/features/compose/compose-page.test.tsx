@@ -367,6 +367,7 @@ describe('idempotency error codes', () => {
     const client = show(initial);
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('已为这封邮件更换新凭据');
+    expect(screen.getByRole('link', { name: '已发送' })).toHaveAttribute('href', '/sent');
     expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
     expect(savedKey()).toBeUndefined();
     const oldKey = mocks.send.mock.calls[0]![1];
@@ -388,7 +389,7 @@ describe('source mail no longer available', () => {
   });
 
   it('a reply whose original is gone can be sent as a new mail after the user confirms, with a new key', async () => {
-    mocks.send.mockRejectedValueOnce(new ApiError('邮件不存在', { code: 'not_found', httpStatus: 404 })).mockResolvedValueOnce(sent);
+    mocks.send.mockRejectedValueOnce(new ApiError('回复的原邮件不存在或不可见', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
     const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
@@ -408,7 +409,7 @@ describe('source mail no longer available', () => {
   });
 
   it('a forward whose source attachments are gone can drop them and resend on the next click', async () => {
-    mocks.send.mockRejectedValueOnce(new ApiError('附件「a.pdf」已丢失，无法完整转发', { code: 'not_found', httpStatus: 404 })).mockResolvedValueOnce(sent);
+    mocks.send.mockRejectedValueOnce(new ApiError('转发的原邮件附件不可用', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
     const client = show({ fromAddress: 'first@one.example', to: ['friend@example.com'], subject: 'Fwd: hi', body: 'fyi', mode: 'forward', forwardAttachmentsFrom: 8, sourceMessageId: 8 });
     expect(screen.getByText(/将保留原邮件附件/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
@@ -423,11 +424,11 @@ describe('source mail no longer available', () => {
     client.clear();
   });
 
-  it('other 404s stay plain errors without offering to drop the source', async () => {
-    mocks.send.mockRejectedValueOnce(new ApiError('发件邮箱不存在', { code: 'not_found', httpStatus: 404 }));
+  it.each(['发件邮箱不存在', '邮件不存在'])('a plain not_found (%s) stays a plain error: only source_unavailable offers to drop the source', async (text) => {
+    mocks.send.mockRejectedValueOnce(new ApiError(text, { code: 'not_found', httpStatus: 404 }));
     const client = show({ fromAddress: 'first@one.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('发件邮箱不存在');
+    expect(await screen.findByRole('alert')).toHaveTextContent(text);
     expect(screen.queryByRole('button', { name: '作为新邮件发送' })).toBeNull();
     client.clear();
   });
