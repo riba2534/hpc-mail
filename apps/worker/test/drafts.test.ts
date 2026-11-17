@@ -452,3 +452,103 @@ describe('限定范围的 Key（PR4a）', () => {
     expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('不再覆盖这个发件地址') });
   });
 });
+
+describe('到点按安排者的有效权限发送（CR2/CR3/A23）', () => {
+  const setKeyScopes = (id: number, scopes: string[]) => db.update(apiKeys).set({ scopes: scopes as ApiScope[] }).where(eq(apiKeys.id, id));
+
+  it('CR2：管理员名下不带 admin scope 的 Key 安排的定时发送按普通用户身份，不能借此用别人的邮箱发信', async () => {
+    const admin = await account('sched-role-admin', USER_SCOPES, 'admin');
+    const victim = await account('sched-role-victim');
+    const [box] = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, victim.address));
+    // 直接发信时这把 Key 已按普通用户处理（403），定时发送不能绕过
+    expect((await failure(await call('/v1/messages', req(admin.key, 'POST', complete('ignored@hpc.email', 'x@hpc.email', { from: { mailboxId: box!.id } }))), 403)).code)
+      .toBe('forbidden');
+    const draft = await data<Draft>(await call('/v1/drafts', req(admin.key, 'POST',
+      complete('ignored@hpc.email', 'sched-role-to@hpc.email', { from: { mailboxId: box!.id }, sendAt: inMinutes(5) }))), 201);
+    await makeDue(draft.id);
+    await dispatch();
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', messageId: null });
+    expect(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.address, victim.address), eq(messages.direction, 'outbound'))))
+      .toEqual([]);
+    // 网页会话安排的仍按管理员身份
+    const web = await data<Draft>(await call('/api/drafts', req(admin.jwt, 'POST',
+      complete('ignored@hpc.email', 'sched-role-to2@hpc.email', { from: { mailboxId: box!.id }, sendAt: inMinutes(5) }))), 201);
+    await makeDue(web.id);
+    await dispatch();
+    expect(await row(web.id)).toMatchObject({ status: 'sent' });
+  });
+
+  it('CR3：到点时安排它的 Key 已没有 mail.send，或引用原信却没有 mail.read，就取消发送', async () => {
+    const me = await account('sched-scope');
+    const plain = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 'scope-a@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    const [source] = await db.insert(messages).values({ direction: 'inbound', address: me.address, domain: 'hpc.email', status: 'received',
+      fromAddress: 'peer@example.net', subject: 'hi', preview: 'p', messageId: '<src@example.net>' }).returning({ id: messages.id });
+    const reply = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST',
+      complete(me.address, 'scope-b@hpc.email', { replyToMessageId: source!.id, sendAt: inMinutes(5) }))), 201);
+    await setKeyScopes(me.keyId, ['mail.send']);
+    await makeDue(plain.id);
+    await makeDue(reply.id);
+    await dispatch();
+    expect(await row(reply.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('mail.read') });
+    expect(await row(plain.id)).toMatchObject({ status: 'sent' });
+
+    const another = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 'scope-c@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await setKeyScopes(me.keyId, ['mail.read']);
+    await makeDue(another.id);
+    await dispatch();
+    expect(await row(another.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('mail.send') });
+  });
+
+  it('A23：已安排的草稿被另一把 Key 改写后，到点复核的是最后改写它的 Key', async () => {
+    const me = await account('sched-rewrite');
+    const draft = await data<Draft>(await call('/api/drafts', req(me.jwt, 'POST', complete(me.address, 'rw-a@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await data(await call(`/v1/drafts/${draft.id}`, req(me.key, 'PATCH', { to: ['rw-b@hpc.email'] })));
+    expect(await row(draft.id)).toMatchObject({ status: 'scheduled', scheduledByKeyId: me.keyId });
+    await db.update(apiKeys).set({ status: 'revoked' }).where(eq(apiKeys.id, me.keyId));
+    await makeDue(draft.id);
+    await dispatch();
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('API Key 已失效') });
+  });
+});
+
+describe('草稿接口的未知字段（E2）', () => {
+  it('创建与修改带未知字段返回 400，fix 给出正确字段名，什么也不保存', async () => {
+    const me = await account('draft-strict');
+    const created = await failure(await call('/v1/drafts', req(me.key, 'POST', { ...complete(me.address, 's1@hpc.email'), scheduledAt: inMinutes(5) })), 400);
+    expect(created).toMatchObject({ code: 'validation_failed', message: '草稿不接受字段：scheduledAt' });
+    expect(created.fix).toContain('scheduledAt 应写成 sendAt');
+    expect(await db.select({ id: drafts.id }).from(drafts).where(eq(drafts.userId, me.id))).toEqual([]);
+    const draft = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', complete(me.address, 's1@hpc.email'))), 201);
+    const patched = await failure(await call(`/v1/drafts/${draft.id}`, req(me.key, 'PATCH', { body: 'x' })), 400);
+    expect(patched.fix).toContain('body 应写成 text 或 html');
+    expect(await row(draft.id)).toMatchObject({ version: 1 });
+  });
+});
+
+describe('草稿里的 URL 附件（A12）', () => {
+  it('未发送草稿已达上限时不去拉取，直接 409；保存时的拉取计入每分钟额度', async () => {
+    const me = await account('draft-url-limit');
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.hostname === 'cloudflare-dns.com') return Response.json({ Status: 0, Answer: [{ type: url.searchParams.get('type') === '1' ? 1 : 28, data: url.searchParams.get('type') === '1' ? '93.184.216.34' : '2606:2800:220:1::1' }] });
+      return new Response('pdf', { headers: { 'Content-Length': '3' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const saved = await data<Draft>(await call('/v1/drafts', req(me.key, 'POST', { attachments: [{ url: 'https://files.example.com/a.pdf' }] })), 201);
+      expect(saved.attachments).toMatchObject([{ filename: 'a.pdf', size: 3 }]);
+      const counter = await env.db.prepare(`SELECT SUM(count) AS n FROM rate_counters WHERE scope = 'url-fetch' AND subject = ?`).bind(String(me.id)).first<{ n: number }>();
+      expect(counter!.n).toBe(1);
+      const now = Date.now();
+      await env.db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+        INSERT INTO drafts (user_id, status, content, created_via, created_at, updated_at) SELECT ?, 'draft', '{}', 'web', ?, ? FROM n`)
+        .bind(MAX_DRAFTS_PER_USER - 1, me.id, now, now).run();
+      fetchMock.mockClear();
+      expect((await failure(await call('/v1/drafts', req(me.key, 'POST', { attachments: [{ url: 'https://files.example.com/b.pdf' }] })), 409)).code)
+        .toBe('draft_limit_reached');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

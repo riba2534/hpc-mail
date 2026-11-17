@@ -192,6 +192,11 @@ export const SENT_DRAFT_RETENTION_DAYS = 7;
 /** 批量发送单次最多项数 */
 export const MAX_BATCH_SEND_ITEMS = 20;
 
+/** URL 附件：每个用户每分钟最多拉取的个数（发信、批量与草稿合计） */
+export const MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE = 30;
+/** URL 附件：没有 Content-Length 的响应要先读进内存，一个请求里这类缓冲合计的上限（批量的各项共用） */
+export const MAX_URL_ATTACHMENT_BUFFER_BYTES = 10 * 1024 * 1024;
+
 /** URL 附件：单次拉取总超时、最多跟随的重定向次数 */
 export const URL_ATTACHMENT_TIMEOUT_MS = 15 * 1000;
 export const URL_ATTACHMENT_MAX_REDIRECTS = 3;
