@@ -9,7 +9,7 @@ import {
   type Page,
   type UpdateApiKeyRequest,
 } from '@hpc-mail/shared';
-import { and, desc, eq, lt } from 'drizzle-orm';
+import { and, desc, eq, lt, ne, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
 import { apiKeys, apiRequestLogs, users } from '../db/schema.js';
 import { bytesToHex, sha256Hex } from '../lib/crypto.js';
@@ -156,6 +156,20 @@ export async function revokeApiKey(env: Env, id: number, userId?: number): Promi
   const db = createDb(env);
   await requireKey(db, id, userId);
   await db.update(apiKeys).set({ status: 'revoked' }).where(eq(apiKeys.id, id));
+}
+
+/**
+ * 吊销用户全部未吊销的 Key，供改密/重置密码与密码更新放进同一个 batch：
+ * 守卫要求用户密码已是本次写入的新哈希（带随机盐，唯一），密码更新未生效时不吊销。
+ * 返回被吊销 Key 的 id 列表。
+ */
+export function revokeAllApiKeysQuery(db: Db, userId: number, newPasswordHash: string) {
+  return db
+    .update(apiKeys)
+    .set({ status: 'revoked' })
+    .where(and(eq(apiKeys.userId, userId), ne(apiKeys.status, 'revoked'),
+      sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${userId} AND ${users.passwordHash} = ${newPasswordHash})`))
+    .returning({ id: apiKeys.id });
 }
 
 export async function listApiKeyLogs(

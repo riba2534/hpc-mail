@@ -5,6 +5,7 @@ import { mailboxes, users } from '../db/schema.js';
 import { AppError } from '../lib/errors.js';
 import { hashPassword } from '../lib/password.js';
 import type { Env, ExecCtx } from '../types.js';
+import { revokeAllApiKeysQuery } from './api-key.js';
 import { avatarUrl } from './avatar.js';
 import { mirrorUserEpoch } from './session.js';
 import { getSettingsFresh } from './setting.js';
@@ -111,13 +112,17 @@ export async function createUser(env: Env, req: CreateUserRequest): Promise<Admi
   return serialize(row!, [], 0);
 }
 
+/**
+ * 管理员修改用户。重置密码时同一 batch 事务里吊销该用户全部 API Key（不可选）：
+ * 重置通常意味着账号可能失窃，Key 不比较鉴权版本，只踢会话收不回它。
+ */
 export async function updateUser(
   env: Env,
   actingUserId: number,
   id: number,
   req: UpdateUserRequest,
   ctx?: ExecCtx | null,
-): Promise<AdminUser> {
+): Promise<{ user: AdminUser; revokedApiKeys: number }> {
   const db = createDb(env);
   const target = await db.select().from(users).where(eq(users.id, id)).get();
   if (!target) throw new AppError('not_found', '用户不存在');
@@ -164,14 +169,22 @@ export async function updateUser(
   }
 
   let row: UserRow | undefined;
+  let revokedApiKeys = 0;
   try {
-    [row] = await db.update(users).set({ ...patch,
+    const update = db.update(users).set({ ...patch,
       ...(req.mailboxPolicy !== undefined || req.role !== undefined ? { mailboxPolicyRevision: sql`${users.mailboxPolicyRevision} + 1` } : {}),
       ...(bumpEpoch ? { authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true } : {}),
     }).where(and(eq(users.id, id),
       req.mailboxPolicy === undefined ? undefined : eq(users.mailboxPolicyRevision, req.expectedMailboxPolicyRevision!),
       domainsRevision === undefined ? undefined : sql`COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0) = ${domainsRevision}`,
     )).returning();
+    if (patch.passwordHash) {
+      const [rows, revoked] = await db.batch([update, revokeAllApiKeysQuery(db, id, patch.passwordHash)]);
+      row = rows[0];
+      revokedApiKeys = revoked.length;
+    } else {
+      [row] = await update;
+    }
   } catch (error) {
     if (isLastAdminConstraint(error)) {
       throw new AppError('forbidden', '至少保留一个可用管理员，无法执行此操作');
@@ -186,7 +199,7 @@ export async function updateUser(
     .from(users)
     .where(eq(users.id, id))
     .get();
-  return serialize(row!, await listMailboxAddresses(db, id), Number(count?.apiKeyCount ?? 0));
+  return { user: serialize(row!, await listMailboxAddresses(db, id), Number(count?.apiKeyCount ?? 0)), revokedApiKeys };
 }
 
 /**

@@ -452,7 +452,9 @@ describe('验证链接收件识别与输出', () => {
     const waited = await data<{ message: MessageSummary }>(await request(`/v1/messages/wait?address=${address}&afterId=${base}&timeout=1`, { headers: auth(user.key) }));
     expect(waited.message.verificationLink).toBe(verifyUrl);
     const job = await createDb(env).select().from(notificationJobs).where(eq(notificationJobs.messageId, row!.id)).get();
-    expect((job!.payload as { message: { verificationLink: string } }).message.verificationLink).toBe(verifyUrl);
+    // 推送成功后载荷（含链接）随终态清空，链接以实际推送内容为准
+    expect(job!.status).toBe('succeeded');
+    expect(job!.payload).toEqual({});
     expect(delivered.map((body) => body.message.verificationLink)).toEqual([verifyUrl]);
 
     // 升级前入队的载荷没有该字段：投递时补空串

@@ -6,7 +6,7 @@ import { harvestPurgeStatement } from './claude-facts.js';
 import { scheduleStorageCleanup } from './storage-cleanup.js';
 
 /** purgeStatements 里删除 messages 行那条语句的下标；调用方据此读取实际删除条数 */
-export const PURGE_MESSAGES_INDEX = 5;
+export const PURGE_MESSAGES_INDEX = 6;
 
 /** All metadata removal and garbage references commit together, before awaiting R2. */
 export function purgeStatements(env: Env, token: string): D1PreparedStatement[] {
@@ -22,6 +22,8 @@ export function purgeStatements(env: Env, token: string): D1PreparedStatement[] 
     env.db.prepare(`DELETE FROM stars WHERE message_id IN (${selected})`).bind(token),
     // 译文是邮件内容的派生副本，必须随邮件一起删除
     env.db.prepare(`DELETE FROM message_translations WHERE message_id IN (${selected})`).bind(token),
+    // 通知载荷含主题、验证码、链接与正文前 4000 字，同属派生副本；任务行保留供通知健康页查看
+    env.db.prepare(`UPDATE notification_jobs SET payload = '{}' WHERE message_id IN (${selected}) AND payload <> '{}'`).bind(token),
     env.db.prepare('DELETE FROM messages WHERE purge_token = ?').bind(token),
   ];
 }

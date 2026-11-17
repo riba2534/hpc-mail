@@ -25,6 +25,25 @@ export interface CounterGuard {
 }
 
 /**
+ * 守卫：某个计数在本窗口未超过 limit（行不存在按 0 计）。放在同一 batch 里该计数的
+ * 递增语句之后，读到的就是包含本次请求的新值。
+ */
+export function counterWithinGuard(scope: string, subject: string, window: number, limit: number): CounterGuard {
+  return {
+    sql: 'COALESCE((SELECT count FROM rate_counters WHERE scope = ? AND subject = ? AND "window" = ?), 0) <= ?',
+    params: [scope, subject, window, limit],
+  };
+}
+
+/** 多个守卫取与 */
+export function andGuards(...guards: CounterGuard[]): CounterGuard {
+  return {
+    sql: guards.map(guard => `(${guard.sql})`).join(' AND '),
+    params: guards.flatMap(guard => guard.params),
+  };
+}
+
+/**
  * bumpCounter 的预编译语句形态，供调用方与其他语句合进同一个 `db.batch` 往返。
  * `RETURNING count, units` 在结果的 `results[0]`；带 guard 且条件不成立时无行。
  */

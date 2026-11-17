@@ -24,7 +24,7 @@ app.put('/:id', async (c) => {
   const acting = c.get('user')!;
   const id = parseId(c.req.param('id'));
   const req = await parseBody(c, updateUserRequestSchema);
-  const updated = await updateUser(c.env, acting.id, id, req, execCtx(c));
+  const { user: updated, revokedApiKeys } = await updateUser(c.env, acting.id, id, req, execCtx(c));
   const changes: string[] = [];
   if (req.status) changes.push(req.status === 'disabled' ? '禁用' : '启用');
   if (req.role) changes.push(`角色→${req.role}`);
@@ -36,6 +36,9 @@ app.put('/:id', async (c) => {
       : `邮箱权限→专属配置（总数 ${limit(policy.perUserLimit)}；${policy.domains.map((entry) => `${entry.domain}: ${limit(entry.perUserLimit)}`).join('、') || '无可认领域名'}）`);
   }
   await logAdminAction(c.env, acting, 'user.update', updated.username, changes.join('、'), clientIp(c));
+  if (revokedApiKeys) {
+    await logAdminAction(c.env, acting, 'api_key.revoke_all', updated.username, `重置密码时吊销 ${revokedApiKeys} 个 API Key`, clientIp(c));
+  }
   return ok(c, updated);
 });
 

@@ -57,6 +57,8 @@ app.post('/', async (c) => {
   requireScope(c, 'mail.send');
   const key = c.get('apiKey')!;
   const req = await parseBody(c, internalSendMailSchema);
+  // 转发附件、回复都会读出来源邮件的内容或邮件头，与下载附件同属读取，不能只凭 mail.send
+  if (req.forwardAttachmentsFrom || req.replyToMessageId) requireScope(c, 'mail.read');
   const idem = await beginIdempotentSend(
     c.env,
     { type: 'api_key', id: key.id },
@@ -141,9 +143,14 @@ app.get('/contacts', async (c) => {
   return ok(c, { contacts: await getRecentContacts(c.env, messageViewer(c, c.get('apiKey')!)) });
 });
 
+/** 未读数只统计调用者认领的地址；scope 只接受 mine，其他值显式拒绝，不静默退回个人未读数 */
 app.get('/unread-count', async (c) => {
   requireScope(c, 'mail.read');
   const key = c.get('apiKey')!;
+  const scope = c.req.query('scope');
+  if (scope !== undefined && scope !== 'mine') {
+    throw new AppError('validation_failed', '未读数只统计调用者认领的地址，scope 只能为 mine');
+  }
   return ok(c, { unread: await countUnread(c.env, key.userId, key.role) });
 });
 

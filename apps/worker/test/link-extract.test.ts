@@ -84,6 +84,54 @@ https://www.example.cn/user/activate?code=8f14e45fceea167a5a36dedd4bea2543。链
   });
 });
 
+/**
+ * 仿造的 Claude 安全登录邮件（结构仿照真实模板，内容全部虚构）：主题不含 verify/sign in，
+ * 引导句在 to 与登录动词之间多一个词或用 -ing 形式，按钮包在 SES 点击追踪长链接里。
+ */
+describe('验证链接提取：Claude 安全登录链接', () => {
+  const magic = 'https://click.mail.anthropic.com/CL0/https:%2F%2Fclaude.ai%2Fmagic-link%23Zm9vYmFyYmF6cXV4cXV1eDEyMzQ1Njc4OTA:c2FtcGxlQGhwYy5lbWFpbA==/1/0100019a2b3c4d5e-6f708192-a3b4-c5d6-e7f8-091a2b3c4d5e-000000/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789=412';
+  const privacy = 'https://click.mail.anthropic.com/CL0/https:%2F%2Fwww.anthropic.com%2Flegal%2Fprivacy/1/0100019a2b3c4d5e-6f708192-a3b4-c5d6-e7f8-091a2b3c4d5e-000000/ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210=412';
+  const template = (lead: string) => `<table role="presentation" width="100%"><tr><td align="center">
+      <img src="https://cdn.mail.anthropic.com/claude-wordmark.png" alt="Claude" width="120">
+      <h1 style="font-size:24px">Your secure link to Claude.ai</h1>
+      <p>Hello,</p>
+      <p>${lead} This link expires in 60 minutes and can only be used once.</p>
+      <a href="${magic}" style="background:#c96442;color:#ffffff;padding:12px 24px;border-radius:8px">Sign in to Claude.ai</a>
+      <p>If you didn't request this email, you can safely ignore it.</p>
+      <p style="color:#999999">Anthropic · Example Street 1 · San Francisco</p>
+      <a href="${privacy}">Privacy Policy</a>
+    </td></tr></table>`;
+  const subject = 'Your secure link to Claude.ai is here | 2026-11-17';
+
+  it.each([
+    ['to 后插入一个词', 'Click the link below to securely sign in to Claude.ai.'],
+    ['-ing 形式', 'Use the button below to continue signing in to Claude.ai.'],
+  ])('引导句%s：取按钮的追踪链接，页脚隐私链接不入选', (_name, lead) => {
+    const html = template(lead);
+    const text = `Your secure link to Claude.ai\n\n${lead}\n\n${magic}\n\nIf you didn't request this email, you can safely ignore it.`;
+    expect(extractVerificationLink({ subject, html, fromAddress: 'no-reply-q1@mail.anthropic.com' })).toBe(magic);
+    expect(extractVerificationLink({ subject: 'Claude.ai | 2026-11-17', text, html, fromAddress: 'no-reply-q1@mail.anthropic.com' })).toBe(magic);
+  });
+
+  it('正文没有引导句时，主题里的 secure link 也算意图', () => {
+    const html = template('Here it is.');
+    expect(extractVerificationLink({ subject, html, fromAddress: 'no-reply-q1@mail.anthropic.com' })).toBe(magic);
+  });
+
+  it('只凭弱意图时，按钮文字不含动作词的链接不入选（即使路径带 token 且与发件域相同）', () => {
+    const html = `<p>Tap the button below to quickly sign in and claim 20% off your next order.</p>
+      <a href="https://shop.example.com/login?next=%2Fsale&amp;ref=AbCdEfGhIjKlMnOpQrStUvWx">Claim 20% off</a>${footer}`;
+    expect(extractVerificationLink({ subject: 'Members save more this week', html, fromAddress: 'deals@shop.example.com' })).toBe('');
+  });
+
+  it('只凭弱意图时，按钮是「登录」但路径没有验证特征的链接不入选', () => {
+    const html = `<a href="https://files.example.com/account">Log in</a>
+      <p>Share files with a secure link. Start your free trial of Pro today.</p>
+      <a href="https://files.example.com/pricing?plan=pro">Start free trial</a>${footer}`;
+    expect(extractVerificationLink({ subject: 'Share files with a secure link — try Pro free', html, fromAddress: 'news@files.example.com' })).toBe('');
+  });
+});
+
 describe('验证链接提取：误判反例', () => {
   it('营销邮件导航栏的登录链接不算（整封无验证意图）', () => {
     const html = `<a href="https://shop.example.com/login">Log in</a> <a href="https://shop.example.com/sale">Shop the sale</a>

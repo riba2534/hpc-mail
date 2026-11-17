@@ -8,7 +8,7 @@ import {
 } from '@hpc-mail/shared';
 import { and, eq, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
-import { attachments as attachmentsTable, deliveryObjectLeases, idempotencyRecords, mailboxes, messages, storageCleanupJobs } from '../db/schema.js';
+import { attachments as attachmentsTable, deliveryObjectLeases, mailboxes, messages, storageCleanupJobs } from '../db/schema.js';
 import {
   assertNoHeaderInjection,
   getEmailDomain,
@@ -22,6 +22,7 @@ import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
 import { assertHostedSendable, getRoutableDomains } from './domain.js';
 import { resolveDeliveryOwners } from './mailbox.js';
+import { loadSourceMessage } from './message.js';
 import { getUserNotifyPrefs } from './notify-prefs.js';
 import { bumpCounter, dayWindow } from './rate-counter.js';
 import { getSettings } from './setting.js';
@@ -30,7 +31,7 @@ import { assertSendBodySize, bodyBytes, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
 import { enqueueMailNotifications, processNotificationJobs } from './notification-jobs.js';
 import { retainExternalAttachments } from './external-attachment.js';
-import type { IdempotencyHandle } from './idempotency.js';
+import { bindIdempotentSend, type IdempotencyHandle } from './idempotency.js';
 import { injectAttachmentLinks, type AttachmentLink } from './attachment-links.js';
 export { injectAttachmentLinks } from './attachment-links.js';
 
@@ -200,7 +201,7 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/** 转发时把原邮件的附件带入本次发送：校验可见性后从 R2 读回，转成 DecodedAttachment */
+/** 转发时把原邮件的附件带入本次发送：校验可见性（同详情，不可见即 404）后从 R2 读回，转成 DecodedAttachment */
 async function loadForwardedAttachments(
   env: Env,
   db: Db,
@@ -209,16 +210,7 @@ async function loadForwardedAttachments(
   alreadyCount: number,
   alreadyBytes: number,
 ): Promise<DecodedAttachment[]> {
-  const source = await db.select().from(messages).where(eq(messages.id, sourceMessageId)).get();
-  if (!source) throw new AppError('not_found', '转发来源邮件不存在');
-  if (sender.role !== 'admin') {
-    const owned = await db
-      .select({ id: mailboxes.id })
-      .from(mailboxes)
-      .where(and(eq(mailboxes.address, source.address), eq(mailboxes.userId, sender.userId)))
-      .get();
-    if (!owned) throw new AppError('forbidden', '无权转发该邮件的附件');
-  }
+  await loadSourceMessage(env, sender, sourceMessageId);
   const rows = await db
     .select()
     .from(attachmentsTable)
@@ -407,23 +399,14 @@ function summarize(
   };
 }
 
-/** 校验并构造回复线程头（回复的原邮件须对发件人可见） */
+/** 校验并构造回复线程头（回复的原邮件须对发件人可见，同详情口径，不存在与不可见同为 404） */
 async function resolveReply(
-  db: Db,
+  env: Env,
   sender: Sender,
   replyToMessageId: number | undefined,
 ): Promise<{ reply: ReplyContext | null; inReplyTo: string | null; references: string }> {
   if (!replyToMessageId) return { reply: null, inReplyTo: null, references: '' };
-  const orig = await db.select().from(messages).where(eq(messages.id, replyToMessageId)).get();
-  if (!orig) return { reply: null, inReplyTo: null, references: '' };
-  if (sender.role !== 'admin') {
-    const owned = await db
-      .select({ id: mailboxes.id })
-      .from(mailboxes)
-      .where(and(eq(mailboxes.address, orig.address), eq(mailboxes.userId, sender.userId)))
-      .get();
-    if (!owned) throw new AppError('forbidden', '无权回复该邮件');
-  }
+  const orig = await loadSourceMessage(env, sender, replyToMessageId);
   if (!orig.messageId) return { reply: null, inReplyTo: null, references: '' };
   const references = [...new Set([orig.references, orig.inReplyTo, orig.messageId]
     .filter(Boolean).flatMap(value => value!.match(/<[^<>\s]+>/g) ?? []))].join(' ');
@@ -516,7 +499,7 @@ export async function sendMail(
   const uniqueTargets = [...new Set([...recipients.to, ...recipients.cc, ...recipients.bcc])];
   const externalTargets = uniqueTargets.filter(address => !domains.includes(getEmailDomain(address)));
   const internalTargets = uniqueTargets.filter(address => domains.includes(getEmailDomain(address)));
-  const { reply, inReplyTo, references } = await resolveReply(db, sender, req.replyToMessageId);
+  const { reply, inReplyTo, references } = await resolveReply(env, sender, req.replyToMessageId);
   const outgoingMessageId = `<${crypto.randomUUID()}@${from.domain}>`;
   const preview = makePreview(text, html);
   const size = bodyBytes(text, html) + totalAttachmentBytes;
@@ -539,16 +522,8 @@ export async function sendMail(
       errorDetail: '', isRead: true, size, createdAt: new Date(),
     }).returning().get();
     if (!outbound) throw new AppError('internal', '发送记录创建失败');
-    if (handle) {
-      const bound = await db.update(idempotencyRecords)
-        .set({ messageId: outbound.id, updatedAt: new Date() })
-        .where(and(
-          eq(idempotencyRecords.actorType, handle.actor.type), eq(idempotencyRecords.actorId, handle.actor.id),
-          eq(idempotencyRecords.key, handle.key), eq(idempotencyRecords.requestHash, handle.requestHash),
-          eq(idempotencyRecords.status, 'pending'),
-        )).returning({ messageId: idempotencyRecords.messageId }).get();
-      if (!bound) throw new AppError('conflict', '发送幂等状态已变化，请查询发送记录');
-    }
+    // 绑定失败（幂等状态已变化）时同批把发件行标 failed，不留永久 pending
+    await bindIdempotentSend(env, handle, outbound.id);
   } catch (error) {
     await releaseOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
     if (!outbound && storedBody?.bodyR2Key) await queueObjectCleanup(env, [storedBody.bodyR2Key]);

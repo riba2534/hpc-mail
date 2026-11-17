@@ -207,11 +207,12 @@ export function extractCodeByRegex(
 }
 
 /**
- * 读取历史数据时重新校验已存验证码：新规则能提取时以新结果为准；明确的 link-only
- * 邮件则清掉旧版误识别值。其他邮件保留 AI/旧规则结果，避免破坏无法被正则覆盖的真验证码。
+ * 读取时校验已存验证码：明确的 link-only 邮件清掉旧版误识别值；其余情况已存值优先——
+ * 它是收件时按完整正文（或 AI 兜底）得出的，读取时手里只有摘要，摘要里的年份、订单号
+ * 离关键词更近，重提会盖掉第 160 字之后的真码。只有已存值为空的历史行才用摘要重提。
  *
- * body 是摘要这类截断文本时要带上 `bodyTruncated`，否则被切短的码会盖掉收件时
- * 按完整正文存下的正确值（6 位码在摘要边界上只剩 5 位）。
+ * body 是摘要这类截断文本时要带上 `bodyTruncated`，否则被切短的码会被当成完整码
+ * （6 位码在摘要边界上只剩 5 位）。
  */
 export function resolveVerificationCode(
   subject: string,
@@ -221,10 +222,8 @@ export function resolveVerificationCode(
 ): string {
   const corpus = corpusOf(subject, body);
   if (LINK_ONLY_REGEX.test(corpus) && !EXPLICIT_CODE_REGEX.test(withoutUrls(corpus))) return '';
-  const extracted = extractCodeByRegex(subject, body, options);
-  if (extracted) return extracted;
-  if (!storedCode) return '';
-  return storedCode;
+  if (storedCode) return storedCode;
+  return extractCodeByRegex(subject, body, options);
 }
 
 interface AiCodeInput {
