@@ -764,7 +764,7 @@ export const webhookDeliveries = sqliteTable('webhook_deliveries', {
 
 /**
  * 外发与 Cloudflare 投递事件的对应：每个外部收件人一次 send() 一行。事件到达时依次按 send() 返回的
- * Cloudflare 消息 ID、本站 Message-ID（同收件人）、同一发件人与收件人唯一一条未回执的记录查找。
+ * Cloudflare 消息 ID、本站 Message-ID（同收件人）、同一发件人与收件人唯一一条未回执且没有消息 ID 的记录查找。
  * 保留 30 天，由每日维护清理。
  */
 export const emailDeliveryRefs = sqliteTable('email_delivery_refs', {

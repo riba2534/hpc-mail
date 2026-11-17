@@ -289,6 +289,39 @@ describe('外发回执回写与抑制名单', () => {
     expect(outcomeOf(await outbound(fourth.id), a).status).toBe('sent');
   });
 
+  it('A6：兜底不匹配带有其他 Cloudflare 消息 ID 的记录，回执不会写到同一发件人与收件人的另一封信上', async () => {
+    const f = await fixture();
+    const target = f.ext('a6');
+    const sentRow = async (subject: string, providerMessageId: string | null) => {
+      const row = (await db.insert(messages).values({ direction: 'outbound', address: f.address, domain: 'hpc.email',
+        fromAddress: f.address, subject, status: 'sent', recipientOutcomes: [{ address: target, status: 'sent' }] }).returning().get())!;
+      await env.db.prepare(`INSERT INTO email_delivery_refs (provider_message_id, kind, message_id, sender, recipient, created_at)
+        VALUES (?, 'message', ?, ?, ?, ?)`).bind(providerMessageId, row.id, f.address, target, Date.now()).run();
+      return row;
+    };
+    // M0 已发出（ID P0），回执还没到；M1 的 send() 返回了 P1，但对应关系要等整封投递完才写入
+    const m0 = await sentRow(`${f.prefix}-a6-m0`, `${f.prefix}-P0`);
+    const e1 = event('bounced', { messageId: `${f.prefix}-P1`, sender: f.address, recipient: target,
+      smtp: ['550', '5.1.1', '550 5.1.1 User unknown'], bounceType: 'hard' });
+    expect(await processDeliveryEvent(env, e1, { attempts: 1 })).toBe('retry');
+    expect(outcomeOf(await outbound(m0.id), target)).toEqual({ address: target, status: 'sent' });
+    // 重试耗尽也不落到 M0 上
+    expect(await processDeliveryEvent(env, e1, { attempts: 4 })).toBe('unmatched');
+    expect(outcomeOf(await outbound(m0.id), target).status).toBe('sent');
+
+    // 两条记录：一条带其他 ID（M0），一条 send() 没返回 ID（M2）：兜底只认后者
+    const m2 = await sentRow(`${f.prefix}-a6-m2`, null);
+    const e2 = event('delivered', { messageId: `${f.prefix}-P2`, sender: f.address, recipient: target });
+    expect(await processDeliveryEvent(env, e2)).toBe('applied');
+    expect(outcomeOf(await outbound(m2.id), target).status).toBe('delivered');
+    expect(outcomeOf(await outbound(m0.id), target).status).toBe('sent');
+
+    // M0 自己的回执照常按 ID 命中
+    expect(await processDeliveryEvent(env, event('delivered', { messageId: `${f.prefix}-P0`, sender: f.address, recipient: target })))
+      .toBe('applied');
+    expect(outcomeOf(await outbound(m0.id), target).status).toBe('delivered');
+  });
+
   it('中转转发在 Cloudflare 侧最终失败时，转发记录改为失败并在通知健康里可见', async () => {
     const f = await fixture();
     await updateUserNotifyPrefs(env, f.user.id, { forward: { enabled: true, addresses: [f.ext('fwd')] } });

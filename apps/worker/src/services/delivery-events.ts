@@ -123,9 +123,12 @@ async function findRef(env: Env, event: DeliveryEvent, suppression: D1PreparedSt
     env.db.prepare(`${columns} WHERE provider_message_id = ? LIMIT 1`).bind(event.messageId),
     env.db.prepare(`${columns} WHERE rfc_message_id = ? AND recipient = ? ORDER BY id DESC LIMIT 1`)
       .bind(stripBrackets(event.messageId), event.recipient),
-    // 兜底：同一发件人发给同一收件人、还没有回执的只有一条时才认定（多条时无法分辨，宁可不回写）
+    // 兜底：只给 send() 没返回消息 ID 的记录用——同一发件人发给同一收件人、还没有回执的这类记录只有一条时才认定
+    // （多条时无法分辨，宁可不回写）。带 ID 的记录只能按 ID 命中：事件对不上它的 ID 就不是它的回执，
+    // 多半是另一封信的对应关系还没写入，交给重试
     env.db.prepare(`${columns} INDEXED BY idx_delivery_refs_pending_pair
-      WHERE recipient = ? AND sender = ? AND resolved_at IS NULL AND created_at >= ? ORDER BY id LIMIT 2`)
+      WHERE recipient = ? AND sender = ? AND resolved_at IS NULL AND provider_message_id IS NULL AND created_at >= ?
+      ORDER BY id LIMIT 2`)
       .bind(event.recipient, event.sender, event.at - 3 * 86_400_000),
   ];
   const results = await env.db.batch<RefRow>(statements);
