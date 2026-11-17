@@ -10,11 +10,6 @@ import type { Env } from '../types.js';
 
 const iso = (ms: number) => new Date(Number(ms)).toISOString();
 
-/** 重复的查询参数用逗号拼成一个值，交给 adminLookupList 拆分（?addresses=a&addresses=b 与 ?addresses=a,b 等价） */
-export function joinRepeatedQuery(queries: Record<string, string[]>): Record<string, string> {
-  return Object.fromEntries(Object.entries(queries).map(([key, values]) => [key, values.join(',')]));
-}
-
 interface MailboxRow {
   id: number;
   address: string;

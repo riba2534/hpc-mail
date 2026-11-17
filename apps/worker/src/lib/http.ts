@@ -124,3 +124,8 @@ export function parseQuery<T>(c: Context<AppContext>, schema: SafeParser<T>): T 
   if (!result.success) throw issueError(result.error.issues[0]);
   return result.data;
 }
+
+/** 同 parseQuery，但重复的参数用逗号拼成一个值（?a=x&a=y 与 ?a=x,y 等价），由 schema 拆分 */
+export function parseListQuery<T>(c: Context<AppContext>, schema: SafeParser<T>): T {
+  return parseValue(schema, Object.fromEntries(Object.entries(c.req.queries()).map(([key, values]) => [key, values.join(',')])));
+}
