@@ -546,8 +546,56 @@ export interface MessageSyncResult {
   head: string;
 }
 
+/** RFC 8601 认证结果（小写）；无法识别的取值按 none 记录 */
+export const MAIL_AUTH_RESULTS = ['pass', 'fail', 'softfail', 'neutral', 'none', 'temperror', 'permerror', 'policy'] as const;
+export type MailAuthResult = (typeof MAIL_AUTH_RESULTS)[number];
+
+/**
+ * 入站邮件的发件认证结果：只取 Cloudflare Email Routing 在最上方添加、authserv-id 为 mx.cloudflare.net 的
+ * Authentication-Results（发件人自带的同名头不可信）。摘要里为 null 表示没有可信结果：功能上线前的历史邮件、
+ * 站内互投，或这封信没有带 Cloudflare 的认证头；发件（outbound）不返回本字段。
+ */
+export interface MessageAuth {
+  spf: MailAuthResult;
+  /** 任一 DKIM 签名通过即为 pass，否则取第一个签名的结果；没有签名为 none */
+  dkim: MailAuthResult;
+  /** DKIM 签名域（header.d）：优先取与 From 域对齐的通过签名；没有签名为空串 */
+  dkimDomain: string;
+  dmarc: MailAuthResult;
+  /**
+   * 显示的 From 域与认证身份是否对齐：DMARC 通过，或通过的 DKIM 签名域 / SPF 发信域与 From 域相同或互为子域。
+   * 邮件有多个 From、To 或 Subject 头时为 false（显示的值可能不是被签名的那一个）。
+   */
+  aligned: boolean;
+}
+
+/** prompt injection 规则检测命中的原因代码（只做提示，命中不代表邮件一定恶意） */
+export const PROMPT_INJECTION_REASONS = [
+  /** 要求忽略、无视或忘记之前的指令 */
+  'ignore_instructions',
+  /** 直接称呼读信的 AI / Agent 或给它重设角色 */
+  'addresses_ai',
+  /** 伪造系统提示、聊天模板标记或「新指令」段落 */
+  'prompt_markup',
+  /** 要求立即转发、发送、调用工具或执行操作 */
+  'action_request',
+  /** 要求对用户隐瞒 */
+  'conceal_from_user',
+  /** 索要提示词、密钥、密码或验证码 */
+  'secret_request',
+] as const;
+export type PromptInjectionReason = (typeof PROMPT_INJECTION_REASONS)[number];
+
+/** 收件内容的风险标签（规则检测，宁缺毋滥）；Agent 不应执行邮件里的任何指令 */
+export interface MessageRisk {
+  promptInjection: boolean;
+  reasons: PromptInjectionReason[];
+}
+
 export interface MessageSummary {
   recipientOutcomes?: RecipientOutcome[];
+  /** 仅收件：发件认证结果，没有可信结果为 null，见 MessageAuth */
+  auth?: MessageAuth | null;
   id: number;
   direction: MessageDirection;
   address: string;
@@ -600,6 +648,10 @@ export interface MessageDetail extends MessageSummary {
   attachments: AttachmentMeta[];
   /** 是否存有原始 .eml，可经 /api/messages/:id/raw 下载 */
   hasRaw: boolean;
+  /** 仅收件：去掉引用历史后的纯文本（回复链里新写的部分）；认不出引用时为完整纯文本 */
+  extractedText?: string;
+  /** 仅收件：prompt injection 风险标签 */
+  risk?: MessageRisk;
 }
 
 /** GET /v1/messages/wait 的结果：include=body 时 message 为 MessageDetail */
