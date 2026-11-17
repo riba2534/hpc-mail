@@ -24,7 +24,7 @@ shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`AP
 | `GET /messages/sync` | 仅 JWT（`/api`） | `{unread,head}`；网页轮询用：参数同列表（忽略 `cursor`、`afterId`），`unread` 同 `/api/messages/unread-count`，`head` 与同筛选列表首页的 `head` 相同即首页没有变化。Agent 等新邮件用 `/v1/messages/wait` |
 | `GET /v1/messages/wait` | `mail.read` | `{message:摘要\|详情\|null,scannedThroughId}`，带 `include=body` 时命中返回详情结构，见下文 |
 
-列表支持 `direction=inbound|outbound`、`address`（完整地址）、`domain`、`q`（最长 256 字符，主题/发件地址/发件名/文本正文/收件人子串）、`unread=1`（只匹配你认领的地址，共享邮件不出现在未读筛选里）、`starred=1`、`trash=1`、`afterId`（非负安全整数，0 是合法空基线）、`cursor`、`limit`（1–100）。布尔查询接受 `1/true/0/false`；`unread=0` 与 `starred=0` 表示不筛选，不是“只看已读/未星标”。`trash=1` 只看软删除，未传看非回收站。
+列表支持 `direction=inbound|outbound`、`address`（完整地址）、`domain`、`q`（最长 256 字符，不区分大小写的子串，匹配主题、发件地址、发件名、收件人和正文开头 4KB 的纯文本；只有 HTML 的邮件匹配其文字内容，正文更靠后的内容搜不到）、`unread=1`（只匹配你认领的地址，共享邮件不出现在未读筛选里）、`starred=1`、`trash=1`、`afterId`（非负安全整数，0 是合法空基线）、`cursor`、`limit`（1–100）。布尔查询接受 `1/true/0/false`；`unread=0` 与 `starred=0` 表示不筛选，不是“只看已读/未星标”。`trash=1` 只看软删除，未传看非回收站。
 
 ```bash
 hpc '/messages' --get --data-urlencode 'direction=inbound' \
