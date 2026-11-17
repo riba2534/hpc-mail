@@ -877,6 +877,15 @@ export const HOSTED_AUTO_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, 
     AND (SELECT lim = 0 OR (SELECT COUNT(*) FROM mailboxes WHERE domain = ?2) < lim
       FROM (SELECT COALESCE((SELECT json_extract(value, '$.autoClaimLimit') FROM settings WHERE key = 'hosted_domains'), 0) AS lim))`;
 
+/**
+ * 托管域名所有者发信（?1 = 发件地址，?2 = 域名，?3 = 发信人）：域名可用且发信已就绪时，未认领的地址
+ * 在发出前认领给所有者，发件记录与之后的回信都在他名下可见。与所有者手动认领同一口径：不占全站每人上限，
+ * 也不受只约束收件自动认领的 autoClaimLimit；地址已有主人时不改动，由调用方按主人判定。
+ */
+export const HOSTED_SEND_CLAIM_SQL = `INSERT OR IGNORE INTO mailboxes (address, domain, user_id, display_name)
+  SELECT ?1, ?2, user_id, '' FROM hosted_domains WHERE domain = ?2 AND user_id = ?3
+    AND status IN (${USABLE_HOSTED_SQL}) AND sending_status = 'ready'`;
+
 /** 收件域名的托管状态与该地址是否已有主人（?1 = 收件地址，?2 = 域名）；非托管域名无结果 */
 export const HOSTED_STATUS_SQL = `SELECT status, EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1) AS claimed
   FROM hosted_domains WHERE domain = ?2`;

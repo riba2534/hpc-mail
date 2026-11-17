@@ -33,6 +33,14 @@ const ACTION_META: Record<string, { label: string; tone: BadgeTone }> = {
   'mailbox.update': { label: '修改他人发件名', tone: 'neutral' },
   'mail.read_user': { label: '查看用户邮件', tone: 'caution' },
   'mail.purge_unclaimed': { label: '永久删除未认领邮件', tone: 'critical' },
+  'system_domain.create': { label: '创建域名接入', tone: 'positive' },
+  'system_domain.confirm': { label: '确认接入变更', tone: 'caution' },
+  'system_domain.complete': { label: '完成域名接入', tone: 'positive' },
+  'system_domain.cancel': { label: '取消域名接入', tone: 'neutral' },
+  'system_domain.zone_delete': { label: '删除接入 zone', tone: 'critical' },
+  'system_domain.fail': { label: '域名接入失败', tone: 'critical' },
+  'system_domain.hide': { label: '隐藏可接入域名', tone: 'neutral' },
+  'system_domain.unhide': { label: '恢复可接入域名', tone: 'neutral' },
 };
 
 const ALL_ACTIONS = 'all';

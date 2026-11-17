@@ -9,6 +9,11 @@ export interface CloudflareCredentials {
   accountId: string;
   /** catch-all 投递目标：本 Worker 的脚本名 */
   workerName: string;
+  /**
+   * 判定 zone 不存在前的可见性参照：另一个最近核对为 active 的托管 zone。Token 可见范围变窄时它也会读不到，
+   * 据此避免把全部托管域名一起误判为失踪；没有参照时改为确认账户里仍能列出 zone。
+   */
+  probeZone?: { id: string } | null;
 }
 
 export function cloudflareCredentials(env: Env): CloudflareCredentials | null {
@@ -20,9 +25,13 @@ export function cloudflareCredentials(env: Env): CloudflareCredentials | null {
 
 /** Cloudflare API 失败：status 为 HTTP 状态（0 表示网络错误或超时），codes 为响应里的错误码 */
 export class CloudflareApiError extends Error {
-  constructor(readonly status: number, readonly codes: number[], message: string) {
+  /** 429 时响应头 retry-after 的秒数（没有该头为 undefined） */
+  readonly retryAfter?: number;
+
+  constructor(readonly status: number, readonly codes: number[], message: string, retryAfter?: number) {
     super(message);
     this.name = 'CloudflareApiError';
+    if (retryAfter !== undefined) this.retryAfter = retryAfter;
   }
 
   has(...codes: number[]): boolean {
@@ -60,7 +69,9 @@ async function cfFetch<T>(creds: CloudflareCredentials, method: string, path: st
   if (!res.ok || !payload?.success) {
     const errors = payload?.errors ?? [];
     const detail = errors.map((e) => `${e.code} ${e.message}`).join('; ');
-    throw new CloudflareApiError(res.status, errors.map((e) => Number(e.code)), detail || `HTTP ${res.status}`);
+    const retryAfter = Number(res.headers.get('retry-after'));
+    throw new CloudflareApiError(res.status, errors.map((e) => Number(e.code)), detail || `HTTP ${res.status}`,
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
   }
   return payload;
 }
@@ -73,6 +84,10 @@ export interface CfZone {
   id: string;
   name: string;
   status: 'initializing' | 'pending' | 'active' | 'moved';
+  /** full / partial / secondary / internal；Email Routing 需要 full */
+  type?: string;
+  paused?: boolean;
+  account?: { id: string; name?: string };
   name_servers?: string[];
   original_name_servers?: string[] | null;
   original_registrar?: string | null;
@@ -83,17 +98,37 @@ export interface CfZone {
 export interface CfRouting {
   enabled: boolean;
   status: 'ready' | 'unconfigured' | 'misconfigured' | 'misconfigured/locked' | 'unlocked';
+  name?: string;
+  support_subaddress?: boolean;
 }
 
 export interface CfCatchAll {
+  id?: string;
+  name?: string;
   enabled?: boolean;
+  matchers?: { type: string }[];
   actions?: { type: string; value?: string[] }[];
+  /** api：经 API 或控制台配置；wrangler：由某个 Worker 的 wrangler `addresses` 管理 */
+  source?: 'api' | 'wrangler' | string;
+}
+
+/** Email Routing 规则（专用地址规则；catch-all 另有接口） */
+export interface CfRoutingRule {
+  id: string;
+  name?: string;
+  enabled: boolean;
+  priority?: number;
+  matchers: { type: string; field?: string; value?: string }[];
+  actions: { type: string; value?: string[] }[];
+  source?: string;
 }
 
 export interface CfSendingSubdomain {
   tag: string;
   name: string;
   enabled?: boolean;
+  dkim_selector?: string;
+  return_path_domain?: string;
 }
 
 export interface CfSendingDnsStatus {
@@ -102,20 +137,56 @@ export interface CfSendingDnsStatus {
 }
 
 /**
- * 「可能不存在」：不存在的 zone 返回 403/9109（与无权限难以区分）或 404/7003，
- * 所以对 zone 的结论一律再按名称列一次账户里的 zone 确认，不凭单次报错做破坏性判断。
+ * 「可能不存在」：不存在的 zone 返回 403/9109（与无权限难以区分）或 404/7003。只认这几种，其他 403（Token 无权限等）
+ * 一律当作失败；即便如此也要再按名称列一次账户里的 zone 并做可见性自检，不凭单次报错做破坏性判断。
  */
 const maybeMissing = (error: unknown) => error instanceof CloudflareApiError
-  && (error.status === 403 || error.status === 404 || error.has(1001, 7003, 9109));
+  && (error.status === 404 || error.has(7003, 9109));
 
-/** 超时、网络错误、5xx 与限流：结果不确定，调用方应保留原状态稍后重试 */
+/**
+ * 超时、网络错误、5xx、限流，以及 2xx/3xx 但响应体解析失败或 success:false：结果不确定（请求可能已生效），
+ * 调用方应保留原状态稍后重试
+ */
 export function isTransientCloudflareError(error: unknown): boolean {
-  return !(error instanceof CloudflareApiError) || error.status === 0 || error.status === 429 || error.status >= 500;
+  return !(error instanceof CloudflareApiError) || error.status < 400 || error.status === 429 || error.status >= 500;
+}
+
+/** 自检没通过时抛出：status 0 让调用方按结果不确定处理（保留原状态、只记 lastError） */
+const unconfirmed = (detail: string) => new CloudflareApiError(0, [], `无法确认 zone 已不存在：${detail}`);
+
+/**
+ * 按名称列不到之后、下「zone 不存在」结论之前，确认 Token 仍看得到账户里的 zone：优先读参照 zone（不能是被判定的这个），
+ * 没有参照时要求账户 zone 总数至少为 1。可见范围变窄时两者都会失败，避免把全部托管域名判为失踪或把删除当作成功。
+ */
+export async function assertZonesVisible(creds: CloudflareCredentials, zoneId: string): Promise<void> {
+  const probe = creds.probeZone && creds.probeZone.id !== zoneId ? creds.probeZone : null;
+  let visible: boolean;
+  try {
+    if (probe) {
+      visible = (await cf<CfZone>(creds, 'GET', `/zones/${probe.id}`)).id === probe.id;
+    } else {
+      // Cloudflare 的 per_page 最小为 5
+      const query = new URLSearchParams({ 'account.id': creds.accountId, per_page: '5' });
+      visible = ((await cfFetch<unknown[]>(creds, 'GET', `/zones?${query}`)).result_info?.total_count ?? 0) >= 1;
+    }
+  } catch (error) {
+    throw unconfirmed(`可见性自检失败（${error instanceof Error ? error.message : String(error)}）`);
+  }
+  if (!visible) throw unconfirmed(probe ? '可见性自检读到的参照 zone 不符' : '可见性自检列不到账户里的任何 zone');
+}
+
+/**
+ * 写请求的结果不明：超时、网络错误、5xx，或 2xx/3xx 但响应体不可解析。写入可能已经生效，调用方必须先读远端再决定。
+ * 429 表示请求未被处理，不算结果不明。
+ */
+export function isOutcomeUnknown(error: unknown): boolean {
+  return !(error instanceof CloudflareApiError) || error.status === 0 || (error.status > 0 && error.status < 400) || error.status >= 500;
 }
 
 async function confirmMissing(creds: CloudflareCredentials, zoneId: string, name: string, error: unknown): Promise<void> {
   if (!maybeMissing(error)) throw error;
   if ((await findZone(creds, name))?.id === zoneId) throw error;
+  await assertZonesVisible(creds, zoneId);
 }
 
 /** 账户内同名 zone（含 pending）；不存在返回 null */
@@ -129,7 +200,7 @@ export function createZone(creds: CloudflareCredentials, name: string): Promise<
   return cf<CfZone>(creds, 'POST', '/zones', { name, account: { id: creds.accountId }, type: 'full' });
 }
 
-/** zone 已被删除（账户里按名称也找不到该 id）时返回 null */
+/** zone 已被删除（账户里按名称也找不到该 id，且通过可见性自检）时返回 null */
 export async function getZone(creds: CloudflareCredentials, zoneId: string, name: string): Promise<CfZone | null> {
   try {
     return await cf<CfZone>(creds, 'GET', `/zones/${zoneId}`);
@@ -139,8 +210,24 @@ export async function getZone(creds: CloudflareCredentials, zoneId: string, name
   }
 }
 
-/** 已不存在视为成功 */
-export async function deleteZone(creds: CloudflareCredentials, zoneId: string, name: string): Promise<void> {
+/** 删除前核对的 zone 身份：不能是系统域名；创建时间不早于本站记录（留 1 分钟时钟误差） */
+export interface ZoneDeleteGuard {
+  notBefore?: Date | null;
+  protectedNames?: readonly string[];
+}
+
+/**
+ * 先读出 zone 核对身份再删除：名称须与记录一致，身份不符时抛错且不删除（D1 里的 zone_id 被人工改错时
+ * 不会删到别的 zone）。已不存在视为成功。
+ */
+export async function deleteZone(creds: CloudflareCredentials, zoneId: string, name: string, guard: ZoneDeleteGuard = {}): Promise<void> {
+  if (guard.protectedNames?.includes(name)) throw new Error(`拒绝删除：${name} 是本站的系统域名`);
+  const zone = await getZone(creds, zoneId, name);
+  if (!zone) return;
+  if (zone.name !== name) throw new Error(`拒绝删除：zone ${zoneId} 的名称为 ${zone.name}，与记录的 ${name} 不符`);
+  if (guard.notBefore && zone.created_on && new Date(zone.created_on).getTime() < guard.notBefore.getTime() - 60_000) {
+    throw new Error(`拒绝删除：zone ${zoneId} 创建于 ${zone.created_on}，早于本站记录`);
+  }
   try {
     await cf(creds, 'DELETE', `/zones/${zoneId}`);
   } catch (error) {
@@ -174,11 +261,16 @@ export function getCatchAll(creds: CloudflareCredentials, zoneId: string): Promi
 }
 
 export function putCatchAll(creds: CloudflareCredentials, zoneId: string): Promise<CfCatchAll> {
+  return putCatchAllWorker(creds, zoneId, creds.workerName);
+}
+
+/** catch-all 整体替换为投递到指定 Worker（PUT 本身幂等） */
+export function putCatchAllWorker(creds: CloudflareCredentials, zoneId: string, workerName: string): Promise<CfCatchAll> {
   return cf<CfCatchAll>(creds, 'PUT', `/zones/${zoneId}/email/routing/rules/catch_all`, {
-    name: `Catch-all → ${creds.workerName}`,
+    name: `Catch-all → ${workerName}`,
     enabled: true,
     matchers: [{ type: 'all' }],
-    actions: [{ type: 'worker', value: [creds.workerName] }],
+    actions: [{ type: 'worker', value: [workerName] }],
   });
 }
 
@@ -235,6 +327,56 @@ export async function countZones(creds: CloudflareCredentials): Promise<{ total:
   };
   const [total, pending] = await Promise.all([count({}), count({ status: 'pending' })]);
   return { total, pending };
+}
+
+// ---------------------------------------------------------------------------
+// 分页列表：complete=false 表示没有取全，调用方不能据此判定「不存在」
+
+export interface CfPage<T> {
+  items: T[];
+  complete: boolean;
+  total: number | null;
+}
+
+async function listPages<T>(creds: CloudflareCredentials, path: string, params: Record<string, string>, perPage: number, maxPages: number): Promise<CfPage<T>> {
+  const items: T[] = [];
+  let total: number | null = null;
+  for (let page = 1; page <= maxPages; page++) {
+    const query = new URLSearchParams({ ...params, page: String(page), per_page: String(perPage) });
+    const res = await cfFetch<T[]>(creds, 'GET', `${path}?${query}`);
+    const batch = res.result ?? [];
+    items.push(...batch);
+    total = res.result_info?.total_count ?? total;
+    const pages = res.result_info?.total_pages;
+    if (batch.length < perPage || (pages !== undefined && page >= pages)) return { items, complete: true, total };
+  }
+  return { items, complete: false, total };
+}
+
+/** 账户中 Token 可见的 zone（按名称排序）；默认最多 10 页（500 个），搜索在本地进行 */
+export function listAccountZones(creds: CloudflareCredentials, opts: { status?: CfZone['status']; maxPages?: number } = {}): Promise<CfPage<CfZone>> {
+  return listPages<CfZone>(creds, '/zones', {
+    'account.id': creds.accountId, order: 'name', direction: 'asc', ...(opts.status ? { status: opts.status } : {}),
+  }, 50, opts.maxPages ?? 10);
+}
+
+/** Email Routing 专用地址规则；每个域名最多 200 条，加上子域的规则，默认最多读 6 页 */
+export function listRoutingRules(creds: CloudflareCredentials, zoneId: string, maxPages = 6): Promise<CfPage<CfRoutingRule>> {
+  return listPages<CfRoutingRule>(creds, `/zones/${zoneId}/email/routing/rules`, {}, 50, maxPages);
+}
+
+/**
+ * 预检用的精确 DNS 查询（name.exact / name.endswith 不区分大小写），必须看 complete：
+ * 取不全时视为未知，不要用会静默截断的 listDnsRecords。
+ */
+export function queryDnsRecords(
+  creds: CloudflareCredentials, zoneId: string, filter: { exact?: string; endsWith?: string; type?: string }, maxPages = 5,
+): Promise<CfPage<CfDnsRecord>> {
+  const params: Record<string, string> = {};
+  if (filter.exact) params['name.exact'] = filter.exact;
+  if (filter.endsWith) params['name.endswith'] = filter.endsWith;
+  if (filter.type) params.type = filter.type;
+  return listPages<CfDnsRecord>(creds, `/zones/${zoneId}/dns_records`, params, 100, maxPages);
 }
 
 // ---------------------------------------------------------------------------

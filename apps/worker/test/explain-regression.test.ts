@@ -5,8 +5,12 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { createDb } from '../src/db/client.js';
 import { attachments, mailboxShares, mailboxes, messages, stars, users } from '../src/db/schema.js';
 import { encodeCursor } from '../src/lib/pagination.js';
+import { syncDueHostedDomains } from '../src/services/hosted-domain.js';
 import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
 import { purgeStatements } from '../src/services/message-lifecycle.js';
+import { anyOnboardingSql, hostedTakenSql, onboardingActiveSql } from '../src/services/domain-occupancy.js';
+import { syncDueOnboarding } from '../src/services/system-domain.js';
+import { occupancyFacts } from '../src/services/zone-catalog.js';
 import {
   countUnread, findNextMessage, getRecentContacts, getThread, listMessages, markAllRead, syncMessages, UNREAD_COUNT_CAP, type Viewer,
 } from '../src/services/message.js';
@@ -708,4 +712,62 @@ describe('列表改走地址索引、domain 下推与分流：结果与改前逐
       expect(await getRecentContacts(env, viewer), who).toEqual([...expected].slice(0, 100));
     }
   }, 20_000); // 逐视图逐页回放，CI 慢机上整文件曾到 5 秒以上
+});
+
+describe('执行计划回归：系统域名接入', () => {
+  const planOf = async (sql: string, ...params: unknown[]) =>
+    (await env.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(...params).all<{ detail: string }>()).results.map((row) => row.detail).join(' | ');
+
+  it('同名互斥按域名走部分唯一索引与托管唯一索引（表达式与索引的 WHERE 一致）', async () => {
+    expect(await planOf(`SELECT ${onboardingActiveSql('?1')}`, 'x.test')).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(await planOf(`SELECT ${anyOnboardingSql('?1')}`, '["x.test"]')).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(await planOf(`SELECT ${hostedTakenSql('?1')}`, 'x.test')).toMatch(/hosted_domains_domain_unique \(domain=\?\)/);
+    const facts = await capturePlans((e) => occupancyFacts(e, 'x.test', 1));
+    expect(facts).toHaveLength(1);
+    expect(facts[0]!.plan).toMatch(/uniq_system_onboarding_active_domain \(domain=\?\)/);
+    expect(facts[0]!.plan).toMatch(/hosted_domains_domain_unique \(domain=\?\)/);
+  });
+
+  it('定时任务按 (state, next_check_at) 索引取到期任务', async () => {
+    const plans = await capturePlans((e) => syncDueOnboarding({ ...e, cf_api_token: 't', cf_account_id: 'a' }));
+    expect(plans).toHaveLength(1);
+    expect(plans[0]!.plan).toMatch(/idx_system_onboarding_due \(state=\? AND next_check_at<\?\)/);
+    expect(plans[0]!.plan).not.toMatch(/SCAN system_domain_onboarding\b/);
+  });
+});
+
+describe('执行计划回归：托管域名巡检领取', () => {
+  it('到期领取的子查询每个分支按 status 走 idx_hosted_domains_status，参照候选按 status 倒序取', async () => {
+    const statements: { sql: string; params: unknown[] }[] = [];
+    const db = new Proxy(env.db, {
+      get(target, property) {
+        if (property === 'prepare') return (query: string) => {
+          const entry = { sql: query, params: [] as unknown[] };
+          statements.push(entry);
+          const statement = target.prepare(query);
+          return new Proxy(statement, { get(stmt, key) {
+            if (key === 'bind') return (...args: unknown[]) => { entry.params = args; return stmt.bind(...args); };
+            const value = Reflect.get(stmt, key);
+            return typeof value === 'function' ? value.bind(stmt) : value;
+          } });
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    // 没有到期域名也会发出领取语句；凭据只用来通过功能开关，不会调用 Cloudflare
+    await syncDueHostedDomains({ ...env, db, cf_api_token: 'test-token', cf_account_id: 'acct-explain' } as typeof env);
+    const plan = async (pattern: RegExp) => {
+      const statement = statements.find((entry) => pattern.test(entry.sql))!;
+      const rows = await env.db.prepare(`EXPLAIN QUERY PLAN ${statement.sql}`).bind(...statement.params).all<{ detail: string }>();
+      return rows.results.map((row) => row.detail).join(' | ');
+    };
+    const claim = await plan(/^update "hosted_domains" set "sync_lease_until"/i);
+    expect(claim).toContain('MULTI-INDEX OR');
+    expect(claim.match(/SEARCH hosted_domains USING INDEX idx_hosted_domains_status \(status=\?\)/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(claim).not.toMatch(/SCAN hosted_domains(?! USING)/);
+    const probes = await plan(/^select "zone_id" from "hosted_domains"/i);
+    expect(probes).toContain('idx_hosted_domains_status (status=?)');
+    expect(probes).not.toContain('TEMP B-TREE');
+  });
 });

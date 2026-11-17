@@ -1,6 +1,6 @@
 import { API_SCOPES, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, conditionalDetail, describePaths, domainName, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription,
+  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, composeOperation, conditionalDetail, describePaths, domainName, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription,
   int, listQuery, mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, operation, optionalPageQuery, positiveId, query, ref,
   scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths, usedExamples, usedSchemas, type Paths,
 } from '../openapi-common.js';
@@ -43,6 +43,8 @@ export function buildOpenApiSpec(origin: string) {
         description: 'Descending cursor pagination. Use nextCursor exactly as returned; null ends the page stream. Shared inboxes only add non-trash inbound visibility. afterId supports incremental polling, but process all relevant results before advancing. unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt.' }),
       post: sendMailOperation('mail.send'),
     },
+    '/messages/{id}/reply': { post: composeOperation('reply') },
+    '/messages/{id}/forward': { post: composeOperation('forward') },
     '/messages/wait': { get: operation('waitForMessage', 'Wait for the earliest new incoming message matching optional filters', object({
       message: { anyOf: [ref('MessageSummary'), ref('MessageDetail'), { type: 'null' }],
         description: 'The matching message: a MessageSummary, or with include=body a MessageDetail (same as GET /messages/{id}); null on timeout.' },

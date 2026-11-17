@@ -870,6 +870,31 @@ export async function loadSourceMessage(
   return { address: row.address, direction: row.direction, deletedAt: row.deletedAt, messageId: row.messageId, inReplyTo: row.inReplyTo, references: row.references };
 }
 
+/**
+ * 回复/转发接口按原信生成收件人、主题与引用：可见口径与错误同 loadSourceMessage（整行与可见性一条语句），
+ * 另带完整正文（含 R2 中的大正文）。
+ */
+export async function loadSourceContent(
+  env: Env,
+  sender: { userId: number; role: Role },
+  id: number,
+  unavailableMessage: string,
+  source: 'reply' | 'forward',
+): Promise<MessageRow> {
+  const db = createDb(env);
+  const viewer: Viewer = { userId: sender.userId, role: sender.role };
+  const scope = resolveScope(viewer);
+  const row = await db
+    .select({ ...messageColumns, ...visibilityColumns(viewer, scope) })
+    .from(messages)
+    .where(eq(messages.id, id))
+    .get();
+  if (!row || !isVisible(viewer, scope, row, row)) {
+    throw new AppError('source_unavailable', unavailableMessage, { details: { source } });
+  }
+  return { ...row, ...(await readMailBody(env, row)) };
+}
+
 const messageColumns = getTableColumns(messages);
 /** 除正文外的全部列，ETag 由它们计算（正文变化必然伴随 status、body_r2_key 等列变化） */
 const metaColumns = Object.fromEntries(

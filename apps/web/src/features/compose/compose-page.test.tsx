@@ -1,13 +1,16 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { createMemoryRouter, RouterProvider } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-const mocks=vi.hoisted(()=>({user:{id:1,role:'user'},boxes:[] as Array<{id:number,address:string}>,domains:['one.example'],send:vi.fn(async(_payload:import('@hpc-mail/shared').InternalSendMailRequest,_key?:string)=>({id:22,status:'sent',errorDetail:'',recipientOutcomes:[] as Array<{address:string,status:string,error?:string}>})),single:vi.fn(),remove:vi.fn(async()=>({success:true})),toast:vi.fn()}));
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+const mocks=vi.hoisted(()=>({user:{id:1,role:'user'},boxes:[] as Array<{id:number,address:string}>,domains:['one.example'],send:vi.fn(async(_payload:import('@hpc-mail/shared').InternalSendMailRequest,_key?:string)=>({id:22,status:'sent',errorDetail:'',recipientOutcomes:[] as Array<{address:string,status:string,error?:string}>})),single:vi.fn(),remove:vi.fn(async()=>({success:true})),toast:vi.fn(),identities:{identities:[],domains:[]} as import('@hpc-mail/shared').SendIdentities,apiGet:vi.fn()}));
 vi.mock('@/api/resources',()=>({messageApi:{contacts:vi.fn(async()=>({contacts:[]})),send:mocks.send},uploadsApi:{single:mocks.single,remove:mocks.remove}}));
 vi.mock('@/lib/use-config',()=>({useDomains:()=>({data:mocks.domains})}));
 vi.mock('@/lib/use-session',()=>({useCurrentUser:()=>mocks.user}));
 vi.mock('@/features/mailboxes/use-mailboxes',()=>({useMailboxesQuery:()=>({data:mocks.boxes})}));
 vi.mock('@/components/ui/toast',()=>({toast:mocks.toast}));
+// 发件身份由写信页按需读取 /identities；其余接口仍走上面的 resources mock
+vi.mock('@/api/client',async(importOriginal)=>({...await importOriginal<typeof import('@/api/client')>(),api:{get:mocks.apiGet}}));
+mocks.apiGet.mockImplementation(async(path:string)=>{if(path==='/identities') return mocks.identities;throw new Error(`unexpected GET ${path}`)});
 import { ComposePage } from './compose-page';
 import { draftKeyForUser, identityKeyForUser, lastIdentityKeyForUser, legacyDraftKeyForUser } from './compose-draft';
 import { sendAttemptKeyForUser } from './send-attempt';
@@ -536,6 +539,125 @@ describe('source mail no longer available', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(text);
     expect(screen.queryByRole('button', { name: '作为新邮件发送' })).toBeNull();
+    client.clear();
+  });
+});
+
+describe('custom prefix on hosted domains', () => {
+  const sent = { id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] };
+  const domainsOf = (system: string[], hosted: string[]) => ({
+    identities: [],
+    domains: [
+      ...system.map((domain) => ({ domain, kind: 'system' as const, anyLocalPart: true as const })),
+      ...hosted.map((domain) => ({ domain, kind: 'hosted' as const, anyLocalPart: true as const })),
+    ],
+  });
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.send.mockResolvedValue(sent); mocks.toast.mockClear(); mocks.apiGet.mockClear();
+    mocks.user = { id: 1, role: 'user' }; mocks.domains = ['one.example'];
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+    mocks.identities = domainsOf([], ['own.example']);
+  });
+  afterEach(() => { mocks.identities = domainsOf([], []); });
+
+  it('an owner picks any prefix on the hosted domain, sends it as {localPart, domain} and refreshes mailboxes', async () => {
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    client.setQueryData(queryKeys.mailboxes.list('mine'), mocks.boxes);
+    fireEvent.click(await screen.findByRole('combobox', { name: /发件身份/ }));
+    fireEvent.click(screen.getByRole('option', { name: '用 own.example 的任意前缀发信' }));
+    fireEvent.change(screen.getByPlaceholderText('前缀'), { target: { value: 'Hello' } });
+    fireEvent.click(screen.getByRole('combobox', { name: '发件域名' }));
+    // 系统域名（one.example）不给普通用户
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['own.example']);
+    fireEvent.click(screen.getByRole('option', { name: 'own.example' }));
+    expect(screen.getByText('用 own.example 的任意前缀发信（发出时自动认领）')).toBeInTheDocument();
+    // 草稿记下自定义身份
+    fireEvent.change(screen.getByLabelText(/主题/), { target: { value: 'hi there' } });
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(draftKeyForUser(1))!)).toMatchObject({
+      mailboxId: null, localPart: 'hello', adminDomain: 'own.example', fromAddress: 'hello@own.example',
+    }));
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'hello', domain: 'own.example' });
+    await screen.findByText('sent page');
+    // 服务端发出时已认领该地址
+    expect(client.getQueryState(queryKeys.mailboxes.list('mine'))?.isInvalidated).toBe(true);
+    expect(JSON.parse(localStorage.getItem(lastIdentityKeyForUser(1))!)).toEqual({ mailboxId: null, localPart: 'hello', domain: 'own.example' });
+    expect(mocks.apiGet).toHaveBeenCalledWith('/identities');
+    client.clear();
+  });
+
+  it('a default custom identity waits for the hosted domains and is kept instead of falling back to a mailbox', async () => {
+    localStorage.setItem(identityKeyForUser(1), JSON.stringify({ mailboxId: null, localPart: 'support', domain: 'own.example' }));
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    expect(await screen.findByDisplayValue('support')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'support', domain: 'own.example' });
+    client.clear();
+  });
+
+  it('a saved custom identity on a domain the owner no longer hosts falls back to a mailbox', async () => {
+    localStorage.setItem(lastIdentityKeyForUser(1), JSON.stringify({ mailboxId: null, localPart: 'old', domain: 'gone.example' }));
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    await waitFor(() => expect(screen.getByRole('combobox', { name: /发件身份/ })).toHaveTextContent('first@one.example'));
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ mailboxId: 9 });
+    client.clear();
+  });
+
+  it('a reply addressed to an unclaimed address on the hosted domain preselects that prefix', async () => {
+    const client = show({ fromAddress: 'support@own.example', to: ['sender@example.com'], subject: 'Re: hi', body: 'answer', mode: 'reply', replyToMessageId: 5, sourceMessageId: 5 });
+    expect(await screen.findByDisplayValue('support')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0]).toMatchObject({ from: { localPart: 'support', domain: 'own.example' }, replyToMessageId: 5 });
+    client.clear();
+  });
+
+  it('restores a custom hosted identity from a saved draft', async () => {
+    localStorage.setItem(draftKeyForUser(1), JSON.stringify({ fromAddress: 'sales@own.example', mailboxId: null, localPart: 'sales', adminDomain: 'own.example',
+      to: ['to@example.com'], cc: [], bcc: [], subject: 'saved', body: 'body', isHtml: false }));
+    const client = show();
+    fireEvent.click(await screen.findByRole('button', { name: '继续编辑' }));
+    expect(await screen.findByDisplayValue('sales')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'sales', domain: 'own.example' });
+    client.clear();
+  });
+
+  it('a user without hosted domains sees no custom prefix and a stale custom identity falls back to a mailbox', async () => {
+    mocks.identities = domainsOf([], []);
+    localStorage.setItem(lastIdentityKeyForUser(1), JSON.stringify({ mailboxId: null, localPart: 'old', domain: 'gone.example' }));
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    await waitFor(() => expect(screen.getByRole('combobox', { name: /发件地址/ })).toHaveTextContent('first@one.example'));
+    expect(screen.queryByRole('combobox', { name: /发件身份/ })).toBeNull();
+    expect(screen.queryByText(/任意前缀/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ mailboxId: 9 });
+    client.clear();
+  });
+
+  it('administrators keep system domains and also get their own hosted domains, without the auto-claim refresh', async () => {
+    mocks.user = { id: 1, role: 'admin' }; mocks.boxes = [];
+    mocks.identities = domainsOf(['one.example'], ['own.example']);
+    const client = show({ to: ['to@example.com'], subject: 'hi', body: 'body' });
+    client.setQueryData(queryKeys.mailboxes.list('mine'), []);
+    fireEvent.click(await screen.findByRole('combobox', { name: /发件身份/ }));
+    expect(screen.getAllByRole('option')[0]).toHaveTextContent('自定义发件地址');
+    fireEvent.keyDown(screen.getByRole('searchbox'), { key: 'Escape' });
+    fireEvent.change(screen.getByPlaceholderText('前缀'), { target: { value: 'ops' } });
+    fireEvent.click(screen.getByRole('combobox', { name: '发件域名' }));
+    await waitFor(() => expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['one.example', 'own.example']));
+    fireEvent.click(screen.getByRole('option', { name: 'one.example' }));
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].from).toEqual({ localPart: 'ops', domain: 'one.example' });
+    await screen.findByText('sent page');
+    expect(client.getQueryState(queryKeys.mailboxes.list('mine'))?.isInvalidated).toBe(false);
     client.clear();
   });
 });

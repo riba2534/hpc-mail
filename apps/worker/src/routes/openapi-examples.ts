@@ -1,6 +1,6 @@
 import {
   API_SCOPES, MAX_API_KEYS_PER_USER, MAX_DRAFT_ATTACHMENT_BYTES_PER_USER, MAX_DRAFT_ATTACHMENTS_PER_USER, MAX_HOSTED_DNS_RECORDS,
-  MAX_SEND_REQUEST_BYTES, MULTIPART_PART_BYTES, type ApiErrorDetails, type ErrorCode, type SuppressedRecipient,
+  MAX_SEND_REQUEST_BYTES, MULTIPART_PART_BYTES, type ApiErrorDetails, type ErrorCode, type SuppressedRecipient, type SystemDomainPrecheck,
 } from '@hpc-mail/shared';
 
 /**
@@ -25,6 +25,11 @@ export const sentMessageExample = {
   verificationCode: '', status: 'sent', errorDetail: '', recipientOutcomes: [{ address: 'bob@example.net', status: 'sent' }],
   recipientsTo: ['bob@example.net'], isRead: true, isStarred: false, hasAttachments: false, size: 1532, createdAt: LATER,
 };
+/** 转发成功（201）的摘要：原邮件附件一并带上 */
+export const forwardedMessageExample = {
+  ...sentMessageExample, id: 1027, subject: 'Fwd: Your verification code', preview: 'FYI, see the code below.',
+  hasAttachments: true, size: 53120,
+};
 const attachment = {
   id: 77, filename: 'invoice.pdf', mimeType: 'application/pdf', size: 48213, contentId: '', disposition: 'attachment', inline: false, url: ATTACHMENT_URL,
 };
@@ -48,6 +53,16 @@ const delivery = {
   createdAt: AT, updatedAt: LATER, nextAttemptAt: AT, lastAttemptAt: LATER,
 };
 
+/** 系统域名接入的预检：已有 zone，根域有第三方 MX 需要确认删除 */
+const systemDomainPrecheck: SystemDomainPrecheck = {
+  mode: 'existing_zone', domain: 'example.com', zoneId: '023e105f4ecef8ad9ca31a8372d0c353', zoneStatus: 'active', checkedAt: AT,
+  checks: [{ key: 'mx', state: 'conflict', severity: 'confirm', ack: 'mx.delete', danger: true, title: '根域有第三方 MX',
+    current: '10 smtp.google.com', proposed: 'Cloudflare Email Routing 的 MX', impact: '确认后删除原 MX，该域名不再经原服务商收信',
+    records: [{ type: 'MX', name: 'example.com', content: 'smtp.google.com', priority: 10, ttl: 3600 }] }],
+  steps: [{ kind: 'mx.delete', detail: '删除 1 条第三方 MX' }, { kind: 'routing.enable', detail: '开启 Email Routing' }],
+  requiredAcks: ['mx.delete'], verdict: 'confirm', fingerprint: '5f2c9a7e1b3d4c6a', registrar: { name: 'Example Registrar', cloudflare: false },
+  nameServers: ['ada.ns.cloudflare.com', 'bob.ns.cloudflare.com'], dnssec: null,
+};
 /** 组件 schema 的成功示例：键为 components.schemas 的名字 */
 export const SCHEMA_EXAMPLES: Record<string, unknown> = {
   MessageSummary: inboundSummary,
@@ -87,6 +102,7 @@ export const SCHEMA_EXAMPLES: Record<string, unknown> = {
     limits: { userRequestsPerMinute: 120, waitPollsPerMinute: 120 },
     outbound: { sent: 4, recipients: 6, dailyLimit: 100, dailyRecipientLimit: 300, exempt: false, resetsAt: '2026-11-18T00:00:00.000Z' },
   },
+  SystemDomainPrecheck: systemDomainPrecheck,
   SessionUser: sessionUser,
   LoginResponse: { token: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOjN9.c2lnbmF0dXJl', user: sessionUser },
   ChangePasswordResponse: { token: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOjN9.bmV3LXNpZw', user: sessionUser, revokedApiKeys: 2 },
@@ -210,6 +226,18 @@ export const ERROR_EXAMPLES = {
   ShareToOwner: { code: 'validation_failed', message: '邮箱所有者已经拥有访问权限，无需共享' },
   ShareListChanged: { code: 'conflict', message: '共享名单已改变，请刷新后重试' },
   ForbiddenSender: { code: 'forbidden', message: '只能使用自己认领的地址发件', fix: FORBIDDEN_SENDER_FIX, docs: '/references/errors.md#forbidden-sender' },
+  FromRequired: { code: 'from_required', message: '原信的收件地址 team@example.org 不是你可用的发件身份（例如共享给你的邮箱），请在 from 指定自己的地址',
+    fix: '先调 GET /v1/identities，从 canSend=true 的地址里选一个填进 from（写法同 POST /v1/messages）', docs: '/references/errors.md#from_required' },
+  CloudflareCredentialsMissing: { code: 'forbidden', message: '本站 Worker 未配置 Cloudflare 凭据，不能自动接入系统域名' },
+  ZoneNotVisible: { code: 'not_found', message: 'Cloudflare 账户中没有该 zone：它可能在其他账户，或站长的 Token 无权访问' },
+  NotFoundOnboarding: { code: 'not_found', message: '接入任务不存在' },
+  OnboardingNeedsConfirmation: { code: 'conflict', message: '需要确认 1 项变更', details: { precheck: systemDomainPrecheck } },
+  UnconfirmedChanges: { code: 'validation_failed', message: '还有 1 项变更未确认', details: { precheck: systemDomainPrecheck } },
+  OnboardingFinished: { code: 'conflict', message: '接入已结束' },
+  OnboardingBusy: { code: 'conflict', message: '正在检查，请稍后再试' },
+  OnboardingNotAwaitingConfirmation: { code: 'conflict', message: '当前状态不需要确认' },
+  HiddenZonesChanged: { code: 'conflict', message: '隐藏列表已被其他请求修改，请刷新后重试' },
+  HostedNotMoved: { code: 'conflict', message: '只有名称服务器已改走的域名可以重新接入' },
   SourceUnavailableReply: { code: 'source_unavailable', message: '回复的原邮件不存在或不可见', details: { source: 'reply' } },
   SourceUnavailableForward: { code: 'source_unavailable', message: '转发的原邮件不存在或不可见', details: { source: 'forward' } },
   HeaderNotAllowed: { code: 'header_not_allowed', message: '不允许的邮件头：Message-ID 由平台生成，不能自定义',
@@ -260,8 +288,10 @@ export const ERROR_EXAMPLES = {
 } satisfies Record<string, ErrorExample>;
 export type ErrorExampleName = keyof typeof ERROR_EXAMPLES;
 
+/** 按 scope 生成的 403 示例名 */
+export type ScopeExampleName = `ForbiddenScope${string}`;
 /** 缺少 scope 的 403 示例名：mail.read → ForbiddenScopeMailRead */
-export function scopeExampleName(scope: string): string {
+export function scopeExampleName(scope: string): ScopeExampleName {
   return `ForbiddenScope${scope.split(/[._-]/).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('')}`;
 }
 const SCOPE_EXAMPLES: Record<string, ErrorExample> = Object.fromEntries(API_SCOPES.map(scope => [scopeExampleName(scope), {
