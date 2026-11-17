@@ -218,7 +218,8 @@ describe('OpenAPI 质量约束：operationId、security 与示例', () => {
           expect(names('401'), `${method} ${path}`).toContain(unauthorized);
           expect(names('429'), `${method} ${path}`).toContain(limited);
         }
-        if (path.includes('{')) expect(names('404').some(name => name.startsWith('NotFound')), `${method} ${path}`).toBe(true);
+        // 回复/转发的原信不存在报 source_unavailable，不挂路径资源的 not_found 示例
+        if (path.includes('{')) expect(names('404').some(name => /^(NotFound|SourceUnavailable)/.test(name)), `${method} ${path}`).toBe(true);
       }
     }
     const scoped = opAt('v1', '/messages/{id}', 'get');
