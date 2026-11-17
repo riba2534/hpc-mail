@@ -43,7 +43,12 @@ const ATTACHMENT_INSERT_BATCH = 12;
  * 不可信 MIME 的解析上限（postal-mime 缺省分别是 256 层、10000 段、10 层）。超过嵌套或分段上限时
  * 解析抛错，按解析失败落最小记录；内嵌 message/rfc822 超过层数只当附件保存。
  */
-const MIME_LIMITS = { maxNestingDepth: 32, maxPartCount: 500, maxRfc822NestingDepth: 3 };
+export const MIME_LIMITS = { maxNestingDepth: 32, maxPartCount: 500, maxRfc822NestingDepth: 3 };
+
+/** 入站幂等键：收件地址 + Message-ID（截断到 998）+ 原文摘要。pending 自愈据此确认 R2 原文就是该行收下的那一封 */
+export function inboundIngestKey(toAddress: string, sourceMessageId: string, rawDigest: string): Promise<string> {
+  return sha256Hex(`${toAddress}\n${sourceMessageId.slice(0, 998)}\n${rawDigest}`);
+}
 
 /** 有限并发执行；任一失败整体 reject（与串行时「任一失败即抛出」语义一致） */
 async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
@@ -242,7 +247,7 @@ async function receiveInbound(
   const html = email.html || '';
   const sourceMessageId = (email.messageId || '').slice(0, 998);
   const sourceReferences = (email.references || '').slice(0, 4096);
-  const ingestKey = await sha256Hex(`${toAddress}\n${sourceMessageId}\n${rawDigest}`);
+  const ingestKey = await inboundIngestKey(toAddress, sourceMessageId, rawDigest);
   const db = createDb(env);
   const bodySize = bodyBytes(text, html);
   trace.bodySize = bodySize;
