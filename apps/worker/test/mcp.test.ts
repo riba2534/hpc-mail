@@ -542,6 +542,8 @@ describe('MCP 部署配置与文档', () => {
 
   it('references/mcp.md 列出全部工具，入口与 llms.txt 指向它', () => {
     for (const name of MCP_TOOL_NAMES) expect(mcpDoc, name).toContain(`| \`${name}\` |`);
+    // reply_email 与回复接口同一套规则（mail.md「回复和转发」）：收件人上限与主题折叠、截断
+    for (const rule of ['去重后超过 100 个', '换行与制表符折叠成空格', '998 个 UTF-8 字节']) expect(mcpDoc, rule).toContain(rule);
     expect(mcpDoc).toContain('https://hpc.email/mcp');
     expect(mcpDoc).toContain('Authorization: Bearer');
     expect(skillDoc).toContain('(references/mcp.md)');

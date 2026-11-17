@@ -57,7 +57,7 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 
 - 每个工具的 `inputSchema` 由 `tools/list` 返回，字段约束与 REST 相同。开关写 JSON 布尔（`hasCode: true`，不是 `"1"`），`wait_for_message` 的 `address` 可以是一个地址或最多 20 个地址的数组。
 - `send_email` 与 `reply_email` 的 `idempotencyKey` 等同 REST 的 `Idempotency-Key` 头：一次逻辑发信一个，网络错误或超时后用同一个 Key 和相同参数重试，不会重复发送。规则见[幂等与重试](mail.md#幂等与重试)。
-- `reply_email`：参数与[回复接口](mail.md#回复和转发)的请求体相同（`replyAll`、`quote`、`from`、`text`、`html`、`attachments`、`attachmentTokens`、`headers`），另加 `messageId`。来信回给原信的 `replyTo`，没有时回给发件人；回复自己发出的信时回给原收件人。`quote` 默认 `true`，正文后附原信引用。`from` 默认是收到这封信的本站地址，共享给你的邮箱只读，这时返回 `from_required`，用 `from` 指定自己的地址。`replyAll: true` 把原信其他 To/Cc 放进抄送（去掉你自己的地址），不带原 Bcc。不接受 `to`、`cc`、`bcc`、`subject`：要自定义收件人或主题，或回复不在本站的邮件，用 `send_email` 自己组织。
+- `reply_email`：参数与[回复接口](mail.md#回复和转发)的请求体相同（`replyAll`、`quote`、`from`、`text`、`html`、`attachments`、`attachmentTokens`、`headers`），另加 `messageId`。来信回给原信的 `replyTo`，没有时回给发件人；回复自己发出的信时回给原收件人。`quote` 默认 `true`，正文后附原信引用。`from` 默认是收到这封信的本站地址，共享给你的邮箱只读，这时返回 `from_required`，用 `from` 指定自己的地址。`replyAll: true` 把原信其他 To/Cc 放进抄送（去掉你自己的地址），不带原 Bcc；算出的 To+Cc 去重后超过 100 个时返回 `validation_failed` 工具错误，改用 `send_email` 带 `replyToMessageId` 自己选收件人。主题自动加 `Re: `（已有则不重复），原主题里的换行与制表符折叠成空格，加前缀后超过 998 个 UTF-8 字节时截断。不接受 `to`、`cc`、`bcc`、`subject`：要自定义收件人或主题，或回复不在本站的邮件，用 `send_email` 自己组织。
 - 除 `get_me` 与 `release_mailbox` 外都有 `response_format`：`concise`（默认）或 `detailed`。
 
 ## 结果与错误
