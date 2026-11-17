@@ -465,12 +465,13 @@ export async function updateDraft(
     updatedAt: new Date(),
     origin: request.origin,
     ...(sendAt !== undefined ? { sendAt, errorDetail: '' } : {}),
-    // 安排者记的是最后一个让它保持定时的写入者（安排或改写内容都算）与当时的账户安全版本：到点按它复核，
-    // 别的 Key 改写已安排的草稿后，到点复核的就是改写者，不会沿用原安排者的权限
-    ...(status === 'scheduled' ? {
+    // 安排者记的是最后一个写入者（安排或改写内容都算）与当时的账户安全版本：到点按它复核，别的 Key 改写后，
+    // 到点复核的就是改写者，不会沿用原安排者的权限。定时失败（failed，send_at 仍在）的草稿同样如此：
+    // 之后立即发送中断时会按定时规则重排，到点复核的必须是改写它的人
+    ...(status === 'draft' ? { scheduledByKeyId: null, scheduledAuthVersion: null } : {
       scheduledByKeyId: actor.apiKeyId,
       scheduledAuthVersion: sql`(select auth_version from users where id = ${actor.userId})`,
-    } : status === 'draft' ? { scheduledByKeyId: null, scheduledAuthVersion: null } : {}),
+    }),
   }).where(and(eq(drafts.id, id), eq(drafts.userId, actor.userId), eq(drafts.version, row.version), inArray(drafts.status, EDITABLE)))
     .returning({ id: drafts.id });
   let updated: { id: number }[];

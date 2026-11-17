@@ -522,6 +522,40 @@ describe('到点按安排者的有效权限发送（CR2/CR3/A23）', () => {
     await dispatch();
     expect(await row(draft.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('API Key 已失效') });
   });
+
+  it("CR3'：定时失败（保留 send_at）的草稿被另一把 Key 改写，立即发送中断后经租约恢复重排时，到点复核的是改写者", async () => {
+    const admin = await account('sched-failed-admin', USER_SCOPES, 'admin');
+    const victim = await account('sched-failed-victim');
+    const [box] = await db.select({ id: mailboxes.id }).from(mailboxes).where(eq(mailboxes.address, victim.address));
+    // 管理员在网页安排的定时信到点失败：status=failed，send_at 仍在，安排者是网页会话（NULL）
+    const draft = await data<Draft>(await call('/api/drafts', req(admin.jwt, 'POST', complete(admin.address, 'sf-a@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await db.update(drafts).set({ status: 'failed', sendAt: new Date(Date.now() - MINUTE), errorDetail: '收件人全部被拒收' }).where(eq(drafts.id, draft.id));
+    // 名下不带 admin scope 的 Key 改写发件人（不带 sendAt，状态仍是 failed）
+    await data(await call(`/v1/drafts/${draft.id}`, req(admin.key, 'PATCH', { from: { mailboxId: box!.id }, to: ['sf-b@hpc.email'] })));
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', scheduledByKeyId: admin.keyId });
+    // 这把 Key 立即发送：认领之后、写回之前被中断，租约到期后按定时规则重排
+    await db.update(drafts).set({ status: 'sending', attempt: 1, claimedAt: new Date(Date.now() - DRAFT_SENDING_LEASE_MS - MINUTE) })
+      .where(eq(drafts.id, draft.id));
+    await dispatch();
+    await makeDue(draft.id);
+    await dispatch();
+    expect(await row(draft.id)).toMatchObject({ status: 'failed', messageId: null });
+    expect(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.address, victim.address), eq(messages.direction, 'outbound'))))
+      .toEqual([]);
+
+    // 普通用户：改写者的 Key 吊销后，重排的这封不再发出
+    const me = await account('sched-failed-user');
+    const own = await data<Draft>(await call('/api/drafts', req(me.jwt, 'POST', complete(me.address, 'sf-c@hpc.email', { sendAt: inMinutes(5) }))), 201);
+    await db.update(drafts).set({ status: 'failed', sendAt: new Date(Date.now() - MINUTE) }).where(eq(drafts.id, own.id));
+    await data(await call(`/v1/drafts/${own.id}`, req(me.key, 'PATCH', { to: ['sf-d@hpc.email'] })));
+    await db.update(apiKeys).set({ status: 'revoked' }).where(eq(apiKeys.id, me.keyId));
+    await db.update(drafts).set({ status: 'sending', attempt: 1, claimedAt: new Date(Date.now() - DRAFT_SENDING_LEASE_MS - MINUTE) })
+      .where(eq(drafts.id, own.id));
+    await dispatch();
+    await makeDue(own.id);
+    await dispatch();
+    expect(await row(own.id)).toMatchObject({ status: 'failed', errorDetail: expect.stringContaining('API Key 已失效') });
+  });
 });
 
 describe('草稿接口的未知字段（E2）', () => {
