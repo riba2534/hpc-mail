@@ -153,15 +153,15 @@ jq --arg domain "$HPC_NEW_DOMAIN" '
 | `GET` / `PUT /hosted-domains/:id/members` | 成员名单；PUT `{userIds,expectedOwnerId}` 整体替换（已禁用的现有成员可保留，新增的须为启用中的用户），选人用 `GET /mailboxes/share-users` |
 | `DELETE /hosted-domains/:id/members/:userId` | 移除成员；成员传自己的 id 即退出共享。已认领的地址保留 |
 | `POST /hosted-domains/:id/transfer` | `{userId,expectedOwnerId,includeMailboxes}`；`includeMailboxes:true` 连同原所有者在该域的地址与全部历史一起过户。调用者过户后失去权限时返回 `domain:null` |
-| `DELETE /hosted-domains/:id` | 不可逆：立即拒收，随后永久删除该域全部邮件、释放全部地址并删除 zone。先在注册商把 NS 改回 `originalNameServers` |
+| `DELETE /hosted-domains/:id` | 不可逆：立即拒收，随后永久删除该域全部邮件、释放全部地址并删除 zone。先在注册商把 NS 改回 `originalNameServers`：改回之前其他用户无法在本站添加这个域名（见下文添加限制） |
 | `/hosted-domains/:id/dns-records…` | 所有者或管理员管理 DNS 解析，见 [托管域名的 DNS 解析](#托管域名的-dns-解析) |
 
 状态：`pending` 等待改 NS → NS 生效后系统自动开通收件与发信（`provisioning`）→ `active`。`error` 为开通或巡检未通过（自动重试），`moved` 为 NS 已不再指向本站，`suspended` 为管理员暂停（拒收、禁止发信与新认领），`deleting` 为删除中。定时任务约每 5 分钟推进一次。
 
 - 权限：所有者与管理员可查看进度、管理成员、过户、删除；管理员还能在任何人的托管域名下认领地址，并像其他邮箱一样用 `/admin/mailboxes/:id/transfer`、`/admin/mailbox-shares` 过户或共享其中的地址（含自动认领给所有者的地址）；成员只能在该域认领地址（受 `memberLimit` 与系统保留前缀约束），看不到域名设置，也看不到他人地址的邮件；其他用户看到 404。管理员额外可用 `POST /admin/hosted-domains/:id/suspend|resume`。
 - 收件：已生效域名上**未认领地址的来信自动认领给域名所有者**，直接出现在所有者收件箱并按其个人偏好通知；自动认领默认不限数量（`hosted_domains.autoClaimLimit` 为 0），管理员设了正数上限时，域内地址达到上限后未认领新地址的来信拒收；暂停或删除中的域名拒收。释放托管域名下的地址且保留历史时，下一封来信会把该地址连同历史邮件自动认领给域名所有者；不想留给所有者就用 `deleteHistory=1` 释放。
-- 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。
-- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；全站 Cloudflare 调用额度见下文 DNS 解析的限流说明：添加时占位计 2 次（额度不足直接 429），开通前的后台预配置再计 5 次；删除计 2 次，只计数不会因额度被拒。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
+- 认领与发信：托管域名的地址不占全站每人认领上限；所有者不受保留前缀限制。从托管域名发信要求 `steps.sending` 为 ready，否则返回 400。发信就绪后所有者可用本域**任意前缀**发信（`/identities` 的 `domains` 里 `kind:"hosted"`），未认领的地址发出时自动认领给所有者；成员只能用自己认领的地址，见[发件身份](#发件身份)。
+- 添加限制：普通用户受 `hosted_domains.maxPerUser` 与同时等待生效数限制；系统域名、本站已有历史地址或邮件的域名、站长 Cloudflare 账户里已存在的 zone 一律 409；子域名或未注册域名 400。托管域名删除或到期删除后，本站保留前所有者与分配过的 NS 90 天；普通用户添加前会查该域名在注册局的公开 NS 委派（RDAP，查不到再用 DNS）：仍指向本站分配过的 NS 时返回 409 `conflict`（防止前所有者没改回 NS 时被他人接管来信），先在注册商把 NS 改到其他服务商再添加；委派暂时查不到、而该域名 90 天内由他人托管过时也是 409，稍后重试。前所有者重新添加与管理员不受此限。添加每人每分钟最多 5 次（包括被 Cloudflare 拒绝的，管理员也计）；全站 Cloudflare 调用额度见下文 DNS 解析的限流说明：添加时占位计 2 次（额度不足直接 429），开通前的后台预配置再计 5 次；删除计 3 次（撤发信接入、核对 zone 身份、删 zone），只计数不会因额度被拒。删除前会核对 zone 的名称与创建时间，与记录不符或是系统域名时不删并在 `lastError` 说明。超出任一限制或 Cloudflare 限流都返回 429 `rate_limited`，稍后重试，不要循环提交。
 
 ### 托管域名的 DNS 解析
 
