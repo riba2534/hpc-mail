@@ -9,6 +9,7 @@ import {
   headersFromRaw, INBOUND_PENDING_STALE_MS, MAX_INBOUND_REPAIR_ATTEMPTS, repairPendingInbound, STALE_INBOUND_SQL,
 } from '../src/services/inbound-repair.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
+import { CRON_HEARTBEAT_KEY, readCronHeartbeat } from '../src/services/ops-probe.js';
 import { runScheduled } from '../src/services/scheduled.js';
 import type { Env } from '../src/types.js';
 
@@ -55,6 +56,29 @@ function failingAttachments(prefix = 'att/'): Env {
     return typeof value === 'function' ? value.bind(target) : value;
   } });
   return { ...env, r2 } as Env;
+}
+
+/**
+ * 模拟修复途中 isolate 被平台按内存或 CPU 上限直接终止：读这封原文的 R2 调用永不返回，
+ * 调用方放弃这次修复（不 await），之后的代码一行都不会执行，catch 也拦不到。
+ */
+function killedWhileRepairing(rawKey: string): Env {
+  const r2 = new Proxy(env.r2, { get(target, property) {
+    if (property === 'get') return (key: string, ...args: unknown[]) => key === rawKey
+      ? new Promise(() => {})
+      : (target.get as (...a: unknown[]) => Promise<unknown>)(key, ...args);
+    const value = Reflect.get(target, property);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  return { ...env, r2 } as Env;
+}
+
+async function until(check: () => Promise<boolean>, what: string, ms = 3000) {
+  const deadline = Date.now() + ms;
+  while (!(await check())) {
+    if (Date.now() > deadline) throw new Error(`等待超时：${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 /** 首次投递附件写 R2 失败，留下一行 pending，并把它推到自愈门槛之前 */
@@ -144,19 +168,19 @@ describe('入站 pending 自愈', () => {
     const poison = await pendingDelivery(owner.address, 'repair-poison-subject');
     const broken = failingAttachments();
 
-    expect(await repairPendingInbound(broken, Date.now(), 1)).toBe(1);
+    expect(await repairPendingInbound(broken, Date.now(), { limit: 1 })).toBe(1);
     expect(await rowOf(poison.id)).toMatchObject({ status: 'pending', inboundRepairAttempts: 1 });
     expect((await rowOf(poison.id))?.errorDetail).toContain('第 1 次');
 
     // 更新的一行（未失败过）优先于失败过的旧行
     const fresh = await pendingDelivery(owner.address, 'repair-poison-fresh');
     await age(fresh.id, INBOUND_PENDING_STALE_MS + 30_000);
-    expect(await repairPendingInbound(env, Date.now(), 1)).toBe(1);
+    expect(await repairPendingInbound(env, Date.now(), { limit: 1 })).toBe(1);
     expect((await rowOf(fresh.id))?.status).toBe('received');
     expect((await rowOf(poison.id))?.inboundRepairAttempts).toBe(1);
 
     for (let attempt = 2; attempt <= MAX_INBOUND_REPAIR_ATTEMPTS; attempt++) {
-      expect(await repairPendingInbound(broken, Date.now(), 1)).toBe(1);
+      expect(await repairPendingInbound(broken, Date.now(), { limit: 1 })).toBe(1);
       expect((await rowOf(poison.id))?.inboundRepairAttempts).toBe(attempt);
     }
     const gaveUp = await rowOf(poison.id);
@@ -211,5 +235,73 @@ describe('入站 pending 自愈', () => {
     const plan = await env.db.prepare(`EXPLAIN QUERY PLAN ${STALE_INBOUND_SQL}`).bind(Date.now(), 5).all<{ detail: string }>();
     const details = plan.results.map((row) => row.detail).join('\n');
     expect(details).toContain('idx_messages_inbound_pending');
+  });
+
+  it('修复途中被平台终止的行：领取时已先计一次，下一轮新行优先，累计 6 次中断后标 degraded', async () => {
+    await clearPending();
+    const owner = await seedOwner('repair-killed');
+    const poison = await pendingDelivery(owner.address, 'repair-killed-subject');
+    const killed = killedWhileRepairing(poison.rawR2Key!);
+
+    void repairPendingInbound(killed, Date.now(), { limit: 1 });
+    await until(async () => (await rowOf(poison.id))?.inboundRepairAttempts === 1, '领取时先计一次');
+
+    // 新出现的 pending 行排在被中断过的行之前
+    const fresh = await pendingDelivery(owner.address, 'repair-killed-fresh');
+    await age(fresh.id, INBOUND_PENDING_STALE_MS + 30_000);
+    expect(await repairPendingInbound(env, Date.now(), { limit: 1 })).toBe(1);
+    expect((await rowOf(fresh.id))?.status).toBe('received');
+    expect((await rowOf(poison.id))?.inboundRepairAttempts).toBe(1);
+
+    for (let attempt = 2; attempt <= MAX_INBOUND_REPAIR_ATTEMPTS; attempt++) {
+      void repairPendingInbound(killed, Date.now(), { limit: 1 });
+      await until(async () => (await rowOf(poison.id))?.inboundRepairAttempts === attempt, `第 ${attempt} 次领取`);
+    }
+    // 中断满 6 次：下一轮直接放弃，不再读原文
+    expect((await rowOf(poison.id))?.status).toBe('pending');
+    await repairPendingInbound(killed);
+    const gaveUp = await rowOf(poison.id);
+    expect(gaveUp?.status).toBe('degraded');
+    expect(gaveUp?.errorDetail).toContain('中断');
+    expect(gaveUp?.errorDetail).toContain('保存失败');
+  });
+
+  it('自愈排在其他 5 分钟步骤与 cron 心跳之后：修复被终止也不挡住它们', async () => {
+    await clearPending();
+    const owner = await seedOwner('repair-blocking');
+    const poison = await pendingDelivery(owner.address, 'repair-blocking-subject');
+    await env.kv.delete(CRON_HEARTBEAT_KEY);
+    const logs: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: unknown) => { logs.push(String(line)); });
+
+    void runScheduled(killedWhileRepairing(poison.rawR2Key!), false);
+    await until(async () => (await rowOf(poison.id))?.inboundRepairAttempts === 1, '自愈开始');
+    expect(await readCronHeartbeat(env)).toMatchObject({ cron: 'regular', ok: true });
+    const summary = JSON.parse(logs.find((line) => line.includes('"event":"scheduled"'))!) as { steps: { step: string }[] };
+    expect(summary.steps.map((entry) => entry.step)).toContain('webhooks.process');
+    expect(summary.steps.map((entry) => entry.step)).not.toContain('inbound.repair');
+  });
+
+  it('每轮有时间上限：超出预算就不再领取新行', async () => {
+    await clearPending();
+    const owner = await seedOwner('repair-budget');
+    const rows = [await pendingDelivery(owner.address, 'repair-budget-1'), await pendingDelivery(owner.address, 'repair-budget-2')];
+    let tick = 0;
+    // 每次读时钟前进 70 秒：开始时在预算内，处理完第一行已超出 60 秒预算
+    const clock = () => Date.now() + 70_000 * tick++;
+    expect(await repairPendingInbound(env, Date.now(), { budgetMs: 60_000, clock })).toBe(1);
+    const statuses = await Promise.all(rows.map(async (row) => (await rowOf(row.id))?.status));
+    expect(statuses.filter((status) => status === 'received')).toHaveLength(1);
+    expect(statuses.filter((status) => status === 'pending')).toHaveLength(1);
+    expect(await repairPendingInbound(env)).toBe(1);
+  });
+
+  it('已删除的 pending 行不再修复', async () => {
+    await clearPending();
+    const owner = await seedOwner('repair-deleted');
+    const pending = await pendingDelivery(owner.address, 'repair-deleted-subject');
+    await createDb(env).update(messages).set({ deletedAt: new Date() }).where(eq(messages.id, pending.id));
+    expect(await repairPendingInbound(env)).toBe(0);
+    expect(await rowOf(pending.id)).toMatchObject({ status: 'pending', inboundRepairAttempts: 0 });
   });
 });

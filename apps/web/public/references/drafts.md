@@ -35,7 +35,7 @@ shell 示例复用[入口指南](../skill.md)的 `hpc()`、`FROM`、`WORK`。草
 
 ## 保存草稿
 
-请求体字段与[发信](mail.md#发送)相同（`from,to,cc,bcc,replyTo,subject,text,html,headers,replyToMessageId,forwardAttachmentsFrom,attachments,attachmentTokens`），另有 `sendAt` 与 `expectedVersion`。所有字段都可以暂缺：草稿可以先没有收件人、主题或正文，发送或安排定时时才按完整发信请求校验。格式与上限照常检查（畸形地址、收件人合计超过 100、正文超过 1 MiB、`contentId` 重复等返回 400）。
+请求体字段与[发信](mail.md#发送)相同（`from,to,cc,bcc,replyTo,subject,text,html,headers,replyToMessageId,forwardAttachmentsFrom,attachments,attachmentTokens`），另有 `sendAt` 与 `expectedVersion`。所有字段都可以暂缺：草稿可以先没有收件人、主题或正文，发送或安排定时时才按完整发信请求校验。不认识的字段返回 400 `validation_failed`，`fix` 给出正确的字段名（例如定时时间是 `sendAt`，不是 `scheduledAt`），不会被静默忽略。格式与上限照常检查（畸形地址、收件人合计超过 100、正文超过 1 MiB、`contentId` 重复等返回 400）。
 
 ```bash
 jq -n --arg from "$FROM" '{from:$from, to:["Bob <bob@example.net>"], subject:"合同确认", html:"<p>请确认附件</p>"}' > "$WORK/draft.json"
@@ -75,7 +75,8 @@ jq -n '{sendAt:"2026-11-18T09:00:00+08:00"}' |
 - 安排时草稿必须已是完整的发信请求（有 `from`、收件人、主题和正文），否则 400，`message` 以「草稿还不能发送：」开头并指出缺什么。定时中的草稿仍可修改，修改后同样要保持完整；改内容不改 `sendAt` 时不再检查时间范围。
 - 精度：服务器每分钟检查一次到期的草稿，到点后 1 分钟内发出（定时任务本身可能再晚几十秒）。一次最多发 20 封，积压的下一分钟继续。
 - `PATCH {"sendAt":null}` 取消定时，草稿回到 `draft`；也可以随时用 `POST /drafts/:id/send` 提前发出。
-- 到点复核：安排它的 API Key 已被吊销、禁用、过期或范围已不再覆盖发件地址，账户改过密码、被重置或禁用（安全状态变化）时，不会发出，草稿标为 `failed`，`errorDetail` 写明原因；确认后重新安排即可。所以 Agent 安排的定时发送不会在用户撤销 Key 之后继续发出。
+- 「安排者」是最后一个让草稿处于定时状态的写入者：安排时间，或改写已安排草稿的内容，都会把安排者换成这次请求的 Key（网页会话则为账户本身）。到点按安排者的权限发信：Key 安排的与直接用这把 Key 发信相同（管理员名下的 Key 不带 `admin` scope 时按普通用户，受外发配额约束，只能用自己的邮箱）。
+- 到点复核：安排者的 API Key 已被吊销、禁用、过期、去掉了 `mail.send`（草稿引用原信时还有 `mail.read`）或范围已不再覆盖发件地址，账户改过密码、被重置或禁用（安全状态变化）时，不会发出，草稿标为 `failed`，`errorDetail` 写明原因；确认后重新安排即可。所以 Agent 安排的定时发送不会在用户撤销 Key 之后继续发出。
 - 每日外发配额在实际发送时计算，与直接发信相同；到点时配额已满，草稿标为 `failed`（`errorDetail` 说明），不会自动再试。
 
 ## 发送

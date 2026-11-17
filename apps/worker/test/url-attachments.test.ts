@@ -1,4 +1,4 @@
-import { type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
+import { MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE, type BatchSendResult, type CreatedApiKey, type MessageSummary } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { and, eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,6 +11,7 @@ import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { isForbiddenAddress, parseIPv6 } from '../src/lib/ssrf.js';
 import { fetchUrlAttachments } from '../src/services/url-attachment.js';
+import { newUrlBufferBudget } from '../src/services/url-fetch-budget.js';
 import type { Env } from '../src/types.js';
 
 const app = createApp();
@@ -247,7 +248,7 @@ describe('URL 附件：直接发信', () => {
 });
 
 describe('URL 附件：拉取函数的边界', () => {
-  const opts = { selfHosts: ['mail.example'], budgetBytes: 50 * 1024 * 1024 };
+  const opts = () => ({ selfHosts: ['mail.example'], budgetBytes: 50 * 1024 * 1024, memory: newUrlBufferBudget() });
 
   it('没有 Content-Length 时最多读 10MiB；超过即中止', async () => {
     const me = await account('urlatt-chunked');
@@ -261,9 +262,9 @@ describe('URL 附件：拉取函数的边界', () => {
         start(controller) { controller.enqueue(bytes('abc')); controller.enqueue(bytes('def')); controller.close(); },
       }), { headers: { 'Content-Type': 'text/plain' } }),
     });
-    await expect(fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/stream' }], opts)).rejects.toMatchObject({ code: 'payload_too_large' });
+    await expect(fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/stream' }], opts())).rejects.toMatchObject({ code: 'payload_too_large' });
     expect(sent).toBeLessThanOrEqual(12);
-    const [small] = await fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/small' }], opts);
+    const [small] = await fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/small' }], opts());
     expect(small).toMatchObject({ size: 6, mimeType: 'text/plain', filename: 'small' });
     expect(await (await env.r2.get(small!.r2Key))!.text()).toBe('abcdef');
     const row = await db.select().from(draftAttachments).where(eq(draftAttachments.token, small!.token)).get();
@@ -279,13 +280,65 @@ describe('URL 附件：拉取函数的边界', () => {
       }),
     });
     await expect(fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/600' }, { url: 'https://files.example.com/600' }],
-      { ...opts, budgetBytes: 1000 })).rejects.toMatchObject({ code: 'payload_too_large' });
+      { ...opts(), budgetBytes: 1000 })).rejects.toMatchObject({ code: 'payload_too_large' });
     expect(await db.select().from(draftAttachments).where(eq(draftAttachments.userId, me.id))).toEqual([]);
     const [pinned] = await fetchUrlAttachments(env, me.id, [{ url: 'https://files.example.com/600', filename: 'a.bin', contentType: 'application/x-test' }],
-      { ...opts, draftId: 777 });
+      { ...opts(), draftId: 777 });
     expect(await db.select().from(draftAttachments).where(eq(draftAttachments.token, pinned!.token)).get())
       .toMatchObject({ draftId: 777, filename: 'a.bin', mimeType: 'application/x-test' });
-    const slow = fetchUrlAttachments(env, me.id, [{ url: 'https://slow.example/never' }], { ...opts, timeoutMs: 50 });
+    const slow = fetchUrlAttachments(env, me.id, [{ url: 'https://slow.example/never' }], { ...opts(), timeoutMs: 50 });
     await expect(slow).rejects.toMatchObject({ code: 'attachment_url_fetch_failed', message: expect.stringContaining('秒未完成') });
+  });
+});
+
+describe('URL 附件：先授权与配额、再拉取（A12）', () => {
+  it('发件人无权或外发配额已满时不发起任何 DNS 与内容请求', async () => {
+    const me = await account('urlatt-order');
+    const net = internet({ 'files.example.com': PUBLIC }, { 'https://files.example.com/ok': file('fine') });
+    const body = (from: string) => ({ from, to: ['urlatt-order-to@hpc.email'], subject: 's', text: 't', attachments: [{ url: 'https://files.example.com/ok' }] });
+    expect((await failure(await call(env, '/v1/messages', json(me.key, body('someone-else@hpc.email'))), 403)).code).toBe('forbidden');
+    await updateSettings(env, { quota: { dailyOutbound: 1, dailyRecipients: 0 } });
+    try {
+      await data<MessageSummary>(await call(env, '/v1/messages', json(me.key, { ...body(me.address), attachments: [] })));
+      expect((await failure(await call(env, '/v1/messages', json(me.key, body(me.address))), 429)).message).toContain('每日外发上限');
+    } finally {
+      await updateSettings(env, { quota: { dailyOutbound: 0, dailyRecipients: 0 } });
+    }
+    expect(net.calls).toEqual([]);
+  });
+
+  it(`每个用户每分钟最多拉取 ${MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE} 个 URL 附件，超过的请求 429 且不去拉`, async () => {
+    const me = await account('urlatt-budget-min');
+    const routes = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`https://files.example.com/b${i}`, file(`b${i}`)]));
+    const net = internet({ 'files.example.com': PUBLIC }, routes);
+    const send = (count: number) => call(env, '/v1/messages', json(me.key, {
+      from: me.address, to: ['urlatt-budget-to@hpc.email'], subject: 's', text: 't',
+      attachments: Array.from({ length: count }, (_, i) => ({ url: `https://files.example.com/b${i}` })),
+    }));
+    for (let round = 0; round < MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE / 10; round++) await data<MessageSummary>(await send(10));
+    const fetchedBefore = net.contentCalls().length;
+    const limited = await failure(await send(1), 429);
+    expect(limited).toMatchObject({ code: 'rate_limited' });
+    expect(limited.message).toContain(`每分钟最多拉取 ${MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE} 个 URL 附件`);
+    expect(net.contentCalls()).toHaveLength(fetchedBefore);
+    // 被拒的这次不占额度：外发日配额与拉取额度都退回
+    const counters = await env.db.prepare(`SELECT count FROM rate_counters WHERE scope = 'url-fetch' AND subject = ?`).bind(String(me.id)).all<{ count: number }>();
+    expect(counters.results.reduce((sum, row) => sum + row.count, 0)).toBe(MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE);
+  });
+});
+
+describe('URL 附件：长度未知的缓冲按单请求封顶（A13）', () => {
+  it('批量里几项并发拉取长度未知的附件，合计超过 10MiB 的那一项 413，不会每项各缓冲 10MiB', async () => {
+    const me = await account('urlatt-memory');
+    const sixMiB = () => new Response(new ReadableStream({
+      start(controller) { for (let i = 0; i < 6; i++) controller.enqueue(new Uint8Array(1024 * 1024)); controller.close(); },
+    }));
+    internet({ 'files.example.com': PUBLIC }, { 'https://files.example.com/m1': sixMiB, 'https://files.example.com/m2': sixMiB });
+    const item = (url: string, to: string) => ({ from: me.address, to: [to], subject: 's', text: 't', attachments: [{ url }] });
+    const result = await data<BatchSendResult>(await call(env, '/v1/messages/batch', json(me.key, { items: [
+      item('https://files.example.com/m1', 'mem-a@hpc.email'), item('https://files.example.com/m2', 'mem-b@hpc.email'),
+    ] })), 200);
+    expect(result.items.map((r) => r.httpStatus).sort()).toEqual([201, 413]);
+    expect(result.items.find((r) => !r.ok)!.error!.message).toContain('合计最多读 10MiB');
   });
 });

@@ -1,6 +1,6 @@
 import {
   MAX_ATTACHMENT_FILE_BYTES,
-  SINGLE_UPLOAD_THRESHOLD_BYTES,
+  MAX_URL_ATTACHMENT_BUFFER_BYTES,
   URL_ATTACHMENT_MAX_REDIRECTS,
   URL_ATTACHMENT_TIMEOUT_MS,
   attachmentFilenameSchema,
@@ -12,6 +12,7 @@ import { isForbiddenAddress, isInternalHostname, parseIPv4 } from '../lib/ssrf.j
 import type { Env } from '../types.js';
 import { attachmentDisposition, type StoredAttachment } from './outbound.js';
 import { consumeDraftAttachments, draftKey, newDraftToken, releaseDraftStatements, reserveDraftAttachment } from './upload.js';
+import type { UrlBufferBudget } from './url-fetch-budget.js';
 
 /** 拉取并转存后的 URL 附件：token 是转存出的上传附件（draft_attachments 行），发送成功后与 attachmentTokens 一起回收 */
 export interface FetchedUrlAttachment extends StoredAttachment {
@@ -25,6 +26,8 @@ export interface UrlFetchOptions {
   budgetBytes: number;
   /** 转存出的附件直接被这个服务端草稿引用（draft_attachments.draft_id） */
   draftId?: number;
+  /** 本请求「长度未知、要先读进内存」的缓冲还剩多少字节（整个请求共用一份，批量的各项并发时也从这里扣） */
+  memory: UrlBufferBudget;
   /** 单个附件的拉取总时限（含 DNS 与重定向）；测试用，默认 URL_ATTACHMENT_TIMEOUT_MS */
   timeoutMs?: number;
 }
@@ -162,8 +165,17 @@ function pickMimeType(requested: string | undefined, response: Response): string
   return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(type) && type.length <= 128 ? type : 'application/octet-stream';
 }
 
-/** 没有 Content-Length（或经过压缩、长度不可信）时边读边计数，最多缓冲 cap 字节 */
-async function readCapped(body: ReadableStream<Uint8Array>, cap: number, shown: string): Promise<Uint8Array> {
+/**
+ * 没有 Content-Length（或经过压缩、长度不可信）时边读边计数：单个不超过 cap，同时从整个请求共用的缓冲预算里逐块扣减，
+ * 并发的几路拉取合计也封顶。只保留读到的分块、不拼成一整块（拼接会让峰值翻倍），写 R2 时按分块流式写入。
+ */
+async function readChunks(
+  body: ReadableStream<Uint8Array>,
+  cap: number,
+  memory: UrlBufferBudget,
+  shown: string,
+  tooLarge: () => AppError,
+): Promise<{ chunks: Uint8Array[]; total: number }> {
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -171,18 +183,34 @@ async function readCapped(body: ReadableStream<Uint8Array>, cap: number, shown: 
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
+    memory.remaining -= value.byteLength;
     if (total > cap) {
       await reader.cancel();
-      throw new AppError('payload_too_large', `附件超过 ${Math.floor(cap / 1024 / 1024)}MiB 上限（没有 Content-Length 的响应最多 ${SINGLE_UPLOAD_THRESHOLD_BYTES / 1024 / 1024}MiB）`, {
-        details: { url: shown },
-      });
+      throw tooLarge();
+    }
+    if (memory.remaining < 0) {
+      await reader.cancel();
+      throw new AppError('payload_too_large',
+        `没有 Content-Length 的 URL 附件在一个请求里合计最多读 ${MAX_URL_ATTACHMENT_BUFFER_BYTES / 1024 / 1024}MiB`, {
+          fix: '换成会返回 Content-Length 的地址（如对象存储的直链），或先用 POST /v1/uploads 上传后写进 attachmentTokens',
+          details: { url: shown },
+        });
     }
     chunks.push(value);
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return bytes;
+  return { chunks, total };
+}
+
+/** 已知总长的分块按顺序写进 R2（FixedLengthStream 给出确定长度，不另拼一份完整内容） */
+async function putChunks(env: Env, key: string, chunks: Uint8Array[], total: number, contentType: string): Promise<void> {
+  const { readable, writable } = new FixedLengthStream(total);
+  const put = env.r2.put(key, readable, { httpMetadata: { contentType } });
+  const writer = writable.getWriter();
+  const writing = (async () => {
+    for (const chunk of chunks.splice(0)) await writer.write(chunk);
+    await writer.close();
+  })();
+  await Promise.all([put, writing]);
 }
 
 /** 拉取一个 URL 附件并转存；失败时自己占用的行（若有）登记清理后再抛错 */
@@ -204,18 +232,17 @@ async function fetchOne(env: Env, userId: number, item: UrlAttachment, options: 
   const filename = pickFilename(item.filename, response, url);
   const mimeType = pickMimeType(item.contentType, response);
 
-  // 长度已知时直接流式写 R2（FixedLengthStream 在实际字节数与声明不符时报错）；未知时先有上限地读进内存
-  let bytes: Uint8Array | null = null;
+  // 长度已知时直接流式写 R2（FixedLengthStream 在实际字节数与声明不符时报错）；未知时先有上限地分块读进内存
+  let buffered: { chunks: Uint8Array[]; total: number } | null = null;
   if (declared === null) {
-    try { bytes = await readCapped(response.body, Math.min(limit, SINGLE_UPLOAD_THRESHOLD_BYTES), shown); }
+    try { buffered = await readChunks(response.body, Math.min(limit, MAX_URL_ATTACHMENT_BUFFER_BYTES), options.memory, shown, tooLarge); }
     catch (error) {
-      if (error instanceof AppError && error.code === 'payload_too_large' && limit < SINGLE_UPLOAD_THRESHOLD_BYTES) throw tooLarge();
       if (error instanceof AppError) throw error;
       throw fetchFailed(shown, signal.aborted ? deadline.message : '读取内容中断');
     }
-    if (!bytes.byteLength) throw fetchFailed(shown, '内容为空');
+    if (!buffered.total) throw fetchFailed(shown, '内容为空');
   }
-  const size = declared ?? bytes!.byteLength;
+  const size = declared ?? buffered!.total;
   const token = newDraftToken();
   const r2Key = draftKey(userId, token);
   let rowId: number;
@@ -226,8 +253,8 @@ async function fetchOne(env: Env, userId: number, item: UrlAttachment, options: 
     throw error;
   }
   try {
-    if (bytes) {
-      await env.r2.put(r2Key, bytes, { httpMetadata: { contentType: mimeType } });
+    if (buffered) {
+      await putChunks(env, r2Key, buffered.chunks, buffered.total, mimeType);
     } else {
       const { readable, writable } = new FixedLengthStream(size);
       const piping = response.body.pipeTo(writable);

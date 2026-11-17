@@ -268,6 +268,6 @@ export function buildSessionOpenApiSpec(origin: string) {
     components: { securitySchemes: {
       sessionToken: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
       attachmentSignature: { type: 'apiKey', in: 'query', name: 'sig' }, attachmentExpiry: { type: 'apiKey', in: 'query', name: 'exp' },
-    }, schemas: usedSchemas(described), examples: usedExamples(described, origin) }, paths: described,
+    }, schemas: usedSchemas(described), examples: usedExamples(described, origin, '/api') }, paths: described,
   };
 }

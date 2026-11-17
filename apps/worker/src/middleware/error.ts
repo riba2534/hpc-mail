@@ -31,6 +31,23 @@ export const DEFAULT_ERROR_HINTS: Partial<Record<ErrorCode, AppErrorHints>> = Ob
   Object.entries(DEFAULT_FIXES).map(([code, fix]) => [code, { fix, docs: `${ERRORS_DOC}#${code}` }]),
 );
 
+/**
+ * 不走 /v1 的请求（网页会话的 /api 等）对 429/413 的建议：上面的默认值写的是 Key 的速率上限、/v1/me 与 /v1/uploads，
+ * 对会话请求是误导（会话没有 Key，头像等 413 也与附件上传无关）。
+ */
+const SESSION_FIXES: Partial<Record<ErrorCode, string>> = {
+  rate_limited: '请求过于频繁或已达今日配额：稍后再试，不要立即重复提交',
+  payload_too_large: '缩小内容后重试；发信的大附件先用 POST /api/uploads 上传，再在 attachmentTokens 里引用 token',
+};
+
+/** 按请求路径取默认建议：/v1 用面向 API Key 的版本，其余路径对 SESSION_FIXES 里的错误码换成会话版本 */
+export function defaultErrorHints(code: ErrorCode, path: string): AppErrorHints {
+  const defaults = DEFAULT_ERROR_HINTS[code] ?? {};
+  const isV1 = path === '/v1' || path.startsWith('/v1/');
+  const session = isV1 ? undefined : SESSION_FIXES[code];
+  return session ? { ...defaults, fix: session } : defaults;
+}
+
 /** 每请求分配 requestId 并回显 X-Request-ID */
 export const requestId: MiddlewareHandler<AppContext> = async (c, next) => {
   const supplied = c.req.header('X-Request-ID');
@@ -72,7 +89,7 @@ export function errorObject(
   }));
   if (err instanceof AppError) {
     if (err.status >= 500) log(err.code, err.message);
-    const defaults = DEFAULT_ERROR_HINTS[err.code] ?? {};
+    const defaults = defaultErrorHints(err.code, c.req.path);
     const fix = err.hints.fix ?? defaults.fix;
     const docs = err.hints.docs ?? defaults.docs;
     const details = err.hints.details;

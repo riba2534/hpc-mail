@@ -17,7 +17,7 @@ import {
   MAIL_AUTH_RESULTS, PROMPT_INJECTION_REASONS, ERROR_STATUS,
   MAX_HOSTED_DOMAIN_BATCH, batchCreateHostedDomainsRequestSchema, batchCheckHostedDomainsRequestSchema,
   MAX_ATTACHMENT_FILE_BYTES, URL_ATTACHMENT_MAX_REDIRECTS, URL_ATTACHMENT_TIMEOUT_MS,
-  MAX_BATCH_SEND_ITEMS, DRAFT_STATUSES, MAX_DRAFTS_PER_USER, SENT_DRAFT_RETENTION_DAYS, draftInputSchema,
+  MAX_BATCH_SEND_ITEMS, MAX_URL_ATTACHMENT_BUFFER_BYTES, MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE, DRAFT_STATUSES, MAX_DRAFTS_PER_USER, SENT_DRAFT_RETENTION_DAYS, draftInputSchema,
   DELIVERY_EVENT_TYPES, DELIVERY_EVENTS_QUEUE, SUPPRESSION_REASONS,
   LIST_PAGE_DEFAULT_LIMIT, LIST_PAGE_MAX_LIMIT,
   DNSSEC_STATES, SYSTEM_DOMAIN_ACKS, SYSTEM_DOMAIN_CHANGE_KINDS, SYSTEM_DOMAIN_CHECK_KEYS, SYSTEM_DOMAIN_ONBOARDING_MODES,
@@ -25,7 +25,7 @@ import {
   SYSTEM_DOMAIN_ZONE_CATEGORIES, SYSTEM_DOMAIN_ZONE_ORIGINS, cancelSystemDomainOnboardingRequestSchema, confirmSystemDomainOnboardingRequestSchema,
   createSystemDomainOnboardingRequestSchema, updateSystemDomainHiddenZonesRequestSchema,
 } from '@hpc-mail/shared';
-import { DEFAULT_ERROR_HINTS, REQUEST_ID_PATTERN } from '../middleware/error.js';
+import { defaultErrorHints, REQUEST_ID_PATTERN } from '../middleware/error.js';
 import {
   MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE, RECONNECT_CF_CALLS,
 } from '../services/hosted-domain.js';
@@ -136,7 +136,7 @@ const urlAttachmentFields = urlAttachment!.properties as Record<string, Schema>;
 urlAttachmentFields.contentId = { ...urlAttachmentFields.contentId, description: contentIdDescription };
 urlAttachmentFields.disposition = { ...urlAttachmentFields.disposition, description: dispositionDescription };
 urlAttachmentFields.url = { ...urlAttachmentFields.url, examples: ['https://files.example.com/report.pdf'],
-  description: `Public https URL fetched by the server. Only the default port 443, no credentials. Private, loopback, link-local (including cloud metadata 169.254.169.254), CGNAT, multicast, reserved and documentation addresses are refused, as literal IPs or as DNS answers (A and AAAA), and so are internal hostnames (localhost, *.local, *.internal…) and this site itself: 400 attachment_url_forbidden. Up to ${URL_ATTACHMENT_MAX_REDIRECTS} redirects are followed, each hop checked again; the whole fetch must finish within ${URL_ATTACHMENT_TIMEOUT_MS / 1000} seconds. DNS failure, timeout, non-2xx, too many redirects, empty content or a length mismatch return 422 attachment_url_fetch_failed. Each file is at most ${MAX_ATTACHMENT_FILE_BYTES / MIB} MiB and counts toward the ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB total; a response without Content-Length is limited to ${SINGLE_UPLOAD_THRESHOLD_BYTES / MIB} MiB (413 payload_too_large). Errors carry details.url. Fetched content is stored like an upload (counts toward the per-user pending-upload quota until sent).` };
+  description: `Public https URL fetched by the server. Only the default port 443, no credentials. Private, loopback, link-local (including cloud metadata 169.254.169.254), CGNAT, multicast, reserved and documentation addresses are refused, as literal IPs or as DNS answers (A and AAAA), and so are internal hostnames (localhost, *.local, *.internal…) and this site itself: 400 attachment_url_forbidden. Up to ${URL_ATTACHMENT_MAX_REDIRECTS} redirects are followed, each hop checked again; the whole fetch must finish within ${URL_ATTACHMENT_TIMEOUT_MS / 1000} seconds. DNS failure, timeout, non-2xx, too many redirects, empty content or a length mismatch return 422 attachment_url_fetch_failed. Each file is at most ${MAX_ATTACHMENT_FILE_BYTES / MIB} MiB and counts toward the ${MAX_ATTACHMENT_TOTAL_BYTES / MIB} MiB total; responses without Content-Length are buffered and limited to ${MAX_URL_ATTACHMENT_BUFFER_BYTES / MIB} MiB combined per request, shared by all items of a batch (413 payload_too_large). The sender and the daily outbound quota are checked before anything is fetched, and each user may fetch at most ${MAX_URL_ATTACHMENT_FETCHES_PER_MINUTE} URL attachments per minute across sends, batches and drafts (429 rate_limited). Errors carry details.url. Fetched content is stored like an upload (counts toward the per-user pending-upload quota until sent).` };
 urlAttachmentFields.filename = { ...urlAttachmentFields.filename, description: 'Optional; defaults to the Content-Disposition filename, else the last URL path segment, else attachment.' };
 urlAttachmentFields.contentType = { ...urlAttachmentFields.contentType, description: 'Optional; defaults to the response Content-Type (parameters removed), else application/octet-stream.' };
 delete urlAttachmentFields.content;
@@ -369,6 +369,8 @@ function hostedDomainBatchResult(key: Record<string, Schema>): Schema {
 /** 服务端草稿：请求体与发信相同、字段都可暂缺；响应按 shared 的 DraftSummary / Draft */
 const draftInput = fromZod(draftInputSchema);
 {
+  // 未知字段返回 400（schema 用 looseObject 收下再逐个报错，好在 fix 里提示正确字段名）
+  draftInput.additionalProperties = false;
   const fields = draftInput.properties as Record<string, Schema>;
   const sendFields = sendProperties;
   for (const name of ['to', 'cc', 'bcc', 'replyTo', 'headers', 'attachmentTokens', 'attachments']) {
@@ -378,7 +380,7 @@ const draftInput = fromZod(draftInputSchema);
   fields.sendAt = { anyOf: [{ type: 'string', maxLength: 40 }, { type: 'null' }], examples: ['2026-11-18T09:00:00+08:00'],
     description: 'ISO 8601 with a time zone (or a date, meaning UTC midnight), at least 1 minute and at most 30 days ahead by server time. Setting it schedules the draft (status scheduled) and requires a complete send request; null cancels the schedule (status draft).' };
   fields.expectedVersion = { ...fields.expectedVersion, description: 'PATCH only: the version you read. A different current version returns 409 draft_state_conflict.' };
-  draftInput.description = `Every field is optional. POST: omitted fields start empty. PATCH: omitted fields keep their value, null clears from/replyToMessageId/forwardAttachmentsFrom/sendAt. attachments (base64 or {url}) are stored as uploads when saved and the draft keeps only tokens; when attachments or attachmentTokens is present the attachment set is replaced by the newly stored ones followed by attachmentTokens, so list existing tokens in attachmentTokens to keep them. Draft attachments count toward the per-user pending-upload quota and do not expire while referenced. At most ${MAX_DRAFTS_PER_USER} unsent drafts per user (409 draft_limit_reached).`;
+  draftInput.description = `Every field is optional. POST: omitted fields start empty. PATCH: omitted fields keep their value, null clears from/replyToMessageId/forwardAttachmentsFrom/sendAt. Unknown fields (for example scheduledAt instead of sendAt) return 400 validation_failed whose fix names the right field. attachments (base64 or {url}) are stored as uploads when saved and the draft keeps only tokens; when attachments or attachmentTokens is present the attachment set is replaced by the newly stored ones followed by attachmentTokens, so list existing tokens in attachmentTokens to keep them. Draft attachments count toward the per-user pending-upload quota and do not expire while referenced. At most ${MAX_DRAFTS_PER_USER} unsent drafts per user (409 draft_limit_reached).`;
 }
 const draftStatus: Schema = { type: 'string', enum: DRAFT_STATUSES,
   description: 'draft: editable; scheduled: will be sent by the per-minute cron at sendAt; sending: in progress, cannot be changed or deleted; sent: a send ran, see messageId for its result (partial failure or unknown included); failed: nobody received it, edit and send again.' };
@@ -965,8 +967,8 @@ export function registerSchemas(extra: Record<string, Schema>): void {
   }
 }
 
-/** components.examples：只输出 paths 引用到的失败示例；fix/docs 缺省时按错误码套用中间件的默认建议，docs 按 origin 补成绝对 URL */
-export function usedExamples(paths: Paths, origin: string): Record<string, Schema> {
+/** components.examples：只输出 paths 引用到的失败示例；fix/docs 缺省时按错误码与规格（/api 或 /v1）套用中间件的默认建议，docs 按 origin 补成绝对 URL */
+export function usedExamples(paths: Paths, origin: string, base: '/api' | '/v1'): Record<string, Schema> {
   const names = new Set<string>();
   JSON.stringify(paths, (key, value: unknown) => {
     if (key === '$ref' && typeof value === 'string' && value.startsWith('#/components/examples/')) names.add(value.slice('#/components/examples/'.length));
@@ -974,7 +976,7 @@ export function usedExamples(paths: Paths, origin: string): Record<string, Schem
   });
   return Object.fromEntries([...names].sort().map(name => {
     const example = errorExample(name)!;
-    const hints = DEFAULT_ERROR_HINTS[example.code] ?? {};
+    const hints = defaultErrorHints(example.code, base);
     const fix = example.fix ?? hints.fix;
     const docs = example.docs ?? hints.docs;
     return [name, { summary: `${example.code}: ${example.message}`, value: {

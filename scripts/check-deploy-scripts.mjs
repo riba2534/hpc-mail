@@ -3,19 +3,24 @@
  * smoke.sh 与 deploy-probe.sh 的本地自检：起一个模拟线上接口的 HTTP 桩，按场景执行脚本并检查退出码与输出。
  * 覆盖：管理员未开/已开两步验证（含用 ADMIN_TOTP_SECRET 登录）、管理员凭据与线上不符、站点强制两步验证、
  * 发布切换期首页引用旧资源的重试、请求挂住时单请求超时、金丝雀显式启用/外发重试/旧版本收件补发/超时/令牌错误、
- * cron 心跳等待与超时。
+ * cron 心跳等待与超时；回滚基线记录与恢复 Worker cron 触发器（worker-schedules.sh）；部署工作流不跑 npx 现装的第三方包。
  * 需要 bash、curl、jq（CI runner 自带）。用法：node scripts/check-deploy-scripts.mjs
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SMOKE = join(here, 'smoke.sh');
 const PROBE = join(here, 'deploy-probe.sh');
+const SCHEDULES = join(here, 'worker-schedules.sh');
+const ACCOUNT = 'acct0123456789abcdef0123456789ab';
+const CF_TOKEN = 'cf-token-for-self-test';
 const ADMIN = { id: 1, username: 'site-admin', password: 'p"a\\ss word $1 ok' };
 const SMOKE_USER = { id: 2, username: 'ci-smoke', password: '0123456789abcdef0123456789abcdef' };
 const BUILD = 'b'.repeat(40);
@@ -44,6 +49,8 @@ const reset = (overrides = {}) => {
     ...overrides,
     // statuses：依次作为每次外发的响应状态，用完后返回 200
     canary: { receiveAfter: 1, staleSends: 0, never: false, statuses: [], ...overrides.canary },
+    // Cloudflare schedules API 桩：schedules 为当前触发器；getStatus/putStatus 非 200 时返回错误；missing 表示 Worker 不存在
+    cf: { schedules: [{ cron: '* * * * *' }, { cron: '*/5 * * * *' }], getStatus: 200, putStatus: 200, missing: false, requests: [], ...overrides.cf },
   };
 };
 
@@ -127,6 +134,25 @@ function handle(req, body) {
   if (path === '/api/auth/logout') {
     S.sessions.delete(auth);
     return json(200, { data: { ok: true } });
+  }
+
+  // Cloudflare API：GET/PUT /client/v4/accounts/<账户>/workers/scripts/<名称>/schedules
+  const schedulesPath = path.match(/^\/client\/v4\/accounts\/([^/]+)\/workers\/scripts\/([^/]+)\/schedules$/);
+  if (schedulesPath) {
+    S.cf.requests.push({ method: req.method, account: schedulesPath[1], script: schedulesPath[2], auth, body });
+    const cfError = (status, code) => json(status, { success: false, errors: [{ code, message: 'stub error' }], messages: [], result: null });
+    if (auth !== CF_TOKEN) return cfError(403, 10000);
+    if (S.cf.missing) return cfError(404, 10007);
+    if (req.method === 'GET') {
+      if (S.cf.getStatus !== 200) return cfError(S.cf.getStatus, 10013);
+      return json(200, { success: true, errors: [], messages: [], result: { schedules: S.cf.schedules.map((item) => ({ ...item, created_on: 'x', modified_on: 'y' })) } });
+    }
+    if (req.method === 'PUT') {
+      if (S.cf.putStatus !== 200) return cfError(S.cf.putStatus, 10013);
+      S.cf.schedules = JSON.parse(body);
+      return json(200, { success: true, errors: [], messages: [], result: { schedules: S.cf.schedules } });
+    }
+    return cfError(405, 10000);
   }
 
   // 内部探针端点
@@ -223,6 +249,19 @@ const probe = (mode, env = {}, limitMs) => run(PROBE, [mode], {
 // 金丝雀须显式启用；默认用 DEPLOY_CANARY=on（由服务端选域名）
 const canary = (env = {}, limitMs) => probe('canary', { DEPLOY_CANARY: 'on', ...env }, limitMs);
 const adminHits = () => S.hits.filter((h) => h.user === ADMIN.username && h.path !== '/api/auth/me' && h.path !== '/api/auth/logout');
+
+// worker-schedules.sh：save|restore <文件>；返回退出码、输出与本次写入的 Job Summary
+const workDir = mkdtempSync(join(tmpdir(), 'hpc-deploy-check-'));
+async function schedules(mode, file, env = {}, limitMs) {
+  const summaryFile = join(workDir, `summary-${Date.now()}-${Math.random().toString(16).slice(2)}.md`);
+  writeFileSync(summaryFile, '');
+  const r = await run(SCHEDULES, [mode, file], {
+    CLOUDFLARE_API_TOKEN: CF_TOKEN, CLOUDFLARE_ACCOUNT_ID: ACCOUNT, CF_API_BASE: `${BASE_URL}/client/v4`,
+    GITHUB_STEP_SUMMARY: summaryFile, ...env,
+  }, limitMs);
+  return { ...r, summary: readFileSync(summaryFile, 'utf8') };
+}
+const readJson = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
 const cases = [];
 const test = (name, fn) => cases.push([name, fn]);
@@ -435,6 +474,88 @@ test('probe heartbeat：等到新版本心跳；有失败步骤只告警；超�
   r = await probe('heartbeat', { HEARTBEAT_TIMEOUT: '2', PROBE_CURL_TIMEOUT: '1' }, 8000);
   assert.equal(r.status, 1, r.output);
   assert.match(r.output, /2s 内没有等到新版本的 cron 心跳/);
+});
+
+test('schedules save：记录部署前的触发器；首次部署记空；读取失败终止部署，日志不含账户 id', async () => {
+  reset();
+  const file = join(workDir, 'baseline.json');
+  let r = await schedules('save', file);
+  assert.equal(r.status, 0, r.output);
+  assert.deepEqual(readJson(file), [{ cron: '* * * * *' }, { cron: '*/5 * * * *' }]);
+  assert.match(r.summary, /部署前的 cron 触发器：`\* \* \* \* \*`、`\*\/5 \* \* \* \*`/);
+  assert.deepEqual(S.cf.requests.map((q) => [q.method, q.account, q.script]), [['GET', ACCOUNT, 'hpc-cloud-mail']]);
+  assert.ok(!r.output.includes(ACCOUNT) && !r.summary.includes(ACCOUNT), '日志与 Summary 不能出现账户 id');
+
+  reset({ cf: { missing: true } });
+  r = await schedules('save', file);
+  assert.equal(r.status, 0, r.output);
+  assert.deepEqual(readJson(file), []);
+  assert.match(r.output, /::notice::Worker 尚未部署过/);
+
+  reset({ cf: { getStatus: 500 } });
+  r = await schedules('save', join(workDir, 'unreadable.json'));
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.output, /::error::读取部署前的 cron 触发器失败（HTTP 500，错误码 10013）/);
+  assert.ok(!r.output.includes(ACCOUNT), r.output);
+});
+
+test('schedules restore：回滚后把触发器恢复为基线值，Summary 记录', async () => {
+  reset({ cf: { schedules: [{ cron: '* * * * *' }, { cron: '*/5 * * * *' }, { cron: '0 16 * * *' }] } });
+  const file = join(workDir, 'restore.json');
+  writeFileSync(file, JSON.stringify([{ cron: '*/5 * * * *' }, { cron: '0 16 * * *' }]));
+  const r = await schedules('restore', file);
+  assert.equal(r.status, 0, r.output);
+  assert.deepEqual(S.cf.schedules, [{ cron: '*/5 * * * *' }, { cron: '0 16 * * *' }], '线上触发器应恢复为基线');
+  const put = S.cf.requests.find((q) => q.method === 'PUT');
+  assert.deepEqual(JSON.parse(put.body), [{ cron: '*/5 * * * *' }, { cron: '0 16 * * *' }]);
+  assert.match(r.summary, /cron 触发器已恢复为部署前的值：`\*\/5 \* \* \* \*`、`0 16 \* \* \*`/);
+  assert.doesNotMatch(r.output, /::(error|warning)::/);
+  assert.ok(!r.output.includes(ACCOUNT) && !r.summary.includes(ACCOUNT));
+});
+
+test('schedules restore：恢复失败、挂住或没有基线都只告警并以 0 退出，不改变回滚结论', async () => {
+  const file = join(workDir, 'restore-fail.json');
+  writeFileSync(file, JSON.stringify([{ cron: '*/5 * * * *' }]));
+  reset({ cf: { putStatus: 500 } });
+  let r = await schedules('restore', file);
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /::warning::恢复 cron 触发器失败（HTTP 500，错误码 10013），请手动恢复为：`\*\/5 \* \* \* \*`/);
+  assert.match(r.summary, /cron 触发器恢复失败/);
+  assert.ok(!r.output.includes(ACCOUNT) && !r.summary.includes(ACCOUNT));
+
+  const hangPath = `/client/v4/accounts/${ACCOUNT}/workers/scripts/hpc-cloud-mail/schedules`;
+  reset({ hangs: { [hangPath]: Infinity } });
+  r = await schedules('restore', file, { SCHEDULES_CURL_TIMEOUT: '1' }, 8000);
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /::warning::恢复 cron 触发器失败（HTTP 000/);
+  assert.ok(!r.output.includes(ACCOUNT), r.output);
+
+  reset();
+  r = await schedules('restore', join(workDir, 'no-such-baseline.json'));
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.output, /::warning::没有记录到部署前的 cron 触发器/);
+  assert.deepEqual(S.cf.requests, [], '没有基线时不能改线上触发器');
+});
+
+test('部署工作流：基线记录触发器、回滚后恢复且失败不中断；不在部署 job 里跑 npx 现装的包（Spectral 只在 PR CI）', () => {
+  const deploy = readFileSync(join(here, '..', '.github', 'workflows', 'deploy.yml'), 'utf8');
+  const ci = readFileSync(join(here, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
+  const step = (name) => {
+    const start = deploy.indexOf(`- name: ${name}`);
+    assert.ok(start >= 0, `缺少步骤：${name}`);
+    const next = deploy.indexOf('\n      - ', start + 1);
+    return deploy.slice(start, next < 0 ? undefined : next);
+  };
+  assert.match(step('记录回滚基线'), /worker-schedules\.sh" save "\$RUNNER_TEMP\/worker-schedules\.json"/);
+  assert.ok(deploy.indexOf('- name: 记录回滚基线') < deploy.indexOf('- name: 部署 Worker'), '基线须在发布之前记录');
+  const rollback = step('失败自动回滚 Worker');
+  const rolledBack = rollback.indexOf('npx wrangler rollback');
+  const restore = rollback.indexOf('worker-schedules.sh" restore "$RUNNER_TEMP/worker-schedules.json"');
+  assert.ok(rolledBack >= 0 && restore > rolledBack, '恢复触发器须在 wrangler rollback 之后');
+  assert.match(rollback.slice(restore), /^[^\n]*\\\n\s*\|\| echo '::warning::/, '恢复脚本异常退出也不能让回滚步骤失败');
+  const commands = deploy.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+  assert.doesNotMatch(commands, /npx --yes|spectral|check-openapi\.sh/i, '部署工作流不能跑 npx 现装的第三方包');
+  assert.match(ci, /bash scripts\/check-openapi\.sh/, 'Spectral 检查留在 PR CI');
 });
 
 try {

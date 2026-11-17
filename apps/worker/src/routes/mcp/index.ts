@@ -3,7 +3,8 @@ import { MCP_PROTOCOL_VERSIONS, mcpToolInputSchemas, type McpToolName } from '@h
 import { Hono, type Context, type ExecutionContext } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { AppError } from '../../lib/errors.js';
-import { apiKeyAuth } from '../../middleware/api-key-auth.js';
+import { readBodyWithLimit } from '../../lib/request-body.js';
+import { apiKeyAuth, trustInternalRequest } from '../../middleware/api-key-auth.js';
 import { DEFAULT_ERROR_HINTS } from '../../middleware/error.js';
 import type { AppContext, Env } from '../../types.js';
 import { RestError, TOOLS, listTools, type Rest, type ToolError } from './tools.js';
@@ -66,7 +67,8 @@ function executionContext(c: Context<AppContext>): ExecutionContext | undefined 
 }
 
 /**
- * 工具的每次 REST 调用都是一个独立的内部 /v1 请求，由 /v1 路由完成鉴权、scope、限流与审计，与直接调用 REST 完全一致。
+ * 工具的每次 REST 调用都是一个独立的内部 /v1 请求，由 /v1 路由执行 scope、Key 限定范围与业务规则，与直接调用 REST 完全一致。
+ * Key 已在 /mcp 请求上鉴权并计过一次限流，内部请求沿用同一个 Key 上下文（不再查库、不再计数），审计记 /v1 路径。
  * 外层 requestId 作为 X-Request-ID 传入，内外日志可以关联；客户端断开时随外层请求一起取消。
  */
 function restClient(c: Context<AppContext>, dispatch: Dispatch): Rest {
@@ -80,9 +82,11 @@ function restClient(c: Context<AppContext>, dispatch: Dispatch): Rest {
     }
     if (body !== undefined) headers.set('Content-Type', 'application/json');
     if (idempotencyKey) headers.set('Idempotency-Key', idempotencyKey);
-    const response = await dispatch(new Request(url, {
+    const request = new Request(url, {
       method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: c.req.raw.signal,
-    }), c.env, executionContext(c));
+    });
+    trustInternalRequest(request, c);
+    const response = await dispatch(request, c.env, executionContext(c));
     const payload = await response.json().catch(() => null) as { data?: T; error?: ToolError; requestId?: string } | null;
     if (response.ok && payload && 'data' in payload) return payload.data as T;
     throw new RestError(response.status, payload?.error ? { error: payload.error, requestId: payload.requestId }
@@ -130,8 +134,6 @@ async function callTool(c: Context<AppContext>, dispatch: Dispatch, id: JsonRpcI
     return c.json({ jsonrpc: '2.0', id, result: toolSuccess(result) });
   } catch (error) {
     if (error instanceof RestError) {
-      // Key 无效、已禁用或过期属于连接层问题，与 initialize 一样回 HTTP 401，客户端能提示重新配置凭据
-      if (error.status === 401) return httpError(c, id, error.body.error, 401);
       return c.json({ jsonrpc: '2.0', id, result: toolFailure(error.body.error, error.body.requestId ?? requestId) });
     }
     console.error(JSON.stringify({ level: 'error', requestId, operation: `mcp tools/call ${toolName}`, message: error instanceof Error ? error.message : String(error) }));
@@ -139,18 +141,6 @@ async function callTool(c: Context<AppContext>, dispatch: Dispatch, id: JsonRpcI
   }
 }
 
-/** initialize 与 tools/list 在 /mcp 请求本身上执行 /v1 的 apiKeyAuth（计一次限流、写一条 POST /mcp 审计） */
-async function withApiKey(c: Context<AppContext>, id: JsonRpcId, result: () => unknown): Promise<Response> {
-  try {
-    await apiKeyAuth(c, async () => { c.res = c.json({ jsonrpc: '2.0', id, result: result() }); });
-    return c.res;
-  } catch (error) {
-    if (!(error instanceof AppError)) throw error;
-    const fix = error.hints.fix ?? DEFAULT_ERROR_HINTS[error.code]?.fix ?? (error.code === 'unauthorized' ? AUTH_FIX : undefined);
-    const docs = error.hints.docs ?? DEFAULT_ERROR_HINTS[error.code]?.docs ?? (error.code === 'unauthorized' ? AUTH_DOCS : undefined);
-    return httpError(c, id, { code: error.code, message: error.message, ...(fix ? { fix } : {}), ...(docs ? { docs } : {}) }, error.status);
-  }
-}
 
 function initializeResult(c: Context<AppContext>, params: unknown) {
   const requested = isObject(params) ? params.protocolVersion : undefined;
@@ -168,6 +158,10 @@ function initializeResult(c: Context<AppContext>, params: unknown) {
   };
 }
 
+/**
+ * 先查验 Origin、协议版本与 Key（/v1 的 apiKeyAuth：一次 D1 读、计一次限流、写一条 POST /mcp 审计），
+ * 通过后才读请求体：无效 Key 拿不到读取和解析请求体的资源。鉴权在请求体之前，失败时还不知道 JSON-RPC id，按规范以 null 回。
+ */
 async function handle(c: Context<AppContext>, dispatch: Dispatch): Promise<Response> {
   const origin = c.req.header('Origin');
   if (origin && !originAllowed(c, origin)) return c.json(rpcError(null, INVALID_REQUEST, `不接受来自 ${origin} 的请求`), 403);
@@ -175,15 +169,25 @@ async function handle(c: Context<AppContext>, dispatch: Dispatch): Promise<Respo
   if (version !== undefined && !(MCP_PROTOCOL_VERSIONS as readonly string[]).includes(version)) {
     return c.json(rpcError(null, INVALID_REQUEST, `不支持的 MCP-Protocol-Version：${version}`, { supported: MCP_PROTOCOL_VERSIONS }), 400);
   }
-  if (Number(c.req.header('Content-Length')) > MAX_MCP_REQUEST_BYTES) {
-    return c.json(rpcError(null, INVALID_REQUEST, `请求体超过 ${Math.floor(MAX_MCP_REQUEST_BYTES / 1024 / 1024)}MB 上限`), 413);
-  }
   if (!bearerFormatOk(c)) return unauthorized(c, null, '缺少或非法的 API Key');
+  try {
+    await apiKeyAuth(c, async () => { c.res = await handleMessage(c, dispatch); });
+    return c.res;
+  } catch (error) {
+    if (!(error instanceof AppError)) throw error;
+    const fix = error.hints.fix ?? DEFAULT_ERROR_HINTS[error.code]?.fix ?? (error.code === 'unauthorized' ? AUTH_FIX : undefined);
+    const docs = error.hints.docs ?? DEFAULT_ERROR_HINTS[error.code]?.docs ?? (error.code === 'unauthorized' ? AUTH_DOCS : undefined);
+    return httpError(c, null, { code: error.code, message: error.message, ...(fix ? { fix } : {}), ...(docs ? { docs } : {}) }, error.status);
+  }
+}
 
+async function handleMessage(c: Context<AppContext>, dispatch: Dispatch): Promise<Response> {
   let message: unknown;
   try {
-    message = await c.req.json();
-  } catch {
+    // 按流读取并限制大小：chunked 请求没有 Content-Length，超限时立即中止
+    message = JSON.parse(await readBodyWithLimit(c, MAX_MCP_REQUEST_BYTES, `请求体超过 ${Math.floor(MAX_MCP_REQUEST_BYTES / 1024 / 1024)}MB 上限`));
+  } catch (error) {
+    if (error instanceof AppError) return c.json(rpcError(null, INVALID_REQUEST, error.message), error.status as ContentfulStatusCode);
     return c.json(rpcError(null, PARSE_ERROR, '请求体不是合法 JSON'), 400);
   }
   if (Array.isArray(message)) return c.json(rpcError(null, INVALID_REQUEST, '不支持 JSON-RPC 批量请求，每条消息单独 POST'), 400);
@@ -203,8 +207,8 @@ async function handle(c: Context<AppContext>, dispatch: Dispatch): Promise<Respo
   }
 
   switch (message.method) {
-    case 'initialize': return withApiKey(c, id, () => initializeResult(c, message.params));
-    case 'tools/list': return withApiKey(c, id, () => ({ tools: listTools() }));
+    case 'initialize': return c.json({ jsonrpc: '2.0', id, result: initializeResult(c, message.params) });
+    case 'tools/list': return c.json({ jsonrpc: '2.0', id, result: { tools: listTools() } });
     case 'ping': return c.json({ jsonrpc: '2.0', id, result: {} });
     case 'tools/call': return callTool(c, dispatch, id, message.params);
     default: return c.json(rpcError(id, METHOD_NOT_FOUND, `Method not found: ${message.method}`));

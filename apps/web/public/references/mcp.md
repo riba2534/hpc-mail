@@ -14,7 +14,7 @@
 
 - 地址：`https://hpc.email/mcp`，自部署时换成对应 origin。传输为 Streamable HTTP（协议版本 2025-11-25，也接受 2025-06-18、2025-03-26），每条 JSON-RPC 消息一个 POST，响应一律是 `application/json`。服务端无状态：不发会话 ID，不开 SSE（GET 返回 405），不支持 JSON-RPC 批量。
 - 认证：每个请求带 `Authorization: Bearer hpcm_…`，与 `/v1` 是同一把 API Key，在网页「API Key」页面创建并勾选需要的 scope。缺少或格式不对返回 HTTP 401。
-- 权限与限流同 REST：每次工具调用都转成对应的 `/v1` 请求，scope、IP 白名单、每分钟请求上限、外发日配额与审计都按那个 REST 端点计算，审计里记的是 `/v1` 路径。`initialize` 与 `tools/list` 各计一次请求，审计路径为 `/mcp`；`ping` 与通知不计。
+- 权限与限流同 REST：每个 `/mcp` 请求先校验 Key（状态、过期、IP 白名单），通过后才读取请求体，并计一次每分钟请求、写一条路径为 `/mcp` 的审计。工具调用转成对应的 `/v1` 请求执行，scope、Key 限定范围、外发日配额都按那个 REST 端点计算；这些内部请求沿用本次鉴权，不再计入速率，审计另记 `/v1` 路径。
 - 浏览器跨站请求带的 `Origin` 不是本站时返回 403；服务端客户端不带 `Origin`，不受影响。
 
 Claude Code：
@@ -44,9 +44,9 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 |---|---|---|---|
 | `get_me` | Key、所属用户、scopes、速率上限、今日外发用量，以及可认领新地址的 `domains` | `GET /v1/me`、`GET /v1/domains` | 任一有效 Key |
 | `list_identities` | 能发信的地址，`canSend=true` 的才能当 `from` | `GET /v1/identities` | `mail.send` 或 `mailbox.read` |
-| `list_mailboxes` | 自己认领的邮箱、id、邮件数、能否发信 | `GET /v1/mailboxes` | `mailbox.read` |
+| `list_mailboxes` | 分页列出自己认领的邮箱、id、邮件数、能否发信：`limit` 默认 50、最多 200，`nextCursor` 传回 `cursor` 翻页，`q` 按地址子串、`domain` 按域名过滤 | `GET /v1/mailboxes` | `mailbox.read` |
 | `claim_mailbox` | 认领 `localPart@domain`，可带 `strategy` | `POST /v1/mailboxes` | `mailbox.write` |
-| `release_mailbox` | 按 `mailboxId` 或 `address` 释放；`deleteHistory:true` 永久删除该地址全部邮件 | `DELETE /v1/mailboxes/:id` | `mailbox.write`，按 `address` 另需 `mailbox.read` |
+| `release_mailbox` | 按 `mailboxId` 或 `address` 释放（按地址时用地址过滤查出 id）；`deleteHistory:true` 永久删除该地址全部邮件 | `DELETE /v1/mailboxes/:id` | `mailbox.write`，按 `address` 另需 `mailbox.read` |
 | `send_email` | 发信，参数与 REST 发信请求体相同，另有 `idempotencyKey` | `POST /v1/messages` | `mail.send`，带 `replyToMessageId` 或 `forwardAttachmentsFrom` 另需 `mail.read` |
 | `reply_email` | 回复：服务端按原信填收件人、`Re: ` 主题、线程头与引用 | `POST /v1/messages/:id/reply` | `mail.send` 与 `mail.read` |
 | `search_messages` | 列表与搜索，从新到旧，`cursor` 翻页 | `GET /v1/messages` | `mail.read` |
@@ -64,7 +64,7 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 
 成功结果同时放在 `structuredContent`（对象）与 `content[0].text`（同一 JSON 的字符串）里。
 
-- `detailed`：与对应 REST 接口的 `data` 完全相同；数组包一层（`{mailboxes:[…]}`）。`get_message` 返回完整的 `bodyText`、`bodyHtml` 与 5 分钟有效的附件签名链接；`wait_for_message` 命中时带完整正文（等同 `include=body`）。
+- `detailed`：与对应 REST 接口的 `data` 相同；列表包一层（`{mailboxes:[…], nextCursor}`）。`get_message` 返回 `bodyText`、`bodyHtml` 与 5 分钟有效的附件签名链接，`wait_for_message` 命中时带正文（等同 `include=body`）。两者的 `bodyText`、`bodyHtml` 各自最多 100000 字符，超出时截断并带 `bodyTruncated: true` 与 `hint`；完整原文用 `GET /v1/messages/:id/raw` 下载 .eml，附件用 `GET /v1/messages/:id/attachments/:attId`。
 - `concise`：只留常用字段，空字段省略。邮件摘要为 `id,direction,address,from,fromName,subject,preview,verificationCode,verificationLink,isRead,hasAttachments,createdAt`，`preview` 最多 200 字符；`get_message` 返回纯文本 `text`（HTML 邮件自动转文本），超过 2000 字符截断并标 `textTruncated: true`，附件只列 `id,filename,mimeType,size`；发信结果为 `id,status,address,subject,recipientOutcomes,errorDetail`。
 
 工具执行失败（权限、参数、业务规则、限流）不会让请求出错，而是返回 `isError: true`：
@@ -82,12 +82,13 @@ curl -sS https://hpc.email/mcp -H "Authorization: Bearer $HPC_API_KEY" -H 'Conte
 | 请求体不是 JSON | 400 | -32700 |
 | 不是 JSON-RPC 2.0 消息、批量数组、`id` 不是字符串或数字 | 400 | -32600 |
 | `MCP-Protocol-Version` 头不受支持 | 400 | -32600 |
-| Key 缺失、无效、禁用或过期（工具调用时同样） | 401，带 `WWW-Authenticate` | -32001 |
-| `Origin` 不是本站；`initialize`/`tools/list` 时 API 关闭、IP 不在白名单或用户停用 | 403 | -32600 / -32001 |
-| `initialize`/`tools/list` 超过速率上限 | 429 | -32001 |
-| 请求体超过 16 MiB + 64 KiB | 413 | -32600 |
+| Key 缺失、无效、禁用或过期 | 401，带 `WWW-Authenticate` | -32001 |
+| `Origin` 不是本站 | 403 | -32600 |
+| API 关闭、IP 不在白名单或用户停用 | 403 | -32001 |
+| 超过每分钟请求上限 | 429 | -32001 |
+| 请求体超过 16 MiB + 64 KiB（没有 `Content-Length` 的 chunked 请求同样按实际字节计） | 413 | -32600 |
 
--32001 的 `error.data` 带 `code`（REST 错误码）与可选的 `fix`、`docs`。
+-32001 的 `error.data` 带 `code`（REST 错误码）与可选的 `fix`、`docs`。Key 在读取请求体之前校验，这些错误与 413 的 `id` 为 null。
 
 ## 常用流程
 
