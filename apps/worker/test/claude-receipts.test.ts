@@ -288,6 +288,10 @@ describe('/v1/admin/claude 查询', () => {
       { domain: a, addresses: 3, paid: 2, suspended: 2, suspendedAddresses: [
         { address: `z@${a}`, suspendedAt: '2026-11-02T00:00:00.000Z' }, { address: `y@${a}`, suspendedAt: '2026-11-10T00:00:00.000Z' }] },
     ]);
+    // 重复参数与逗号分隔等价（与其他 /v1/admin 查询一致），不丢后面的值
+    expect(await get<ClaudeDomainFacts[]>(key, `/v1/admin/claude/domains?domains=${empty}&domains=${b.toUpperCase()}&domains=${a},${empty}`)).toEqual(result);
+    const [fromRepeated] = await get<ClaudeAddressFacts[]>(key, `/v1/admin/claude/addresses?addresses=nobody@${empty}&addresses=w@${b}`).then((rows) => rows.slice(1));
+    expect(fromRepeated?.address).toBe(`w@${b}`);
     expect((await get<unknown>(key, '/v1/admin/claude/domains', 400))).toBeUndefined();
     const tooMany = Array.from({ length: 201 }, (_, index) => `d${index}.test`).join(',');
     await get(key, `/v1/admin/claude/domains?domains=${tooMany}`, 400);

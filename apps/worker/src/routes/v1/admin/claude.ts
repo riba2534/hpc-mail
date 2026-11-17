@@ -1,6 +1,6 @@
 import { claudeAddressesQuerySchema, claudeDomainsQuerySchema } from '@hpc-mail/shared';
 import { Hono } from 'hono';
-import { ok, parseQuery } from '../../../lib/http.js';
+import { ok, parseListQuery } from '../../../lib/http.js';
 import { lookupClaudeAddresses, lookupClaudeDomains } from '../../../services/admin-lookup.js';
 import type { AppContext } from '../../../types.js';
 
@@ -8,12 +8,12 @@ import type { AppContext } from '../../../types.js';
 const app = new Hono<AppContext>();
 
 app.get('/domains', async (c) => {
-  const { domains } = parseQuery(c, claudeDomainsQuerySchema);
+  const { domains } = parseListQuery(c, claudeDomainsQuerySchema);
   return ok(c, await lookupClaudeDomains(c.env, domains));
 });
 
 app.get('/addresses', async (c) => {
-  const { addresses } = parseQuery(c, claudeAddressesQuerySchema);
+  const { addresses } = parseListQuery(c, claudeAddressesQuerySchema);
   return ok(c, await lookupClaudeAddresses(c.env, addresses));
 });
 
