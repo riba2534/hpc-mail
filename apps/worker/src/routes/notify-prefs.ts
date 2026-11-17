@@ -33,7 +33,7 @@ app.post('/jobs/:id/retry', async (c) => {
 app.put('/', async (c) => {
   const user = c.get('user')!;
   const req = await parseBody(c, updateNotifyPrefsRequestSchema);
-  const { prefs, pending } = await updatePrefsWithForwardConfirmation(c.env, user, req, new URL(c.req.url).origin);
+  const { prefs, pending } = await updatePrefsWithForwardConfirmation(c.env, user, req, new URL(c.req.url).origin, c.get('sessionId')!);
   return ok(c, { ...maskUserNotifyPrefs(prefs), forwardPending: pending } satisfies NotifyPrefsView);
 });
 

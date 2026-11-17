@@ -377,10 +377,12 @@ export async function changePassword(
   env: Env,
   user: AuthUser,
   req: ChangePasswordRequest,
+  sessionId: string,
 ): Promise<ChangePasswordResponse> {
   const db = createDb(env);
-  // 原密码错误与重新验证同一节流（每用户 15 分钟 5 次，403 reauth_failed / 429）：拿到会话的人不能借改密爆破原密码
-  const old = await verifyOldPassword(env, user.id, req.oldPassword);
+  // 原密码错误与重新验证同一节流（每个会话 15 分钟 5 次，403 reauth_failed / 429）：拿到会话的人不能借改密爆破原密码，
+  // 也锁不住受害者在自己会话里改密
+  const old = await verifyOldPassword(env, { userId: user.id, sessionId }, req.oldPassword);
   const passwordHash = await hashPassword(req.newPassword);
   const update = db.update(users).set({ passwordHash,
     authVersion: sql`${users.authVersion} + 1` })
