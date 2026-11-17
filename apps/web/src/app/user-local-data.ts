@@ -1,6 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query';
 import { authApi } from '@/api/resources';
 import { clearAuthToken } from '@/lib/auth-token';
+import { safeStorage, storageKeys } from '@/lib/local-storage';
 
 /**
  * 本机按账户保存的数据：`hpc-<名称>:<uid>[:...]`（写信草稿、发送凭据、信任显示图片的发件人、
@@ -13,17 +14,8 @@ const userKeyPattern = (userId: number) => new RegExp(`^hpc-[a-z-]+:(?:v\\d+:)?$
  * 会话过期（401）不经过这里，草稿保留到重新登录。
  */
 export function clearUserLocalData(userId: number): void {
-  try {
-    const pattern = userKeyPattern(userId);
-    const keys: string[] = [];
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index);
-      if (key && pattern.test(key)) keys.push(key);
-    }
-    for (const key of keys) localStorage.removeItem(key);
-  } catch {
-    // 存储不可用：本来也没有留下数据
-  }
+  const pattern = userKeyPattern(userId);
+  for (const key of storageKeys((key) => pattern.test(key))) safeStorage()?.removeItem(key);
 }
 
 /**
