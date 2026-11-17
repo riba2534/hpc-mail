@@ -48,7 +48,7 @@ HPC Mail 是一个完全跑在 Cloudflare 上的邮箱系统。它用 **Email Ro
 - **完整收发** — 回复线程化（In-Reply-To/References）、转发、CC/BCC、附件；外发走 Cloudflare `send_email`，在 Workers Paid 计划下可发送任意外部地址
 - **转发与通知到你常用的地方** — 每个用户独立配置：转发到任意外部邮箱（原生转发失败自动降级中转重发，带防环路守卫）、推送飞书卡片、回调通用 Webhook（Bark / ntfy / 自建）
 - **AI Agent 原生** — `/skill.md` 是一份部署在站点上的 Agent 操作说明书，`/v1/openapi.json` 提供 OpenAPI 3.1 描述
-- **push 即部署** — 一条 GitHub Actions 流水线：测试门控 → 构建 → 数据库迁移 → 部署 → 线上冒烟 → 收件金丝雀与 cron 心跳，任一失败自动回滚
+- **push 即部署** — 一条 GitHub Actions 流水线：测试门控 → 构建 → 数据库迁移 → 部署 → 线上冒烟 → cron 心跳（可选收件金丝雀），任一失败自动回滚
 
 ## 功能总览
 
@@ -123,7 +123,7 @@ flowchart LR
 | 前端 | React 19 · Vite · Tailwind CSS 4 · TanStack Query 5 · React Router 7 · Radix Primitives |
 | 契约 | pnpm workspace monorepo，`packages/shared` 提供前后端共享的 zod schema 与类型 |
 | 存储 | D1（业务数据）· KV（会话/配置缓存）· R2（附件与超大正文） |
-| CI/CD | GitHub Actions：测试门控 → 构建 → 资源注入 → 迁移与完整性校验 → 部署 → 线上冒烟 → 收件金丝雀 → cron 心跳 → 失败自动回滚 |
+| CI/CD | GitHub Actions：测试门控 → 构建 → 资源注入 → 迁移与完整性校验 → 部署 → 线上冒烟 → 收件金丝雀（可选）→ cron 心跳 → 失败自动回滚 |
 
 ## 快速开始
 
@@ -238,17 +238,18 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 | Variable | `CUSTOM_DOMAIN` | 站点域名（Worker custom domain，不含 `https://`） |
 | Variable | `ADMIN_USERNAME` | 管理员用户名（3–32 位小写字母/数字/`-`/`_`） |
 | Secret（可选） | `CF_HOSTED_DOMAINS_TOKEN` | 开启「托管域名」：用户添加自己的域名时，Worker 用它在你的 Cloudflare 账户建 zone 并开通收发。不设置则该功能隐藏。权限见下方说明 |
-| Variable（可选） | `DEPLOY_CANARY` | 设为 `off` 跳过部署后的收件金丝雀。金丝雀经 `send_email` 外发一封信到系统域名、确认新版本收到；Workers Free 计划只能发往已验证地址，需要设为 `off`。还没添加系统域名时自动跳过 |
-| Variable（可选） | `CANARY_FROM_DOMAIN` / `CANARY_TO_DOMAIN` | 指定金丝雀的发件 / 收件域名（须在系统域名列表内）；默认取系统域名按字母序的前两个 |
+| Variable（可选） | `CANARY_FROM_DOMAIN` / `CANARY_TO_DOMAIN` | 两个都设置即启用部署后的**收件金丝雀**：经 `send_email` 从发件域外发一封信到收件域，确认新版本的收件链路可用（两个域名须在系统域名列表内，收件域已配好 catch-all）。默认不启用；Workers Free 计划只能发往已验证地址，不要启用 |
+| Variable（可选） | `DEPLOY_CANARY` | `on`：启用金丝雀并由服务端取系统域名按字母序的前两个；`off`：一律跳过 |
+| Secret（可选） | `ADMIN_TOTP_SECRET` | 管理员 TOTP 种子（base32）。管理员开了两步验证后，部署冒烟用它算验证码登录，保住管理员检查；不设则跳过管理员检查 |
 | Variable（可选） | `PLACEMENT_REGION` | Worker 放置区域，填 D1 主库附近的云区域（如主库在美西填 `aws:us-west-1`，在新加坡填 `aws:ap-southeast-1`）。设置后 API 请求在数据库附近执行，每个请求只跨一次远程；不设则在离用户最近的节点执行。D1 主库位置在建库时用 `wrangler d1 create --location <wnam/enam/weur/apac…>` 指定，应选在多数访问的入口节点附近（Cloudflare 日志里的 colo） |
 
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
 >
 > **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。
 
-> 仓库公开时 Actions 日志也公开。`CLOUDFLARE_ACCOUNT_ID`、`D1_DATABASE_ID`、`KV_NAMESPACE_ID`、`ADMIN_USERNAME` 在工作流第一步就被屏蔽，之后的日志里显示为 `***`。只有第一步的环境变量回显仍是明文；想完全不出现，把它们改配成同名 **Secret**（优先于 Variable）。
+> 仓库公开时 Actions 日志也公开。`CLOUDFLARE_ACCOUNT_ID`、`D1_DATABASE_ID`、`KV_NAMESPACE_ID` 与 6 位及以上的 `ADMIN_USERNAME` 在工作流第一步就被屏蔽，之后的日志里显示为 `***`（更短的用户名如 `admin` 不屏蔽，否则日志里所有同样的词都会被打码）。第一步的环境变量回显仍是明文；想让它们完全不出现在日志里，把这四项改配成同名 **Secret**（工作流优先读 Secret，读不到才用 Variable）。
 
-**3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 由迁移从零建表。此后每次 push 到 `main` 自动部署：部署前记录当前线上版本，冒烟、收件金丝雀或 cron 心跳任一失败就自动回滚 Worker（数据库迁移不回滚），详见 [发布与回滚手册](docs/ROLLBACK.md)。部署还会自动创建一个普通用户 `ci-smoke` 供冒烟登录，不要删除或禁用它；管理员账号因此可以放心开启两步验证。
+**3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 由迁移从零建表。此后每次 push 到 `main` 自动部署：部署前记录当前线上版本，冒烟、cron 心跳或（启用时的）收件金丝雀任一失败就自动回滚 Worker（数据库迁移不回滚），详见 [发布与回滚手册](docs/ROLLBACK.md)。部署还会自动创建一个普通用户 `ci-smoke`（系统保留用户名）供冒烟登录，不要删除、禁用它或给它认领邮箱；管理员账号因此可以放心开启两步验证（想保留管理员检查就配置 `ADMIN_TOTP_SECRET`）。
 
 > 首次部署若在「线上冒烟」步骤超时，通常是 custom domain 边缘证书还在签发——等一分钟重跑 workflow 即可（各步骤幂等）。
 
@@ -304,12 +305,12 @@ git fetch upstream && git merge upstream/main && git push          # push 即触
 
 ### 备份与恢复
 
-以下 wrangler 命令在仓库根目录执行（`apps/worker/wrangler.toml` 里的 D1 id 是占位符，在那里执行会解析失败）。
+以下 wrangler 命令在 `apps/worker` 目录用 `pnpm exec wrangler` 执行（仓库锁定版本）。D1 命令加 `--cwd "$(mktemp -d)"`：`wrangler.toml` 里的 D1 id 是占位符，不加会解析到占位符而失败；此时相对路径也按那个临时目录解析，输出文件请写绝对路径。
 
-- **D1（核心数据，必备）**：`wrangler d1 export hpc-cloud-mail-db --remote --output backup.sql`；同账号内倒回某个时间点优先用 Time Travel（见上方手册）
+- **D1（核心数据，必备）**：`pnpm exec wrangler d1 export hpc-cloud-mail-db --remote --output "$PWD/backup.sql" --cwd "$(mktemp -d)"`；同账号内倒回某个时间点优先用 Time Travel（见上方手册）
 - **R2（附件与超大正文）**：用 `wrangler r2 object get` 或 rclone 按需同步
 - **KV**：只存会话与缓存，无需备份（丢失只是全员重新登录）
-- **换 Cloudflare 账号搬迁**：新账号照部署步骤建资源 → 更新 GitHub Variables 里的账户/资源 ID → `wrangler d1 execute hpc-cloud-mail-db --remote --file backup.sql` 导入 → 部署后在管理后台把域名列表写回
+- **换 Cloudflare 账号搬迁**：新账号照部署步骤建资源 → 更新 GitHub Variables 里的账户/资源 ID → `pnpm exec wrangler d1 execute hpc-cloud-mail-db --remote --file "$PWD/backup.sql" --cwd "$(mktemp -d)"` 导入 → 部署后在管理后台把域名列表写回
 
 ## FAQ
 
