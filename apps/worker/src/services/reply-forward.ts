@@ -1,5 +1,6 @@
 import {
   MAX_BODY_BYTES,
+  MAX_RECIPIENTS,
   domainSchema,
   formatMailAddress,
   localPartSchema,
@@ -37,11 +38,27 @@ export function fromRequiredError(address: string): AppError {
   });
 }
 
-/** 主题前缀：已带同类前缀不重复加；超出主题上限时截断 */
+/** 主题上限：与发信 schema 的 998 一致，按 UTF-8 字节计，同时满足字符数上限与邮件头的单行字节限制 */
+const MAX_SUBJECT_BYTES = 998;
+
+/** 按 UTF-8 字节截断，只在完整字符（码点）之间切，不留半个代理对 */
+function clipUtf8(value: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const char of value) {
+    const cp = char.codePointAt(0)!;
+    bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+    if (bytes > maxBytes) break;
+    end += char.length;
+  }
+  return value.slice(0, end);
+}
+
+/** 主题前缀：已带同类前缀不重复加；加上前缀后超出主题上限时截断（原信主题最长可到 2048 字符） */
 function prefixed(subject: string, prefix: 'Re' | 'Fwd'): string {
   const trimmed = subject.trim() || '(无主题)';
   const pattern = prefix === 'Re' ? /^re:/i : /^(fwd?|转发):/i;
-  return (pattern.test(trimmed) ? trimmed : `${prefix}: ${trimmed}`).slice(0, 998);
+  return clipUtf8(pattern.test(trimmed) ? trimmed : `${prefix}: ${trimmed}`, MAX_SUBJECT_BYTES).trimEnd();
 }
 
 function formatTime(date: Date): string {
@@ -192,6 +209,12 @@ export async function composeReply(
   let cc = [...new Set(others.map(lower))].filter((address) => !self.has(address) && !taken.has(address)).map((address) => ({ address, name: '' }));
   if (!to.length) [to, cc] = [cc, []];
   if (!to.length) throw new AppError('validation_failed', '原邮件没有可回复的收件人', { fix: '改用 POST /v1/messages 自己填写收件人，并带 replyToMessageId 保持线程' });
+  // 原信的 Reply-To/To/Cc 由发件方决定（入站每类最多存 200 个），回复不能借此突破单封收件人上限
+  if (to.length + cc.length > MAX_RECIPIENTS) {
+    throw new AppError('validation_failed', `收件人合计不能超过 ${MAX_RECIPIENTS} 个`, {
+      fix: `原信的收件人超过单封上限：改用 POST /v1/messages 自己选不超过 ${MAX_RECIPIENTS} 个收件人，并带 replyToMessageId 保持线程`,
+    });
+  }
 
   let text = req.text ?? '';
   let html = req.html ?? '';

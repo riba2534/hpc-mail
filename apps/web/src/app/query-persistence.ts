@@ -5,6 +5,7 @@ import { queryKeys } from '@/api/query-keys';
 import { inboxListQuery, parseInboxFilters } from '@/features/inbox/inbox-query';
 import type { MessageListData } from '@/features/inbox/message-cache';
 import { getAuthRevision, getAuthToken, subscribeAuthToken } from '@/lib/auth-token';
+import { safeStorage, storageKeys } from '@/lib/local-storage';
 import { isObject, readTokenClaims } from '@/lib/token-claims';
 
 /**
@@ -61,28 +62,12 @@ interface StoredEntry {
   updatedAt: number;
 }
 
-function storage(): Storage | null {
-  try {
-    return globalThis.localStorage ?? null;
-  } catch {
-    return null;
-  }
-}
 
-function persistedKeys(): string[] {
-  const store = storage();
-  if (!store) return [];
-  const keys: string[] = [];
-  for (let index = 0; index < store.length; index += 1) {
-    const key = store.key(index);
-    if (key?.startsWith(QUERY_CACHE_PREFIX)) keys.push(key);
-  }
-  return keys;
-}
+const persistedKeys = () => storageKeys((key) => key.startsWith(QUERY_CACHE_PREFIX));
 
 /** 删除所有账户的持久缓存（退出登录、401、切换账户），下一个使用这台电脑的人看不到上一位的邮件 */
 export function clearPersistedQueryCache(): void {
-  const store = storage();
+  const store = safeStorage();
   for (const key of persistedKeys()) {
     try {
       store?.removeItem(key);
@@ -106,7 +91,7 @@ export function restoreQueryCache(client: QueryClient, now = Date.now()): boolea
     return false;
   }
   const storageKey = queryCacheStorageKey(claims.sub);
-  const store = storage();
+  const store = safeStorage();
   // 其他账户与旧版本的残留一并清掉
   for (const key of persistedKeys()) if (key !== storageKey) store?.removeItem(key);
   // token 已过期时服务端必然 401：不先闪现旧收件箱再跳登录页
@@ -173,10 +158,10 @@ export function writeQueryCache(client: QueryClient, now = Date.now()): void {
   }
   const key = queryCacheStorageKey(claims.sub);
   try {
-    storage()?.setItem(key, `{"savedAt":${now},"entries":{${parts.join(',')}}}`);
+    safeStorage()?.setItem(key, `{"savedAt":${now},"entries":{${parts.join(',')}}}`);
   } catch {
     // 配额不足等：宁可不留，也不留半截旧数据
-    storage()?.removeItem(key);
+    safeStorage()?.removeItem(key);
   }
 }
 

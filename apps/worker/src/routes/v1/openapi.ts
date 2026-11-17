@@ -1,7 +1,7 @@
 import { API_SCOPES, MAX_BATCH_SEND_ITEMS, MAX_WAIT_ADDRESSES } from '@hpc-mail/shared';
 import {
-  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, composeOperation, conditionalDetail, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, idempotencyHeader, identitiesDescription,
-  int, listQuery, mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, operation, optionalPageQuery, positiveId, query, ref,
+  array, arrayOrPage, bool, boolFlag, changed, claimStrategy, clientRequestIdRule, composeOperation, conditionalDetail, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, idempotencyHeader, identitiesDescription,
+  int, listQuery, mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, operation, optionalPageQuery, positiveId, query, ref, roleEnum,
   scopeQuery, sendMailOperation, specInfo, specificationOperation, str, uploadPaths, usedExamples, usedSchemas, type Paths,
 } from '../openapi-common.js';
 import { accountKeyPaths } from '../openapi-account.js';
@@ -13,7 +13,7 @@ export function buildOpenApiSpec(origin: string) {
   const paths: Paths = {
     '/openapi.json': { get: specificationOperation() },
     '/status': { get: operation('getStatus', 'Check API key access', object({ status: { type: 'string', const: 'operational' }, userId: positiveId,
-      role: { type: 'string', enum: ['admin', 'user'], description: 'The role this key acts with (admin only with the admin scope on an administrator account).' },
+      role: { ...roleEnum, description: 'The role this key acts with (admin only with the admin scope on an administrator account).' },
       scopes: array({ type: 'string', enum: [...API_SCOPES] }) }),
       { example: { status: 'operational', userId: 3, role: 'user', scopes: ['mail.read', 'mail.send'] }, description: 'Requires an active API key and enabled API. No additional scope. This confirms access, not end-to-end mail delivery. userId identifies the key owner; GET /identities lists the addresses this key can send from, and GET /me adds key details, rate limits and today’s outbound usage. Revoked keys, including those revoked by a password change or administrator password reset, return 401 like unknown keys.' }) },
     '/me': { get: operation('getCurrentApiKey', 'Describe this API key, its owner, limits and today’s outbound usage', ref('ApiKeySelf'), {
@@ -24,7 +24,7 @@ export function buildOpenApiSpec(origin: string) {
     '/domains': { get: operation('listDomains', 'List configured domains available to this user', object({ domains: array(str) }),
       { example: { domains: ['example.org', 'alice.dev'] }, description: 'Domains the key owner may claim new addresses on. No additional scope. Ordinary users see public domains or their dedicated mailboxPolicy domains, including explicitly granted private domains; administrators see all configured domains. Active hosted domains follow the system domains: those the key owner owns or was granted (see GET /hosted-domains), or every active hosted domain for administrators. Claim only a returned domain. Removed domains remain usable for existing owned mailbox identities but are absent from this new-claim list.' }) },
     '/mailboxes': {
-      get: operation('listMailboxes', 'List owned mailboxes', arrayOrPage(ref('Mailbox')), { scope: 'mailbox.read', parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator-only, explicit all=1 lists every owner. Default lists caller-owned mailboxes.'),
+      get: operation('listMailboxes', 'List owned mailboxes', arrayOrPage(ref('Mailbox')), { scope: 'mailbox.read', parameters: [query('all', boolFlag, 'Administrator-only, explicit all=1 lists every owner. Default lists caller-owned mailboxes.'),
         ...mailboxSearchQuery, ...optionalPageQuery], description: mailboxListDescription }),
       post: operation('claimMailbox', 'Claim a mailbox in an existing configured domain', ref('Mailbox'), { errors: ['AddressTaken', 'ClaimQuota', 'ClaimDomainForbidden', 'ClaudeSuspended'], request: 'ClaimMailboxRequest', scope: 'mailbox.write', status: 201,
         description: 'Use a domain returned by GET /domains. Does not register a domain or provision DNS. Ordinary users obey system reserved-prefix restrictions and their effective public or dedicated domain/total/per-domain quotas. Dedicated policies replace public limits. Claiming inherits all historical mail at this address. A concurrent domain or user permission change returns 409. Existing owned mailboxes remain usable after permissions tighten. Optional strategy=claude rejects any domain with a historical Claude suspension with 403 forbidden, including for administrators and hosted domains; checked atomically at insertion. Omitted or uniform preserves ordinary claims.' }),
@@ -38,7 +38,7 @@ export function buildOpenApiSpec(origin: string) {
       description: 'Advisory and not a reservation. Uses the same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit, domain_unavailable or claude_suspended. A subsequent claim still re-checks everything, including concurrent ownership.' }) },
     '/mailboxes/{id}': {
       put: operation('updateMailbox', 'Update mailbox display name', ref('Mailbox'), { scope: 'mailbox.write', request: 'UpdateMailboxRequest' }),
-      delete: operation('releaseMailbox', 'Release a mailbox', object({ success: bool, deletedMessages: int }), { scope: 'mailbox.write', parameters: [query('deleteHistory', { type: 'string', enum: ['1', 'true', '0', 'false'] })],
+      delete: operation('releaseMailbox', 'Release a mailbox', object({ success: bool, deletedMessages: int }), { scope: 'mailbox.write', parameters: [query('deleteHistory', boolFlag)],
         description: 'Default retains all history and a future claimant inherits it. deleteHistory=1 atomically removes the address history and ownership. Already delivered external download links retain their promised 90-day lifetime. Owner or administrator only.' }),
     },
     '/messages': {
@@ -66,7 +66,7 @@ export function buildOpenApiSpec(origin: string) {
         query('afterId', { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }), query('timeout', { type: 'integer', minimum: 1, maximum: 50, default: 25 }),
         query('from', { type: 'string', maxLength: 254 }, 'Sender filter, case-insensitive: a full address for an exact match, or @domain to match that exact domain suffix (subdomains are not included).'),
         query('subjectContains', { type: 'string', minLength: 1, maxLength: 200 }, 'Case-insensitive subject substring.'),
-        query('hasCode', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Only messages whose returned verificationCode is non-empty. A just-arrived message without a code is held for up to 30 seconds while asynchronous AI extraction may still fill it.'),
+        query('hasCode', boolFlag, 'Only messages whose returned verificationCode is non-empty. A just-arrived message without a code is held for up to 30 seconds while asynchronous AI extraction may still fill it.'),
         ...scopeQuery],
       description: 'Returns the earliest inbound id > afterId that matches every supplied filter, skipping non-matching mail, or message:null on timeout. A new message whose attachments are still being stored (status pending) is never skipped: scanning stops before it and scannedThroughId stays below its id until a later call. Default scope is caller-owned/shared inbound; administrator may explicitly select unclaimed or user with userId. Poll every two seconds internally; maximum 120 polls per user per minute. Persist message.id (or scannedThroughId after a timeout) as the next afterId only after processing.' }) },
     '/messages/read': { post: operation('markMessagesRead', 'Mark selected owned messages read or unread', changed, { request: 'MarkReadRequest', scope: 'mail.write', parameters: mutationQuery,

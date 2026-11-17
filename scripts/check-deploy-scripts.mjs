@@ -59,6 +59,9 @@ const OPENAPI = {
     '/mailboxes/shares/{mailboxId}/grantees/{userId}': { delete: {} },
     '/mailboxes/share-users': { get: {} },
     '/admin/mailbox-shares': { put: { 'x-required-role': 'admin' } },
+    '/admin/system-domains/zones': { get: { 'x-required-role': 'admin' } },
+    '/admin/system-domains/onboardings': { post: { 'x-required-role': 'admin' } },
+    '/admin/system-domains/hidden-zones': { put: { 'x-required-role': 'admin' } },
   },
   components: {
     schemas: {
@@ -231,7 +234,7 @@ test('smoke：管理员未开两步验证时执行全部检查', async () => {
   assert.match(r.output, /冒烟账号 ci-smoke 真实登录/);
   assert.match(r.output, /普通用户无法访问管理接口/);
   assert.match(r.output, /管理员登出后旧 token 失效/);
-  assert.match(r.output, /冒烟全部通过（27 项）/);
+  assert.match(r.output, /冒烟全部通过（28 项）/);
   assert.doesNotMatch(r.output, /::(error|warning)::/, '成功路径不应有错误或告警');
   assert.ok(adminHits().some((h) => h.path === '/api/admin/settings'), '管理员检查应已执行');
   assert.equal(S.sessions.size, 0, '两个会话都应已登出');
@@ -253,7 +256,7 @@ test('smoke：配置 ADMIN_TOTP_SECRET 时算出验证码完成管理员登录�
   // 小写、带空格的种子也要能用（Authenticator 常见的展示格式）
   let r = await smoke({ ADMIN_TOTP_SECRET: TOTP_SECRET.toLowerCase().replace(/(.{4})/g, '$1 ') });
   assert.equal(r.status, 0, r.output);
-  assert.match(r.output, /冒烟全部通过（27 项）/);
+  assert.match(r.output, /冒烟全部通过（28 项）/);
   assert.ok(adminHits().some((h) => h.path === '/api/admin/settings'), '管理员检查应已执行');
   assert.ok(!r.output.toUpperCase().includes(TOTP_SECRET), '种子不能出现在输出里');
   const adminLogin = S.logins.find((l) => l.username === ADMIN.username);
@@ -263,7 +266,7 @@ test('smoke：配置 ADMIN_TOTP_SECRET 时算出验证码完成管理员登录�
   reset();
   r = await smoke({ ADMIN_TOTP_SECRET: TOTP_SECRET });
   assert.equal(r.status, 0, r.output);
-  assert.match(r.output, /冒烟全部通过（27 项）/);
+  assert.match(r.output, /冒烟全部通过（28 项）/);
 });
 
 test('smoke：管理员密码或种子与线上不符时告警并跳过管理员检查，不判失败', async () => {

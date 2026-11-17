@@ -8,7 +8,7 @@ import {
 } from '@hpc-mail/shared';
 import { Hono } from 'hono';
 import { AppError } from '../../lib/errors.js';
-import { clientIp, execCtx, ok, parseBody } from '../../lib/http.js';
+import { clientIp, ok, parseBody } from '../../lib/http.js';
 import { requireAdmin, requireAuth } from '../../middleware/auth.js';
 import { describeSettingsChange, logAdminAction } from '../../services/audit.js';
 import { getDomainClaudeStats } from '../../services/claim-plan.js';
@@ -32,7 +32,7 @@ app.put('/', async (c) => {
   const req = await parseBody(c, updateSettingsRequestSchema);
   if (req.domains && req.expectedDomainsRevision === undefined) throw new AppError('validation_failed', '更新域名需提供 expectedDomainsRevision');
   const before = await getSettingsFresh(c.env);
-  await updateSettings(c.env, req, execCtx(c));
+  await updateSettings(c.env, req);
   const settings = await getSettingsFresh(c.env);
   // 目标只记设置键（不含 expectedDomainsRevision），明细写变更摘要
   const { target, detail } = describeSettingsChange(before, settings, Object.keys(req));

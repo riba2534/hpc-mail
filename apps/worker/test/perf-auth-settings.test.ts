@@ -145,7 +145,7 @@ describe('settings 只用 isolate 内存缓存与 D1', () => {
     await env.kv.put('setting-cache', JSON.stringify({ ...DEFAULT_SETTINGS, site: { ...DEFAULT_SETTINGS.site, title: 'Stale KV Title' } }));
     const traced = tracedEnv();
     const ctx = createExecutionContext();
-    const first = await getSettings(traced.env, ctx);
+    const first = await getSettings(traced.env);
     await waitOnExecutionContext(ctx);
     expect(first).toEqual(await getSettingsFresh(env));
     expect(first.site.title).not.toBe('Stale KV Title');
@@ -164,13 +164,11 @@ describe('settings 只用 isolate 内存缓存与 D1', () => {
     invalidateSettingsMemory();
     const before = await getSettings(env);
     const traced = tracedEnv();
-    const { ctx, pending } = collectingCtx();
-    await updateSettings(traced.env, { site: { ...before.site, title: 'Perf Updated Title' } }, ctx);
+    await updateSettings(traced.env, { site: { ...before.site, title: 'Perf Updated Title' } });
     expect((await getSettings(env)).site.title).toBe('Perf Updated Title');
     await updateSettings(traced.env, { site: before.site });
     expect((await getSettings(env)).site.title).toBe(before.site.title);
     expect(traced.kvCalls).toEqual([]);
-    expect(pending).toEqual([]);
   });
 
   it('失效前发出、失效后才返回的读取不回填缓存', async () => {

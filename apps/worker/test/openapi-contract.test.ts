@@ -425,6 +425,17 @@ describe('Agent 接口第 1 期反映在 OpenAPI 中', () => {
       .map(operation => (operation.parameters as Array<{ name: string; description: string }>).find(param => param.name === 'cursor')!.description);
     for (const description of cursors) expect(description).toContain('400 validation_failed');
   });
+
+  it('只列服务端实际处理的参数与错误：sync 不列 cursor/afterId，回复/转发的 404 只有 source_unavailable', () => {
+    const sync = (specs.api.paths['/messages/sync']!.get!.parameters as Array<{ name: string }>).map(param => param.name);
+    expect(sync).not.toContain('cursor');
+    expect(sync).not.toContain('afterId');
+    expect(sync).toEqual(expect.arrayContaining(['q', 'limit', 'scope']));
+    for (const [op, example] of [['reply', 'SourceUnavailableReply'], ['forward', 'SourceUnavailableForward']] as const) {
+      const notFound = (specs.v1.paths[`/messages/{id}/${op}`]!.post!.responses as Record<string, { content: Record<string, { examples: object }> }>)['404']!;
+      expect(Object.keys(notFound.content['application/json']!.examples)).toEqual([example]);
+    }
+  });
 });
 
 describe('第 1 期发信契约在两份 OpenAPI 与 Agent 文档中一致', () => {

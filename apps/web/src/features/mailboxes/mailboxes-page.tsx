@@ -246,7 +246,7 @@ export function MailboxesPage() {
   const isMobile = useIsMobile();
   const domainsQuery = useDomains();
   const { data: visibleDomains } = domainsQuery;
-  const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery(false);
+  const { data: mailboxes, isLoading, isError, error, refetch } = useMailboxesQuery();
   const shared = useSharedMailboxesQuery();
   const [searchParams, setSearchParams] = useSearchParams();
   const [claimOpen, setClaimOpen] = useState(false);

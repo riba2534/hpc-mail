@@ -207,7 +207,7 @@ export async function translateMessage(
   id: number,
   segments: string[],
 ): Promise<MessageTranslation> {
-  const settings = await getSettings(env, ctx);
+  const settings = await getSettings(env);
   if (!isTranslationReady(settings)) throw new AppError('forbidden', '管理员未启用 AI 翻译');
   const config = settings.ai_model;
 

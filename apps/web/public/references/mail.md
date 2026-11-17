@@ -9,7 +9,7 @@
 - [维护状态与回收站](#维护状态与回收站)：已读、全部已读、星标、删除、恢复、永久删除
 - [发送](#发送)：请求字段，[发件身份](#发件身份)、[收件人与显示名](#收件人与显示名)、[自定义邮件头](#自定义邮件头)、[结果与状态](#结果与状态)、[幂等与重试](#幂等与重试)、[回复和转发](#回复和转发)（`/v1` 回复与转发接口、回复站外邮件）、[部分失败补发](#部分失败补发)、[批量发送](#批量发送)
 
-shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`API`、`AUTH`。邮件读/维护路径在 `/api` 与 `/v1` 相同；JWT 无 Key scope，Key 需下面的 scope。唯有发送是 `/api/messages/send` 对应 `/v1/messages`，长轮询仅 `/v1`。
+shell 示例复用 [入口指南](../skill.md) 的 `hpc()`、`BASE`、`UA`、`API`、`AUTH`。邮件读/维护路径在 `/api` 与 `/v1` 相同；JWT 无 Key scope，Key 需下面的 scope。发送是 `/api/messages/send` 对应 `/v1/messages`；长轮询、回复与转发接口、批量发送只在 `/v1`，翻译与 `sync` 只在 `/api`。
 
 ## 读取与搜索
 
@@ -122,7 +122,7 @@ hpc '/messages' --get --data-urlencode 'direction=outbound' --data-urlencode 'to
 | `subjectContains` | 主题包含该文本，1–200 字符 |
 | `hasCode=1` | 只要返回的 `verificationCode` 非空的邮件；管理员开启 AI 兜底并配置了 AI 模型时，刚到且暂无码的邮件会被保留最多约 30 秒等待异步 AI 补码，期间不越过它 |
 
-返回基线之后**最早一封满足过滤**的未删除 inbound，跳过不满足的邮件；超时返回 `message:null`。`scannedThroughId` 是本次已检查到的最大 ID：命中时等于 `message.id`，未命中时是最后一封被跳过的邮件 ID，没有新邮件时等于 `afterId`。处理完命中邮件后以其 ID 为新基线；超时则以 `scannedThroughId` 为新基线，被跳过的邮件不会再出现。附件仍在保存（`status=pending`）的新来信不会被越过：扫描停在它之前，`scannedThroughId` 不包含它，下一轮再返回或判定。不传过滤时行为与旧版一致（未必有验证码），需自行检查发件人/主题。用总截止时间限制全部请求。普通账户仅个人/共享可见范围，Key 仅需 `mail.read`。
+返回基线之后**最早一封满足过滤**的未删除 inbound，跳过不满足的邮件；超时返回 `message:null`。`scannedThroughId` 是本次已检查到的最大 ID：命中时等于 `message.id`，未命中时是最后一封被跳过的邮件 ID，没有新邮件时等于 `afterId`。处理完命中邮件后以其 ID 为新基线；超时则以 `scannedThroughId` 为新基线，被跳过的邮件不会再出现。附件仍在保存（`status=pending`）的新来信不会被越过：扫描停在它之前，`scannedThroughId` 不包含它，下一轮再返回或判定。不传过滤时返回任何新来信（未必有验证码），需自行检查发件人/主题。用总截止时间限制全部请求。普通账户仅个人/共享可见范围，Key 仅需 `mail.read`。
 
 `verificationLink` 只是辅助识别，来源是不可信的邮件正文：打开前核对链接主机属于本次验证的服务（点击追踪域名先确认跳转目标），只在用户授权完成该验证时访问一次，不在日志或报告中公开链接全文；为空时读取详情正文自行判断，不要猜测或拼接链接。
 
@@ -234,10 +234,10 @@ if not matched:
 | `headers` | 可选对象 `{名称:取值}`，只允许 `X-*` 与白名单头，见[自定义邮件头](#自定义邮件头) |
 | `replyToMessageId` | 可选站内邮件 ID，服务器据此写 In-Reply-To/References；不自动填收件人/主题/正文。不能与 `headers` 的 `In-Reply-To`/`References` 同时给（400） |
 | `forwardAttachmentsFrom` | 可选站内来源 ID，复制其全部附件（含内嵌图）；不自动填正文、主题或目标 |
-| `attachments` | 可选附件数组：base64 项 `{filename,contentType,content,contentId?,disposition?}`（合计解码后最多 10 MiB），或 URL 项 `{url,filename?,contentType?,contentId?,disposition?}` 由服务端拉取（见 [URL 附件](attachments.md#url-附件)）；带 `contentId` 即内联图片，见[附件参考](attachments.md#内联图片) |
+| `attachments` | 可选附件数组：base64 项 `{filename,contentType,content,contentId?,disposition?}`，或 URL 项 `{url,filename?,contentType?,contentId?,disposition?}` 由服务端拉取（见 [URL 附件](attachments.md#url-附件)）；带 `contentId` 即内联图片，见[附件参考](attachments.md#内联图片) |
 | `attachmentTokens` | 可选已完成上传的 token 数组：字符串，或 `{token,contentId?,disposition?}` |
 
-附件各路（base64、URL、token、`forwardAttachmentsFrom`）合计最多 10 个、50 MiB。整个请求体超过 16 MiB 时在解析前返回 413 `payload_too_large`。例子是请求结构，地址、正文必须替换为用户确认的值并用 JSON 序列化器生成：
+附件个数、大小与请求体上限见[大小与数量限制](attachments.md#大小与数量限制)。例子是请求结构，地址、正文必须替换为用户确认的值并用 JSON 序列化器生成：
 
 ```json
 {"from":"Alice <alice@example.org>","to":["Bob <bob@example.net>",{"address":"li@example.net","name":"李雷"}],
@@ -307,7 +307,7 @@ hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,addre
 `recipientOutcomes` 每个去重后的收件人一项：`delivered`（站内已投递，或外部收件服务器已接收）、`sent`（外部已接受）、`failed`（`error` 为原因）、`bounced`（退信）、`complained`（已送达但被标为垃圾邮件）、`unknown`（结果不明，`error` 为原因，例如发信服务超时或「投递中断，结果未确认」，可能已经送达）。只有发信服务明确拒收（目标未验证、发信域未就绪、地址非法、超出限额等）才记 `failed`；无法判断的错误一律记 `unknown`，避免诱导重复投递。`bounced`、`complained` 与外部的 `delivered` 来自[投递回执](#投递回执)。外部收件人最多 4 路并发投递，每完成一个就回填，所以 `pending` 的邮件可能已有部分结果。
 
 - **201**：至少一个收件人成功，或没有成功但有结果不明的收件人（`status:"unknown"`）。`errorDetail` 为空即全部成功；部分失败时为「部分收件人失败: 地址: 原因; …」，有结果不明的收件人时为「…投递结果未确认，可能已送达，补发前先向收件人核对: …」。按[部分失败补发](#部分失败补发)处理：只补发 `failed`，`unknown` 先核对。
-- **422 `delivery_failed`**：每个收件人都明确失败，什么也没发出——发信服务逐个拒收，或服务端在开始投递前就出错（例如附件保存失败，此时每个收件人的 `error` 写明原因）。message 为「全部收件人投递失败: …」，`error.details` 为 `{messageId,recipientOutcomes}`，`messageId` 是已记录的发件行（`direction=outbound` 列表里可见）。这次不占当日外发配额，上传的草稿附件保留，可以再次引用。同 Key 重试返回同一个 422；修正后用新 Key 重发。
+- **422 `delivery_failed`**：每个收件人都明确失败，什么也没发出——发信服务逐个拒收，或服务端在开始投递前就出错（例如附件保存失败，此时每个收件人的 `error` 写明原因）。message 为「全部收件人投递失败: …」，`error.details` 为 `{messageId,recipientOutcomes}`，`messageId` 是已记录的发件行（`direction=outbound` 列表里可见）。这次不占当日外发配额，用到的上传附件保留，可以再次引用。同 Key 重试返回同一个 422；修正后用新 Key 重发。
 - 首次响应与同 Key 重放一致（状态码、`status`、`recipientOutcomes`）。极少数情况下结果写库多次失败，同 Key 重试会一直返回 409 `send_in_progress`，直到 1 小时后被标为 `unknown`；这期间到已发送列表核对，不要换 Key 重发。
 
 #### 投递回执
@@ -321,7 +321,7 @@ hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,addre
 | `bounced` | 收件服务器退信（`event:"bounced"`）；`error` 为 SMTP 应答或退信原因，`smtpStatus` 如 `550 5.1.1` |
 | `failed` | 明确失败：发送时被拒（`error` 为原因）；命中本站抑制名单（`code:"recipient_suppressed"`，没有发出，见[抑制名单](#抑制名单)）；或回执为 failed、rejected（`error` 为「Cloudflare 投递失败（原因）」或「Cloudflare 拒绝投递（原因：说明）」） |
 | `complained` | 已送达，但收件人把邮件标为垃圾邮件（`event:"complained"`）；不算失败，没有 `error` |
-| `unknown` | 投递中断，结果未回填，见上文 |
+| `unknown` | 结果不明（发信服务超时、网络错误或投递中断），见上文 |
 
 回写过的收件人还带 `event`（最近一次回执：`delivered`、`bounced`、`failed`、`rejected`、`complained`）、`eventAt`（事件时间，ISO 8601）和 `smtpStatus`（事件带应答码时才有）。只采用比已有 `eventAt` 更新的事件，乱序或重复的回执不会把结果改回去。
 
@@ -443,7 +443,7 @@ jq -n --slurpfile original message.json --arg from "$HPC_FROM" \
 
 ### 部分失败补发
 
-获取完整原详情，以 `recipientOutcomes.status=failed`（带 `code:"recipient_suppressed"` 的除外；`bounced` 的地址已进抑制名单，对方恢复前不补发，见[抑制名单](#抑制名单)）筛原 `recipients.to/cc/bcc` 各数组，新的请求只保留失败地址，`to` 可为空，保持原分组；原 HTML/text 与 `replyToMessageId` 上下文按需要保留，附件通过 `forwardAttachmentsFrom=原 outbound ID` 复制，不引用已消费的旧 Tokens。这是新的发送，使用新持久化 Key。原邮件的附件曾被转成下载链接时，沿用原正文即可：服务器会先去掉正文里本站注入的「附件下载」区块，再按本次大小决定是否重新生成，不会出现两段。
+获取完整原详情，以 `recipientOutcomes.status=failed`（带 `code:"recipient_suppressed"` 的除外；`bounced` 的地址已进抑制名单，对方恢复前不补发，见[抑制名单](#抑制名单)）筛原 `recipients.to/cc/bcc` 各数组，新的请求只保留失败地址，`to` 可为空，保持原分组；原 HTML/text 与 `replyToMessageId` 上下文按需要保留，附件通过 `forwardAttachmentsFrom=原 outbound ID` 复制，不引用已消费的旧 Tokens。这是新的发送，使用新持久化 Key。原邮件的附件曾被转成下载链接时沿用原正文即可，见[外发大附件](attachments.md#外发大附件与保留)。
 
 - `status=unknown` 或某个收件人为 `unknown`：投递中断，结果未确认，对方可能已经收到。先向用户或收件人确认，确认没收到的再按上面的方法补发，不要把 `unknown` 当成 `failed` 直接重发。
 - 仍是 `pending`、没有逐收件人结果时先等待并核实，不全体重发。

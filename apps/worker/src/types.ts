@@ -63,7 +63,6 @@ export interface AppVariables {
   authEpoch?: number;
   apiKey?: ApiKeyContext;
   apiClientIp?: string;
-  apiStartedAt?: number;
 }
 
 /** Hono 泛型上下文 */

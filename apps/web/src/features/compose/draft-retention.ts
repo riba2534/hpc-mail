@@ -2,29 +2,19 @@
  * 草稿在本机的留存：按账户列出草稿、启动时回收遗弃的草稿。
  * 不引入 @hpc-mail/shared，外壳 chunk 可以静态引用而不带上契约包。
  */
+import { storageKeys } from '@/lib/local-storage';
 
 /** 写信草稿 key 的公共前缀：`hpc-compose-draft:<uid>`（旧版单 key）与 `hpc-compose-draft:<uid>:<场景>` */
 export const DRAFT_KEY_PREFIX = 'hpc-compose-draft:';
 /** 最后保存超过 30 天的草稿视为遗弃 */
 export const DRAFT_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 
-function draftKeys(): string[] {
-  try {
-    const keys: string[] = [];
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index);
-      if (key?.startsWith(DRAFT_KEY_PREFIX)) keys.push(key);
-    }
-    return keys;
-  } catch {
-    return [];
-  }
-}
+const localDraftKeys = () => storageKeys((key) => key.startsWith(DRAFT_KEY_PREFIX));
 
 /** 该账户在本机保存的未发送草稿（新建与各封邮件的回复/转发/重发） */
 export function userDraftKeys(userId: number): string[] {
   const own = `${DRAFT_KEY_PREFIX}${userId}`;
-  return draftKeys().filter((key) => key === own || key.startsWith(`${own}:`));
+  return localDraftKeys().filter((key) => key === own || key.startsWith(`${own}:`));
 }
 
 /**
@@ -33,7 +23,7 @@ export function userDraftKeys(userId: number): string[] {
  */
 export function purgeExpiredDrafts(now = Date.now()): number {
   let removed = 0;
-  for (const key of draftKeys()) {
+  for (const key of localDraftKeys()) {
     try {
       const raw = localStorage.getItem(key);
       let draft: unknown = null;

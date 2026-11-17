@@ -280,10 +280,11 @@ export const systemDomainZonesQuerySchema = z.object({
 });
 export type SystemDomainZonesQuery = z.infer<typeof systemDomainZonesQuerySchema>;
 
-export const systemDomainPrecheckQuerySchema = z.discriminatedUnion('mode', [
-  z.object({ mode: z.literal('new_zone'), domain: domainSchema }),
-  z.object({ mode: z.literal('existing_zone'), zoneId: cloudflareZoneIdSchema }),
-]);
+/** 接入目标：新建 zone（填域名）或账户里已有的 zone */
+const newZoneTarget = z.object({ mode: z.literal('new_zone'), domain: domainSchema });
+const existingZoneTarget = z.object({ mode: z.literal('existing_zone'), zoneId: cloudflareZoneIdSchema });
+
+export const systemDomainPrecheckQuerySchema = z.discriminatedUnion('mode', [newZoneTarget, existingZoneTarget]);
 export type SystemDomainPrecheckQuery = z.infer<typeof systemDomainPrecheckQuerySchema>;
 
 const fingerprintSchema = z.string().trim().min(1).max(128);
@@ -293,9 +294,10 @@ const acceptSchema = z.array(z.enum(SYSTEM_DOMAIN_ACKS)).max(SYSTEM_DOMAIN_ACKS.
  * 一键接入。服务端重新预检：没有需确认项，或 accept 覆盖全部需确认项且 fingerprint 一致时创建任务并立即开始；
  * 否则返回 409，error.details.precheck 带最新预检（计划与指纹）。同一域名、同一方式的进行中任务重放返回 200。
  */
+const ackShape = { fingerprint: fingerprintSchema.optional(), accept: acceptSchema };
 export const createSystemDomainOnboardingRequestSchema = z.discriminatedUnion('mode', [
-  z.object({ mode: z.literal('new_zone'), domain: domainSchema, fingerprint: fingerprintSchema.optional(), accept: acceptSchema }),
-  z.object({ mode: z.literal('existing_zone'), zoneId: cloudflareZoneIdSchema, fingerprint: fingerprintSchema.optional(), accept: acceptSchema }),
+  newZoneTarget.extend(ackShape),
+  existingZoneTarget.extend(ackShape),
 ]);
 export type CreateSystemDomainOnboardingRequest = z.input<typeof createSystemDomainOnboardingRequestSchema>;
 

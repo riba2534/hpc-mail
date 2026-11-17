@@ -1,7 +1,7 @@
 import { HOSTED_DOMAIN_STATUSES, MAX_ADMIN_MAILBOX_BATCH } from '@hpc-mail/shared';
 import {
-  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, conditionalDetail, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
-  mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref,
+  array, arrayOrPage, bool, boolFlag, changed, claimStrategy, clientRequestIdRule, conditionalDetail, describePaths, domainName, draftPaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
+  mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref, syncQuery,
   scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedExamples, usedSchemas, type Paths,
 } from './openapi-common.js';
 import { accountSessionPaths } from './openapi-account.js';
@@ -56,7 +56,7 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/hosted-domains/{id}/transfer': { post: operation('transferHostedDomain', 'Transfer a hosted domain to another user', ref('HostedDomainTransferResult'), { errors: ['HostedTransferLimit', 'HostedStateChanged'], request: 'TransferHostedDomainRequest',
       description: 'Owner or administrator. The target must be an active user; ordinary owners are limited by the target’s hosted_domains.maxPerUser. includeMailboxes moves the previous owner’s addresses on the domain with all history and revokes their mailbox shares. Members are kept. A stale expectedOwnerId returns 409; retrying a completed transfer returns transferred=false.' }) },
     '/mailboxes': {
-      get: operation('listMailboxes', 'List caller-owned mailboxes', arrayOrPage(ref('Mailbox')), { parameters: [query('all', { type: 'string', enum: ['1', 'true', '0', 'false'] }, 'Administrator all=1 or true includes all owners; ordinary users cannot request this range.'),
+      get: operation('listMailboxes', 'List caller-owned mailboxes', arrayOrPage(ref('Mailbox')), { parameters: [query('all', boolFlag, 'Administrator all=1 or true includes all owners; ordinary users cannot request this range.'),
         ...mailboxSearchQuery, ...optionalPageQuery], description: mailboxListDescription }),
       post: operation('claimMailbox', 'Claim an address on a configured domain', ref('Mailbox'), { errors: ['AddressTaken', 'ClaimQuota', 'ClaimDomainForbidden', 'ClaudeSuspended'], request: 'ClaimMailboxRequest', status: 201,
         description: 'Claim only a domain returned by /domains. Existing history at the address becomes visible to the claimant. Ordinary users obey their effective public or dedicated domain/global/per-domain quotas and system reserved-prefix restrictions. Dedicated policies do not revoke existing owned mailboxes. Does not provision a domain or Email Routing. Optional strategy=claude rejects any historical Claude suspension with 403 forbidden, including for administrators and hosted domains; checked atomically at insertion. Omitted or uniform preserves ordinary claims.' }),
@@ -81,11 +81,11 @@ export function buildSessionOpenApiSpec(origin: string) {
       description: 'Advisory only, not a reservation. Same rules as claiming; when available=false, reason is taken, reserved, quota, domain_limit, domain_unavailable or claude_suspended. Claim still re-checks everything.' }) },
     '/mailboxes/{id}': {
       put: operation('updateMailbox', 'Set mailbox display name', ref('Mailbox'), { request: 'UpdateMailboxRequest', description: 'Mailbox owner or administrator only.' }),
-      delete: operation('releaseMailbox', 'Release mailbox ownership', object({ success: bool, deletedMessages: int }), { parameters: [query('deleteHistory', { type: 'string', enum: ['1', 'true', '0', 'false'] })],
+      delete: operation('releaseMailbox', 'Release mailbox ownership', object({ success: bool, deletedMessages: int }), { parameters: [query('deleteHistory', boolFlag)],
         description: 'Default retains all address history for the next claimant. deleteHistory=1 atomically removes all existing address mail and ownership. Owner or administrator only. Previously delivered external links retain their promised 90-day validity.' }),
     },
     '/messages': { get: operation('listMessages', 'List mail with cursor pagination', ref('SessionMessagePage'), { parameters: listQuery, description: 'unread=1 matches only caller-claimed addresses; other views still include shared inbound mail. trash=1 items include deletedAt. Inbound summaries carry verificationLink (empty when none was detected).' }) },
-    '/messages/sync': { get: operation('syncMessages', 'Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: listQuery,
+    '/messages/sync': { get: operation('syncMessages', 'Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: syncQuery,
       description: 'Lightweight polling for the list view: accepts the same filters as GET /messages (cursor and afterId are ignored). Refetch the list only when head differs from the head returned with its first page.' }) },
     '/messages/send': { post: sendMailOperation() },
     '/messages/read': { post: operation('markMessagesRead', 'Mark selected owned messages read/unread',

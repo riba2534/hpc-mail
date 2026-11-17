@@ -1,5 +1,7 @@
 /** RFC 6238 TOTP（SHA-1、6 位、30s 步长）+ base32 + 恢复码，纯 Web Crypto 实现 */
 
+import { bytesToHex, sha256Hex } from './crypto.js';
+
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const PERIOD = 30;
 const DIGITS = 6;
@@ -117,17 +119,12 @@ export async function generateRecoveryCodes(
   for (let i = 0; i < count; i++) {
     const bytes = new Uint8Array(5);
     crypto.getRandomValues(bytes);
-    const code = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    const code = bytesToHex(bytes);
     const formatted = `${code.slice(0, 5)}-${code.slice(5)}`;
     plain.push(formatted);
     hashes.push(await sha256Hex(formatted));
   }
   return { plain, hashes };
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export { sha256Hex as hashRecoveryCode };

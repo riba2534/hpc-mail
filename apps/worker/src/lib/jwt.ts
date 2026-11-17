@@ -1,20 +1,7 @@
-import { deriveSubkey } from './crypto.js';
+import { base64urlToBytes as base64urlDecode, bytesToBase64url as base64url, deriveSubkey } from './crypto.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-function base64url(input: ArrayBuffer | Uint8Array): string {
-  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-}
-
-function base64urlDecode(str: string): Uint8Array {
-  let normalized = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (normalized.length % 4) normalized += '=';
-  return Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0));
-}
 
 /**
  * JWT claims：sub=userId, sid=会话 id, uepoch=用户鉴权版本（D1 users.auth_version）。

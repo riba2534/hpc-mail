@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import type { AdminAuditLogEntry } from '@hpc-mail/shared';
 import { adminApi } from '@/api/resources';
 import { PageHeader } from '@/components/page-header';
+import { LoadMoreFooter } from '@/components/load-more-footer';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge, type BadgeTone } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -208,13 +209,7 @@ export function AuditPage() {
               </TableBody>
             </Table>
           )}
-          {hasNextPage && (
-            <div className="mt-3 text-center">
-              <Button variant="secondary" size="sm" loading={isFetchingNextPage} onClick={() => fetchNextPage()}>
-                加载更多
-              </Button>
-            </div>
-          )}
+          <LoadMoreFooter auto={false} hasNextPage={hasNextPage} isFetchingNextPage={isFetchingNextPage} onLoadMore={() => void fetchNextPage()} />
         </>
       )}
     </div>

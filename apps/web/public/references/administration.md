@@ -139,9 +139,9 @@ count 1–50 默认 1；maxUses 1–1000 默认 1；expiresAt 可选 ISO 8601 �
 
 外发 dailyRecipients 以每次请求去重后的收件地址计数，不是跨全天同一收件人只计一次；站内/外收件均计入。系统当前策略必须先读取，不把 schema 默认值当线上设置。
 
-retention.unclaimedDays 对当时未认领地址的旧 inbound 生效；allMessagesDays 对所有旧邮件生效，包括已认领及已发送。设置清理期限可能在下一次定时任务永久删除已有历史，按用户授权范围修改；0 不清理会继续增长，不能自动替用户开启破坏性策略。回收站 7 天清理和草稿附件 24 小时清理是独立机制，不受这两个 0 禁用。DNS 接入检测 `GET /admin/settings/domain-status` 及多域并发控制见域名参考。
+retention.unclaimedDays 对当时未认领地址的旧 inbound 生效；allMessagesDays 对所有旧邮件生效，包括已认领及已发送。设置清理期限可能在下一次定时任务永久删除已有历史，按用户授权范围修改；0 不清理会继续增长，不能自动替用户开启破坏性策略。回收站 7 天清理和未发送上传附件的 24 小时清理是独立机制，不受这两个 0 禁用。DNS 接入检测 `GET /admin/settings/domain-status` 及多域并发控制见域名参考。
 
-AI 模型默认未配置，翻译默认关闭；本站不再使用 Cloudflare Workers AI。配置 `ai_model`（例如 DeepSeek：`baseUrl=https://api.deepseek.com`、`model=deepseek-flash`）后，邮件内容会在两种情况下发送到该第三方服务：① 翻译启用后，用户在网页邮件详情点「翻译」时，主题与正文中的文字片段；只有能在该邮件中找到的片段才会发送，验证码、纯数字、URL、邮箱等无字母片段不发送，译文缓存在本站并随邮件永久删除一并删除；② `code_extract.aiEnabled` 开启时，正则没提到码、且主题或正文（不含 URL）出现验证码相关词（验证码、code、OTP、passcode、PIN、verification、one-time 等）的入站邮件，其主题和正文前 6000 字符，每域每日最多 500 封，10 秒超时；只让点链接的邮件不发送，模型返回的码必须在原文中出现才采用。是否把邮件内容交给第三方处理属于隐私决定，按用户授权和所在组织的数据政策决定是否配置，不要替用户开启。`GET /api/config` 的 `translationEnabled` 只公开是否可用，不公开服务地址或 Key。翻译另有每用户每分钟 30 次模型调用上限；超额返回 429，翻译服务失败返回 500 并退还字符额度。翻译接口 `POST /api/messages/:id/translate` 仅 JWT，见邮件参考。
+AI 模型默认未配置，翻译默认关闭；翻译与验证码 AI 兜底只用这里配置的模型。配置 `ai_model`（例如 DeepSeek：`baseUrl=https://api.deepseek.com`、`model=deepseek-flash`）后，邮件内容会在两种情况下发送到该第三方服务：① 翻译启用后，用户在网页邮件详情点「翻译」时，主题与正文中的文字片段；只有能在该邮件中找到的片段才会发送，验证码、纯数字、URL、邮箱等无字母片段不发送，译文缓存在本站并随邮件永久删除一并删除；② `code_extract.aiEnabled` 开启时，正则没提到码、且主题或正文（不含 URL）出现验证码相关词（验证码、code、OTP、passcode、PIN、verification、one-time 等）的入站邮件，其主题和正文前 6000 字符，每域每日最多 500 封，10 秒超时；只让点链接的邮件不发送，模型返回的码必须在原文中出现才采用。是否把邮件内容交给第三方处理属于隐私决定，按用户授权和所在组织的数据政策决定是否配置，不要替用户开启。`GET /api/config` 的 `translationEnabled` 只公开是否可用，不公开服务地址或 Key。翻译接口 `POST /api/messages/:id/translate`（仅 JWT）的请求、限额与错误见[邮件参考](mail.md#读取与搜索)。
 
 `POST /admin/settings/ai-model-test` 用固定英文示例按翻译格式真实调用一次 AI 模型，返回 `{ok:true,latencyMs,sample}`；body 可省略，`{baseUrl,apiKey,model}` 中未提交或为空的字段、以及 apiKey 为 `******` 时用已保存的 `ai_model`，不要求任何功能已启用，便于保存前验证。沿用已存 apiKey（未填、空串或 `******`）时 baseUrl 的 origin 与路径必须与已保存的一致（末尾斜杠视为相同），否则返回 400 `validation_failed`，要测试新地址需同时填写 apiKey。三项解析后仍缺失返回 400；服务失败返回 500，message 说明 HTTP 状态码、超时或返回格式无效，不回显 Key。测试会产生一次真实外部调用，不计用户额度。
 

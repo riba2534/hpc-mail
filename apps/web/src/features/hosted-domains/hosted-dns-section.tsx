@@ -310,7 +310,8 @@ export function HostedDnsSection({ domain }: { domain: HostedDomain }) {
             名称服务器生效前就可以添加解析：建议先把网站等原有记录补到这里，再修改名称服务器，网站等记录切换时不中断（根域邮件由本站接管）。
           </p>
           <p>
-            请在{domain.expiresAt ? ` ${formatDateTime(domain.expiresAt)} ` : '截止时间'}前完成名称服务器修改，逾期未生效时域名会连同已添加的解析一起删除。
+            请在{domain.expiresAt ? ` ${formatDateTime(domain.expiresAt)} ` : '截止时间'}前完成名称服务器修改，
+            {domain.activatedAt ? '逾期未生效时会撤回这次重新接入，已添加的解析一并删除。' : '逾期未生效时域名会连同已添加的解析一起删除。'}
           </p>
         </div>
       )}

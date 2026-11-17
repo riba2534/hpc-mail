@@ -9,9 +9,7 @@ import {
   type WebhookEndpoint,
   type WebhookEventType,
 } from '@hpc-mail/shared';
-import { ApiError } from '@/api/errors';
-import { queryKeys } from '@/api/query-keys';
-import { webhookApi } from '@/api/resources';
+import { errorMessage } from '@/api/errors';
 import { QueryErrorState } from '@/components/query-error-state';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -25,6 +23,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
 import { toast } from '@/components/ui/toast';
 import { formatDateTime } from '@/lib/format';
+import { webhookApi, webhookKeys } from './webhooks-api';
 
 export const EVENT_LABELS: Record<WebhookEventType, string> = {
   'mail.received': '收到新邮件',
@@ -36,7 +35,6 @@ export const EVENT_LABELS: Record<WebhookEventType, string> = {
 };
 
 const splitList = (text: string) => text.split(/[\s,，]+/).map((item) => item.trim()).filter(Boolean);
-const errorText = (err: unknown, fallback: string) => (err instanceof ApiError ? err.message : fallback);
 
 /** 新建端点：成功后只在这里显示一次签名密钥 */
 function CreateEndpointDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
@@ -54,9 +52,9 @@ function CreateEndpointDialog({ open, onOpenChange }: { open: boolean; onOpenCha
     mutationFn: webhookApi.create,
     onSuccess: (data) => {
       setCreated(data);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.root });
+      void queryClient.invalidateQueries({ queryKey: webhookKeys.list });
     },
-    onError: (err) => setError(errorText(err, '创建失败，请重试')),
+    onError: (err) => setError(errorMessage(err, '创建失败，请重试')),
   });
 
   const close = () => {
@@ -148,14 +146,15 @@ function CreateEndpointDialog({ open, onOpenChange }: { open: boolean; onOpenCha
 /** 最近投递：失败的可以手动重试一次 */
 function Deliveries({ endpoint }: { endpoint: WebhookEndpoint }) {
   const queryClient = useQueryClient();
-  const deliveries = useQuery({ queryKey: queryKeys.webhooks.deliveries(endpoint.id), queryFn: () => webhookApi.deliveries(endpoint.id) });
+  const deliveries = useQuery({ queryKey: webhookKeys.deliveries(endpoint.id), queryFn: () => webhookApi.deliveries(endpoint.id) });
   const retry = useMutation({
     mutationFn: (deliveryId: number) => webhookApi.retry(endpoint.id, deliveryId),
     onSuccess: () => {
       toast({ title: '已重新投递', variant: 'success' });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.root });
+      void queryClient.invalidateQueries({ queryKey: webhookKeys.deliveries(endpoint.id) });
+      void queryClient.invalidateQueries({ queryKey: webhookKeys.list });
     },
-    onError: (err) => toast({ title: errorText(err, '重试失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '重试失败'), variant: 'error' }),
   });
   if (deliveries.isLoading) return <Skeleton className="h-16 w-full rounded-md" />;
   if (deliveries.isError) return <QueryErrorState error={deliveries.error} onRetry={() => void deliveries.refetch()} />;
@@ -185,19 +184,20 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
   const [showDeliveries, setShowDeliveries] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
-  const refresh = () => queryClient.invalidateQueries({ queryKey: queryKeys.webhooks.root });
+  // 启停、轮换、删除只改端点本身：重拉端点列表，其他端点已展开的投递记录不受影响
+  const refresh = () => queryClient.invalidateQueries({ queryKey: webhookKeys.list });
 
   const toggle = useMutation({
     mutationFn: () => webhookApi.update(endpoint.id, { enabled: endpoint.status !== 'active' }),
     onSuccess: () => void refresh(),
-    onError: (err) => toast({ title: errorText(err, '操作失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '操作失败'), variant: 'error' }),
   });
   const test = useMutation({
     mutationFn: () => webhookApi.test(endpoint.id),
     onSuccess: (result) => toast(result.ok
       ? { title: `测试事件已送达（HTTP ${result.httpStatus}）`, variant: 'success' }
       : { title: '测试事件发送失败', description: result.error, variant: 'error' }),
-    onError: (err) => toast({ title: errorText(err, '发送失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '发送失败'), variant: 'error' }),
   });
   const rotate = useMutation({
     mutationFn: () => webhookApi.rotateSecret(endpoint.id),
@@ -205,7 +205,7 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
       setRotated(data.secret);
       void refresh();
     },
-    onError: (err) => toast({ title: errorText(err, '轮换失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '轮换失败'), variant: 'error' }),
   });
   const remove = useMutation({
     mutationFn: () => webhookApi.remove(endpoint.id),
@@ -213,7 +213,7 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
       toast({ title: '端点已删除', variant: 'success' });
       void refresh();
     },
-    onError: (err) => toast({ title: errorText(err, '删除失败'), variant: 'error' }),
+    onError: (err) => toast({ title: errorMessage(err, '删除失败'), variant: 'error' }),
   });
 
   const filters = [...endpoint.addresses, ...endpoint.domains];
@@ -270,7 +270,7 @@ function EndpointCard({ endpoint }: { endpoint: WebhookEndpoint }) {
 /** 个人设置里的 Webhook v2 端点管理 */
 export function WebhooksSection({ id }: { id: string }) {
   const [createOpen, setCreateOpen] = useState(false);
-  const endpoints = useQuery({ queryKey: queryKeys.webhooks.list, queryFn: webhookApi.list });
+  const endpoints = useQuery({ queryKey: webhookKeys.list, queryFn: webhookApi.list });
 
   return (
     <section id={id} tabIndex={-1} className="flex scroll-mt-20 flex-col gap-4 rounded-lg border border-line bg-surface p-5 focus:outline-none">

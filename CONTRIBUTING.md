@@ -10,7 +10,7 @@
 
 ## worker 集成测试的环境要求
 
-`apps/worker/test/*.test.ts` 依赖 `@cloudflare/vitest-plugin`（workerd，原 vitest-pool-workers），宿主机需要 **glibc ≥ 2.32**（Ubuntu 22.04+），满足时可以本机运行。glibc 过旧的机器上这些测试起不来，请依赖 PR 的 CI 结果兜底；`packages/shared` 与 `apps/web` 的单测不受影响。
+`apps/worker/test/*.test.ts` 依赖 `@cloudflare/vitest-plugin`（workerd），宿主机需要 **glibc ≥ 2.32**（Ubuntu 22.04+），满足时可以本机运行。glibc 过旧的机器上这些测试起不来，请依赖 PR 的 CI 结果兜底；`packages/shared` 与 `apps/web` 的单测不受影响。
 
 `apps/worker/.dev.vars` 会被测试环境读入：里面写了真实凭据（如 `cf_api_token`）时，「没有凭据」类用例会失败，跑 worker 测试前先移走。同一测试文件内的用例共享 D1/KV，造数据时错开用户名与地址。
 

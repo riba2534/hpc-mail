@@ -29,7 +29,7 @@ import messages from './routes/messages.js';
 import notifyPrefs from './routes/notify-prefs.js';
 import v1 from './routes/v1/index.js';
 import webhooks from './routes/webhooks.js';
-import { buildSessionOpenApiSpec } from './routes/api-openapi.js';
+import { serveOpenApi } from './routes/openapi-serve.js';
 import { createMcpRoutes } from './routes/mcp/index.js';
 import type { AppContext } from './types.js';
 
@@ -45,12 +45,11 @@ export function createApp() {
   app.notFound((c) => onError(new AppError('not_found', '接口不存在'), c));
 
   const api = new Hono<AppContext>();
-  api.get('/openapi.json', (c) => c.json(buildSessionOpenApiSpec(new URL(c.req.url).origin)));
+  api.get('/openapi.json', (c) => serveOpenApi(c, 'api'));
   api.route('/auth', auth);
   api.route('/avatar', avatar);
   api.route('/config', config);
   api.route('/domains', domains);
-  // 批量接口按路由挂「已鉴权即跳过」的鉴权，与同前缀子应用谁先挂都只鉴权一次
   api.route('/hosted-domains', hostedDomains);
   api.route('/identities', identities);
   api.route('/mailboxes', mailboxes);
