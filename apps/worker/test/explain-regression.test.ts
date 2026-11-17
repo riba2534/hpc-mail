@@ -6,6 +6,7 @@ import { createDb } from '../src/db/client.js';
 import { mailboxShares, mailboxes, messages, users } from '../src/db/schema.js';
 import { encodeCursor } from '../src/lib/pagination.js';
 import { listMailboxes, resolveNotifyOwnerIds } from '../src/services/mailbox.js';
+import { purgeStatements } from '../src/services/message-lifecycle.js';
 import {
   countUnread, getRecentContacts, getThread, listMessages, syncMessages, UNREAD_COUNT_CAP, type Viewer,
 } from '../src/services/message.js';
@@ -255,6 +256,33 @@ async function legacyPage(viewer: Viewer, query: ListMessagesQuery, cursorId: nu
   const page = ids.slice(0, query.limit);
   return { ids: page, nextCursor: ids.length > query.limit ? encodeCursor(page.at(-1)!) : null };
 }
+
+describe('执行计划回归：永久删除清空通知载荷', () => {
+  it('按 purge_token 取邮件、按 dedupe_key 前缀范围查任务，不扫 notification_jobs 全表（message_id 无索引）', async () => {
+    const statements: { sql: string; params: unknown[] }[] = [];
+    const db = new Proxy(env.db, { get(target, property) {
+      if (property === 'prepare') return (query: string) => {
+        const entry = { sql: query, params: [] as unknown[] };
+        statements.push(entry);
+        const statement = target.prepare(query);
+        return new Proxy(statement, { get(stmt, key) {
+          if (key === 'bind') return (...args: unknown[]) => { entry.params = args; return stmt.bind(...args); };
+          const value = Reflect.get(stmt, key);
+          return typeof value === 'function' ? value.bind(stmt) : value;
+        } });
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    purgeStatements({ ...env, db } as typeof env, 'explain-purge-token');
+    const update = statements.find((statement) => /UPDATE notification_jobs/.test(statement.sql))!;
+    const plan = (await env.db.prepare(`EXPLAIN QUERY PLAN ${update.sql}`).bind(...update.params).all<{ detail: string }>())
+      .results.map((row) => row.detail).join(' | ');
+    expect(plan).toMatch(/idx_messages_purge_token \(purge_token=\?\)/);
+    expect(plan).toMatch(/notification_jobs_dedupe_key_unique \(dedupe_key>\? AND dedupe_key<\?\)/);
+    expect(plan).not.toMatch(/SCAN (notification_jobs|j)\b/);
+  });
+});
 
 describe('默认视图改走地址索引：结果与改前逐条一致', () => {
   it('认领/共享（含已删除、外发、所有者禁用）/未认领混合数据，各视图逐页一致；联系人一致', async () => {
