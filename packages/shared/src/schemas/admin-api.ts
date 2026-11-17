@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { MAX_MAILBOX_GRANTEES, type Role, type UserStatus } from '../constants.js';
 import { usernameSchema } from './auth.js';
 import {
-  adminBatchClaimRequestSchema, adminBatchMailboxRefsSchema, domainSchema, mailboxAddressSchema,
+  adminBatchClaimRequestSchema, adminBatchShareRequestSchema, domainSchema, mailboxAddressSchema,
   type AdminMailboxBatchResult, type BatchClaimMailboxResult,
 } from './mailbox.js';
 import type { UserMailboxPolicy } from './mailbox-policy.js';
@@ -91,10 +91,9 @@ export interface AdminMailboxView {
   createdAt: string;
 }
 
-/** 把每个邮箱的共享成员替换为 userIds（空数组表示清空）；不能包含邮箱所有者 */
-export const adminBatchReplaceSharesRequestSchema = z.object({
+/** 把每个邮箱的共享成员替换为 userIds（空数组表示清空）；不能包含邮箱所有者。其余同批量共享 */
+export const adminBatchReplaceSharesRequestSchema = adminBatchShareRequestSchema.extend({
   userIds: z.array(z.number().int().positive()).max(MAX_MAILBOX_GRANTEES),
-  items: adminBatchMailboxRefsSchema,
 });
 export type AdminBatchReplaceSharesRequest = z.infer<typeof adminBatchReplaceSharesRequestSchema>;
 
@@ -126,7 +125,6 @@ export function claudeTierFromAmount(amountCents: number | null): ClaudeTier | n
 }
 
 export const claudeDomainsQuerySchema = z.object({ domains: adminLookupList(domainSchema) });
-export type ClaudeDomainsQuery = z.infer<typeof claudeDomainsQuerySchema>;
 
 /** 每个后缀的 Claude 事实汇总；没有任何事实的域名也返回（计数为 0） */
 export interface ClaudeDomainFacts {
@@ -139,7 +137,6 @@ export interface ClaudeDomainFacts {
 }
 
 export const claudeAddressesQuerySchema = z.object({ addresses: adminLookupList(mailboxAddressSchema) });
-export type ClaudeAddressesQuery = z.infer<typeof claudeAddressesQuerySchema>;
 
 export interface ClaudeReceipt {
   /** 原邮件 id；邮件被永久删除后为 null，收据记录本身保留 */

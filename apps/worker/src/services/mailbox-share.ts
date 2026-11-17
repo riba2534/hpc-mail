@@ -22,6 +22,11 @@ function assertManageableMailbox<T extends { userId: number }>(
 const owners = alias(users, 'owners');
 
 /** 被分享人复核：存在、不是系统保留账号（共享给 CI 冒烟用户会干扰部署流水线）、已启用；共享、批量共享与管理员批量共享共用 */
+/** 被分享人的读取，结果交给 assertShareTargets 复核 */
+export function shareTargetsStatement(env: Env, userIds: readonly number[]): D1PreparedStatement {
+  return env.db.prepare('SELECT id, username, status FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(userIds));
+}
+
 export function assertShareTargets(targets: readonly { username: string; status: string }[], expected: number): void {
   if (targets.length !== expected) {
     throw new AppError('validation_failed', '包含不存在的用户');
@@ -228,7 +233,7 @@ export async function shareMailboxes(
   const granteeJson = JSON.stringify(granteeIds);
   const [ownedResult, targetResult, sizeResult] = await env.db.batch([
     env.db.prepare('SELECT id FROM mailboxes WHERE id IN (SELECT value FROM json_each(?)) AND user_id = ?').bind(boxJson, ownerId),
-    env.db.prepare('SELECT id, username, status FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(granteeJson),
+    shareTargetsStatement(env, granteeIds),
     // 追加后的人数 = 现有成员 + 本次用户 − 本次用户中已在名单里的
     env.db.prepare(`SELECT mailbox_id, COUNT(*) + ? - SUM(user_id IN (SELECT value FROM json_each(?))) AS total
       FROM mailbox_shares WHERE mailbox_id IN (SELECT value FROM json_each(?)) GROUP BY mailbox_id`)
