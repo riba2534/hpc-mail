@@ -116,7 +116,7 @@ describe('inbox list toolbar and rows',()=>{
   });
   it('when the sender failed SPF/DKIM the row offers no one-click verification link; the detail page shows the warning',()=>{
     mocks.items=[mail(1,{fromAddress:'security@bank.example',verificationLink:'https://bank.example/verify',
-      auth:{spf:'fail',dkim:'fail',dkimDomain:null,dmarc:'fail',aligned:false}})];
+      auth:{spf:'fail',dkim:'fail',dkimDomain:'evil.example',dmarc:'fail',aligned:false}})];
     const client=show(inbox,'inbox');
     expect(screen.queryByRole('link',{name:/打开验证链接/})).toBeNull();
     expect(document.querySelector('a[href^="https://bank.example/verify"]')).toBeNull();
