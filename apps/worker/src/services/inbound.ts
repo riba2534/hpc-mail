@@ -6,9 +6,11 @@ import PostalMime, { type Address } from 'postal-mime';
 import { and, eq } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { attachments as attachmentsTable, messages } from '../db/schema.js';
+import { inboundAuth, type AuthSource } from '../lib/auth-results.js';
 import { d1Statement } from '../lib/d1.js';
 import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-address.js';
 import { sha256Hex } from '../lib/crypto.js';
+import { runLimited } from '../lib/concurrency.js';
 import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
@@ -27,6 +29,7 @@ import { bodyBytes, D1_BODY_LIMIT, storeMailBody } from './mail-body.js';
 import { forwardReceivedMail } from './forwarding.js';
 import { HOSTED_AUTO_CLAIM_SQL, HOSTED_STATUS_SQL, NOTIFY_OWNER_IDS_SQL, hostedRejectReason } from './mailbox.js';
 import { enqueueMailNotifications } from './notification-jobs.js';
+import { consumeCanaryMail } from './ops-probe.js';
 import { attachmentKey, getExt, putObject, sha256Hex16 } from './storage.js';
 
 /** 未认领 catch-all 转发必须按稳定主体限额，不能让随机 local-part 刷新额度。 */
@@ -48,14 +51,6 @@ export const MIME_LIMITS = { maxNestingDepth: 32, maxPartCount: 500, maxRfc822Ne
 /** 入站幂等键：收件地址 + Message-ID（截断到 998）+ 原文摘要。pending 自愈据此确认 R2 原文就是该行收下的那一封 */
 export function inboundIngestKey(toAddress: string, sourceMessageId: string, rawDigest: string): Promise<string> {
   return sha256Hex(`${toAddress}\n${sourceMessageId.slice(0, 998)}\n${rawDigest}`);
-}
-
-/** 有限并发执行；任一失败整体 reject（与串行时「任一失败即抛出」语义一致） */
-async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) await task(items[next++]!);
-  }));
 }
 
 interface ParsedAttachment {
@@ -152,6 +147,8 @@ interface InboundTrace {
   rawR2: boolean;
   bodyR2: boolean;
   messageId: number | null;
+  /** 发件认证结果的来源（不含结果本身）：上线后据此确认 Cloudflare 确实附带了认证头 */
+  auth: AuthSource;
   ms: Partial<Record<'parse' | 'lookup' | 'store' | 'db' | 'attachments' | 'total', number>>;
 }
 
@@ -161,10 +158,13 @@ export async function handleInbound(
   env: Env,
   ctx: ExecCtx,
 ): Promise<void> {
+  // 部署金丝雀只看 Cloudflare 已解析的信头：签名有效记 KV 后结束，普通来信不多任何 D1 往返
+  if (await consumeCanaryMail(message, env)) return;
   const started = Date.now();
   const trace: InboundTrace = {
     stage: 'parse', domain: getEmailDomain(normalizeEmail(message.to)), rawSize: 0, bodySize: 0,
-    attachments: 0, attachmentBytes: 0, attachmentsDropped: false, rawR2: false, bodyR2: false, messageId: null, ms: {},
+    attachments: 0, attachmentBytes: 0, attachmentsDropped: false, rawR2: false, bodyR2: false, messageId: null,
+    auth: 'missing', ms: {},
   };
   let result: InboundResult | 'error' = 'error';
   let errorClass: string | undefined;
@@ -189,7 +189,7 @@ function cleanupIfPurgedStatement(env: Env, messageId: number, keys: (string | n
 }
 
 /**
- * 收件链路：解析 → 去重 + 归属人 + 偏好的 D1 batch（往返期间完成提码与摘要）→ 非重复时原文/大正文并行写 R2
+ * 收件链路：解析 → 去重 + 归属人 + 偏好的 D1 batch（往返期间完成提码与摘要）→ 非重复时原文与正文并行写 R2（不带 HTML 的短文本只进 D1）
  * → 落库 → 附件落 R2 → waitUntil(邮箱转发、AI 兜底 + 通知队列)。原文/正文/附件未完整保存则 SMTP 重试。
  */
 async function receiveInbound(
@@ -234,6 +234,9 @@ async function receiveInbound(
   const domain = getEmailDomain(toAddress);
   const fromAddress = normalizeEmail(email.from?.address);
   const fromName = (email.from?.name || getNameFromEmail(fromAddress)).trim().slice(0, 512);
+  // 只采信 Cloudflare 加在最上方的 Authentication-Results，纯字符串解析，不增加往返
+  const { auth, source: authSource } = inboundAuth(email.headers ?? [], fromAddress);
+  trace.auth = authSource;
 
   const mapAddrs = (list: Address[] | undefined): string[] =>
     [...new Set((list ?? []).flatMap(item => item.group ?? [item])
@@ -273,7 +276,7 @@ async function receiveInbound(
   if (settings.code_extract.enabled) {
     code = extractCodeByRegex(subject, body.plain);
     if (!code) {
-      codeBody = codeScanBody(text, html, body.plain);
+      codeBody = codeScanBody(text, html, body);
       if (codeBody !== body.plain) code = extractCodeByRegex(subject, codeBody);
     }
     verificationLink = extractVerificationLink({ subject, text, html, fromAddress });
@@ -328,7 +331,7 @@ async function receiveInbound(
   const rawR2Key = `raw/${ingestKey}.eml`;
   const [, { bodyText, bodyHtml, bodyR2Key }] = await Promise.all([
     env.r2.put(rawR2Key, rawBytes, { httpMetadata: { contentType: 'message/rfc822' } }),
-    storeMailBody(env, text, html, ingestKey, bodySize),
+    storeMailBody(env, text, html, ingestKey, body),
   ]);
   trace.ms.store = Date.now() - storeStarted;
   Object.assign(trace, { rawR2: true, bodyR2: bodyR2Key !== null });
@@ -372,6 +375,7 @@ async function receiveInbound(
       ingestKey,
       verificationCode: code,
       verificationLink,
+      auth,
       messageId: sourceMessageId || null,
       inReplyTo: (email.inReplyTo || '').slice(0, 998) || null,
       references: sourceReferences,

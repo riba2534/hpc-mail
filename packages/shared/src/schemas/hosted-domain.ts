@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { MAX_HOSTED_DOMAIN_MEMBERS } from '../constants.js';
+import { MAX_HOSTED_DOMAIN_BATCH, MAX_HOSTED_DOMAIN_MEMBERS } from '../constants.js';
+import type { ErrorCode } from '../envelope.js';
 import { domainSchema, withOptionalPage } from './mailbox.js';
 
 /**
@@ -79,6 +80,50 @@ export const createHostedDomainRequestSchema = z.object({
   domain: domainSchema,
 });
 export type CreateHostedDomainRequest = z.infer<typeof createHostedDomainRequestSchema>;
+
+/** 列表里规范化后重复的项报在第二次出现的位置 */
+function rejectDuplicates<T>(items: T[], ctx: z.RefinementCtx, field: string, label: string): void {
+  const seen = new Set<T>();
+  items.forEach((item, index) => {
+    if (seen.has(item)) ctx.addIssue({ code: 'custom', message: `${field} 中有重复的${label}：${String(item)}`, path: [field, index] });
+    seen.add(item);
+  });
+}
+
+/** 批量添加托管域名：按顺序逐个添加，每项独立结果 */
+export const batchCreateHostedDomainsRequestSchema = z.object({
+  domains: z.array(domainSchema).min(1).max(MAX_HOSTED_DOMAIN_BATCH),
+}).superRefine((value, ctx) => rejectDuplicates(value.domains, ctx, 'domains', '域名'));
+export type BatchCreateHostedDomainsRequest = z.infer<typeof batchCreateHostedDomainsRequestSchema>;
+
+/** 批量立即检测：按顺序逐个检测，每项独立结果 */
+export const batchCheckHostedDomainsRequestSchema = z.object({
+  ids: z.array(z.number().int().positive()).min(1).max(MAX_HOSTED_DOMAIN_BATCH),
+}).superRefine((value, ctx) => rejectDuplicates(value.ids, ctx, 'ids', '域名 id'));
+export type BatchCheckHostedDomainsRequest = z.infer<typeof batchCheckHostedDomainsRequestSchema>;
+
+/** 批量操作中单项的失败原因，取值与错误信封的 error 相同（不含 details） */
+export interface HostedDomainBatchError {
+  code: ErrorCode;
+  message: string;
+  fix?: string;
+  docs?: string;
+}
+
+/** 单项结果：成功时带该域名的最新视图，失败时带原因；因额度或前序错误未处理的项也是失败 */
+export type HostedDomainBatchOutcome =
+  | { ok: true; hostedDomain: HostedDomain }
+  | { ok: false; error: HostedDomainBatchError };
+
+export type HostedDomainBatchCreateItem = { domain: string } & HostedDomainBatchOutcome;
+export type HostedDomainBatchCheckItem = { id: number } & HostedDomainBatchOutcome;
+
+/** 批量结果：items 与请求顺序一一对应 */
+export interface HostedDomainBatchResult<T extends HostedDomainBatchOutcome> {
+  items: T[];
+  succeeded: number;
+  failed: number;
+}
 
 export const updateHostedDomainRequestSchema = z.object({
   memberLimit: z.number().int().min(0).max(10000),

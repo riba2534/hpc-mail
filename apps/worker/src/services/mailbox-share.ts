@@ -1,4 +1,4 @@
-import { MAX_MAILBOX_GRANTEES, type MailboxShareGrant, type Page, type SharedMailboxView } from '@hpc-mail/shared';
+import { MAX_MAILBOX_GRANTEES, RESERVED_USERNAMES, type MailboxShareGrant, type Page, type SharedMailboxView } from '@hpc-mail/shared';
 import { and, asc, desc, eq, inArray, lt, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/sqlite-core';
 import { createDb } from '../db/client.js';
@@ -20,6 +20,19 @@ function assertManageableMailbox<T extends { userId: number }>(
 }
 
 const owners = alias(users, 'owners');
+
+/** 被分享人复核：存在、不是系统保留账号（共享给 CI 冒烟用户会干扰部署流水线）、已启用 */
+function assertShareTargets(targets: readonly { username: string; status: string }[], expected: number): void {
+  if (targets.length !== expected) {
+    throw new AppError('validation_failed', '包含不存在的用户');
+  }
+  if (targets.some((target) => RESERVED_USERNAMES.includes(target.username))) {
+    throw new AppError('validation_failed', '系统保留用户不能作为共享成员');
+  }
+  if (targets.some((target) => target.status !== 'active')) {
+    throw new AppError('validation_failed', '只能共享给启用中的用户');
+  }
+}
 
 /** 邮箱 LEFT JOIN 共享与被分享人后的扁平行；没有共享时 grantee 字段为 null */
 interface ShareGrantRow {
@@ -147,18 +160,13 @@ export async function replaceMailboxShares(
     const targets = [];
     for (const batch of chunk(uniqueIds)) {
       const part = await db
-        .select({ id: users.id, role: users.role, status: users.status })
+        .select({ id: users.id, username: users.username, status: users.status })
         .from(users)
         .where(inArray(users.id, batch))
         .all();
       targets.push(...part);
     }
-    if (targets.length !== uniqueIds.length) {
-      throw new AppError('validation_failed', '包含不存在的用户');
-    }
-    if (targets.some((target) => target.status !== 'active')) {
-      throw new AppError('validation_failed', '只能共享给启用中的用户');
-    }
+    assertShareTargets(targets, uniqueIds.length);
   }
 
   try {
@@ -220,7 +228,7 @@ export async function shareMailboxes(
   const granteeJson = JSON.stringify(granteeIds);
   const [ownedResult, targetResult, sizeResult] = await env.db.batch([
     env.db.prepare('SELECT id FROM mailboxes WHERE id IN (SELECT value FROM json_each(?)) AND user_id = ?').bind(boxJson, ownerId),
-    env.db.prepare('SELECT id, status FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(granteeJson),
+    env.db.prepare('SELECT id, username, status FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(granteeJson),
     // 追加后的人数 = 现有成员 + 本次用户 − 本次用户中已在名单里的
     env.db.prepare(`SELECT mailbox_id, COUNT(*) + ? - SUM(user_id IN (SELECT value FROM json_each(?))) AS total
       FROM mailbox_shares WHERE mailbox_id IN (SELECT value FROM json_each(?)) GROUP BY mailbox_id`)
@@ -229,13 +237,7 @@ export async function shareMailboxes(
   if ((ownedResult?.results ?? []).length !== boxIds.length) {
     throw new AppError('forbidden', '只能共享自己已认领的地址');
   }
-  const targets = (targetResult?.results ?? []) as { id: number; status: string }[];
-  if (targets.length !== granteeIds.length) {
-    throw new AppError('validation_failed', '包含不存在的用户');
-  }
-  if (targets.some((target) => target.status !== 'active')) {
-    throw new AppError('validation_failed', '只能共享给启用中的用户');
-  }
+  assertShareTargets((targetResult?.results ?? []) as { username: string; status: string }[], granteeIds.length);
   if (granteeIds.length > MAX_MAILBOX_GRANTEES
     || ((sizeResult?.results ?? []) as { total: number }[]).some((row) => row.total > MAX_MAILBOX_GRANTEES)) {
     throw new AppError('validation_failed', `每只邮箱最多共享给 ${MAX_MAILBOX_GRANTEES} 个用户`);

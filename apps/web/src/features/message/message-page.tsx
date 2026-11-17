@@ -55,6 +55,7 @@ import { formatBytes, formatDateTime } from '@/lib/format';
 import { extractOtp } from '@/lib/otp';
 import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
+import { SenderAuthBanner, senderAuthFailed } from './sender-auth-banner';
 import { TranslationBar } from './translation/translation-bar';
 import { useMessageTranslation } from './translation/use-message-translation';
 import { inspectVerificationLink } from './verification-link';
@@ -64,6 +65,11 @@ import { QueryErrorState } from '@/components/query-error-state';
 import { ApiError } from '@/api/errors';
 
 /** 去重（不区分大小写，保留首次出现的写法） */
+/** 详情页 j/k 翻阅的方向 */
+type KeyboardStep = 'next' | 'prev';
+/** 列表行带来的上下文，加上详情页内 j/k 翻阅时记下的方向（决定预取哪一封） */
+type DetailLinkState = Partial<MailListLinkState> & { keyboard?: KeyboardStep };
+
 function uniqueAddresses(addresses: string[], exclude: ReadonlySet<string> = new Set()): string[] {
   const seen = new Set(exclude);
   return addresses.filter((address) => {
@@ -86,11 +92,13 @@ function RecipientLine({ label, addresses }: { label: string; addresses: string[
 function VerificationLinkBanner({ message }: { message: MessageDetail }) {
   const link = inspectVerificationLink(message.verificationLink, message.fromAddress);
   if (!link) return null;
+  const unverifiedSender = senderAuthFailed(message.auth);
+  const caution = link.mismatch || unverifiedSender;
   return (
     <div
       className={cn(
         'flex flex-col gap-2 rounded-lg border px-4 py-3',
-        link.mismatch ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
+        caution ? 'border-caution/40 bg-caution-soft' : 'border-line bg-canvas',
       )}
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -98,7 +106,7 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
           <p className="text-xs font-medium text-ink-secondary">验证链接</p>
           <p className="truncate text-sm text-ink" title={link.href}>{link.hostname}</p>
         </div>
-        <Button asChild size="sm" variant={link.mismatch ? 'secondary' : 'primary'}>
+        <Button asChild size="sm" variant={caution ? 'secondary' : 'primary'}>
           <a href={link.href} target="_blank" rel="noopener noreferrer">
             <ExternalLink className="size-4" />
             打开验证链接
@@ -109,6 +117,12 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
         <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           链接域名与发件人不一致，请确认后再打开
+        </p>
+      )}
+      {!link.mismatch && unverifiedSender && (
+        <p className="flex items-start gap-1.5 text-sm font-medium text-caution">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          发件人未通过验证，请确认后再打开
         </p>
       )}
     </div>
@@ -188,23 +202,27 @@ export function MessagePage() {
   const position = order ? order.indexOf(messageId) : -1;
   const prevId = order && position > 0 ? order[position - 1] : undefined;
   const nextId = order && position >= 0 ? order[position + 1] : undefined;
-  const goToMessage = (target: number | undefined) => {
+  // j/k 进入的详情记下方向：连续翻阅时只预取同方向的下一封；直接打开、点链接或按钮切换都不预取
+  const goToMessage = (target: number | undefined, keyboard?: KeyboardStep) => {
     if (target === undefined) return;
-    navigate(mailHref(target, view ?? {}), { replace: true, state: location.state });
+    const state: DetailLinkState = { ...(location.state as DetailLinkState | null), keyboard };
+    navigate(mailHref(target, view ?? {}), { replace: true, state });
   };
+  const keyboardStep = (location.state as DetailLinkState | null)?.keyboard;
+  const prefetchTarget = keyboardStep === 'next' ? nextId : keyboardStep === 'prev' ? prevId : undefined;
   useEffect(() => {
-    for (const target of [nextId, prevId]) {
-      if (target !== undefined) void queryClient.prefetchQuery(messageDetailQueryOptions(target, view));
-    }
+    if (prefetchTarget !== undefined) void queryClient.prefetchQuery(messageDetailQueryOptions(prefetchTarget, view));
     // view 由查询串决定，随 messageId 一起变化
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextId, prevId, queryClient]);
+  }, [prefetchTarget, queryClient]);
 
   const markRead = useMutation({
-    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope }) => messageApi.markRead([args.id], args.isRead, args.scope),
+    // 个人视图让服务端随响应带回未读数，不再单独请求 unread-count
+    mutationFn: (args: { id: number; isRead: boolean; scope: typeof mutationScope }) =>
+      messageApi.markRead([args.id], args.isRead, args.scope, args.scope === undefined),
     onSuccess: (result, { id, isRead }) => {
       // 只同步这一封的已读状态与未读数；列表只标记过期，回到列表时由首页探测/单页重拉对齐
-      if (result.changed > 0) syncReadState(queryClient, [id], isRead);
+      if (result.changed > 0) syncReadState(queryClient, [id], isRead, result.unread);
     },
   });
 
@@ -281,8 +299,8 @@ export function MessagePage() {
 
   useMailShortcuts(
     {
-      j: () => goToMessage(nextId),
-      k: () => goToMessage(prevId),
+      j: () => goToMessage(nextId, 'next'),
+      k: () => goToMessage(prevId, 'prev'),
       r: () => void reply(),
       a: () => void replyAll(),
       f: () => void forward(),
@@ -488,6 +506,7 @@ export function MessagePage() {
         </header>
 
         <div className="flex flex-col gap-4 px-4 py-5 sm:px-5">
+          {!outbound && <SenderAuthBanner auth={message.auth} fromAddress={message.fromAddress} />}
           {translation.translated && <TranslationBar translation={translation} />}
           {deliveryPending && (
             <p role="status" className="rounded-md border border-line bg-canvas px-3 py-2.5 text-sm text-ink-secondary">投递中，结果尚未回填</p>

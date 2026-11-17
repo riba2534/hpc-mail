@@ -5,6 +5,7 @@ import type {
 import { and, desc, eq, inArray, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
 import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schema.js';
+import { chunk, d1Statement } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { fetchLimit, toPage, type PageRequest } from '../lib/pagination.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
@@ -54,10 +55,10 @@ export const MAX_HOSTED_CHECKS_PER_MINUTE = 10;
  * 计入全站额度的 Cloudflare 调用数（按调用序列基准用例核实）：添加先按名称查 zone 再创建 2 次，建好后后台预配置
  * catch-all 与发信 5 次；删除撤发信接入、删 zone 2 次；检测在等待 NS 时 2 次，生效后补齐配置约 4 次。
  */
-const CREATE_CF_CALLS = 2;
+export const CREATE_CF_CALLS = 2;
 const PRECONFIGURE_CF_CALLS = 5;
 const TEARDOWN_CF_CALLS = 2;
-const CHECK_CF_CALLS = 4;
+export const CHECK_CF_CALLS = 4;
 const SITE_BUSY = '当前域名操作较多，请稍后再试';
 
 /** 功能可用：设置总开关打开且 Worker 配置了 Cloudflare 凭据 */
@@ -738,9 +739,12 @@ export async function replaceHostedDomainMembers(
   // 只校验新增的人：已被禁用的现有成员可以留在名单里，不妨碍添加其他人
   const added = unique.filter((userId) => !before.some((member) => member.userId === userId));
   if (added.length) {
-    const active = await createDb(env).select({ id: users.id }).from(users)
-      .where(and(inArray(users.id, added), eq(users.status, 'active'))).all();
-    if (active.length !== added.length) throw new AppError('validation_failed', '只能共享给启用中的用户');
+    // 一次最多新增 100 人，连同 status 超过 D1 的 100 个绑定参数：分批放进同一个 batch，仍是一次往返
+    const db = createDb(env);
+    const active = await env.db.batch(chunk(added).map((batch) => d1Statement(env,
+      db.select({ id: users.id }).from(users).where(and(inArray(users.id, batch), eq(users.status, 'active'))))));
+    const activeCount = active.reduce((total, part) => total + part.results.length, 0);
+    if (activeCount !== added.length) throw new AppError('validation_failed', '只能共享给启用中的用户');
   }
   const ids = JSON.stringify(unique);
   const ownerGuard = `EXISTS (SELECT 1 FROM hosted_domains WHERE id = ?1 AND user_id = ?2 AND status <> 'deleting')`;

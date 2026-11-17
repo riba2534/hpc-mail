@@ -1,3 +1,7 @@
 packages:
   - apps/*
   - packages/*
+
+# pnpm run / exec 之前核对 node_modules 与锁文件、各 package.json 是否一致，过期就报错并提示 pnpm install，
+# 不带着旧依赖跑出类型检查或测试的假失败。不用 install：跑测试时不应悄悄改动依赖。
+verifyDepsBeforeRun: error

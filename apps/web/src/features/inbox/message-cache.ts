@@ -1,6 +1,7 @@
 import type { InfiniteData, Query, QueryClient, QueryKey } from '@tanstack/react-query';
 import type { ListMessagesQuery, MessageDetail, MessageListPage, MessageSummary } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
+import { markUnreadRefreshed } from './use-unread-count';
 
 export type MessageListData = InfiniteData<MessageListPage, string>;
 type ListFilters = Partial<ListMessagesQuery>;
@@ -80,8 +81,22 @@ function refreshUnreadCount(client: QueryClient): void {
   void client.invalidateQueries({ queryKey: queryKeys.messages.unreadCount });
 }
 
-/** 已读/未读变更成功后：就地更新列表与详情，已读邮件移出「未读」筛选，未读数立即刷新。 */
-export function syncReadState(client: QueryClient, ids: readonly number[], isRead: boolean): void {
+/**
+ * 写入服务端随标已读带回的未读数，省掉一次重拉。在途的未读数请求发出得更早、结果更旧，先取消再写；
+ * 还有别的写操作在途（本次标记自身之外）时口径可能又变了，退回失效重拉。
+ */
+async function applyUnreadCount(client: QueryClient, unread: number): Promise<void> {
+  if (client.isMutating() > 1) return refreshUnreadCount(client);
+  await client.cancelQueries({ queryKey: queryKeys.messages.unreadCount, exact: true });
+  client.setQueryData(queryKeys.messages.unreadCount, { unread });
+  markUnreadRefreshed(client);
+}
+
+/**
+ * 已读/未读变更成功后：就地更新列表与详情，已读邮件移出「未读」筛选，未读数立即更新——
+ * 服务端已带回未读数（unread）时直接写入，否则失效重拉。
+ */
+export function syncReadState(client: QueryClient, ids: readonly number[], isRead: boolean, unread?: number): void {
   const idSet = new Set(ids);
   patchDetails(client, idSet, { isRead });
   updateLists(client, (item, filters) => {
@@ -90,7 +105,8 @@ export function syncReadState(client: QueryClient, ids: readonly number[], isRea
     return item.isRead === isRead ? item : { ...item, isRead };
   });
   refreshLists(client);
-  refreshUnreadCount(client);
+  if (unread === undefined) refreshUnreadCount(client);
+  else void applyUnreadCount(client, unread);
 }
 
 /**

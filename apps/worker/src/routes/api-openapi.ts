@@ -1,14 +1,14 @@
-import { HOSTED_DOMAIN_STATUSES, MAX_HOSTED_DNS_RECORDS, MAX_HOSTED_DNS_REQUESTS_PER_MINUTE } from '@hpc-mail/shared';
+import { HOSTED_DOMAIN_STATUSES } from '@hpc-mail/shared';
 import {
-  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, describePaths, identitiesDescription, int, listQuery, mailboxBatchPaths, mailboxListDescription,
-  mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref, scopeQuery, sendMailOperation, specInfo,
-  specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
+  array, arrayOrPage, bool, changed, claimStrategy, clientRequestIdRule, describePaths, hostedDomainBatchPaths, hostedDomainPaths, identitiesDescription, int, listQuery,
+  mailboxBatchPaths, mailboxListDescription, mailboxSearchQuery, mutationQuery, object, okResult, operation, optionalPageQuery, page, pageQuery, query, ref,
+  scopeQuery, sendMailOperation, specInfo, specificationOperation, str, success, uploadPaths, usedSchemas, type Paths,
 } from './openapi-common.js';
-import { MAX_HOSTED_CHECKS_PER_MINUTE, MAX_HOSTED_CREATES_PER_MINUTE, MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE } from '../services/hosted-domain.js';
 
 /** Complete JWT-session contract; API keys are never accepted for these operations. */
 export function buildSessionOpenApiSpec(origin: string) {
   const admin = { role: 'admin' as const };
+  const hosted = hostedDomainPaths();
   const paths: Paths = {
     '/openapi.json': { get: specificationOperation() },
     '/config': { get: operation('Read public site configuration', ref('PublicConfig'), { public: true }) },
@@ -33,20 +33,14 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/auth/logout': { post: operation('Revoke the current session', success) },
     '/domains': { get: operation('List configured domains visible to this user', array(str), { description: 'Returns data as an array, unlike /v1/domains data.domains. Ordinary users see public domains or the domains allowed by their dedicated mailboxPolicy. Dedicated policies replace public visibility and quotas; explicitly granted private domains are allowed. Active hosted domains follow the system domains: those the caller owns or was granted, or every active hosted domain for administrators, who may claim addresses on any user’s hosted domain. Adding/managing system domains requires administrator settings; users host their own domains with /hosted-domains; claiming an address is a separate operation.' }) },
     '/identities': { get: operation('List sender identities', ref('SendIdentities'), { description: identitiesDescription }) },
-    '/hosted-domains': {
-      get: operation('List hosted domains the caller owns or was granted', array(ref('HostedDomain')), {
-        description: 'Users can host their own domains on this site. Each item has role owner or member; administrators also see only their own here and use /admin/hosted-domains for all.' }),
-      post: operation('Host a domain', ref('HostedDomain'), { request: 'CreateHostedDomainRequest', status: 201,
-        description: `Requires /config hostedDomainsEnabled. Enter a registered root domain (not a subdomain). The site creates a Cloudflare zone and returns status pending with the two nameServers to set at the registrar; existing DNS records at the old nameservers are not migrated automatically; recreate common records (website, verification and so on) with /hosted-domains/{id}/dns-records, preferably before changing the nameservers. Disable DNSSEC at the registrar first. After the nameservers take effect, receiving (Email Routing catch-all) and sending (Email Sending) are configured automatically; poll GET /hosted-domains/{id}. Mail to any unclaimed address on an active hosted domain is claimed for the owner on arrival. Ordinary users obey hosted_domains.maxPerUser and pending limits; domains already used on this site, system domains and zones already in the site account are rejected with 409. More than ${MAX_HOSTED_CREATES_PER_MINUTE} attempts per user per minute (including attempts Cloudflare rejected; administrators included) return 429 rate_limited. The site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} Cloudflare calls per minute, shared with checks, deletions and DNS records, is charged with the real calls: 2 when the domain is reserved (an exhausted budget returns 429 rate_limited, as does Cloudflare rate limiting) and 5 more for the background preconfiguration.` }),
-    },
+    ...hosted,
+    ...hostedDomainBatchPaths(),
     '/hosted-domains/{id}': {
-      get: operation('Read a hosted domain and its setup progress', ref('HostedDomain'), { description: 'Owner, member or administrator; otherwise 404.' }),
+      ...hosted['/hosted-domains/{id}'],
       put: operation('Set the per-member claim limit', ref('HostedDomain'), { request: 'UpdateHostedDomainRequest', description: 'Owner or administrator.' }),
       delete: operation('Stop hosting and delete the domain', success, {
         description: 'Owner or administrator. Irreversible: the domain enters deleting, rejects mail immediately, then every message on the domain is permanently deleted, all its addresses are released and the Cloudflare zone is removed. Restore the original nameservers at the registrar first or the domain stops resolving. The teardown counts 2 calls toward the site-wide Cloudflare budget but is never refused for it.' }),
     },
-    '/hosted-domains/{id}/check': { post: operation('Check the nameservers and continue setup now', ref('HostedDomain'), {
-      description: `Owner or administrator. Asks Cloudflare to re-check nameservers while pending, then advances setup. Calls within 15 seconds of the last check return the current state. More than ${MAX_HOSTED_CHECKS_PER_MINUTE} requests per user per minute (including throttled or forbidden ones) return 429 rate_limited. A check that reaches Cloudflare costs 4 calls of the shared site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} calls per minute; an exhausted budget also returns 429 rate_limited. Nothing is charged while hosted domains are disabled or the Worker has no Cloudflare credentials.` }) },
     '/hosted-domains/{id}/members': {
       get: operation('List members of a hosted domain', array(ref('HostedDomainMember')), { description: 'Owner or administrator.' }),
       put: operation('Replace the members of a hosted domain', array(ref('HostedDomainMember')), { request: 'ReplaceHostedDomainMembersRequest',
@@ -54,18 +48,6 @@ export function buildSessionOpenApiSpec(origin: string) {
     },
     '/hosted-domains/{id}/members/{userId}': { delete: operation('Remove a member or leave a shared domain', success, {
       description: 'Owner or administrator removes any member; a member may remove themselves. Their claimed addresses are kept.' }) },
-    '/hosted-domains/{id}/dns-records': {
-      get: operation('List DNS records of a hosted domain', array(ref('HostedDnsRecord')), {
-        description: `Owner or administrator; members get 403, other users 404. Reads the domain’s Cloudflare zone directly and needs only the Worker’s Cloudflare credentials, not hosted_domains.enabled (403 without them). Works while pending, so records can be added before changing the nameservers, and while suspended. Deleting domains return 409, as do domains still being created. Sorted by name (@ first), type and content, including kind=mail records used for receiving and sending and kind=readonly records this site cannot edit. All four DNS endpoints share a limit of ${MAX_HOSTED_DNS_REQUESTS_PER_MINUTE} requests per user per minute, administrators included. Because every hosted domain uses the site’s Cloudflare token, user actions share a site-wide budget of ${MAX_HOSTED_DNS_SITE_CALLS_PER_MINUTE} Cloudflare calls per minute with hosted-domain additions (2 when reserved plus 5 for background preconfiguration), immediate checks (4) and deletions (2, counted but never refused): listing records costs 1, adding, updating and deleting records cost 2 each, and only requests that can reach Cloudflare count (not those over the per-user limit, or rejected for permission or domain status). Either limit returns 429 rate_limited.` }),
-      post: operation('Add a DNS record to a hosted domain', ref('HostedDnsRecord'), { request: 'HostedDnsRecordInput', status: 201,
-        description: `Owner or administrator; on suspended domains only administrators may write (403). DNS only: A, AAAA and CNAME are created with proxied=false. Records that would conflict with mail are rejected with 400 before Cloudflare is called: root MX, root SPF TXT, any record at _dmarc, _domainkey, *._domainkey, cf-bounce or *.cf-bounce, and a CNAME at the root. At most ${MAX_HOSTED_DNS_RECORDS} non-mail records per domain (403). Cloudflare rejecting the value returns 400; an existing record that cannot coexist with the same name returns 409.` }),
-    },
-    '/hosted-domains/{id}/dns-records/{recordId}': {
-      put: operation('Update a DNS record of a hosted domain', ref('HostedDnsRecord'), { request: 'HostedDnsRecordInput',
-        description: 'Owner or administrator, same domain status rules as adding. Only kind=user records can be changed; mail and readonly records return 403 with their lockedReason. type must equal the existing record type (400; delete and re-add instead). The new name and value follow the same mail-conflict rules as adding. An unknown or malformed recordId returns 404.' }),
-      delete: operation('Delete a DNS record of a hosted domain', success, {
-        description: 'Owner or administrator, same domain status rules as adding. Only kind=user records can be deleted; mail and readonly records return 403. An unknown or malformed recordId returns 404.' }),
-    },
     '/hosted-domains/{id}/transfer': { post: operation('Transfer a hosted domain to another user', ref('HostedDomainTransferResult'), { request: 'TransferHostedDomainRequest',
       description: 'Owner or administrator. The target must be an active user; ordinary owners are limited by the target’s hosted_domains.maxPerUser. includeMailboxes moves the previous owner’s addresses on the domain with all history and revokes their mailbox shares. Members are kept. A stale expectedOwnerId returns 409; retrying a completed transfer returns transferred=false.' }) },
     '/mailboxes': {
@@ -101,8 +83,10 @@ export function buildSessionOpenApiSpec(origin: string) {
     '/messages/sync': { get: operation('Poll unread count and first-page fingerprint', ref('MessageSync'), { parameters: listQuery,
       description: 'Lightweight polling for the list view: accepts the same filters as GET /messages (cursor and afterId are ignored). Refetch the list only when head differs from the head returned with its first page.' }) },
     '/messages/send': { post: sendMailOperation() },
-    '/messages/read': { post: operation('Mark selected owned messages read/unread', changed, { request: 'MarkReadRequest', parameters: mutationQuery,
-      description: 'Changes only mail at addresses the caller owns (or unclaimed addresses with administrator scope=unclaimed). Shared mail is silently skipped; changed counts actual matches.' }) },
+    '/messages/read': { post: operation('Mark selected owned messages read/unread',
+      object({ changed: int, unread: { ...int, description: 'Only when includeUnread=true in the caller’s own view: unread count after this change, capped like GET /messages/unread-count.' } }, ['unread']),
+      { request: 'ApiMarkReadRequest', parameters: mutationQuery,
+        description: 'Changes only mail at addresses the caller owns (or unclaimed addresses with administrator scope=unclaimed). Shared mail is silently skipped; changed counts actual matches.' }) },
     '/messages/read-all': { post: operation('Mark incoming messages read, optionally narrowed by filters', changed, { parameters: mutationQuery, request: 'MarkAllReadRequest', requestRequired: false,
       description: 'Range is unread, non-trash inbound mail in the caller’s own claimed mailboxes (administrator scope=unclaimed: unclaimed addresses). Shared mail is never changed: its read state belongs to the owner. domain/address/q narrow it with the list search semantics. It never applies pagination.' }) },
     '/messages/delete': { post: operation('Move selected messages to trash', object({ deleted: int }), { request: 'MessageIdsRequest', parameters: mutationQuery,
