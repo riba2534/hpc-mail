@@ -136,6 +136,9 @@ for (const schema of [settingsResponse, settingsUpdate]) {
   properties.translation!.description = 'AI translation switch and quota. Enabling requires a configured ai_model (checked against the merged result when both are submitted). dailyCharsPerUser limits characters sent per user per UTC day, administrators included; 0 is unlimited.';
 }
 const notifyPrefs = fromZod(userNotifyPrefsSchema, 'output');
+(notifyPrefs.properties as Record<string, Schema>).forwardPending = { ...array(object({ address: str, expiresAt: date })),
+  description: 'Forwarding targets waiting for the target mailbox owner to confirm (the confirmation mail is valid for 72 hours). They are not in forward.addresses and receive nothing until confirmed.' };
+(notifyPrefs.required as string[] | undefined)?.push('forwardPending');
 notifyPrefs.description = 'Personal preferences. Configured feishu.secret, webhook.secret and pushdeer.pushkey are returned as ******; plaintext secrets are never returned. In updates ****** preserves the secret (for PushDeer only while the endpoint keeps the same origin and path, ignoring a trailing slash, with an empty endpoint meaning the official one; otherwise 400 validation_failed asks for the pushkey again) and an explicit empty string clears it. Enabled configurations must have valid complete endpoints/keys/forward addresses. These are mail-owner notifications; shared mailbox readers do not receive owner notifications.';
 /** 逐收件人结果：发件摘要与 delivery_failed 错误的 details 共用 */
 const recipientOutcome = { ...object({ address: str,
@@ -386,7 +389,13 @@ export const schemas: Record<string, Schema> = {
   })(),
   UpdateApiKeyRequest: fromZod(updateApiKeyRequestSchema), CreateInviteRequest: fromZod(createInviteRequestSchema), ReplaceMailboxSharesRequest: fromZod(replaceMailboxSharesRequestSchema),
   BatchShareMailboxesRequest: fromZod(batchShareMailboxesRequestSchema),
-  UpdateSettingsRequest: settingsUpdate, UpdateNotifyPrefsRequest: fromZod(updateNotifyPrefsRequestSchema),
+  UpdateSettingsRequest: settingsUpdate, UpdateNotifyPrefsRequest: (() => {
+    const schema = fromZod(updateNotifyPrefsRequestSchema);
+    const properties = schema.properties as Record<string, Schema>;
+    properties.password = { ...properties.password, description: 'Current login password. Required (403 reauth_required / reauth_failed) when forward adds an address not yet confirmed or turns forwarding on.' };
+    properties.forward = { ...properties.forward, description: 'Desired forwarding targets (web session only). Already confirmed addresses stay; new ones are not applied but receive a confirmation mail and appear in forwardPending until confirmed; pending addresses missing from the list are cancelled.' };
+    return schema;
+  })(),
   SingleUploadResult: object({ token: str, filename: str, size: int, mimeType: str }),
   MultipartInitResult: object({ token: str, uploadId: str, partBytes: positiveId, partCount: positiveId }),
   MultipartPartResult: object({ partNumber: positiveId, etag: str }), MultipartCompleteResult: object({ token: str, size: int }),
