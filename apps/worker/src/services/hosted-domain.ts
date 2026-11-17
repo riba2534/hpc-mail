@@ -8,6 +8,7 @@ import { hostedDomainMembers, hostedDomains, messages, users } from '../db/schem
 import { AppError } from '../lib/errors.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
 import { logAdminAction } from './audit.js';
+import { subscribeHostedDomainEvents } from './event-subscriptions.js';
 import {
   CloudflareApiError, catchAllTargetsWorker, cloudflareCredentials, countZones, createSendingSubdomain, createZone, deleteSendingSubdomain,
   deleteZone, enableRouting, findZone, getCatchAll, getRouting, getSendingDnsStatus, getZone, isCloudflareNotFound,
@@ -598,6 +599,8 @@ export async function syncHostedDomain(env: Env, id: number, opts: { activationC
   }
   const activatedAt = row.activatedAt ?? (zone.activated_on ? new Date(zone.activated_on) : now);
   const config = await ensureMailConfig(creds, row, true);
+  // 发信就绪后订阅投递回执（失败只记录在订阅状态里，不影响开通）
+  if (config.sendingStatus === 'ready') await subscribeHostedDomainEvents(env, creds, row.domain, zone.id);
   const ready = config.routingStatus === 'ready' && config.catchAllReady && config.sendingStatus === 'ready';
   await saveChecked(env, id, {
     status: ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning',

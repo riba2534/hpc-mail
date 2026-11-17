@@ -51,6 +51,15 @@ bucket_name = "hpc-cloud-mail-r2"
 [[send_email]]
 name = "email"
 
+# 外发投递回执：Cloudflare Email Sending 事件订阅投递到这个 Queue，由本 Worker 消费。
+# Queue 由部署流程（deploy.yml「确保投递回执 Queue 存在」）在 wrangler deploy 之前创建
+[[queues.consumers]]
+queue = "hpc-mail-email-events"
+max_batch_size = 20
+max_batch_timeout = 5
+max_retries = 5
+max_concurrency = 1
+
 [assets]
 binding = "assets"
 directory = "./dist"

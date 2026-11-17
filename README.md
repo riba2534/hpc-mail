@@ -244,6 +244,8 @@ wrangler r2 bucket create hpc-cloud-mail-r2
 > **API Token 权限**：用「Edit Cloudflare Workers」模板创建，再手动补两条——**Account → D1:Edit**（模板不含）、**Zone → Workers Routes:Edit** 且 Zone Resources 勾选 `CUSTOM_DOMAIN` 所在 zone（缺这条会在「部署 Worker」步骤失败）。
 >
 > **托管域名 Token（可选）**：单独创建一个 Token，权限 **Zone → Zone:Edit、DNS:Edit、Zone Settings:Edit、Email Routing Rules:Edit**，**Account → Email Sending:Edit**；Zone Resources 选「All zones from an account」并 **Exclude 站点域名等关键 zone**。部署时 CI 把它与 `CLOUDFLARE_ACCOUNT_ID` 写入 Worker secrets（`cf_api_token` / `cf_account_id`）。用户的域名会成为你账户下的 zone：收件、发信额度与信誉都算在你的账户上，可在后台「托管域名」页暂停或删除。Cloudflare 在账户超过 50 个 zone 且 pending 多于 active 时禁止新增，后台「系统设置 → 域名托管」可限制每人域名数与同时等待生效的数量。
+>
+> **外发投递回执**：送达、退信、投诉经 Cloudflare Email Sending 的事件订阅投递到 Queue `hpc-mail-email-events`，由 Worker 回写到已发送邮件的逐收件人结果，退信与投诉进入抑制名单。CI 在「部署 Worker」前自动创建该 Queue（`CLOUDFLARE_API_TOKEN` 的 Workers Scripts:Edit 已够用）。订阅由 Worker 用上面的托管域名 Token 自动建立，需给它**追加 Account → Queues:Edit**；系统域名还要求该 Token 能读取域名所在 zone——被 Exclude 的 zone 会在「系统设置 → 投递回执」显示失败，可手动建立（之后自动识别为已订阅）：`npx wrangler@latest queues subscription create hpc-mail-email-events --source email.sending --events message.delivered,message.bounced,message.failed,message.rejected,message.complained --zone-id <ZONE_ID> --domain <域名>`。
 
 **3. 首次部署**：fork 仓库的 **Actions 默认是禁用的**——先进仓库 Actions 页点击启用，然后在 `Deploy HPC Mail` workflow 手动 **Run workflow**（刚 fork 没有新提交，push 不会自动触发）。全新空 D1 **不需要**勾 `reset_database`，迁移会自动从零建表；只有复用了含旧表的数据库才勾它（危险：会清空数据）。此后每次 push 到 `main` 自动部署。
 

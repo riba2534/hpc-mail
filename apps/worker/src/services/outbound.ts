@@ -11,6 +11,7 @@ import {
 } from '@hpc-mail/shared';
 import { and, eq, notInArray, sql } from 'drizzle-orm';
 import { createDb, type Db } from '../db/client.js';
+import { d1Statement } from '../lib/d1.js';
 import { attachments as attachmentsTable, deliveryObjectLeases, mailboxes, messages, storageCleanupJobs } from '../db/schema.js';
 import {
   assertNoHeaderInjection,
@@ -48,6 +49,8 @@ import { enqueueMailNotifications, processNotificationJobs } from './notificatio
 import { retainExternalAttachments } from './external-attachment.js';
 import { bindIdempotentSend, type IdempotencyHandle } from './idempotency.js';
 import { injectAttachmentLinks, stripAttachmentLinks, type AttachmentLink } from './attachment-links.js';
+import { deliveryRefStatements } from './delivery-events.js';
+import { lookupSuppressions, recipientSuppressedError, suppressedFor, suppressionMessage } from './suppression.js';
 export { injectAttachmentLinks } from './attachment-links.js';
 
 export interface Sender {
@@ -439,11 +442,14 @@ async function prepareOutboundMime(
   return (target) => (input.to.length ? (shared ??= build(input.to)) : build([{ address: target, name: '' }]));
 }
 
-/** Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文；并发投递前只 import 一次 */
-async function cloudflareSender(env: Env, fromAddress: string): Promise<(toAddr: string, raw: string) => Promise<void>> {
+/**
+ * Cloudflare 原生发信（send_email binding），逐收件人投递同一份原文；并发投递前只 import 一次。
+ * 返回 send() 给出的 Cloudflare 消息 ID（投递回执按它关联），没有时为 null。
+ */
+async function cloudflareSender(env: Env, fromAddress: string): Promise<(toAddr: string, raw: string) => Promise<string | null>> {
   // 动态 import：`cloudflare:email` 在 vitest workerd 里静态加载会崩
   const { EmailMessage } = await import('cloudflare:email');
-  return async (toAddr, raw) => { await env.email.send(new EmailMessage(fromAddress, toAddr, raw)); };
+  return async (toAddr, raw) => (await env.email.send(new EmailMessage(fromAddress, toAddr, raw)))?.messageId || null;
 }
 
 /** 有界并发：最多 limit 个任务同时进行 */
@@ -585,6 +591,9 @@ export async function sendMail(
     ...[...to, ...cc, ...bcc].map(item => getEmailDomain(item.address)),
   ];
   const domains = await getRoutableDomains(env, settings, candidateDomains);
+  // 抑制名单只涉及站外收件人，与发件身份校验并行查询（查询失败按未抑制处理，不会拒绝）
+  const suppressionRows = lookupSuppressions(env, [...to, ...cc, ...bcc].map(item => item.address)
+    .filter(address => !domains.includes(getEmailDomain(address))));
   const from = await resolveFrom(env, sender, req, domains);
   await assertHostedSendable(env, settings, from.domain);
   if (req.forwardAttachmentsFrom) {
@@ -638,6 +647,9 @@ export async function sendMail(
   // 只写站内收件副本；发件记录本身不是「收到的验证邮件」
   const verificationLink = settings.code_extract.enabled && internalTargets.length
     ? extractVerificationLink({ subject: req.subject, text, html, fromAddress: from.address }) : '';
+  // 抑制名单按发件域名生效；全部收件人都被抑制时不建发件行、不占配额
+  const suppressed = suppressedFor(await suppressionRows, from.domain);
+  if (suppressed.size && suppressed.size === uniqueTargets.length) throw recipientSuppressedError([...suppressed.values()]);
   await assertOutboundQuota(env, settings.quota, sender, uniqueTargets.length);
 
   let outbound: typeof messages.$inferSelect | undefined;
@@ -682,6 +694,8 @@ export async function sendMail(
     if (results.size < targets.length) writer.write();
   };
   const internalDeliveries: { target: string; messageId: number; ownerIds: number[] }[] = [];
+  /** 已被 Cloudflare 接受的外部收件人与其消息 ID：随最终结果登记，投递回执据此回写 */
+  const sentRefs: { recipient: string; providerMessageId: string | null }[] = [];
 
   /**
    * 投递阶段交给 waitUntil 托住：客户端断开或请求被取消时仍会投递完并回填结果；请求里照常等待最终结果。
@@ -693,7 +707,11 @@ export async function sendMail(
     const objectLeaseToken = crypto.randomUUID();
 
     const deliverExternal = async () => {
-      if (!externalTargets.length) return;
+      for (const [target, blocked] of suppressed) {
+        record({ address: target, status: 'failed', code: 'recipient_suppressed', error: suppressionMessage(blocked) });
+      }
+      const sendable = externalTargets.filter(target => !suppressed.has(target));
+      if (!sendable.length) return;
       try {
         const payload = await buildExternalPayload(env, origin, text, html, attachments, outboundAtts);
         // 展示正文必须在首次外发前保存，发送成功后不再依赖正文持久化。
@@ -712,10 +730,11 @@ export async function sendMail(
           messageId: outgoingMessageId,
         }, payload.atts);
         const send = await cloudflareSender(env, from.address);
-        await runPool(externalTargets, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
+        await runPool(sendable, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
           try {
-            await send(target, rawFor(target));
+            const providerMessageId = await send(target, rawFor(target));
             record({ address: target, status: 'sent' });
+            sentRefs.push({ recipient: target, providerMessageId });
           } catch (error) {
             record({ address: target, status: 'failed', error: errorText(error) });
           }
@@ -811,8 +830,14 @@ export async function sendMail(
     let saved = false;
     for (let attempt = 0; attempt < 2 && !saved; attempt++) {
       try {
-        await db.update(messages).set({ status, errorDetail, recipientOutcomes: outcomes })
+        const finalWrite = db.update(messages).set({ status, errorDetail, recipientOutcomes: outcomes })
           .where(eq(messages.id, sent.id));
+        // 投递回执的对应关系与最终结果同一事务写入：回执查到对应关系时发件行一定已是终态
+        if (sentRefs.length) {
+          await env.db.batch([d1Statement(env, finalWrite), ...deliveryRefStatements(env, {
+            kind: 'message', messageId: sent.id, sender: from.address, rfcMessageId: outgoingMessageId, targets: sentRefs,
+          })]);
+        } else await finalWrite;
         saved = true;
       } catch (error) { console.error('投递结果回填失败:', error); }
     }

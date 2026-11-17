@@ -165,8 +165,10 @@ export async function subscribeHostedDomainEvents(env: Env, creds: CloudflareCre
   try {
     const settings = await getSettings(env);
     if (!settings.delivery_events.enabled) return;
-    const row = await env.db.prepare('SELECT status FROM email_event_subscriptions WHERE domain = ?').bind(domain).first<{ status: string }>();
-    if (row?.status === 'active') return;
+    const row = await env.db.prepare('SELECT status, checked_at FROM email_event_subscriptions WHERE domain = ?').bind(domain)
+      .first<{ status: string; checked_at: number | null }>();
+    // 已订阅，或失败不久（开通中的域名每 5 分钟核对一次，不必每次都重试）
+    if (row?.status === 'active' || (row?.checked_at && Date.now() - Number(row.checked_at) < ERROR_RETRY_MS)) return;
     const target: Target = { domain, kind: 'hosted', zoneId };
     let state: Awaited<ReturnType<typeof loadQueueState>>;
     try {
