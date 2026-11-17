@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ApiError, isRejectedRequest, isUncertainSendError, NETWORK_ERROR_MESSAGE, toApiError } from './errors';
+import { ApiError, isRejectedRequest, NETWORK_ERROR_MESSAGE, toApiError } from './errors';
 
 describe('toApiError', () => {
   it.each([
@@ -21,15 +21,6 @@ describe('toApiError', () => {
   it('其他异常保留原文，空文案退回网络提示', () => {
     expect(toApiError(new Error('boom')).message).toBe('boom');
     expect(toApiError(new Error('')).message).toBe(NETWORK_ERROR_MESSAGE);
-  });
-});
-
-describe('isUncertainSendError', () => {
-  it('网络、超时与 5xx 结果不确定，4xx 业务错误是明确失败', () => {
-    expect(isUncertainSendError(toApiError(new TypeError('Failed to fetch')))).toBe(true);
-    expect(isUncertainSendError(new ApiError('t', { code: 'timeout' }))).toBe(true);
-    expect(isUncertainSendError(new ApiError('g', { code: 'internal', httpStatus: 503 }))).toBe(true);
-    expect(isUncertainSendError(new ApiError('v', { code: 'validation_failed', httpStatus: 400 }))).toBe(false);
   });
 });
 

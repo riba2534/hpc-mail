@@ -5,6 +5,7 @@ import { ApiError } from '@/api/errors';
 import { authApi } from '@/api/resources';
 import { setAuthToken } from '@/lib/auth-token';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/dialog';
 import { FormField } from '@/components/ui/form-field';
 import { PasswordInput } from '@/components/ui/password-input';
@@ -14,14 +15,20 @@ export function ChangePasswordDialog({ open, onOpenChange }: { open: boolean; on
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirm, setConfirm] = useState('');
+  // 默认一并吊销：账号可能已泄露时，改密之外还要收回别人可能留下的 API Key
+  const [revokeApiKeys, setRevokeApiKeys] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
-    mutationFn: () => authApi.changePassword({ oldPassword, newPassword }),
+    mutationFn: () => authApi.changePassword({ oldPassword, newPassword, revokeApiKeys }),
     onSuccess: (res) => {
       // 改密会踢掉全部旧会话，服务端返回的新 token 需立即替换，当前会话才不掉线
       setAuthToken(res.token);
-      toast({ title: '密码已修改', variant: 'success' });
+      toast({
+        title: '密码已修改',
+        description: res.revokedApiKeys > 0 ? `已吊销 ${res.revokedApiKeys} 个 API Key，用到它们的脚本需要换用新 Key` : undefined,
+        variant: 'success',
+      });
       onOpenChange(false);
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : '修改失败，请重试'),
@@ -31,6 +38,7 @@ export function ChangePasswordDialog({ open, onOpenChange }: { open: boolean; on
     setOldPassword('');
     setNewPassword('');
     setConfirm('');
+    setRevokeApiKeys(true);
     setError(null);
   };
 
@@ -91,6 +99,19 @@ export function ChangePasswordDialog({ open, onOpenChange }: { open: boolean; on
                 />
               )}
             </FormField>
+            <label className="flex cursor-pointer items-start gap-2.5 text-sm">
+              <Checkbox
+                className="mt-0.5"
+                checked={revokeApiKeys}
+                onCheckedChange={(checked) => setRevokeApiKeys(checked === true)}
+              />
+              <span className="min-w-0">
+                <span className="font-medium text-ink">同时吊销我的全部 API Key</span>
+                <span className="mt-0.5 block text-ink-tertiary">
+                  怀疑账号泄露时建议勾选。吊销后，使用这些 Key 的脚本和 AI Agent 立即失效，需要到「API Keys」页重新创建。
+                </span>
+              </span>
+            </label>
           </DialogBody>
           <DialogFooter>
             <Button type="button" variant="secondary" onClick={() => onOpenChange(false)}>

@@ -21,7 +21,7 @@ import {
   type UploadedPart,
   internalSendMailSchema,
 } from '@hpc-mail/shared';
-import { ApiError, isUncertainSendError } from '@/api/errors';
+import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi, uploadsApi } from '@/api/resources';
 import { Progress } from '@/components/ui/progress';
@@ -61,7 +61,7 @@ import {
 import { exceedsExternalLimit, hasExternalRecipient } from './compose-attachments';
 import { IdentityPicker } from './identity-picker';
 import { RecipientInput } from './recipient-input';
-import { clearSendAttempt, hashSendPayload, persistSendAttempt, readSendAttempt } from './send-attempt';
+import { classifySendError, clearSendAttempt, hashSendPayload, missingSendSource, persistSendAttempt, readSendAttempt } from './send-attempt';
 
 interface AttachmentUpload {
   key: string;
@@ -258,9 +258,11 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
     for (const attachment of attachmentRefs.current) attachment.abort?.abort();
   }, []);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
-  const [sendError, setSendError] = useState<{ message: string; uncertain: boolean } | null>(null);
+  const [sendError, setSendError] = useState<{ message: string; kind: 'uncertain' | 'in_progress' | 'reply_gone' | 'forward_gone' | 'error' } | null>(null);
   const [dragging, setDragging] = useState(false);
-  const replyToMessageId = initial.replyToMessageId;
+  // 原邮件已删除或不可见时，用户可以去掉回复关联 / 原邮件附件，再作为新邮件发送
+  const [replyToMessageId, setReplyToMessageId] = useState(initial.replyToMessageId);
+  const [forwardAttachmentsFrom, setForwardAttachmentsFrom] = useState(initial.forwardAttachmentsFrom);
 
   const clearFieldError = (key: FieldKey) =>
     setFieldErrors((current) => (current[key] ? { ...current, [key]: undefined } : current));
@@ -313,7 +315,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
   const [initialSnapshot] = useState(contentSnapshot);
   const dirty = contentSnapshot !== initialSnapshot;
   const hasContent =
-    to.length > 0 || cc.length > 0 || bcc.length > 0 || attachments.length > 0 || Boolean(initial.forwardAttachmentsFrom) || subject.trim() !== '' || body.trim() !== '';
+    to.length > 0 || cc.length > 0 || bcc.length > 0 || attachments.length > 0 || Boolean(forwardAttachmentsFrom) || subject.trim() !== '' || body.trim() !== '';
 
   const persistDraft = () => {
     if (sentRef.current || discardedRef.current) return;
@@ -324,6 +326,8 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
     const savedAttachments: SavedAttachment[] = attachments.map(({ key, filename, mimeType, size, token, status, createdAt }) => ({ key, filename, mimeType, size, token, status, createdAt }));
     writeDraft(draftKey, {
       ...initial,
+      replyToMessageId,
+      forwardAttachmentsFrom,
       fromAddress: validMailbox ? mailboxes?.find((box) => box.id === mailboxId)?.address : isAdmin ? `${localPart}@${adminDomain}` : undefined,
       to, cc, bcc, subject, body, isHtml, mailboxId, localPart, adminDomain, attachments: savedAttachments, savedAt: Date.now(),
     });
@@ -339,7 +343,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       return;
     }
     persistDraftRef.current();
-  }, [autosave, dirty, restored, draftKey, contentSnapshot, mailboxId, localPart, adminDomain]);
+  }, [autosave, dirty, restored, draftKey, contentSnapshot, mailboxId, localPart, adminDomain, replyToMessageId, forwardAttachmentsFrom]);
 
   // 用户继续编辑后，上一次发送错误已不对应当前内容
   const editKey = `${contentSnapshot}|${mailboxId}|${localPart}|${adminDomain}`;
@@ -429,18 +433,26 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages.contacts, refetchType: 'none' });
       navigate(result.errorDetail || result.status === 'failed' || result.recipientOutcomes?.some((outcome) => outcome.status === 'failed') ? `/mail/${result.id}` : '/sent');
     },
-    onError: (err) => {
-      // 网络/超时可能发生在服务端已经发送之后，保留同一个 key 可安全查询/重放结果；
-      // 明确的业务错误则允许用户修正后使用新 key。
-      const unresolved = isUncertainSendError(err);
-      if (!unresolved) {
+    onError: (err, payload) => {
+      // 网络/超时可能发生在服务端已经发送之后、服务端也可能仍在处理：保留同一个 key，再次发送只会查询/重放原结果。
+      // 明确的业务错误，或 key 已绑定其他内容（当前内容一定没用它发出）：换新 key，由用户修正或确认后再发。
+      const failure = classifySendError(err);
+      if (failure === 'rejected' || failure === 'key_mismatch') {
         clearSendAttempt(user.id, sendIdempotencyKeyRef.current);
         setRecoveredSendPending(false);
         sendIdempotencyKeyRef.current = null;
         sendPayloadHashRef.current = null;
       }
       const sessionChanged = err instanceof ApiError && err.code === 'session_changed';
-      setSendError({ message: err instanceof ApiError ? err.message : '发送失败，请重试', uncertain: unresolved && !sessionChanged });
+      const message = failure === 'key_mismatch'
+        ? '发送凭据已用于其他内容，已为这封邮件更换新凭据。请先到已发送确认没有重复，再点击发送。'
+        : err instanceof ApiError ? err.message : '发送失败，请重试';
+      const missing = missingSendSource(err, payload);
+      setSendError({
+        message,
+        kind: missing ? (missing === 'reply' ? 'reply_gone' : 'forward_gone')
+          : failure === 'in_progress' ? 'in_progress' : failure === 'uncertain' && !sessionChanged ? 'uncertain' : 'error',
+      });
     },
   });
 
@@ -612,7 +624,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
       ...(isHtml ? { html: body } : { text: body }),
       attachmentTokens,
       ...(replyToMessageId ? { replyToMessageId } : {}),
-      ...(initial.forwardAttachmentsFrom ? { forwardAttachmentsFrom: initial.forwardAttachmentsFrom } : {}),
+      ...(forwardAttachmentsFrom ? { forwardAttachmentsFrom } : {}),
     };
 
     const parsed = internalSendMailSchema.safeParse(payload);
@@ -626,7 +638,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         setFieldErrors(issueErrors);
         focusField(issueErrors);
       } else {
-        setSendError({ message: parsed.error.issues[0]?.message ?? '请检查输入', uncertain: false });
+        setSendError({ message: parsed.error.issues[0]?.message ?? '请检查输入', kind: 'error' });
       }
       return;
     }
@@ -634,6 +646,14 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
     attemptedRef.current = true;
     persistDraftRef.current();
     sendMutation.mutate(parsed.data);
+  };
+
+  // 只去掉失效的来源，不自动重发：由用户确认后再点发送（内容变了，会用新的幂等键）
+  const detachSource = () => {
+    if (sendError?.kind === 'reply_gone') setReplyToMessageId(undefined);
+    else setForwardAttachmentsFrom(undefined);
+    setSendError(null);
+    toast({ title: sendError?.kind === 'reply_gone' ? '已改为新邮件，确认后点击发送' : '已去掉原邮件附件，确认后点击发送' });
   };
 
   // Ctrl/⌘+Enter 发送；等收件人输入框把回车前的地址提交进状态后再提交表单
@@ -838,8 +858,8 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
               onChange={(event) => handleFiles(event.target.files)}
             />
           </div>
-          {initial.forwardAttachmentsFrom && (
-            <p className="text-sm text-ink-secondary">将保留原邮件附件（来源邮件 #{initial.forwardAttachmentsFrom}）。</p>
+          {forwardAttachmentsFrom && (
+            <p className="text-sm text-ink-secondary">将保留原邮件附件（来源邮件 #{forwardAttachmentsFrom}）。</p>
           )}
           {attachments.length > 0 && (
             <ul className="flex flex-col gap-1.5">
@@ -893,7 +913,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
         </div>
 
         {sendError && (
-          sendError.uncertain ? (
+          sendError.kind === 'uncertain' ? (
             <div role="alert" className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
               <p className="font-medium text-caution">发送结果不确定：{sendError.message}</p>
               <p className="mt-1">
@@ -904,6 +924,30 @@ function ComposeEditor({ initial, restored, draftKey, autosave }: ComposeEditorP
               <Button type="submit" size="sm" variant="secondary" className="mt-2" loading={sendMutation.isPending}>
                 重试发送
               </Button>
+            </div>
+          ) : sendError.kind === 'reply_gone' || sendError.kind === 'forward_gone' ? (
+            <div role="alert" className="rounded-md border border-critical/40 bg-critical-soft p-3 text-sm text-ink-secondary">
+              <p className="font-medium text-critical">
+                {sendError.kind === 'reply_gone' ? '原邮件已不存在，无法关联回复线程' : '原邮件的附件已不可用，无法一起转发'}
+              </p>
+              <p className="mt-1">
+                {sendError.kind === 'reply_gone'
+                  ? '可以去掉与原邮件的关联，作为一封新邮件发送。'
+                  : '可以去掉原邮件附件，只发送正文和新添加的附件。'}
+              </p>
+              <Button type="button" size="sm" variant="secondary" className="mt-2" onClick={detachSource}>
+                {sendError.kind === 'reply_gone' ? '作为新邮件发送' : '去掉原邮件附件'}
+              </Button>
+            </div>
+          ) : sendError.kind === 'in_progress' ? (
+            // 服务端仍在处理或结果待确认：不提供重试按钮，避免反复提交；先去已发送核对
+            <div role="alert" className="rounded-md border border-caution/40 bg-caution-soft p-3 text-sm text-ink-secondary">
+              <p className="font-medium text-caution">发送结果待确认</p>
+              <p className="mt-1">
+                服务器仍在处理这封邮件，或上次发送的结果尚未确认。请到
+                <Link to="/sent" className="mx-0.5 font-medium text-accent hover:underline">已发送</Link>
+                查看是否已经发出；内容不变时再次点击发送只会查询原结果，不会重复投递，修改内容则会作为一封新邮件发送。
+              </p>
             </div>
           ) : (
             <p role="alert" className="text-sm text-critical">{sendError.message}</p>
