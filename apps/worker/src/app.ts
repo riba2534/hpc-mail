@@ -29,7 +29,7 @@ import messages from './routes/messages.js';
 import notifyPrefs from './routes/notify-prefs.js';
 import v1 from './routes/v1/index.js';
 import webhooks from './routes/webhooks.js';
-import { buildSessionOpenApiSpec } from './routes/api-openapi.js';
+import { serveOpenApi } from './routes/openapi-serve.js';
 import { createMcpRoutes } from './routes/mcp/index.js';
 import type { AppContext } from './types.js';
 
@@ -45,7 +45,7 @@ export function createApp() {
   app.notFound((c) => onError(new AppError('not_found', '接口不存在'), c));
 
   const api = new Hono<AppContext>();
-  api.get('/openapi.json', (c) => c.json(buildSessionOpenApiSpec(new URL(c.req.url).origin)));
+  api.get('/openapi.json', (c) => serveOpenApi(c, 'api'));
   api.route('/auth', auth);
   api.route('/avatar', avatar);
   api.route('/config', config);

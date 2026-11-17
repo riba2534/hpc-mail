@@ -16,7 +16,7 @@ import v1Messages from './messages.js';
 import { v1Drafts } from '../drafts.js';
 import v1NotifyPrefs from './notify-prefs.js';
 import v1Webhooks from './webhooks.js';
-import { buildOpenApiSpec } from './openapi.js';
+import { serveOpenApi } from '../openapi-serve.js';
 
 const app = new Hono<AppContext>();
 
@@ -66,7 +66,7 @@ app.get('/domains', apiKeyAuth, async (c) => {
 });
 
 /** OpenAPI 描述（公开，无需 key） */
-app.get('/openapi.json', (c) => c.json(buildOpenApiSpec(new URL(c.req.url).origin)));
+app.get('/openapi.json', (c) => serveOpenApi(c, 'v1'));
 
 app.route('/hosted-domains', v1HostedDomains);
 // 共享管理先于 /mailboxes 挂载：/mailboxes/shares 不能落进 /mailboxes/:id
