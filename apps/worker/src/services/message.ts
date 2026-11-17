@@ -35,10 +35,10 @@ import { signAttachment } from '../lib/crypto.js';
 import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
-import { htmlToText, PREVIEW_LIMIT } from '../lib/text.js';
+import { PREVIEW_LIMIT } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
-import { CODE_SCAN_BODY_CHARS, resolveVerificationCode } from './code-extract.js';
+import { resolveVerificationCode } from './code-extract.js';
 import { getSettings } from './setting.js';
 import { getJson } from './storage.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
@@ -424,12 +424,17 @@ export interface WaitFilters {
 const WAIT_SCAN_BATCH = 50;
 /** AI 兜底提码在收件后异步写回；这段时间内无码的新邮件先不判为「不匹配」，避免被跳过 */
 const AI_CODE_GRACE_MS = 30_000;
+/**
+ * 带附件的收件先插 pending 行、附件落 R2 后才转为完整状态，正常几秒内完成。
+ * 窗口内停在它之前等下一轮；超过窗口多半是附件保存失败在等 SMTP 重投，不再挡住后面的新邮件。
+ */
+const PENDING_ATTACHMENTS_GRACE_MS = 2 * 60_000;
 
 /**
  * 增量读取严格返回 afterId 之后最早一封满足过滤条件的收件，保证游标推进时不会跳过突发邮件。
  * scannedThroughId 是本次已确定检查过的最大 id（没有新邮件时等于 afterId）：其间不匹配的邮件被跳过，
- * 调用方超时后可从它继续。hasCode 与返回的 verificationCode 同一口径；AI 可能稍后补码的新邮件
- * 不计入已检查，下一次轮询再判定。
+ * 调用方超时后可从它继续。hasCode 与返回的 verificationCode 同一口径；AI 可能稍后补码的新邮件、
+ * 附件尚未落库（pending）的新邮件都不计入已检查，下一次轮询再判定——游标推过去调用方就再也看不到它。
  */
 export async function findNextMessage(
   env: Env,
@@ -462,6 +467,8 @@ export async function findNextMessage(
       scannedThroughId = row.id;
       continue;
     }
+    // 发件人与主题收件时就已确定，不匹配的 pending 行照常跳过；匹配的要等附件落库再返回
+    if (row.status === 'pending' && Date.now() - row.createdAt.getTime() < PENDING_ATTACHMENTS_GRACE_MS) break;
     const summary = summarize(row, false, false);
     if (input.hasCode && !summary.verificationCode) {
       if (aiPending === undefined) {
@@ -700,6 +707,30 @@ async function assertVisible(db: Db, viewer: Viewer, row: VisibilityRow): Promis
   throw new AppError('not_found', '邮件不存在');
 }
 
+/**
+ * 发信引用的来源邮件（转发附件、回复线程头）：与详情同一可见口径——发件人自己的 mine 范围
+ * （认领 + 共享来的未删除收件），管理员另含未认领地址；不按角色整体放行，管理员也拿不到
+ * 其他用户的私有邮件。不可见与不存在同为 404，不暴露 id 是否存在。
+ */
+export async function loadSourceMessage(env: Env, sender: { userId: number; role: Role }, id: number) {
+  const db = createDb(env);
+  const row = await db
+    .select({
+      address: messages.address,
+      direction: messages.direction,
+      deletedAt: messages.deletedAt,
+      messageId: messages.messageId,
+      inReplyTo: messages.inReplyTo,
+      references: messages.references,
+    })
+    .from(messages)
+    .where(eq(messages.id, id))
+    .get();
+  if (!row) throw new AppError('not_found', '邮件不存在');
+  await assertVisible(db, { userId: sender.userId, role: sender.role }, row);
+  return row;
+}
+
 /** 详情需要完整行（含正文）；只做可见性判定的调用方用 assertVisible 并自选列 */
 async function loadVisible(env: Env, viewer: Viewer, id: number): Promise<MessageRow> {
   const db = createDb(env);
@@ -788,13 +819,8 @@ export async function getMessageDetail(
   );
 
   return {
+    // 验证码与列表、wait、线程同一口径（summarize）：已存值优先，详情不再按正文另算一份
     ...summarize(row, attRows.length > 0, starRows.length > 0),
-    // 只看正文前 16KB：验证码总在开头附近，超长营销邮件不必每次打开都全文扫描
-    verificationCode: resolveVerificationCode(
-      row.subject,
-      (bodyText || htmlToText(bodyHtml)).slice(0, CODE_SCAN_BODY_CHARS),
-      row.verificationCode,
-    ),
     recipients: row.recipients as MessageRecipients,
     replyTo: row.replyTo,
     bodyText,

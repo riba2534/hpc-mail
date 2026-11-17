@@ -633,6 +633,8 @@ describe('共享邮箱', () => {
     const box = await claimMailbox(env, adminId, 'admin', { localPart, domain: 'inbox.test' });
     const inboundId = await seedInbound(address, 'shared code', 'code 654321');
     const db = createDb(env);
+    // seedInbound 不跑提码：补上收件时会存下的验证码，详情与列表都按已存值返回
+    await db.update(messages).set({ verificationCode: '654321' }).where(eq(messages.id, inboundId));
     const [outbound] = await db
       .insert(messages)
       .values({

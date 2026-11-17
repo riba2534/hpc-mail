@@ -3,6 +3,7 @@ import { buildSecureHeaders } from '../lib/attachment-security.js';
 import { verifyAttachmentSig } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
 import { parseId } from '../lib/http.js';
+import { messageViewer } from '../lib/message-viewer.js';
 import { requireAuth } from '../middleware/auth.js';
 import { loadAttachmentById, loadAttachmentForViewer } from '../services/message.js';
 import { loadExternalAttachment } from '../services/external-attachment.js';
@@ -11,7 +12,10 @@ import type { AppContext } from '../types.js';
 
 const app = new Hono<AppContext>();
 
-/** 附件下载：签名 URL（exp+sig，供内嵌 cid 图片）或 JWT + 可见性校验 */
+/**
+ * 附件下载：签名 URL（exp+sig，供内嵌 cid 图片）或 JWT + 可见性校验。
+ * JWT 下载与详情同一可见范围（?scope=&userId=，管理员审计他人邮箱时带 scope=user），非法范围显式拒绝。
+ */
 app.get('/:id', async (c) => {
   const id = parseId(c.req.param('id'));
   const exp = Number(c.req.query('exp'));
@@ -27,7 +31,7 @@ app.get('/:id', async (c) => {
   } else {
     await requireAuth(c, async () => {});
     const user = c.get('user')!;
-    att = await loadAttachmentForViewer(c.env, { userId: user.id, role: user.role }, id);
+    att = await loadAttachmentForViewer(c.env, messageViewer(c, { userId: user.id, role: user.role }), id);
   }
 
   const obj = await getObject(c.env, att.r2Key);
