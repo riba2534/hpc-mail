@@ -14,6 +14,7 @@ import type { Env } from '../types.js';
 import { API_REJECT_SCOPE, dayWindow, minuteWindow, OUTBOUND_QUOTA_SCOPE, purgeCounters } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { REAUTH_FAIL_SCOPE } from './reauth.js';
+import { cleanupWebhookDeliveries, processWebhookDeliveries } from './webhooks.js';
 import { purgeMatchingMessages, purgeStatements } from './message-lifecycle.js';
 import { harvestRecentClaudeFacts } from './claude-facts.js';
 import {
@@ -194,11 +195,14 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
   await step(report, 'storage.cleanup', () => processStorageCleanup(env, 100));
   await step(report, 'hosted_domains.sync', () => syncDueHostedDomains(env));
+  // 排在托管域名核对之后：本轮产生的域名事件同轮投递
+  await step(report, 'webhooks.process', async () => (await processWebhookDeliveries(env, { limit: 50 })).processed);
 }
 
 async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'claude_facts.catchup', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_CATCHUP_MS));
   await step(report, 'notification.cleanup', () => cleanupNotificationJobs(env));
+  await step(report, 'webhooks.cleanup', () => cleanupWebhookDeliveries(env));
   const db = createDb(env);
   const cutoff = new Date(Date.now() - NINETY_DAYS_MS);
   const staleWindow = Math.floor(Date.now() / 60000) - 120;

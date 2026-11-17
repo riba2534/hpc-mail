@@ -19,6 +19,7 @@ import { systemDomainListedSql } from './domain-occupancy.js';
 import { purgeMatchingMessages } from './message-lifecycle.js';
 import { andGuards, counterResult, counterStatement, counterWithinGuard, minuteWindow, type CounterGuard } from './rate-counter.js';
 import { getSettings, getSettingsFresh } from './setting.js';
+import { emitHostedDomainTransitions } from './webhooks.js';
 
 type HostedRow = typeof hostedDomains.$inferSelect;
 type Viewer = Pick<AuthUser, 'id' | 'username' | 'role'>;
@@ -577,6 +578,7 @@ export async function syncHostedDomain(env: Env, id: number, opts: { activationC
   if (!zone) {
     if (row.status === 'pending') return dropPending(env, creds, row, 'Cloudflare 已删除未激活的 zone');
     await saveChecked(env, id, { status: 'moved', zoneStatus: 'missing', lastError: 'Cloudflare 中的 zone 已不存在', checkedAt: now });
+    await emitHostedDomainTransitions(env, row, { status: 'moved', zoneStatus: 'missing' });
     return;
   }
   if (zone.status === 'pending' || zone.status === 'initializing') {
@@ -594,13 +596,15 @@ export async function syncHostedDomain(env: Env, id: number, opts: { activationC
   }
   if (zone.status === 'moved') {
     await saveChecked(env, id, { status: 'moved', zoneStatus: 'moved', lastError: '域名的名称服务器已不再指向本站', checkedAt: now });
+    await emitHostedDomainTransitions(env, row, { status: 'moved', zoneStatus: 'moved' });
     return;
   }
   const activatedAt = row.activatedAt ?? (zone.activated_on ? new Date(zone.activated_on) : now);
   const config = await ensureMailConfig(creds, row, true);
   const ready = config.routingStatus === 'ready' && config.catchAllReady && config.sendingStatus === 'ready';
+  const status = ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning';
   await saveChecked(env, id, {
-    status: ready ? 'active' : now.getTime() - activatedAt.getTime() > PROVISION_GRACE_MS ? 'error' : 'provisioning',
+    status,
     zoneStatus: 'active',
     activatedAt,
     routingStatus: config.routingStatus,
@@ -611,6 +615,7 @@ export async function syncHostedDomain(env: Env, id: number, opts: { activationC
     lastError: ready ? '' : config.error,
     checkedAt: now,
   });
+  await emitHostedDomainTransitions(env, row, { status, zoneStatus: 'active', ...config });
 }
 
 /**

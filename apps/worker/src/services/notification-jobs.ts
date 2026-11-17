@@ -17,6 +17,7 @@ import { NotificationDeliveryError } from './notification-http.js';
 import { sendPushDeerNotification } from './pushdeer.js';
 import { dayWindow } from './rate-counter.js';
 import { sendNotifyWebhook, type WebhookMailPayload } from './webhook-notify.js';
+import { mailReceivedDeliveriesStatement, processWebhookDeliveries } from './webhooks.js';
 import { getJson } from './storage.js';
 
 type Channel = typeof notificationJobs.$inferSelect.channel;
@@ -57,6 +58,7 @@ export async function enqueueMailNotifications(
   input: MailNotificationInput,
 ): Promise<number[]> {
   const ids: number[] = [];
+  const webhookIds: number[] = [];
   try {
     const ownerIds = [...new Set(input.ownerIds ?? await resolveNotifyOwnerIds(env, input.message.address))];
     // 单个用户偏好读取失败不应压制其他管理员的正常通知。
@@ -98,6 +100,8 @@ export async function enqueueMailNotifications(
         .onConflictDoNothing({ target: notificationJobs.dedupeKey }).returning({ id: notificationJobs.id })));
     }
     const insertCount = statements.length;
+    // Webhook v2 的 mail.received 投递在同一事务里入队（不多一次往返），载荷在首次投递时构造
+    if (ownerIds.length) statements.push(mailReceivedDeliveriesStatement(env, ownerIds, input.message, now.getTime()));
     // 只有全部偏好读取和任务写入成功才标记；部分任务可由 cron 按快照补齐，已有 dedupe 不重复发。
     if (prefs.every(result => result.status === 'fulfilled')) {
       statements.push(d1Statement(env, db.update(messages).set({ notificationsQueuedAt: now })
@@ -106,6 +110,7 @@ export async function enqueueMailNotifications(
     if (statements.length) {
       const results = await env.db.batch<{ id: number }>(statements);
       for (const result of results.slice(0, insertCount)) ids.push(...result.results.map(row => Number(row.id)));
+      if (ownerIds.length) webhookIds.push(...(results[insertCount]?.results ?? []).map(row => Number(row.id)));
     }
   } catch {
     console.error('邮件通知任务保存失败（邮件已入库）');
@@ -113,6 +118,9 @@ export async function enqueueMailNotifications(
   if (ctx && ids.length) {
     ctx.waitUntil(processNotificationJobs(env, { jobIds: ids, owners: input.owners })
       .catch(() => console.error('通知队列处理失败')));
+  }
+  if (ctx && webhookIds.length) {
+    ctx.waitUntil(processWebhookDeliveries(env, { ids: webhookIds }).catch(() => console.error('Webhook 投递处理失败')));
   }
   return ids;
 }

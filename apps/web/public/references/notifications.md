@@ -62,7 +62,7 @@ jq '{feishu:(.data.feishu + {contentLevel:"code_only"})}' <<< "$CURRENT_PREFS" |
 
 `verificationLink` 是收件时识别出的验证/登录链接，没有则为空串；字段为新增，接收端应忽略未知字段。链接来自不可信邮件内容，接收端自动访问前须核对域名。
 
-配置非空 secret 时：`X-HPC-Signature = Base64(HMAC-SHA256(UTF8(secret), 原始 JSON request-body 字节))`。不是 `sha256=hex`，不是重序列化 JSON 后签名；接收端先保存原始 body，以同一 UTF-8 密钥计算并恒定时间比较。未配 secret 就不带签名头。payload 没有全文、Token 或额外固定时间戳头，不应凭空要求不存在字段；可按 `event/message.id/address` 与业务记录去重。Webhook 发送约 10 秒超时，不自动重试；若用户要求集成接收端，也需相应系统的授权。
+配置非空 secret 时：`X-HPC-Signature = Base64(HMAC-SHA256(UTF8(secret), 原始 JSON request-body 字节))`。不是 `sha256=hex`，不是重序列化 JSON 后签名；接收端先保存原始 body，以同一 UTF-8 密钥计算并恒定时间比较。过渡期同时带 Svix 兼容的 `webhook-id`（`msg_<邮件 id>`）、`webhook-timestamp`、`webhook-signature`，算法同 [Webhook v2](webhooks.md#签名与校验)，只是这里的密钥按 UTF-8 字节使用（以 `whsec_` 开头的按 Base64 解码）；`X-HPC-Signature` 会在过渡期后移除，新接收端按 Svix 头校验。未配 secret 就不带签名头。payload 没有全文、Token，不应凭空要求不存在字段；可按 `webhook-id` 或 `event/message.id/address` 去重。Webhook 发送约 10 秒超时，不自动重试；需要重试、事件过滤或发信结果推送时改用 [Webhook v2](webhooks.md)。若用户要求集成接收端，也需相应系统的授权。
 
 ## 健康、重试与转发配额
 

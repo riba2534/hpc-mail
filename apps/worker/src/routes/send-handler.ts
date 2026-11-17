@@ -7,7 +7,7 @@ import {
 } from '@hpc-mail/shared';
 import type { Context } from 'hono';
 import { AppError } from '../lib/errors.js';
-import { ok, parseBody } from '../lib/http.js';
+import { execCtx, ok, parseBody } from '../lib/http.js';
 import {
   beginIdempotentSend,
   completeIdempotentSend,
@@ -16,6 +16,7 @@ import {
 } from '../services/idempotency.js';
 import { decodeInlineAttachments, deliveryFailedError, sendMail, type Sender } from '../services/outbound.js';
 import { consumeDraftAttachments, resolveDraftAttachments } from '../services/upload.js';
+import { emitSendResult } from '../services/webhooks.js';
 import type { AppContext } from '../types.js';
 
 /**
@@ -54,8 +55,12 @@ export async function handleSend(
   } catch (error) {
     // 全部失败（422）时幂等键已绑定发件行，这里不会动它，重放由发件行推出同样的结果
     await failIdempotentSend(c.env, idem.handle, error);
+    const failedId = error instanceof AppError && error.code === 'delivery_failed' ? error.hints.details?.messageId : undefined;
+    if (failedId) await emitSendResult(c.env, sender.userId, failedId, execCtx(c));
     throw error;
   }
+  // Webhook v2 的 mail.sent / mail.failed：放进 waitUntil，按发件行最终状态发，去重键保证重放不重复
+  await emitSendResult(c.env, sender.userId, summary.id, execCtx(c));
   // 邮件已发出：结果缓存与草稿回收失败都不能翻转请求结果（前端会提示重发，token 又还在，收件人就收到两封）。
   // 草稿回收失败留给 24h 的草稿清理兜底；两者互不依赖，并行写
   await Promise.all([
