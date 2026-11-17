@@ -37,7 +37,9 @@ export async function markStaleOutbound(env: Env, now = Date.now(), limit = STAL
     ];
     const failed = recorded.filter((outcome) => outcome.status === 'failed')
       .map((outcome) => `${outcome.address}: ${outcome.error ?? ''}`);
-    const errorDetail = `${UNKNOWN_OUTCOME_ERROR}${missing.length ? `: ${missing.join(', ')}` : ''}` +
+    // 增量回填里已经是 unknown 的目标（send_email 报错但不是明确拒收）与没回填的目标一样待核对
+    const unconfirmed = outcomes.filter((outcome) => outcome.status === 'unknown').map((outcome) => outcome.address);
+    const errorDetail = `${UNKNOWN_OUTCOME_ERROR}${unconfirmed.length ? `: ${unconfirmed.join(', ')}` : ''}` +
       (failed.length ? `；已失败: ${failed.join('; ')}` : '');
     return env.db.prepare(`UPDATE messages SET status = 'unknown', recipient_outcomes = ?, error_detail = ?
       WHERE id = ? AND status = 'pending'`).bind(JSON.stringify(outcomes), errorDetail, row.id);
