@@ -1,4 +1,4 @@
-import type { ErrorCode } from '@hpc-mail/shared';
+import type { ApiErrorDetails, ErrorCode } from '@hpc-mail/shared';
 
 /** 非契约错误码：本地网络/超时/响应格式问题 */
 export type ClientErrorCode = 'network' | 'timeout' | 'malformed' | 'session_changed';
@@ -9,12 +9,17 @@ export interface ApiErrorInit {
   httpStatus?: number | null;
   requestId?: string;
   cause?: unknown;
+  /** 错误信封的改正建议与结构化补充（如 delivery_failed 的发件行与逐收件人结果） */
+  fix?: string;
+  details?: ApiErrorDetails;
 }
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode;
   readonly httpStatus: number | null;
   readonly requestId?: string;
+  readonly fix?: string;
+  readonly details?: ApiErrorDetails;
 
   constructor(message: string, init: ApiErrorInit) {
     super(message, { cause: init.cause });
@@ -22,6 +27,8 @@ export class ApiError extends Error {
     this.code = init.code;
     this.httpStatus = init.httpStatus ?? null;
     this.requestId = init.requestId;
+    this.fix = init.fix;
+    this.details = init.details;
   }
 
   get unauthorized(): boolean {

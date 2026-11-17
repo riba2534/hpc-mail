@@ -98,7 +98,10 @@ export const MessageRow = memo(function MessageRow({
   const primary = outbound ? outboundRecipientLabel(message) : message.fromName || message.fromAddress;
   const subject = message.subject || '（无主题）';
   const status = OUTBOUND_STATUS[message.status as OutboundStatus];
-  const failed = outbound && Boolean(message.errorDetail || message.status === 'failed' || message.status === 'bounced');
+  // 待确认（投递中断）的外发不算失败：徽标显示「待确认」，说明用提醒色
+  const unconfirmed = outbound && message.status === 'unknown';
+  const failed = outbound && !unconfirmed && message.status !== 'pending'
+    && Boolean(message.errorDetail || message.status === 'failed' || message.status === 'bounced');
   // 验证链接：与发件域一致才允许在列表里直接打开；不一致只做警示，点击进入详情页核对
   const verification = outbound ? null : inspectVerificationLink(message.verificationLink, message.fromAddress);
   const daysLeft = trash ? trashDaysLeft(message.deletedAt, now) : null;
@@ -221,8 +224,8 @@ export const MessageRow = memo(function MessageRow({
               </span>
             )}
           </div>
-          {failed && message.errorDetail ? (
-            <p className="mt-0.5 truncate text-sm text-critical">{message.errorDetail}</p>
+          {(failed || unconfirmed) && message.errorDetail ? (
+            <p className={cn('mt-0.5 truncate text-sm', failed ? 'text-critical' : 'text-caution')}>{message.errorDetail}</p>
           ) : (
             message.preview && <p className="mt-0.5 truncate text-sm text-ink-tertiary">{message.preview}</p>
           )}

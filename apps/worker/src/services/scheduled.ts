@@ -22,6 +22,8 @@ import { HOSTED_DNS_RATE_SCOPE } from './hosted-dns.js';
 import { processStorageCleanup, expireExternalAttachmentLinks, expireDeliveryObjectLeases } from './storage-cleanup.js';
 import { processNotificationJobs, cleanupNotificationJobs, repairUnqueuedNotifications } from './notification-jobs.js';
 import { TRANSLATE_CHARS_SCOPE, TRANSLATE_REQUESTS_SCOPE } from './translate.js';
+import { releaseDraftStatements } from './upload.js';
+import { markStaleOutbound } from './outbound-recovery.js';
 
 const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -95,8 +97,11 @@ async function runRetention(env: Env): Promise<number> {
   return deleted;
 }
 
-/** 草稿附件孤儿清理：上传后未发送、超过 TTL 的 draft（含未完成 multipart）→ 回收 R2 + 删行 */
-async function runDraftAttachmentCleanup(env: Env): Promise<number> {
+/**
+ * 草稿附件孤儿清理：上传后未发送、超过 TTL 的草稿删行。未完成的分片上传直接 abort；已完成的对象
+ * 可能已被发出（含全部失败而保留）的邮件附件直接引用，改为登记清理台账，由 processStorageCleanup 按引用判断。
+ */
+export async function runDraftAttachmentCleanup(env: Env): Promise<number> {
   const db = createDb(env);
   const cutoff = new Date(Date.now() - DRAFT_ATTACHMENT_TTL_HOURS * 3600 * 1000);
   const stale = await db
@@ -111,29 +116,29 @@ async function runDraftAttachmentCleanup(env: Env): Promise<number> {
     .limit(RETENTION_BATCH)
     .all();
   if (stale.length === 0) return 0;
-  const cleaned: number[] = [];
+  const aborted: number[] = [];
+  const released: number[] = [];
   for (const s of stale) {
     if (s.uploadId && s.status === 'uploading') {
       try {
         await env.r2.resumeMultipartUpload(s.r2Key, s.uploadId).abort();
-        cleaned.push(s.id);
+        aborted.push(s.id);
       } catch (e) {
         console.error('清理：abort multipart 失败:', e);
       }
     } else {
-      try {
-        await env.r2.delete(s.r2Key);
-        cleaned.push(s.id);
-      } catch (e) {
-        console.error('清理：删草稿 R2 失败:', e);
-      }
+      released.push(s.id);
     }
   }
-  for (const batch of chunk(cleaned)) {
+  for (const batch of chunk(aborted)) {
     await db.delete(draftAttachments).where(inArray(draftAttachments.id, batch));
   }
-  console.log(`草稿附件清理：删除 ${cleaned.length} 个过期草稿`);
-  return cleaned.length;
+  for (const batch of chunk(released)) {
+    await env.db.batch(releaseDraftStatements(env, batch));
+  }
+  const cleaned = aborted.length + released.length;
+  console.log(`草稿附件清理：删除 ${cleaned} 个过期草稿`);
+  return cleaned;
 }
 
 interface StepReport {
@@ -177,6 +182,8 @@ async function runRegular(env: Env, report: StepReport[]): Promise<void> {
     for (const row of tokens.results) await env.db.batch(purgeStatements(env, row.token));
     return tokens.results.length;
   });
+  // 投递中断（Worker 被回收、结果回填失败）超过 1 小时仍 pending 的外发标为 unknown，幂等重放才有终态
+  await step(report, 'outbound.stale', () => markStaleOutbound(env));
   await step(report, 'claude_facts.harvest', () => harvestRecentClaudeFacts(env, Date.now() - CLAUDE_FACTS_WINDOW_MS));
   await step(report, 'storage.leases', () => expireDeliveryObjectLeases(env));
   await step(report, 'storage.links', () => expireExternalAttachmentLinks(env));
@@ -213,7 +220,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
   await step(report, 'idempotency.cleanup', async () => {
     const settledBefore = new Date(Date.now() - IDEMPOTENCY_SETTLED_RETENTION_MS);
     const settledMessage = db.select({ id: messages.id }).from(messages).where(and(
-      eq(messages.id, idempotencyRecords.messageId), inArray(messages.status, ['sent', 'delivered', 'failed'])));
+      eq(messages.id, idempotencyRecords.messageId), inArray(messages.status, ['sent', 'delivered', 'failed', 'unknown'])));
     return (await db.delete(idempotencyRecords).where(or(
       and(eq(idempotencyRecords.status, 'completed'), lt(idempotencyRecords.createdAt, settledBefore)),
       and(eq(idempotencyRecords.status, 'failed'),
@@ -232,7 +239,7 @@ async function runMaintenance(env: Env, report: StepReport[]): Promise<void> {
     if (n > 0) console.log(`回收站清理：硬删 ${n} 封`);
     return n;
   });
-  // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ 回收 R2 + 删行
+  // 草稿附件：超过 TTL 未发送的孤儿（上传未完成或未点发送）→ abort 分片或登记清理 + 删行
   await step(report, 'drafts', () => runDraftAttachmentCleanup(env));
   // 计数器：外发/转发/翻译配额按天、各类限流按分钟窗口，按窗口单位分组回收过期行；新增计数 scope 要加进对应分组
   await step(report, 'counters', async () => {

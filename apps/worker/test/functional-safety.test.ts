@@ -149,15 +149,14 @@ describe('mail functional safety regressions', () => {
     expect((await claimMailbox(env, s.viewer.userId, 'admin', { localPart: 'claim-history-count', domain: 'review.example' })).messageCount).toBe(1);
   });
 
-  it('failed draft-object cleanup retains the draft row for later retry', async () => {
+  it('consuming a sent draft only removes the draft row; the object stays for the attachment rows that reference it', async () => {
     const s = await seed('draft-cleanup'); const token = crypto.randomUUID(); const r2Key = `draft/${token}`;
     await env.r2.put(r2Key, 'file');
     await s.db.insert(draftAttachments).values({ userId: s.viewer.userId, token, r2Key, filename: 'file.txt', status: 'ready' });
     const broken = { ...env, r2: { delete: async () => { throw new Error('R2 failure'); } } } as unknown as Env;
     await consumeDraftAttachments(broken, s.viewer.userId, [token]);
-    expect(await s.db.select().from(draftAttachments).where(eq(draftAttachments.token, token)).get()).toBeDefined();
-    await consumeDraftAttachments(env, s.viewer.userId, [token]);
     expect(await s.db.select().from(draftAttachments).where(eq(draftAttachments.token, token)).get()).toBeUndefined();
+    expect(await (await env.r2.get(r2Key))?.text()).toBe('file');
   });
 
   it('expired crashed delivery leases reclaim orphan references without touching a live send', async () => {

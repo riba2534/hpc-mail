@@ -379,6 +379,47 @@ describe('idempotency error codes', () => {
     await screen.findByText('sent page');
     client.clear();
   });
+
+  it('delivery_failed lists each recipient reason, links to the failed record and sends again with a fresh key', async () => {
+    mocks.send
+      .mockRejectedValueOnce(new ApiError('全部收件人投递失败: to@example.com: destination not verified', {
+        code: 'delivery_failed', httpStatus: 422,
+        details: { messageId: 55, recipientOutcomes: [{ address: 'to@example.com', status: 'failed', error: 'destination not verified' }] },
+      }))
+      .mockResolvedValueOnce({ id: 23, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show(initial);
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('所有收件人都没有收到');
+    expect(alert).toHaveTextContent('to@example.com：destination not verified');
+    expect(screen.getByRole('link', { name: '查看失败记录' })).toHaveAttribute('href', '/mail/55');
+    expect(screen.queryByRole('button', { name: '重试发送' })).toBeNull();
+    expect(savedKey()).toBeUndefined();
+    const oldKey = mocks.send.mock.calls[0]![1];
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+    expect(mocks.send.mock.calls[1]![1]).toBeTruthy();
+    expect(mocks.send.mock.calls[1]![1]).not.toBe(oldKey);
+    client.clear();
+  });
+});
+
+describe('resend of unconfirmed recipients', () => {
+  beforeEach(() => {
+    localStorage.clear(); mocks.send.mockReset(); mocks.toast.mockClear(); mocks.user = { id: 1, role: 'user' };
+    mocks.boxes = [{ id: 9, address: 'first@one.example' }];
+  });
+
+  it('lists unconfirmed recipients without adding them to the retry', async () => {
+    mocks.send.mockResolvedValue({ id: 22, status: 'sent', errorDetail: '', recipientOutcomes: [] });
+    const client = show({ fromAddress: 'first@one.example', to: ['failed@example.com'], subject: 'retry', body: 'body', mode: 'resend',
+      sourceMessageId: 7, unconfirmed: ['maybe@example.com'] });
+    expect(screen.getByRole('status')).toHaveTextContent('投递结果未确认，可能已经收到，没有自动加入：maybe@example.com');
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(mocks.send.mock.calls[0]![0].to).toEqual([{ address: 'failed@example.com', name: '' }]);
+    client.clear();
+  });
 });
 
 describe('source mail no longer available', () => {
