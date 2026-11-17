@@ -80,7 +80,7 @@ async function actor(username: string, scopes: ApiScope[] = [...API_SCOPES], rol
       body: JSON.stringify({ name: `mcp-${keyScopes.length}`, scopes: keyScopes.filter((scope) => scope !== 'admin'), rateLimit: 600, password: TEST_PASSWORD }) });
     expect(response.status).toBe(201);
     const created = ((await response.json()) as { data: CreatedApiKey }).data;
-    // admin scope 按存量管理员 Key 的形态补上（新建要求 IP 白名单，测试请求不带来源 IP）
+    // admin scope 按存量管理员 Key 的形态直接补上
     if (role === 'admin' && keyScopes.includes('admin')) await grantLegacyAdminScope(env, created.id);
     return created;
   };

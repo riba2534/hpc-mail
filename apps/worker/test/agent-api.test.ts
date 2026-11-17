@@ -43,7 +43,7 @@ async function actor(username: string, role: 'admin' | 'user' = 'user', scopes: 
   const [user] = await createDb(env).insert(users).values({ username, role, passwordHash: await testPasswordHash(), status: 'active', authVersionMigrated: true }).returning();
   const sid = await createSession(env, user!.id);
   const jwt = await signToken(env.jwt_secret, { sub: user!.id, sid, epoch: 0, uepoch: 0 });
-  // admin scope 按存量管理员 Key 的形态补上（新建要求 IP 白名单，测试请求不带来源 IP）
+  // admin scope 按存量管理员 Key 的形态直接补上
   const granted = scopes.filter((scope) => scope !== 'admin');
   const key = await data<CreatedApiKey>(await request('/api/api-keys', json(jwt, { name: `${username}-agent`, scopes: granted, rateLimit: 120, password: TEST_PASSWORD })), 201);
   expect(key.scopes).toEqual(granted);

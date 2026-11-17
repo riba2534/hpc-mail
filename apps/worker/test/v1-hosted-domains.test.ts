@@ -211,7 +211,7 @@ async function fixture() {
     const user = (await db.insert(users).values({ username: `${prefix}-${suffix}`, role, passwordHash: await testPasswordHash(), authVersionMigrated: true }).returning().get())!;
     const sid = await createSession(env, user.id);
     const jwt = await signToken(env.jwt_secret, { sub: user.id, sid, epoch: 0, uepoch: 0 });
-    // admin scope 按存量管理员 Key 的形态补上（新建要求 IP 白名单，测试请求不带来源 IP）
+    // admin scope 按存量管理员 Key 的形态直接补上
     const granted = scopes.filter((scope) => scope !== 'admin');
     const created = await data<CreatedApiKey>(await api('POST', '/api-keys', jwt, { name: `${suffix}-agent`, scopes: granted, rateLimit: 600, password: TEST_PASSWORD }), 201);
     expect(created.scopes).toEqual(granted);

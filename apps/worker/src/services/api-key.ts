@@ -1,5 +1,4 @@
 import {
-  adminKeyIssues,
   API_KEY_PREFIX,
   MAX_API_KEYS_PER_USER,
   MAX_API_USER_REQUESTS_PER_MINUTE,
@@ -58,17 +57,12 @@ function serialize(row: ApiKeyRow, ownerUsername?: string): ApiKeySummary {
 }
 
 /**
- * 授予与修改 admin scope 的规则：只有管理员能让 Key 带 admin；结果状态带 admin 时必须有 IP 白名单
- * 与不超过 90 天的有效期（shared 的 adminKeyIssues，与前端表单同一份校验）。
+ * 只有管理员能让 Key 新带上 admin scope；IP 白名单与有效期与其他 scope 一样可选。
+ * role 由路由传入（会话用户的角色）；服务层直调（脚本、测试）时读库。
  */
-function assertAdminScopeRules(
-  role: Role,
-  key: { scopes: readonly string[]; allowedIps: readonly string[]; expiresAt: Date | null },
-  granting: boolean,
-): void {
-  if (granting && role !== 'admin') throw new AppError('forbidden', '只有管理员可以授予 admin scope');
-  const [issue] = adminKeyIssues({ ...key, expiresAt: key.expiresAt?.toISOString() ?? null });
-  if (issue) throw new AppError('validation_failed', issue.message);
+async function assertCanGrantAdmin(db: Db, ownerId: number, role: Role | undefined): Promise<void> {
+  const ownerRole = role ?? (await db.select({ role: users.role }).from(users).where(eq(users.id, ownerId)).get())?.role ?? 'user';
+  if (ownerRole !== 'admin') throw new AppError('forbidden', '只有管理员可以授予 admin scope');
 }
 
 /** 限定的邮箱必须是该用户当前认领的：一次查询数命中个数 */
@@ -111,9 +105,7 @@ export async function createApiKey(
   const expiresAt = normalizeExpiry(req.expiresAt);
   const allowedMailboxIds = req.allowedMailboxIds ?? [];
   const allowedDomains = req.allowedDomains ?? [];
-  // role 由路由传入（会话用户的角色）；服务层直调（脚本、测试）时读库
-  const ownerRole = role ?? (await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).get())?.role ?? 'user';
-  assertAdminScopeRules(ownerRole, { scopes: req.scopes, allowedIps: req.allowedIps, expiresAt }, req.scopes.includes('admin'));
+  if (req.scopes.includes('admin')) await assertCanGrantAdmin(db, userId, role);
   await assertOwnedMailboxes(env, userId, allowedMailboxIds);
   const epochGuard = authEpoch === undefined ? '' : 'AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_version = ?)';
   const inserted = await env.db
@@ -232,10 +224,7 @@ export async function getApiKey(env: Env, id: number, userId?: number): Promise<
   return serialize(row);
 }
 
-/**
- * 修改 Key。改到 scopes / allowedIps / expiresAt 时按修改后的结果校验 admin scope 规则（只改名、状态等不校验，
- * 迁移时自动加上 admin scope 的旧管理员 Key 因此照常可用）；新授予 admin 需要管理员。
- */
+/** 修改 Key。新授予 admin scope 需要管理员；已带 admin 的 Key 改名、改状态、白名单或有效期不再校验角色 */
 export async function updateApiKey(
   env: Env,
   id: number,
@@ -245,13 +234,7 @@ export async function updateApiKey(
 ): Promise<ApiKeySummary> {
   const db = createDb(env);
   const current = await requireKey(db, id, userId);
-  if (req.scopes !== undefined || req.allowedIps !== undefined || req.expiresAt !== undefined) {
-    const scopes = req.scopes ?? current.scopes;
-    const expiresAt = req.expiresAt === undefined ? current.expiresAt : req.expiresAt === null ? null : new Date(req.expiresAt);
-    const ownerRole = role ?? (await db.select({ role: users.role }).from(users).where(eq(users.id, current.userId)).get())?.role ?? 'user';
-    assertAdminScopeRules(ownerRole, { scopes, allowedIps: req.allowedIps ?? current.allowedIps, expiresAt },
-      scopes.includes('admin') && !current.scopes.includes('admin'));
-  }
+  if (req.scopes?.includes('admin') && !current.scopes.includes('admin')) await assertCanGrantAdmin(db, current.userId, role);
   if (req.allowedMailboxIds) await assertOwnedMailboxes(env, current.userId, req.allowedMailboxIds);
   const patch: Partial<ApiKeyRow> = {};
   if (req.name !== undefined) patch.name = req.name;

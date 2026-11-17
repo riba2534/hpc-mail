@@ -26,4 +26,4 @@
 ## Optional
 
 - [个人通知与邮箱转发](/references/notifications.md)：飞书、PushDeer、通用 Webhook 与邮箱转发的个人设置；前三项也可用带 notify scope 的 API Key，转发目标只能会话 API 修改且新目标要邮件确认。
-- [管理员功能](/references/administration.md)：用户、邀请、系统设置、全站邮箱与审计（仅管理员会话）。
+- [管理员功能](/references/administration.md)：用户、邀请、系统设置、全站邮箱与审计（管理员会话）；管理员 API Key（admin scope）可用 /v1/admin 运维接口批量认领、释放、过户、共享，查用户、托管域名与 Claude 状态。

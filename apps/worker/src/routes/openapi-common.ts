@@ -270,7 +270,7 @@ const sendIdentityReason = { type: 'string', enum: ['hosted_sending_not_ready', 
 const user = object({ id: positiveId, username: str, role: roleEnum, createdAt: date, avatarUrl: nullable(str), twoFactorEnabled: bool });
 const { twoFactorEnabled: _twoFactorEnabled, ...adminUserProperties } = user.properties as Record<string, Schema>;
 const keyScopes: Schema = { ...array({ type: 'string', enum: API_SCOPES }),
-  description: 'admin is a capability flag: only administrators can grant it, it requires allowedIps and an expiry at most 90 days ahead, and only with it does an administrator key act as administrator (cross-user scopes, all=1, any mailboxId as sender, outbound-quota exemption). Without it an administrator key acts as an ordinary user.' };
+  description: 'admin is a capability flag: only administrators can grant it; allowedIps and expiresAt stay optional as for other scopes. Only with it does an administrator key act as administrator (cross-user scopes, all=1, any mailboxId as sender, outbound-quota exemption, the /v1/admin operations). Without it an administrator key acts as an ordinary user.' };
 const keyRestriction = {
   allowedMailboxIds: { ...array(positiveId), description: 'Mailbox (claim) ids this key may use. Together with allowedDomains: both empty means unrestricted; otherwise an address is usable when its domain is in allowedDomains or its current claim id is in allowedMailboxIds. Releasing and reclaiming an address gives it a new id that an old key no longer covers.' },
   allowedDomains: { ...array(str), description: 'Domains whose addresses this key may use, including addresses claimed later. A key restricted only by mailbox ids cannot claim new addresses.' },
