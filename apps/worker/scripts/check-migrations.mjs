@@ -11,7 +11,8 @@
  *   先发一版去掉引用，下一版再删索引；改索引定义请换新名字（索引只增不改名）。
  * 另外校验 INDEXED BY 引用的索引在迁移重放后确实存在（这一项不能豁免）。
  *
- * 编号小于 FIRST_CHECKED 的迁移已在线上执行，只参与索引重放、不再检查语句；
+ * LEGACY_MIGRATIONS 列出的迁移已在线上执行，只参与索引重放、不再检查语句；按完整文件名精确匹配，
+ * 其他任何文件（新编号、0005b_x.sql、不带编号的 x.sql）都要检查。
  * 确需破坏性变更时在迁移文件里写 `-- migration-check: allow <原因>` 豁免整个文件，检查输出会列出全部豁免。
  * SQL 按词法切分：字符串字面量、`--` 与 `/* *\/` 注释、"x" / `x` / [x] 引用标识符与 schema.x 限定名都按 SQLite 规则处理。
  *
@@ -21,8 +22,30 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** 0000–0020 在引入本检查前已上线 */
-const FIRST_CHECKED = 21;
+/** 引入本检查前已上线的 0000–0020，只增不改：新迁移不要加进来，确需例外用 allow 标注 */
+const LEGACY_MIGRATIONS = new Set([
+  '0000_moaning_maelstrom.sql',
+  '0001_legal_stellaris.sql',
+  '0002_elite_hobgoblin.sql',
+  '0003_old_tiger_shark.sql',
+  '0004_tiresome_doctor_doom.sql',
+  '0005_acoustic_meteorite.sql',
+  '0006_funny_mikhail_rasputin.sql',
+  '0007_nebulous_maginty.sql',
+  '0008_complete_shape.sql',
+  '0009_redundant_namor.sql',
+  '0010_tough_the_hand.sql',
+  '0011_fancy_vargas.sql',
+  '0012_smart_prima.sql',
+  '0013_mail_functional_reliability.sql',
+  '0014_perf_indexes.sql',
+  '0015_verification_link.sql',
+  '0016_message_translations.sql',
+  '0017_user_mailbox_policy.sql',
+  '0018_active_admin_index.sql',
+  '0019_claude_address_facts.sql',
+  '0020_hosted_domains.sql',
+]);
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const arg = (name, fallback) => {
@@ -143,7 +166,7 @@ const allowed = [];
 const indexes = new Set();
 for (const file of migrations) {
   const sql = readFileSync(join(migrationsDir, file), 'utf8');
-  const checked = Number.parseInt(file, 10) >= FIRST_CHECKED;
+  const checked = !LEGACY_MIGRATIONS.has(file);
   const allow = /^\s*--\s*migration-check:\s*allow\s+(\S.*)$/m.exec(sql);
   const found = [];
   for (const statement of statements(tokenize(sql))) {
