@@ -1,5 +1,4 @@
 import type {
-  DeliveryEventsOverview,
   MailboxTransferResult,
   TransferMailboxRequest,
   UserSearchResults,
@@ -267,5 +266,4 @@ export const adminApi = {
     api.put<MailboxShareGrant, ReplaceMailboxSharesRequest>('/admin/mailbox-shares', body),
   revokeMailboxShare: (mailboxId: number, userId: number) =>
     api.delete<{ success: boolean }>(`/admin/mailbox-shares/${mailboxId}/grantees/${userId}`),
-  deliveryEvents: () => api.get<DeliveryEventsOverview>('/admin/delivery-events'),
 };

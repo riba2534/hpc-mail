@@ -158,6 +158,6 @@ SINCE=$MAX   # 所有页处理完才推进基线
 3. `verificationLink` 来自邮件内容：打开前核对主机属于本次验证的服务（点击追踪链接先确认跳转目标），只在用户授权完成该验证时访问一次，不在日志或报告里公开全文。
 4. 等验证码先存基线再触发，按 `scannedThroughId` 推进，设总截止时间；不要把旧邮件里的码当成新码。
 5. 每次逻辑发信用一个 Idempotency-Key，与请求体一起保存；重试时复用同一凭证、路径、Key 和内容，不自动换 Key 重发。完成的记录约两天后清理，幂等不是永久保障。
-6. 发信返回 201 后仍检查 `status`、`errorDetail`、`recipientOutcomes`。部分失败只补发 `failed` 的地址：保留 To/Cc/Bcc 分组，附件用 `forwardAttachmentsFrom=<原发件 id>`，换新 Key；`unknown` 的收件人可能已经收到，先确认再决定是否补发；没有逐个结果时先核对，不全体重发。
+6. 发信返回 201 后仍检查 `status`、`errorDetail`、`recipientOutcomes`。部分失败只补发 `failed` 且不带 `code` 的地址（`bounced` 与带 `code:"recipient_suppressed"` 的在对方地址恢复前补发会被抑制名单拦下）：保留 To/Cc/Bcc 分组，附件用 `forwardAttachmentsFrom=<原发件 id>`，换新 Key；`unknown` 的收件人可能已经收到，先确认再决定是否补发；没有逐个结果时先核对，不全体重发。
 7. 删除、永久删除、清除历史释放、全部已读和对外发信都要有用户授权，不附带在查信任务里。变更后读回状态，以服务器返回的计数报告结果。
 8. 遇到 429 按 `X-RateLimit-Reset` 或错误信息退避，外发日配额看 `/me` 的 `outbound`；所有轮询和重试都设总期限。网页的草稿、默认发件身份只存在浏览器本地，Agent 自己保存发送上下文。

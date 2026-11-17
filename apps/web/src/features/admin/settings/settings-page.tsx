@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { type ReactNode, useEffect, useState } from 'react';
-import type { AiModelTestRequest, AiModelTestResult, Settings } from '@hpc-mail/shared';
+import type { AiModelTestRequest, AiModelTestResult, DeliveryEventsOverview, Settings } from '@hpc-mail/shared';
 import { api } from '@/api/client';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
@@ -209,9 +209,15 @@ function AiModelSection({
   );
 }
 
+/** 只在系统设置页使用：请求与查询键放在本页 chunk，不进入口公共模块 */
+const DELIVERY_EVENTS_KEY = ['admin', 'delivery-events'] as const;
+
 /** 投递回执：自动订阅开关，以及各发信域名的订阅状态（只读，失败的列出原因） */
 function DeliveryEventsSection({ enabled, onChange }: { enabled: boolean; onChange: (value: boolean) => void }) {
-  const { data, isError } = useQuery({ queryKey: queryKeys.admin.deliveryEvents, queryFn: () => adminApi.deliveryEvents() });
+  const { data, isError } = useQuery({
+    queryKey: DELIVERY_EVENTS_KEY,
+    queryFn: () => api.get<DeliveryEventsOverview>('/admin/delivery-events'),
+  });
   const failed = data?.subscriptions.filter((item) => item.status === 'error') ?? [];
   return (
     <Section

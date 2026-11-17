@@ -244,12 +244,12 @@ hpc '/identities' | jq '.data.identities[] | select(.canSend) | {mailboxId,addre
 | `status` | 含义 | 在哪里出现 |
 |---|---|---|
 | `sent` | 至少一个外部收件人被发信服务商接受；不代表已进对方收件箱 | 201 响应、列表、详情 |
-| `delivered` | 收件人都在本站，副本已落库 | 201 响应、列表、详情 |
+| `delivered` | 收件人都在本站且副本已落库；或外部收件人的投递回执都已回来、没有仍在 `sent` 的（见[投递回执](#投递回执)） | 201 响应、列表、详情 |
 | `pending` | 仍在投递，逐收件人结果边投递边回填 | 列表、详情；同 Key 重试返回 409 `send_in_progress` |
 | `unknown` | 创建超过 1 小时仍是 `pending`（投递中断），已回填的结果保留，其余收件人记为 `unknown` | 列表、详情；同 Key 重试返回 201 与这个状态 |
 | `failed` | 全部收件人失败 | 列表、详情；发信接口不以 201 返回它，而是 422 `delivery_failed` |
 
-`recipientOutcomes` 每个去重后的收件人一项：`delivered`（站内已投递）、`sent`（外部已接受）、`failed`（`error` 为原因）、`unknown`（`error` 为「投递中断，结果未确认」，可能已经送达）。外部收件人最多 4 路并发投递，每完成一个就回填，所以 `pending` 的邮件可能已有部分结果。
+`recipientOutcomes` 每个去重后的收件人一项：`delivered`（站内已投递，或外部收件服务器已接收）、`sent`（外部已接受）、`failed`（`error` 为原因）、`bounced`（退信）、`complained`（已送达但被标为垃圾邮件）、`unknown`（`error` 为「投递中断，结果未确认」，可能已经送达）。后三种外部结果来自[投递回执](#投递回执)。外部收件人最多 4 路并发投递，每完成一个就回填，所以 `pending` 的邮件可能已有部分结果。
 
 - **201**：至少一个收件人成功。`errorDetail` 为空即全部成功；部分失败时为「部分收件人失败: 地址: 原因; …」，按[部分失败补发](#部分失败补发)处理。
 - **422 `delivery_failed`**：每个收件人都尝试过且都被拒收，什么也没发出。message 为「全部收件人投递失败: …」，`error.details` 为 `{messageId,recipientOutcomes}`，`messageId` 是已记录的发件行（`direction=outbound` 列表里可见）。这次不占当日外发配额。同 Key 重试返回同一个 422；修正收件人后用新 Key 重发。
@@ -371,7 +371,7 @@ jq -n --slurpfile original message.json --arg from "$HPC_FROM" \
 
 ### 部分失败补发
 
-获取完整原详情，以 `recipientOutcomes.status=failed` 筛原 `recipients.to/cc/bcc` 各数组，新的请求只保留失败地址，`to` 可为空，保持原分组；原 HTML/text 与 `replyToMessageId` 上下文按需要保留，附件通过 `forwardAttachmentsFrom=原 outbound ID` 复制，不引用已消费的旧 Tokens。这是新的发送，使用新持久化 Key。原邮件的附件曾被转成下载链接时，沿用原正文即可：服务器会先去掉正文里本站注入的「附件下载」区块，再按本次大小决定是否重新生成，不会出现两段。
+获取完整原详情，以 `recipientOutcomes.status=failed`（带 `code:"recipient_suppressed"` 的除外；`bounced` 的地址已进抑制名单，对方恢复前不补发，见[抑制名单](#抑制名单)）筛原 `recipients.to/cc/bcc` 各数组，新的请求只保留失败地址，`to` 可为空，保持原分组；原 HTML/text 与 `replyToMessageId` 上下文按需要保留，附件通过 `forwardAttachmentsFrom=原 outbound ID` 复制，不引用已消费的旧 Tokens。这是新的发送，使用新持久化 Key。原邮件的附件曾被转成下载链接时，沿用原正文即可：服务器会先去掉正文里本站注入的「附件下载」区块，再按本次大小决定是否重新生成，不会出现两段。
 
 - `status=unknown` 或某个收件人为 `unknown`：投递中断，结果未确认，对方可能已经收到。先向用户或收件人确认，确认没收到的再按上面的方法补发，不要把 `unknown` 当成 `failed` 直接重发。
 - 仍是 `pending`、没有逐收件人结果时先等待并核实，不全体重发。

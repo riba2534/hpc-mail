@@ -27,8 +27,8 @@ const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
   deliveryEvents: vi.fn(),
 }));
-vi.mock('@/api/resources', () => ({ adminApi: { getSettings: mocks.get, updateSettings: mocks.update, deliveryEvents: mocks.deliveryEvents } }));
-vi.mock('@/api/client', () => ({ api: { post: mocks.post } }));
+vi.mock('@/api/resources', () => ({ adminApi: { getSettings: mocks.get, updateSettings: mocks.update } }));
+vi.mock('@/api/client', () => ({ api: { post: mocks.post, get: mocks.deliveryEvents } }));
 vi.mock('@/components/ui/toast', () => ({ toast: mocks.toast }));
 
 import { parseReservedLocalParts, SECRET_MASK, SettingsPage } from './settings-page';
@@ -330,6 +330,7 @@ describe('SettingsPage 投递回执', () => {
     fireEvent.click(toggle);
     fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
     await waitFor(() => expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ delivery_events: { enabled: false } })));
+    expect(mocks.deliveryEvents).toHaveBeenCalledWith('/admin/delivery-events');
     client.clear();
   });
 
