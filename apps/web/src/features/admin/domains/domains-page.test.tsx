@@ -2,12 +2,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
-const mocks = vi.hoisted(() => ({ get: vi.fn(), update: vi.fn(async (patch) => ({ domains: patch.domains })), toast: vi.fn(), stats: vi.fn(async () => [] as unknown[]) }));
+const mocks = vi.hoisted(() => ({ get: vi.fn(), update: vi.fn(async (patch) => ({ domains: patch.domains })), toast: vi.fn(), stats: vi.fn(async () => [] as unknown[]), apiGet: vi.fn() }));
 vi.mock('@/api/resources', () => ({ adminApi: { getSettings: mocks.get, updateSettings: mocks.update, domainStatus: vi.fn(async () => ({resolved:false})), domainClaudeStats: mocks.stats } }));
-vi.mock('@/features/mailboxes/use-mailboxes', () => ({useMailboxesQuery: () => ({data: []})}));
+vi.mock('@/api/client', () => ({api: {get: mocks.apiGet}}));
 vi.mock('@/components/ui/toast', () => ({toast: mocks.toast}));
 import { DomainsPage } from './domains-page';
 import { ApiError } from '@/api/errors';
+import { fakeAdminMailboxesApi } from '@/features/admin/addresses/fake-admin-mailboxes';
+
+const boxesOn = (domain: string, count: number) => Array.from({length: count}, (_, i) => ({address: `u${i}@${domain}`, domain, ownerUsername: 'owner'}));
 
 describe('domain configuration safety', () => {
   it('blocks adding until a failed GET is successfully retried', async () => {
@@ -122,6 +125,44 @@ describe('domain configuration safety', () => {
     await screen.findByText('old.example');
     expect(await screen.findByText(/Claude 统计暂时加载失败/)).toBeInTheDocument();
     expect(screen.getByRole('button', {name:'添加'})).toBeEnabled();
+    client.clear();
+  });
+  it('进入页面不拉全站邮箱；确认移除时只按该域取第一页，超过一页说「至少」', async () => {
+    mocks.get.mockResolvedValue({domains:{revision:4,list:[
+      {domain:'big.example',public:true,perUserLimit:0},{domain:'small.example',public:true,perUserLimit:0},{domain:'empty.example',public:true,perUserLimit:0},
+    ]}});
+    mocks.apiGet.mockReset();
+    mocks.apiGet.mockImplementation(fakeAdminMailboxesApi([...boxesOn('big.example', 130), ...boxesOn('small.example', 3)]));
+    const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
+    await screen.findByText('big.example');
+    expect(mocks.apiGet).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', {name:'移除 big.example'}));
+    expect(await screen.findByText(/该域至少有 100 个已认领地址。/)).toBeInTheDocument();
+    expect(mocks.apiGet.mock.calls).toEqual([['/mailboxes', {query:{all:1,q:undefined,domain:'big.example',cursor:'',limit:100},signal:expect.any(AbortSignal)}]]);
+    fireEvent.click(screen.getByRole('button', {name:'取消'}));
+
+    fireEvent.click(screen.getByRole('button', {name:'移除 small.example'}));
+    expect(await screen.findByText(/该域当前有 3 个已认领地址。/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', {name:'取消'}));
+
+    fireEvent.click(screen.getByRole('button', {name:'移除 empty.example'}));
+    expect(await screen.findByText(/当前该域下暂无已认领地址/)).toBeInTheDocument();
+    expect(mocks.apiGet).toHaveBeenCalledTimes(3);
+    client.clear();
+  });
+  it('影响面读取失败时不编造数量，仍可确认移除', async () => {
+    mocks.get.mockResolvedValue({domains:{revision:6,list:[{domain:'gone.example',public:true,perUserLimit:0}]}});
+    mocks.apiGet.mockReset();
+    mocks.apiGet.mockRejectedValue(new Error('mailboxes down'));
+    mocks.update.mockClear();
+    const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
+    render(<QueryClientProvider client={client}><MemoryRouter><DomainsPage /></MemoryRouter></QueryClientProvider>);
+    fireEvent.click(await screen.findByRole('button', {name:'移除 gone.example'}));
+    expect(await screen.findByText(/该域的认领地址数暂时无法读取/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', {name:'移除'}));
+    await waitFor(() => expect(mocks.update).toHaveBeenCalledWith({expectedDomainsRevision:6,domains:{list:[]}}));
     client.clear();
   });
 });

@@ -1,7 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft } from 'lucide-react';
 import { Link, useParams } from 'react-router-dom';
-import type { Mailbox } from '@hpc-mail/shared';
 import { ApiError } from '@/api/errors';
 import { queryKeys } from '@/api/query-keys';
 import { adminApi } from '@/api/resources';
@@ -15,6 +14,7 @@ import { useAdminMailDirection } from '@/features/admin/mail/admin-mail-page';
 import { FilterBar } from '@/features/inbox/filter-bar';
 import { MailList } from '@/features/inbox/mail-list';
 import { useInboxFilters } from '@/features/inbox/use-inbox-filters';
+import { findLoadedAdminMailbox } from './admin-mailboxes';
 
 const DIRECTION_OPTIONS = [
   { value: 'inbound', label: '收件箱' },
@@ -44,8 +44,7 @@ function useAdminMailbox(mailboxId: number, enabled: boolean) {
     queryKey: queryKeys.mailboxes.adminDetail(mailboxId),
     queryFn: () => adminApi.getMailbox(mailboxId),
     enabled,
-    placeholderData: () =>
-      queryClient.getQueryData<Mailbox[]>(queryKeys.mailboxes.list('all'))?.find((item) => item.id === mailboxId),
+    placeholderData: () => findLoadedAdminMailbox(queryClient, mailboxId),
   });
 }
 
