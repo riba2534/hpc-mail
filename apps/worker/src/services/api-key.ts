@@ -19,7 +19,7 @@ import { createDb, type Db } from '../db/client.js';
 import { apiKeys, apiRequestLogs, rateCounters, users } from '../db/schema.js';
 import { bytesToHex, sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
-import { encodeCursor, decodeCursor } from '../lib/pagination.js';
+import { decodeCursor, toPage } from '../lib/pagination.js';
 import type { Env } from '../types.js';
 import { dayWindow, OUTBOUND_QUOTA_SCOPE } from './rate-counter.js';
 import { getSettings } from './setting.js';
@@ -310,10 +310,9 @@ export async function listApiKeyLogs(
     .orderBy(desc(apiRequestLogs.id))
     .limit(limit + 1)
     .all();
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
+  const page = toPage(rows, limit, (r) => r.id);
   return {
-    items: page.map((r) => ({
+    items: page.items.map((r) => ({
       id: r.id,
       requestId: r.requestId,
       method: r.method,
@@ -324,6 +323,6 @@ export async function listApiKeyLogs(
       count: r.requestCount,
       createdAt: r.createdAt.toISOString(),
     })),
-    nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.id) : null,
+    nextCursor: page.nextCursor,
   };
 }

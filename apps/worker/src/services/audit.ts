@@ -4,7 +4,7 @@ import type { Context } from 'hono';
 import { createDb } from '../db/client.js';
 import { adminAuditLogs } from '../db/schema.js';
 import { clientIp } from '../lib/http.js';
-import { decodeCursor, encodeCursor } from '../lib/pagination.js';
+import { decodeCursor, toPage } from '../lib/pagination.js';
 import type { AppContext, AuthUser, Env } from '../types.js';
 
 /** 记录一条管理操作（best-effort，写失败不阻断主流程） */
@@ -180,10 +180,9 @@ export async function listAdminAuditLogs(
     .orderBy(desc(adminAuditLogs.id))
     .limit(limit + 1)
     .all();
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
+  const page = toPage(rows, limit, (r) => r.id);
   return {
-    items: page.map((r) => ({
+    items: page.items.map((r) => ({
       id: r.id,
       actorName: r.actorName,
       action: r.action,
@@ -192,6 +191,6 @@ export async function listAdminAuditLogs(
       ip: r.ip,
       createdAt: r.createdAt.toISOString(),
     })),
-    nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.id) : null,
+    nextCursor: page.nextCursor,
   };
 }

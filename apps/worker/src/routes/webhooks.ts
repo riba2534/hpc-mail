@@ -1,7 +1,5 @@
 import {
   createWebhookEndpointRequestSchema,
-  DEFAULT_PAGE_SIZE,
-  MAX_PAGE_SIZE,
   updateWebhookEndpointRequestSchema,
   type WebhookEndpoint,
 } from '@hpc-mail/shared';
@@ -9,6 +7,7 @@ import { Hono, type Context } from 'hono';
 import { getEmailDomain } from '../lib/email-address.js';
 import { AppError } from '../lib/errors.js';
 import { execCtx, ok, parseBody, parseId } from '../lib/http.js';
+import { pageLimit } from '../lib/pagination.js';
 import { apiKeyAuth, keyRestriction, requireScope, type KeyRestriction } from '../middleware/api-key-auth.js';
 import { requireAuth } from '../middleware/auth.js';
 import {
@@ -126,9 +125,7 @@ export function webhookRoutes(mode: 'session' | 'key') {
   app.get('/:id/deliveries', async (c) => {
     const id = parseId(c.req.param('id'));
     await visible(c, id);
-    const limitRaw = Number(c.req.query('limit'));
-    const limit = Number.isInteger(limitRaw) ? Math.min(MAX_PAGE_SIZE, Math.max(1, limitRaw)) : DEFAULT_PAGE_SIZE;
-    return ok(c, await listWebhookDeliveries(c.env, owner(c), id, c.req.query('cursor'), limit));
+    return ok(c, await listWebhookDeliveries(c.env, owner(c), id, c.req.query('cursor'), pageLimit(c.req.query('limit'))));
   });
 
   app.post('/:id/deliveries/:deliveryId/retry', async (c) => {
