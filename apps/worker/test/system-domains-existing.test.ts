@@ -60,7 +60,7 @@ describe('已有 zone：一键接入', () => {
     expect((await auditActions(domain)).map((entry) => [entry.action, entry.actorName])).toEqual([
       ['system_domain.create', admin.username], ['system_domain.complete', 'system'],
     ]);
-    expect((await auditActions(domain))[1]!.detail).toContain(`revision ${before.revision}→${before.revision + 1}`);
+    expect((await auditActions(domain))[1]!.detail).toContain(`加入系统域名（仅管理员可认领），revision ${before.revision + 1}`);
 
     // 完成后再跑定时任务、再检测：没有写入，不重复加入
     const writes = cf.writes().length;

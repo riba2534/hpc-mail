@@ -646,25 +646,24 @@ async function finalize(run: Run): Promise<Step> {
       });
       return 'stop';
     }
-    const revision = listed ? domains.revision : domains.revision + 1;
+    // 完成以「域名已在列表」为条件：本次 CAS 没写入、但其他写入恰好加入了该域名时同样完成，revision 以写入后的实际值为准
     const detail = `任务 #${id}；${run.row.mode === 'new_zone' ? '新建 zone' : '已有 zone'} ${run.row.zoneId ?? ''}（${ORIGIN_LABEL[run.row.zoneOrigin]}）；`
-      + (listed ? '域名已在系统域名列表中' : `加入系统域名（仅管理员可认领），revision ${domains.revision}→${revision}`);
-    const now = Date.now();
+      + `${listed ? '域名已在系统域名列表中' : '加入系统域名（仅管理员可认领）'}，revision `;
     const statements: D1PreparedStatement[] = [];
     if (!listed) {
-      const value = JSON.stringify({ list: [...domains.list, { domain, ...DEFAULT_ENTRY }], revision });
+      const value = JSON.stringify({ list: [...domains.list, { domain, ...DEFAULT_ENTRY }], revision: domains.revision + 1 });
       statements.push(env.db.prepare(domainsCasSql(`NOT ${hostedTakenSql('?3')} AND EXISTS (SELECT 1 FROM system_domain_onboarding
           WHERE id = ?4 AND lease_token = ?5 AND state = 'finalizing' AND cancel_requested_at IS NULL)`))
         .bind(value, domains.revision, domain, id, token));
     }
     statements.push(
-      env.db.prepare(`UPDATE system_domain_onboarding SET state = 'completed', settings_revision = ?1, finished_at = ?2,
-          state_changed_at = ?2, updated_at = ?2, next_check_at = NULL, lease_token = NULL, lease_until = NULL,
+      env.db.prepare(`UPDATE system_domain_onboarding SET state = 'completed', settings_revision = ${DOMAINS_REVISION_SQL},
+          finished_at = ?1, state_changed_at = ?1, updated_at = ?1, next_check_at = NULL, lease_token = NULL, lease_until = NULL,
           error_code = '', last_error = '', attempts = 0
-        WHERE id = ?3 AND lease_token = ?4 AND state = 'finalizing' AND cancel_requested_at IS NULL AND ${systemDomainListedSql('?5')}`)
-        .bind(revision, now, id, token, domain),
+        WHERE id = ?2 AND lease_token = ?3 AND state = 'finalizing' AND cancel_requested_at IS NULL AND ${systemDomainListedSql('?4')}`)
+        .bind(Date.now(), id, token, domain),
       env.db.prepare(`INSERT INTO admin_audit_logs (actor_id, actor_name, action, target, detail, ip)
-        SELECT ?1, ?2, 'system_domain.complete', ?3, ?4, '' WHERE changes() = 1`)
+        SELECT ?1, ?2, 'system_domain.complete', ?3, ?4 || ${DOMAINS_REVISION_SQL}, '' WHERE changes() = 1`)
         .bind(SYSTEM_ACTOR.id, SYSTEM_ACTOR.username, domain, detail),
     );
     const results = await env.db.batch(statements);
@@ -679,6 +678,7 @@ async function finalize(run: Run): Promise<Step> {
   return 'stop';
 }
 
+const DOMAINS_REVISION_SQL = "COALESCE((SELECT json_extract(value, '$.revision') FROM settings WHERE key = 'domains'), 0)";
 const ORIGIN_LABEL: Record<SystemDomainZoneOrigin, string> = { created: '本任务创建', linked: '关联已有', unknown: '来源未确认' };
 
 /** settings.domains 原值（行不存在为空列表；解析失败返回 null，不能据此覆盖写入） */

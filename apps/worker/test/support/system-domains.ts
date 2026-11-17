@@ -94,6 +94,30 @@ export async function errorOf(response: Response, status: number): Promise<Error
   return body.error;
 }
 
+/** 直接写入一条接入任务（跳过接口），用来构造指定状态；默认已到期 */
+export async function insertTask(fields: {
+  domain: string;
+  createdBy: number;
+  state: string;
+  mode?: 'existing_zone' | 'new_zone';
+  zoneId?: string | null;
+  origin?: 'created' | 'linked' | 'unknown';
+  zoneStatus?: string;
+  nextCheckAt?: number | null;
+  leaseToken?: string | null;
+  leaseUntil?: number | null;
+  activatedAt?: number | null;
+}): Promise<number> {
+  const row = await env.db.prepare(`INSERT INTO system_domain_onboarding (domain, mode, state, account_id, zone_id, zone_origin,
+      zone_status, created_by, next_check_at, lease_token, lease_until, activated_at)
+    VALUES (?1, ?2, ?3, 'acct-test', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) RETURNING id`)
+    .bind(fields.domain, fields.mode ?? 'existing_zone', fields.state, fields.zoneId ?? null, fields.origin ?? 'linked',
+      fields.zoneStatus ?? '', fields.createdBy, fields.nextCheckAt === undefined ? Date.now() - 1 : fields.nextCheckAt,
+      fields.leaseToken ?? null, fields.leaseUntil ?? null, fields.activatedAt ?? null)
+    .first<{ id: number }>();
+  return row!.id;
+}
+
 /** 一键接入已有 zone（按预检结果确认全部需确认项） */
 export async function onboardExisting(admin: TestActor, zoneId: string, runtimeEnv: Env = runtime): Promise<Response> {
   const precheck = await data<SystemDomainPrecheck>(await call('GET', `/admin/system-domains/precheck?mode=existing_zone&zoneId=${zoneId}`, admin.jwt, undefined, runtimeEnv));
