@@ -25,6 +25,7 @@ describe('ShortcutsHelpDialog', () => {
       'x=选中 / 取消选中',
       's=星标',
       'e|#=删除',
+      'z=撤销最近一次删除',
       'Shift+I=标为已读',
       'Shift+U=标为未读',
     ]);
