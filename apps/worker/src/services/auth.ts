@@ -1,5 +1,6 @@
 import type {
   ChangePasswordRequest,
+  ChangePasswordResponse,
   LoginRequest,
   LoginResponse,
   RegisterRequest,
@@ -15,6 +16,7 @@ import { signToken } from '../lib/jwt.js';
 import { hashPassword, verifyPassword } from '../lib/password.js';
 import { hashRecoveryCode, verifyTotp } from '../lib/totp.js';
 import type { AuthUser, Env, ExecCtx } from '../types.js';
+import { revokeAllApiKeysQuery } from './api-key.js';
 import { avatarUrl } from './avatar.js';
 import { getSystemFromAddress } from './domain.js';
 import { sendFeishuNotification } from './feishu.js';
@@ -284,12 +286,16 @@ export async function register(env: Env, req: RegisterRequest, ip: string, ctx?:
   return { token, user: toSessionUser(row!) };
 }
 
+/**
+ * 改密并递增鉴权版本踢掉其他会话。revokeApiKeys（未传按 true）时同一 batch 事务里吊销本人全部 API Key：
+ * 账号可能已泄露，旧 Key 不比较鉴权版本，不吊销就会在改密后继续有效。
+ */
 export async function changePassword(
   env: Env,
   user: AuthUser,
   req: ChangePasswordRequest,
   ctx?: ExecCtx | null,
-): Promise<LoginResponse> {
+): Promise<ChangePasswordResponse> {
   const db = createDb(env);
   const row = await db.select().from(users).where(eq(users.id, user.id)).get();
   if (!row) throw new AppError('not_found', '用户不存在');
@@ -297,14 +303,23 @@ export async function changePassword(
     throw new AppError('bad_credentials', '原密码错误');
   }
   const passwordHash = await hashPassword(req.newPassword);
-  const updated = await db.update(users).set({ passwordHash,
+  const update = db.update(users).set({ passwordHash,
     authVersion: sql`${users.authVersion} + 1`, authVersionMigrated: true })
     .where(and(eq(users.id, user.id), eq(users.passwordHash, row.passwordHash), eq(users.authVersion, row.authVersion)))
-    .returning().get();
+    .returning();
+  let updated: typeof users.$inferSelect | undefined;
+  let revokedApiKeys = 0;
+  if (req.revokeApiKeys !== false) {
+    const [rows, revoked] = await db.batch([update, revokeAllApiKeysQuery(db, user.id, passwordHash)]);
+    updated = rows[0];
+    revokedApiKeys = revoked.length;
+  } else {
+    updated = await update.get();
+  }
   if (!updated) throw new AppError('conflict', '密码已在另一请求中修改，请重新登录');
   await mirrorUserEpoch(env, user.id, updated.authVersion, ctx);
   const token = await issueToken(env, updated, ctx);
-  return { token, user: toSessionUser(updated) };
+  return { token, user: toSessionUser(updated), revokedApiKeys };
 }
 
 export async function logout(env: Env, sid: string, ctx?: ExecCtx | null): Promise<void> {
