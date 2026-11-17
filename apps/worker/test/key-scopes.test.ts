@@ -4,7 +4,7 @@ import { eq } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
 import { createDb } from '../src/db/client.js';
-import { apiKeys, mailboxes, messages, users } from '../src/db/schema.js';
+import { apiKeys, hostedDomains, mailboxes, messages, users } from '../src/db/schema.js';
 import { signToken } from '../src/lib/jwt.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { createSession } from '../src/services/session.js';
@@ -241,5 +241,20 @@ describe('限定到域名的 Key', () => {
     expect((await data<{ domains: string[] }>(await request('/v1/domains', { headers: auth(key) }))).domains).toEqual(['scope.test']);
     expect((await request('/v1/messages?domain=hpc.email', { headers: auth(key) })).status).toBe(403);
     expect((await request(`/v1/mailboxes/availability?localPart=x${seq}&domain=hpc.email`, { headers: auth(key) })).status).toBe(403);
+  });
+});
+
+describe('限定范围的 Key 与托管域名接口', () => {
+  it('列表只含 allowedDomains 里的托管域名，按 id 访问或添加范围外的域名 403', async () => {
+    const user = await account('hosted');
+    const mine = (await db.insert(hostedDomains).values({ domain: `ks-mine-${seq}.test`, userId: user.id, status: 'active', zoneId: `z-mine-${seq}` }).returning().get())!;
+    const other = (await db.insert(hostedDomains).values({ domain: `ks-other-${seq}.test`, userId: user.id, status: 'active', zoneId: `z-other-${seq}` }).returning().get())!;
+    const key = (await keyFor(user.jwt, { scopes: ['domain.read', 'domain.write'], allowedDomains: [mine.domain] })).key;
+    const list = await data<{ id: number }[]>(await request('/v1/hosted-domains', { headers: auth(key) }));
+    expect(list.map((item) => item.id)).toEqual([mine.id]);
+    expect((await request(`/v1/hosted-domains/${other.id}`, { headers: auth(key) })).status).toBe(403);
+    expect((await request(`/v1/hosted-domains/${other.id}/dns-records`, { headers: auth(key) })).status).toBe(403);
+    expect((await errorOf(await request('/v1/hosted-domains', json(key, { domain: 'brand-new.test' })), 403)).docs).toContain('#key-restricted');
+    expect((await errorOf(await request('/v1/hosted-domains/batch-check', json(key, { ids: [mine.id, other.id] })), 403)).docs).toContain('#key-restricted');
   });
 });
