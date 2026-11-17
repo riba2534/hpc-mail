@@ -255,6 +255,8 @@ const counter = async (scope: string, subject: string) => (await readCounter(env
 const siteCalls = () => counter(HOSTED_DNS_SITE_RATE_SCOPE, 'all');
 
 /** 离整分钟太近时等到下一分钟，避免计数窗口在用例中途切换 */
+/** 最多等 margin 再开始，用例超时要留出这段等待 */
+const MINUTE_EDGE_TIMEOUT = 30_000;
 async function awayFromMinuteEdge(margin = 10_000) {
   const left = 60_000 - (Date.now() % 60_000);
   if (left < margin) await new Promise((resolve) => setTimeout(resolve, left + 50));
@@ -479,7 +481,7 @@ describe('/v1 托管域名的额度、限流与开关与 /api 共用', () => {
       .toMatchObject({ code: 'rate_limited' });
     expect(cf.calls).toHaveLength(callsBefore);
     expect(await db.select().from(hostedDomains).where(eq(hostedDomains.domain, f.domain('busy'))).get()).toBeUndefined();
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 
   it(`检测每人每分钟 ${MAX_HOSTED_CHECKS_PER_MINUTE} 次、DNS 每人每分钟 ${MAX_HOSTED_DNS_REQUESTS_PER_MINUTE} 次，与 /api 共用计数；超出 429 不调用 Cloudflare`, async () => {
     await awayFromMinuteEdge();
@@ -505,7 +507,7 @@ describe('/v1 托管域名的额度、限流与开关与 /api 共用', () => {
     expect(await errorOf(await v1('GET', `/hosted-domains/${site.id}/dns-records`, admin.key), 429))
       .toMatchObject({ code: 'rate_limited', message: '当前解析操作较多，请稍后再试' });
     expect(cf.calls).toHaveLength(callsBefore);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 
   it('关闭托管开关时添加与检测 403、DNS 仍可用；Worker 没有 Cloudflare 凭据时全部 403', async () => {
     const cf = fakeCloudflare();
