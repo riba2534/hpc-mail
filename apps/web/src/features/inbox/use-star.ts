@@ -36,13 +36,14 @@ export function useStarMutation(view?: { scope?: 'mine' | 'unclaimed' | 'user'; 
       }
       return { prevDetail, listSnapshots, token };
     },
+    // 失败提示由全局 mutationCache 按 meta.errorTitle 给出，这里只回滚
+    meta: { errorTitle: '星标操作失败' },
     onError: (_err, { id }, ctx) => {
       if (ctx?.token !== getAuthToken()) return;
       if (ctx?.prevDetail !== undefined) {
         queryClient.setQueryData(queryKeys.messages.detail(id, view), ctx.prevDetail);
       }
       ctx?.listSnapshots?.forEach(([key, data]) => queryClient.setQueryData(key, data));
-      toast({ title: '操作失败，请重试', variant: 'error' });
     },
     onSuccess: (result, { id, starred }, ctx) => {
       if (ctx?.token !== getAuthToken()) return;

@@ -50,6 +50,6 @@ export function useDeleteMessages(scope?: MessageMutationScope, onDeleted?: (ids
       });
       onDeleted?.(ids);
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '删除失败' },
   });
 }

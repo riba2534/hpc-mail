@@ -67,7 +67,7 @@ export function InboxPage() {
         ownedAddresses: mailboxes ? new Set(mailboxes.map((mailbox) => mailbox.address)) : undefined,
       });
     },
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '全部标为已读失败' },
   });
 
   // 地址下拉：按地址字典序排列（自己的在前、共享的在后），选了域名时只列该域名下的地址

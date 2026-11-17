@@ -283,7 +283,7 @@ export function MailList({
       syncReadState(queryClient, ids, isRead);
       reconcileLists(changed, expected);
     },
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '标记失败' },
   });
 
   const markRead = (ids: number[], isRead: boolean) => {
@@ -304,7 +304,7 @@ export function MailList({
       syncStarState(queryClient, ids, starred);
       reconcileLists(changed, expected);
     },
-    onError: () => toast({ title: '操作失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '星标操作失败' },
   });
 
   const batchDelete = useDeleteMessages(mutationScope, clearSelection);
@@ -325,7 +325,7 @@ export function MailList({
       syncRemovedMessages(queryClient, ids, 'trash');
       reconcileLists(changed, ids.length);
     },
-    onError: () => toast({ title: '恢复失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '恢复失败' },
   });
 
   const batchPurge = useMutation({
@@ -337,7 +337,7 @@ export function MailList({
       syncRemovedMessages(queryClient, ids, 'trash');
       reconcileLists(changed, ids.length);
     },
-    onError: () => toast({ title: '删除失败，请重试', variant: 'error' }),
+    meta: { errorTitle: '永久删除失败' },
   });
 
   const batchPending =

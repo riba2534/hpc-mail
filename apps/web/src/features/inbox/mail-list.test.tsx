@@ -14,7 +14,7 @@ import { MailList } from './mail-list';
 const mail=(id:number,extra:Partial<MessageSummary>={})=>({id,direction:'inbound',address:'me@example.com',domain:'example.com',fromAddress:'sender@example.com',fromName:'',subject:`mail-${id}`,preview:'body',verificationCode:'',status:'received',errorDetail:'',isRead:true,isStarred:false,hasAttachments:false,size:4,createdAt:'2026-10-05T00:00:00Z',...extra}) as MessageSummary;
 beforeEach(()=>{mocks.toast.mockClear();mocks.remove.mockClear();mocks.markRead.mockClear();mocks.restore.mockClear();mocks.items=[1,2].map((id)=>mail(id))});
 function Detail(){const location=useLocation();return <p>detail {location.pathname} {JSON.stringify(location.state)}</p>}
-function show(query:Partial<ListMessagesQuery>={trash:true},variant:'inbox'|'trash'='trash'){const client=new QueryClient();render(<QueryClientProvider client={client}><MemoryRouter><Routes><Route path="/" element={<MailList query={query} variant={variant} emptyTitle="empty"/>}/><Route path="/mail/:id" element={<Detail/>}/></Routes></MemoryRouter></QueryClientProvider>);return client}
+function show(query:Partial<ListMessagesQuery>={trash:true},variant:'inbox'|'trash'='trash',client=new QueryClient()){render(<QueryClientProvider client={client}><MemoryRouter><Routes><Route path="/" element={<MailList query={query} variant={variant} emptyTitle="empty"/>}/><Route path="/mail/:id" element={<Detail/>}/></Routes></MemoryRouter></QueryClientProvider>);return client}
 function selectAll(){fireEvent.click(screen.getAllByRole('checkbox',{name:/^选择：/})[0]!);fireEvent.click(screen.getByRole('checkbox',{name:/^选择：/}))}
 describe('trash mutation feedback',()=>{
   it('does not report the requested ids as restored when the actual changed count is zero',async()=>{
@@ -82,6 +82,16 @@ describe('inbox list toolbar and rows',()=>{
     expect(mocks.restore).toHaveBeenCalledWith([1],undefined);
     await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith(expect.objectContaining({title:'已撤销删除'})));
     client.clear();
+  });
+  it('a failed batch write shows the server reason and request id once',async()=>{
+    const {queryClient}=await import('@/lib/query-client');
+    const {ApiError}=await import('@/api/errors');
+    mocks.markRead.mockRejectedValueOnce(new ApiError('没有权限修改这些邮件',{code:'forbidden',httpStatus:403,requestId:'req-7'}));
+    show(inbox,'inbox',queryClient);selectAll();
+    fireEvent.click(screen.getByRole('button',{name:'标为已读'}));
+    await waitFor(()=>expect(mocks.toast).toHaveBeenCalledWith({title:'标记失败',description:'没有权限修改这些邮件',requestId:'req-7',variant:'error'}));
+    expect(mocks.toast).toHaveBeenCalledOnce();
+    queryClient.clear();
   });
   it('copies a verification code from the row without opening the mail',async()=>{
     const writeText=vi.fn().mockResolvedValue(undefined);

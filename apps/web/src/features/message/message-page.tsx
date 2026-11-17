@@ -206,6 +206,8 @@ export function MessagePage() {
       // 只同步这一封的已读状态与未读数；列表只标记过期，回到列表时由首页探测/单页重拉对齐
       if (result.changed > 0) syncReadState(queryClient, [id], isRead);
     },
+    // 打开未读邮件时自动标已读也走这里：失败由全局 mutationCache 提示原因，否则列表一直显示未读却不知为何
+    meta: { errorTitle: '已读状态更新失败' },
   });
 
   useEffect(() => {
