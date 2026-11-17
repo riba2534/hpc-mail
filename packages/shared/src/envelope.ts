@@ -1,4 +1,5 @@
 import type { RecipientOutcome } from './schemas/mail.js';
+import type { SystemDomainPrecheck } from './schemas/system-domain.js';
 
 /** 成功：HTTP 2xx + { data }；失败：HTTP 4xx/5xx + { error, requestId } */
 export interface ApiSuccess<T> {
@@ -12,6 +13,8 @@ export interface ApiErrorDetails {
   /** delivery_failed：已记录的发件行 id（可在已发送里查看）与逐收件人结果 */
   messageId?: number;
   recipientOutcomes?: RecipientOutcome[];
+  /** 系统域名接入 409：最新预检（需确认项、阻断项与指纹），确认后带 fingerprint 与 accept 重试 */
+  precheck?: SystemDomainPrecheck;
 }
 
 export interface ApiErrorBody {
