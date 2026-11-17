@@ -36,7 +36,8 @@ import { signAttachment } from '../lib/crypto.js';
 import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
-import { PREVIEW_LIMIT } from '../lib/text.js';
+import { detectPromptInjection, extractReplyText } from '../lib/agent-text.js';
+import { mailText, PREVIEW_LIMIT } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
 import { resolveVerificationCode } from './code-extract.js';
@@ -66,6 +67,7 @@ type MessageSummaryRow = Pick<
   | 'preview'
   | 'verificationCode'
   | 'verificationLink'
+  | 'auth'
   | 'status'
   | 'errorDetail'
   | 'recipientOutcomes'
@@ -86,6 +88,7 @@ const summarySelection = {
   preview: messages.preview,
   verificationCode: messages.verificationCode,
   verificationLink: messages.verificationLink,
+  auth: messages.auth,
   status: messages.status,
   errorDetail: messages.errorDetail,
   recipientOutcomes: messages.recipientOutcomes,
@@ -288,6 +291,8 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     preview: row.preview,
     verificationCode,
     verificationLink: row.verificationLink ?? '',
+    // 收件才有认证结果；null 表示没有可信结果（历史邮件、站内互投），与「认证失败」不同
+    auth: row.direction === 'inbound' ? (row.auth ?? null) : undefined,
     status: row.status,
     errorDetail: row.errorDetail ?? '',
     recipientOutcomes: row.recipientOutcomes,
@@ -856,6 +861,8 @@ async function buildDetail(
     })),
   ]);
   const { html, inlined } = rewriteCidUrls(body.bodyHtml, signed);
+  // 给 Agent 的收件预处理在读取时惰性计算，不占收件链路的 CPU；HTML-only 邮件才需要转换
+  const plain = row.direction === 'inbound' ? mailText(body.bodyText, body.bodyHtml).plain : '';
   return {
     // 验证码与列表、wait、线程同一口径（summarize）：已存值优先，详情不再按正文另算一份
     ...summarize(row, attRows.some(countsAsAttachment), starred),
@@ -874,6 +881,9 @@ async function buildDetail(
       url: a.url,
     })),
     hasRaw: !!row.rawR2Key,
+    ...(row.direction === 'inbound'
+      ? { extractedText: extractReplyText(plain), risk: detectPromptInjection(row.subject, plain) }
+      : {}),
   };
 }
 
