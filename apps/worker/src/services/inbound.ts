@@ -9,6 +9,7 @@ import { attachments as attachmentsTable, messages } from '../db/schema.js';
 import { d1Statement } from '../lib/d1.js';
 import { getEmailDomain, getNameFromEmail, normalizeEmail } from '../lib/email-address.js';
 import { sha256Hex } from '../lib/crypto.js';
+import { runLimited } from '../lib/concurrency.js';
 import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { isAiModelConfigured } from './ai-provider.js';
@@ -44,14 +45,6 @@ const ATTACHMENT_INSERT_BATCH = 12;
  * 解析抛错，按解析失败落最小记录；内嵌 message/rfc822 超过层数只当附件保存。
  */
 const MIME_LIMITS = { maxNestingDepth: 32, maxPartCount: 500, maxRfc822NestingDepth: 3 };
-
-/** 有限并发执行；任一失败整体 reject（与串行时「任一失败即抛出」语义一致） */
-async function runLimited<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) await task(items[next++]!);
-  }));
-}
 
 interface ParsedAttachment {
   seq: number;

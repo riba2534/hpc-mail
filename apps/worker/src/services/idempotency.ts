@@ -4,6 +4,7 @@ import { createDb } from '../db/client.js';
 import { idempotencyRecords, messages, attachments } from '../db/schema.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError } from '../lib/errors.js';
+import { COUNTS_AS_ATTACHMENT } from '../lib/attachment-rule.js';
 import { summarize } from './message.js';
 import type { Env } from '../types.js';
 
@@ -83,7 +84,8 @@ export async function beginIdempotentSend(
     if (existing.messageId) {
       const row = await db.select().from(messages).where(eq(messages.id, existing.messageId)).get();
       if (row && row.status !== 'pending') {
-        const attachment = await db.select({ id: attachments.id }).from(attachments).where(eq(attachments.messageId, row.id)).get();
+        const attachment = await db.select({ id: attachments.id }).from(attachments)
+          .where(and(eq(attachments.messageId, row.id), COUNTS_AS_ATTACHMENT)).get();
         const response = summarize(row, !!attachment, false);
         try { await completeIdempotentSend(env, handle, response); }
         catch (error) { console.error('Idempotency recovery persistence deferred:', error); }

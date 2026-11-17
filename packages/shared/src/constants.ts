@@ -136,6 +136,8 @@ export const DEFAULT_RESERVED_LOCAL_PARTS = [
  */
 export const DEFAULT_RELAY_DAILY_LIMIT = 300;
 export const DEFAULT_RELAY_PER_USER_DAILY_LIMIT = 50;
+/** 未认领地址的来信中转全站合计（不按管理员人数叠加） */
+export const DEFAULT_RELAY_UNCLAIMED_DAILY_LIMIT = 50;
 
 /** AI 翻译：单次请求的片段数、单片段字符数与总字符数上限（前端据此分批） */
 export const MAX_TRANSLATE_SEGMENTS = 60;

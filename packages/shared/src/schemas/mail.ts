@@ -17,7 +17,7 @@ import {
   type MessageDirection,
 } from '../constants.js';
 import type { IssueErrorParams, Page } from '../envelope.js';
-import { parseMailAddress, type MailAddress } from '../mail-address.js';
+import { MAX_MAIL_ADDRESS_INPUT_LENGTH, parseMailAddress, type MailAddress } from '../mail-address.js';
 import { checkCustomHeaders } from '../mail-headers.js';
 import { domainSchema, localPartSchema } from './mailbox.js';
 
@@ -191,7 +191,10 @@ export type AttachmentTokenRef = z.infer<typeof attachmentTokenRefSchema>;
 
 /** 一个地址写法（`a@b`、`Name <a@b>`、`{address, name}`）→ MailAddress；label 用于错误提示 */
 function mailAddressSchema(label: string) {
-  return z.union([z.string(), z.object({ address: z.string(), name: z.string().optional() })])
+  return z.union([
+    z.string().max(MAX_MAIL_ADDRESS_INPUT_LENGTH, `${label}地址过长`),
+    z.object({ address: z.string().max(254, `${label}地址过长`), name: z.string().max(200).optional() }),
+  ])
     .transform((value, ctx): MailAddress => {
       const parsed = parseMailAddress(value);
       const shown = (typeof value === 'string' ? value : value.address).slice(0, 100);
@@ -224,7 +227,11 @@ const legacyFromSchema = z.object({
 export type SendFrom = z.infer<typeof legacyFromSchema>;
 
 const fromSchema = z
-  .union([z.string(), z.object({ address: z.string(), name: z.string().optional() }).strict(), legacyFromSchema])
+  .union([
+    z.string().max(MAX_MAIL_ADDRESS_INPUT_LENGTH, 'from 地址过长'),
+    z.object({ address: z.string().max(254, 'from 地址过长'), name: z.string().max(200).optional() }).strict(),
+    legacyFromSchema,
+  ])
   .transform((value, ctx): SendFrom => {
     if (typeof value === 'string' || 'address' in value) {
       const parsed = parseMailAddress(value as string | { address: string; name?: string });
@@ -320,6 +327,12 @@ function validateSendCommon(v: SendCommonShape, ctx: z.RefinementCtx): void {
     ...(v.attachmentTokens ?? []).map((a, index) => ({ ...a, path: ['attachmentTokens', index] as (string | number)[] })),
   ];
   const contentIds = new Set<string>();
+  const tokens = new Set<string>();
+  for (const [index, ref] of (v.attachmentTokens ?? []).entries()) {
+    // 同一份上传只能引用一次：两次引用会落成同一个对象的两行附件，第二个 contentId 在收件端找不到对应部件
+    if (tokens.has(ref.token)) ctx.addIssue({ code: 'custom', message: `附件 token 重复：${ref.token}`, path: ['attachmentTokens', index] });
+    tokens.add(ref.token);
+  }
   for (const ref of refs) {
     if (ref.disposition === 'inline' && !ref.contentId) {
       ctx.addIssue({ code: 'custom', message: 'disposition 为 inline 的附件需要 contentId', path: ref.path });

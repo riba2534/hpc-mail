@@ -18,6 +18,8 @@ import {
   normalizeEmail,
 } from '../lib/email-address.js';
 import { AppError, type AppErrorHints } from '../lib/errors.js';
+import { runLimited } from '../lib/concurrency.js';
+import { countsAsAttachment } from '../lib/attachment-rule.js';
 import {
   base64ToBytes,
   bytesToBase64,
@@ -446,14 +448,6 @@ async function cloudflareSender(env: Env, fromAddress: string): Promise<(toAddr:
   return async (toAddr, raw) => { await env.email.send(new EmailMessage(fromAddress, toAddr, raw)); };
 }
 
-/** 有界并发：最多 limit 个任务同时进行 */
-async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) await task(items[next++]!);
-  }));
-}
-
 function summarize(
   row: typeof messages.$inferSelect,
   hasAttachments: boolean,
@@ -712,7 +706,7 @@ export async function sendMail(
           messageId: outgoingMessageId,
         }, payload.atts);
         const send = await cloudflareSender(env, from.address);
-        await runPool(externalTargets, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
+        await runLimited(externalTargets, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
           try {
             await send(target, rawFor(target));
             record({ address: target, status: 'sent' });
@@ -865,7 +859,7 @@ export async function sendMail(
     throw new AppError('internal', result.errorDetail || '发送失败');
   }
   // 与列表口径一致：正文内联图不算「有附件」
-  const hasAttachments = attachments.some(att => !(att.disposition === 'inline' && att.contentId));
+  const hasAttachments = attachments.some(countsAsAttachment);
   return summarize({ ...sent, ...storedBody!, status: result.status, errorDetail: result.errorDetail,
     recipientOutcomes: result.outcomes }, hasAttachments, false);
 }

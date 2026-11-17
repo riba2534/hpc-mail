@@ -35,6 +35,7 @@ import { attachments as attachmentsTable, mailboxShares, mailboxes, messages, st
 import { signAttachment } from '../lib/crypto.js';
 import { chunk, D1_PAIR_BATCH } from '../lib/d1.js';
 import { AppError } from '../lib/errors.js';
+import { COUNTS_AS_ATTACHMENT, countsAsAttachment } from '../lib/attachment-rule.js';
 import { decodeCursor, encodeCursor, pageHead } from '../lib/pagination.js';
 import { PREVIEW_LIMIT } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
@@ -298,16 +299,6 @@ export function summarize(row: MessageSummaryRow, hasAttachments: boolean, isSta
     size: row.size,
     createdAt: row.createdAt.toISOString(),
   };
-}
-
-/**
- * hasAttachments 的口径：带 Content-ID 的 inline 部件是正文里的内嵌图（logo、签名图），不算附件，
- * 否则带内嵌 logo 的通知邮件在列表里也显示回形针。SQL 与 JS 两种写法供列表与详情共用同一规则。
- */
-const COUNTS_AS_ATTACHMENT = sql`NOT (${attachmentsTable.disposition} = 'inline' AND ${attachmentsTable.contentId} <> '')`;
-
-function countsAsAttachment(att: { disposition: string; contentId: string }): boolean {
-  return !(att.disposition === 'inline' && att.contentId !== '');
 }
 
 /** 给定邮件集合的附件标记与当前用户的星标标记，合成一次 batch 往返 */
