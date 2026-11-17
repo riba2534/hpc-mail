@@ -127,7 +127,7 @@ KEY_RESPONSE=$(hpc '/api-keys' -X POST -H 'Content-Type: application/json' \
 |---|---|
 | 400 `validation_failed`、`invite_invalid` | 修正字段或邀请码，不原样循环 |
 | 400 `header_not_allowed` | 发信 `headers` 里有不允许的头，`details.headers` 列出全部；只保留 `X-*` 与白名单头 |
-| 401 `bad_credentials`、`totp_required` | 核对凭证/获取必要 TOTP；登录错误最多 5 次/15 分钟窗口，勿试探 |
+| 401 `bad_credentials`、`totp_required` | 核对凭证/获取必要 TOTP；同一来源 IP、以及同一用户名加 IP 的登录错误各最多 5 次/15 分钟窗口（IPv6 按 /64 计），勿试探 |
 | 401 `unauthorized` | JWT 会话无效，或 Key 无效/过期/禁用；依原鉴权方式处理 |
 | 403 `forbidden`、`user_disabled`、`registration_closed` | 权限/策略/状态阻止；不换身份绕过。Key 缺 scope 或发件地址无权时 `fix` 说明该怎么做 |
 | 403 `totp_setup_required` | 见 API 绑定流程 |
