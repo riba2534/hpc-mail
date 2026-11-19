@@ -6,7 +6,15 @@ import { mailboxes, messages, users } from '../src/db/schema.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import { updateSettings } from '../src/services/setting.js';
-import type { ExecCtx } from '../src/types.js';
+import type { Env, ExecCtx } from '../src/types.js';
+
+vi.mock('cloudflare:email', () => ({
+  EmailMessage: class {
+    constructor(public from: string, public to: string, public raw: string) {}
+  },
+}));
+
+const mockSend = () => vi.fn(async (_mail: { to: string }) => ({ messageId: 'test-forward' }));
 
 async function seedUser(username: string, role: 'admin' | 'user'): Promise<number> {
   const db = createDb(env);
@@ -49,10 +57,11 @@ function mockMessage(to: string, subject: string, body: string, forward: () => P
   };
 }
 
-async function run(msg: unknown): Promise<void> {
+async function run(msg: unknown, send = mockSend()) {
   const ctx = createExecutionContext() as unknown as ExecCtx;
-  await handleInbound(msg as unknown as ForwardableEmailMessage, env, ctx);
+  await handleInbound(msg as unknown as ForwardableEmailMessage, { ...env, email: { send } } as unknown as Env, ctx);
   await waitOnExecutionContext(ctx as never);
+  return send;
 }
 
 describe('收件链路 handleInbound', () => {
@@ -72,7 +81,7 @@ describe('收件链路 handleInbound', () => {
       forward,
       setReject: vi.fn(),
     };
-    await run(msg);
+    const send = await run(msg);
 
     const db = createDb(env);
     const row = await db
@@ -85,7 +94,8 @@ describe('收件链路 handleInbound', () => {
     expect(row!.subject).toBe('Login code');
     expect(row!.verificationCode).toBe('123456');
     expect(row!.preview).toContain('verification code');
-    expect(forward).toHaveBeenCalledWith('admin-forward@example.com');
+    expect(forward).not.toHaveBeenCalled();
+    expect(send.mock.calls.map(([mail]) => mail.to)).toEqual(['admin-forward@example.com']);
   });
 
   it('已认领地址按认领用户的个人转发，不外溢到管理员', async () => {
@@ -104,10 +114,10 @@ describe('收件链路 handleInbound', () => {
     const forward = vi.fn(async () => {});
     const msg = mockMessage('claimed@example.com', 'Hi', 'no code here', async () => {});
     msg.forward = forward;
-    await run(msg);
+    const send = await run(msg);
 
-    expect(forward).toHaveBeenCalledWith('user-box@gmail.com');
-    expect(forward).not.toHaveBeenCalledWith('admin-box@gmail.com');
+    expect(forward).not.toHaveBeenCalled();
+    expect(send.mock.calls.map(([mail]) => mail.to)).toEqual(['user-box@gmail.com']);
   });
 
   it('外部伪造 X-HPC-Mail-Relay 头不能压制正常转发', async () => {
@@ -122,12 +132,13 @@ describe('收件链路 handleInbound', () => {
     const msg = mockMessage('relayed@example.com', 'Hi', 'body', async () => {});
     msg.forward = forward;
     msg.headers = new Headers({ 'X-HPC-Mail-Relay': '1' });
-    await run(msg);
+    const send = await run(msg);
 
-    expect(forward).toHaveBeenCalledWith('target@gmail.com');
+    expect(forward).not.toHaveBeenCalled();
+    expect(send.mock.calls.map(([mail]) => mail.to)).toEqual(['target@gmail.com']);
   });
 
-  it('原生 forward 失败时尝试中转降级，且不阻断收件落库', async () => {
+  it('隐私中转发送被拒绝时仍完整落库', async () => {
     await updateSettings(env, { code_extract: { enabled: true, aiEnabled: false } });
     const userId = await seedUser('inb-fallback', 'user');
     await claim(userId, 'fallback@example.com');
@@ -135,15 +146,13 @@ describe('收件链路 handleInbound', () => {
       forward: { enabled: true, addresses: ['unverified@example.com'] },
     });
 
-    const forward = vi.fn(async () => {
-      throw new Error('destination address not verified');
-    });
-    const msg = mockMessage('fallback@example.com', 'Hello', 'plain body', async () => {});
-    msg.forward = forward;
-    // 测试环境无 send_email binding，中转发送本身会失败并被吞掉；收件不受影响
-    await run(msg);
+    const forward = vi.fn(async () => {});
+    const msg = mockMessage('fallback@example.com', 'Hello', 'plain body', forward);
+    const send = mockSend().mockRejectedValue(new Error('destination address not verified'));
+    await run(msg, send);
 
-    expect(forward).toHaveBeenCalledWith('unverified@example.com');
+    expect(msg.forward).not.toHaveBeenCalled();
+    expect(send.mock.calls.map(([mail]) => mail.to)).toEqual(['unverified@example.com']);
     const db = createDb(env);
     const row = await db
       .select()
@@ -161,7 +170,7 @@ describe('收件链路 handleInbound', () => {
     const forward = vi.fn(async () => {});
     const msg = mockMessage('noforward@example.com', 'Hi there', 'no codes here', async () => {});
     msg.forward = forward;
-    await run(msg);
+    const send = await run(msg);
 
     const db = createDb(env);
     const row = await db
@@ -172,6 +181,7 @@ describe('收件链路 handleInbound', () => {
     expect(row).toBeTruthy();
     expect(row!.verificationCode).toBe('');
     expect(forward).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('one-time link 的 URL token 不会作为验证码落库', async () => {
@@ -201,8 +211,9 @@ describe('收件链路 handleInbound', () => {
       forward: { enabled: true, addresses: ['dedupe-target@example.net'] },
     });
     const forward = vi.fn(async () => {});
-    await run(mockMessage('dedupe@example.com', 'Same delivery', 'same body', forward));
-    await run(mockMessage('dedupe@example.com', 'Same delivery', 'same body', forward));
+    const send = mockSend();
+    await run(mockMessage('dedupe@example.com', 'Same delivery', 'same body', forward), send);
+    await run(mockMessage('dedupe@example.com', 'Same delivery', 'same body', forward), send);
 
     const db = createDb(env);
     const rows = await db
@@ -211,6 +222,7 @@ describe('收件链路 handleInbound', () => {
       .where(eq(messages.address, 'dedupe@example.com'))
       .all();
     expect(rows).toHaveLength(1);
-    expect(forward).toHaveBeenCalledTimes(1);
+    expect(forward).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
   });
 });

@@ -12,6 +12,12 @@ import { processStorageCleanup } from '../src/services/storage-cleanup.js';
 // @ts-expect-error Vite 的 ?raw 导入（只用于源码结构断言）
 import inboundSource from '../src/services/inbound.ts?raw';
 
+vi.mock('cloudflare:email', () => ({
+  EmailMessage: class {
+    constructor(public from: string, public to: string, public raw: string) {}
+  },
+}));
+
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 /**
@@ -151,7 +157,7 @@ describe('收件链路 Ack 前往返', () => {
     expect(await createDb(env).select().from(attachments).where(eq(attachments.messageId, repaired!.id)).all()).toHaveLength(1);
   });
 
-  it('补投修复按首次收信的归属快照转发，快照里已不是归属人的用户单独补读偏好', async () => {
+  it('补投修复保留首次收信的归属快照，地址换主后双方都不会收到转发', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     await settingsFor({ code_extract: { enabled: false, aiEnabled: false } });
     const first = await seedOwner('rt-snapshot-a');
@@ -168,14 +174,16 @@ describe('收件链路 Ack 前往返', () => {
     const forward = vi.fn(async () => {});
     await expect(handleInbound(incoming(first.address, raw, forward), instrumented({ failPut: (key) => key.startsWith('att/') }).env as never,
       createExecutionContext())).rejects.toThrow('injected R2 failure');
-    // 首次投递之后地址换了主人；修复投递仍按当时的快照结算
+    // 首次投递之后地址换了主人；修复保留快照，但转发要求当前归属也匹配。
     await createDb(env).update(mailboxes).set({ userId: other!.id }).where(eq(mailboxes.address, first.address));
     const ctx = createExecutionContext();
-    await handleInbound(incoming(first.address, raw, forward), env, ctx);
+    const send = vi.fn(async () => ({ messageId: 'snapshot-relay' }));
+    await handleInbound(incoming(first.address, raw, forward), { ...env, email: { send } } as never, ctx);
     await waitOnExecutionContext(ctx);
     const row = await createDb(env).select().from(messages).where(eq(messages.subject, 'rt-snapshot')).get();
     expect(row).toMatchObject({ status: 'received', notifyOwnerIds: [first.userId] });
-    expect(forward.mock.calls).toEqual([['rt-snapshot-a@example.net']]);
+    expect(forward).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('已完整的重复投递只 1 次 D1 往返即返回，不写 R2、不再转发或通知', async () => {
@@ -185,17 +193,19 @@ describe('收件链路 Ack 前往返', () => {
     const raw = plainMail(owner.address, 'rt-dup', 'same delivery');
     const forward = vi.fn(async () => {});
     const first = createExecutionContext();
-    await handleInbound(incoming(owner.address, raw, forward), env, first);
+    const send = vi.fn(async (_mail: { to: string }) => ({ messageId: 'dedupe-relay' }));
+    await handleInbound(incoming(owner.address, raw, forward), { ...env, email: { send } } as never, first);
     await waitOnExecutionContext(first);
 
     const probe = instrumented();
     const ctx = createExecutionContext();
-    await handleInbound(incoming(owner.address, raw, forward), probe.env as never, ctx);
+    await handleInbound(incoming(owner.address, raw, forward), { ...probe.env, email: { send } } as never, ctx);
     expect(probe.ack()).toEqual({ layers: 1, calls: 1 });
     await waitOnExecutionContext(ctx);
     expect(probe.calls()).toBe(1);
     expect(probe.state.puts).toEqual([]);
-    expect(forward).toHaveBeenCalledOnce();
+    expect(forward).not.toHaveBeenCalled();
+    expect(send.mock.calls.map(([mail]) => mail.to)).toEqual(['rt-dup-target@example.net']);
     expect(await createDb(env).select().from(messages).where(eq(messages.address, owner.address)).all()).toHaveLength(1);
   });
 

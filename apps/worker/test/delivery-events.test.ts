@@ -335,6 +335,7 @@ describe('外发回执回写与抑制名单', () => {
     expect(job).toMatchObject({ status: 'succeeded', forwardMode: 'relay' });
     const ref = await db.select().from(emailDeliveryRefs).where(eq(emailDeliveryRefs.recipient, f.ext('fwd'))).get();
     expect(ref).toMatchObject({ kind: 'forward', sender: 'no-reply@hpc.email', ownerIds: [f.user.id], providerMessageId: `cf-1-${f.ext('fwd')}` });
+    expect(job?.dedupeKey).toBe(`mail:${ref!.messageId}:${f.user.id}:forward:${f.ext('fwd')}`);
 
     expect(await processDeliveryEvent(env, event('bounced', { messageId: ref!.providerMessageId!, sender: 'no-reply@hpc.email',
       recipient: f.ext('fwd'), smtp: ['550', '5.1.1', '550 5.1.1 No such user'], bounceType: 'hard' }))).toBe('applied');
