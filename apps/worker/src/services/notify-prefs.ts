@@ -8,7 +8,7 @@ import {
   type UpdateNotifyPrefsRequest,
   type UserNotifyPrefs,
 } from '@hpc-mail/shared';
-import { eq, inArray } from 'drizzle-orm';
+import { inArray } from 'drizzle-orm';
 import { chunk } from '../lib/d1.js';
 import { createDb } from '../db/client.js';
 import { settings as settingsTable, users } from '../db/schema.js';
@@ -82,24 +82,33 @@ async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null>
   return legacyFromRows(rows);
 }
 
-/**
- * 读某用户的个人转发/通知偏好。
- * 已配置 → 用之；未配置且为 admin → 继承旧全局设置（平滑迁移，管理员体验不变）；否则默认（全关）。
- */
-export async function getUserNotifyPrefs(env: Env, userId: number): Promise<UserNotifyPrefs> {
-  const db = createDb(env);
-  const row = await db
-    .select({ notifyPrefs: users.notifyPrefs, role: users.role })
-    .from(users)
-    .where(eq(users.id, userId))
-    .get();
-  if (!row) return clone(DEFAULT_USER_NOTIFY_PREFS);
-  if (row.notifyPrefs) return normalize(row.notifyPrefs);
-  if (row.role === 'admin') {
-    const legacy = await readLegacyGlobalNotify(env);
-    if (legacy) return legacy;
+interface NotifyPrefsSnapshot {
+  raw: string | null;
+  role: string;
+  status: string;
+  prefs: UserNotifyPrefs;
+}
+
+export async function readNotifyPrefsSnapshot(env: Env, userId: number): Promise<NotifyPrefsSnapshot | null> {
+  const row = await env.db.prepare('SELECT notify_prefs AS raw, role, status FROM users WHERE id = ?')
+    .bind(userId).first<{ raw: string | null; role: string; status: string }>();
+  if (!row) return null;
+  if (row.raw === null) {
+    const legacy = row.role === 'admin' ? await readLegacyGlobalNotify(env) : null;
+    return { ...row, prefs: legacy ?? clone(DEFAULT_USER_NOTIFY_PREFS) };
   }
-  return clone(DEFAULT_USER_NOTIFY_PREFS);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.raw);
+  } catch {
+    parsed = null;
+  }
+  return { ...row, prefs: normalize(parsed) };
+}
+
+/** 管理员仅在未配置个人偏好时继承旧全局设置。 */
+export async function getUserNotifyPrefs(env: Env, userId: number): Promise<UserNotifyPrefs> {
+  return (await readNotifyPrefsSnapshot(env, userId))?.prefs ?? clone(DEFAULT_USER_NOTIFY_PREFS);
 }
 
 /** 通知归属人的启用状态与偏好（投递时需要两者） */
@@ -181,9 +190,11 @@ export async function updateUserNotifyPrefs(
   env: Env,
   userId: number,
   patch: UpdateNotifyPrefsRequest,
-  opts: { allowEmptyForward?: boolean } = {},
+  opts: { allowEmptyForward?: boolean; snapshot?: NotifyPrefsSnapshot; beforeSave?: D1PreparedStatement[] } = {},
 ): Promise<UserNotifyPrefs> {
-  const current = await getUserNotifyPrefs(env, userId);
+  const snapshot = opts.snapshot ?? await readNotifyPrefsSnapshot(env, userId);
+  if (!snapshot) throw new AppError('not_found', '用户不存在');
+  const current = snapshot.prefs;
   const next = clone(current);
   if (patch.feishu) {
     next.feishu = {
@@ -225,13 +236,14 @@ export async function updateUserNotifyPrefs(
     throw new AppError('validation_failed', '开启邮箱转发需要至少一个目标地址');
   }
 
-  const db = createDb(env);
-  const res = await db
-    .update(users)
-    .set({ notifyPrefs: next })
-    .where(eq(users.id, userId))
-    .returning({ id: users.id });
-  if (!res.length) throw new AppError('not_found', '用户不存在');
+  // 确认或其他会话可能已收紧转发、撤销目标；只能写入本次实际验证过的配置。
+  const save = env.db.prepare("UPDATE users SET notify_prefs = ? WHERE id = ? AND role = ? AND notify_prefs IS ? AND status = ? RETURNING id")
+    .bind(JSON.stringify(next), userId, snapshot.role, snapshot.raw, snapshot.status);
+  // 附带的语句用相同的快照条件，只能在这一批偏好写入成功时变更待确认目标。
+  const saved = opts.beforeSave?.length
+    ? (await env.db.batch<{ id: number }>([...opts.beforeSave, save])).at(-1)?.results[0]
+    : await save.first<{ id: number }>();
+  if (!saved) throw new AppError('conflict', '通知偏好已变化，请刷新后重试');
   return next;
 }
 

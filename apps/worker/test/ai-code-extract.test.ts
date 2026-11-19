@@ -1,4 +1,4 @@
-import type { Settings } from '@hpc-mail/shared';
+import { DEFAULT_SETTINGS, type Settings } from '@hpc-mail/shared';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { eq } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -7,7 +7,8 @@ import { mailboxes, messages, users } from '../src/db/schema.js';
 import { extractCodeByAi, wantsAiCode } from '../src/services/code-extract.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { dayWindow, readCounter } from '../src/services/rate-counter.js';
-import { updateSettings } from '../src/services/setting.js';
+import { getSettingsFresh, updateSettings } from '../src/services/setting.js';
+import disableAutomaticAiCode from '../migrations/0034_disable_automatic_ai_code.sql?raw';
 import type { ExecCtx } from '../src/types.js';
 
 const API_KEY = 'sk-synthetic-code-test-key';
@@ -18,7 +19,11 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(
 type FetchArgs = [input: string | URL | Request, init?: RequestInit];
 const reply = (content: string) => Response.json({ choices: [{ message: { content } }] });
 function provider(code: string) {
-  const fetchMock = vi.fn(async (..._args: FetchArgs) => reply(JSON.stringify({ code })));
+  const fetchMock = vi.fn(async (...args: FetchArgs) => {
+    const body = JSON.parse(String(args[1]?.body)) as { messages: { content: string }[] };
+    const { eligible } = JSON.parse(body.messages[1]!.content) as { eligible: string[] };
+    return reply(JSON.stringify({ code: code === 'first' ? eligible[0] ?? '' : code }));
+  });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
 }
@@ -32,7 +37,7 @@ const farCode = {
 
 describe('AI 兜底提码 extractCodeByAi', () => {
   it('未配置模型时不调用', async () => {
-    const fetchMock = provider('58204716');
+    const fetchMock = provider('first');
     expect(await extractCodeByAi(unconfigured, farCode)).toBe('');
     expect(await extractCodeByAi({ ...model, apiKey: '' }, farCode)).toBe('');
     expect(fetchMock).not.toHaveBeenCalled();
@@ -53,9 +58,9 @@ describe('AI 兜底提码 extractCodeByAi', () => {
     }
   });
 
-  it('DeepSeek 返回码且在原文中出现时采用，请求关闭思考并只看正文前 6000 字符', async () => {
-    const fetchMock = provider('58204716');
-    const long = { ...farCode, text: `${farCode.text}\n${'filler '.repeat(2000)}` };
+  it('DeepSeek 只收到候选占位符、脱敏上下文与前 6000 字符，请求关闭思考', async () => {
+    const fetchMock = provider('first');
+    const long = { ...farCode, text: `${farCode.text}\nContact us at personal@example.test or https://example.test/reset/secret.\n${'filler '.repeat(1000)}hidden tail` };
     expect(await extractCodeByAi(model, long)).toBe('58204716');
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0]!;
@@ -64,7 +69,13 @@ describe('AI 兜底提码 extractCodeByAi', () => {
     expect(new Headers(init!.headers).get('Authorization')).toBe(`Bearer ${API_KEY}`);
     const body = JSON.parse(String(init!.body)) as { model: string; thinking?: unknown; response_format: unknown; max_tokens: number; messages: { content: string }[] };
     expect(body).toMatchObject({ model: 'deepseek-flash', thinking: { type: 'disabled' }, response_format: { type: 'json_object' }, max_tokens: 64 });
-    expect(body.messages[1]!.content.length).toBeLessThanOrEqual('Subject: Verify your sign-in\n\n'.length + 6000);
+    const { email, eligible } = JSON.parse(body.messages[1]!.content) as { email: string; eligible: string[] };
+    expect(eligible).toHaveLength(1);
+    expect(email).toContain(eligible[0]);
+    expect(email).toContain('Verify your sign-in');
+    for (const secret of ['58204716', 'personal@example.test', 'https://example.test/reset/secret', 'hidden tail']) {
+      expect(body.messages[1]!.content).not.toContain(secret);
+    }
   });
 
   it('原文里不存在、只在 URL 中、或格式不对的码一律丢弃', async () => {
@@ -72,7 +83,7 @@ describe('AI 兜底提码 extractCodeByAi', () => {
     expect(await extractCodeByAi(model, farCode)).toBe('');
     provider('A1B2C3');
     expect(await extractCodeByAi(model, { subject: 'Account security code', text: 'Open https://example.test/session/A1B2C3 to continue.', html: '' })).toBe('');
-    provider('this is not a code');
+    provider('[[HPC_PRIVATE_99_0]]');
     expect(await extractCodeByAi(model, farCode)).toBe('');
     vi.stubGlobal('fetch', vi.fn(async () => reply('not json')));
     expect(await extractCodeByAi(model, farCode)).toBe('');
@@ -91,12 +102,12 @@ describe('AI 兜底提码 extractCodeByAi', () => {
   });
 
   it('原文里用空格或连字符分隔的码也能通过回验，但字符必须按顺序出自原文', async () => {
-    provider('58204716');
+    provider('first');
     const spaced = { subject: 'Sign-in attempt', text: 'Type the digits below to sign in.\n\n5 8 2 0 4 7 1 6\n\nThe one-time passcode expires soon.', html: '' };
     expect(await extractCodeByAi(model, spaced)).toBe('58204716');
-    provider('482913');
     expect(await extractCodeByAi(model, { subject: 'Your verification code', text: 'Code: 482-913', html: '' })).toBe('482913');
-    // 夹在更长数字串里、或顺序不符时仍丢弃
+    // 模型返回原值或编造的编号均无效；无合法候选的长号码不启动调用。
+    provider('482913');
     expect(await extractCodeByAi(model, { subject: 'Your verification code', text: 'Order 9482-9131 shipped', html: '' })).toBe('');
     expect(await extractCodeByAi(model, { subject: 'Your verification code', text: 'Code: 4 8 2 9 3 1', html: '' })).toBe('');
   });
@@ -130,7 +141,7 @@ describe('收件链路的 AI 兜底', () => {
 
   it('正则提不到时用 ai_model 补码写库；未配置模型或无关键词时不调用、不占每域额度', async () => {
     await updateSettings(env, { code_extract: { enabled: true, aiEnabled: true }, ai_model: model });
-    const fetchMock = provider('58204716');
+    const fetchMock = provider('first');
     const hit = `aic-hit@aic-${crypto.randomUUID().slice(0, 6)}.test`;
     await seedOwner(hit);
     expect((await receive(hit, farCode.subject, farCode.text)).verificationCode).toBe('58204716');
@@ -148,5 +159,17 @@ describe('收件链路的 AI 兜底', () => {
     expect((await receive(off, farCode.subject, farCode.text)).verificationCode).toBe('');
     expect(await aiUsage(off.split('@')[1]!)).toBe(0);
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe('隐私升级默认关闭自动 AI 兜底', () => {
+  it('新部署与已启用的旧部署只关闭 AI，管理员仍可主动开启', async () => {
+    expect(DEFAULT_SETTINGS.code_extract).toEqual({ enabled: true, aiEnabled: false });
+    await updateSettings(env, { code_extract: { enabled: true, aiEnabled: true } });
+    const statement = disableAutomaticAiCode.replace(/^(?:--[^\n]*\n)+/, '').trim().replace(/;$/, '');
+    await env.db.prepare(statement).run();
+    expect((await getSettingsFresh(env)).code_extract).toEqual({ enabled: true, aiEnabled: false });
+    await updateSettings(env, { code_extract: { enabled: true, aiEnabled: true } });
+    expect((await getSettingsFresh(env)).code_extract).toEqual({ enabled: true, aiEnabled: true });
   });
 });

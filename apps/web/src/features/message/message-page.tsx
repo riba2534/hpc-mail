@@ -24,6 +24,8 @@ import type { MessageDetail } from '@hpc-mail/shared';
 import { queryKeys } from '@/api/query-keys';
 import { messageApi } from '@/api/resources';
 import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { useCopy } from '@/components/ui/copy-button';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -54,15 +56,13 @@ import { EmailBodyBoundary } from '@/lib/email-html/body-error-boundary';
 import { PlainTextBody } from '@/lib/email-html/plain-text-body';
 import { formatBytes, formatDateTime } from '@/lib/format';
 import { extractOtp } from '@/lib/otp';
-import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { OtpBanner } from './otp-banner';
 import { SenderAuthBanner, senderAuthFailed } from './sender-auth-banner';
 import { TranslationBar } from './translation/translation-bar';
 import { useMessageTranslation } from './translation/use-message-translation';
 import { isFailedOutcome } from './delivery-outcomes';
-import { inspectVerificationLink } from './verification-link';
+import { inspectOpaqueVerificationLink, inspectVerificationLink, type VerificationLinkInfo } from './verification-link';
 import { useDocumentTitle } from '@/lib/use-document-title';
-import { useCurrentUser } from '@/lib/use-session';
 import { QueryErrorState } from '@/components/query-error-state';
 import { ApiError } from '@/api/errors';
 
@@ -91,9 +91,36 @@ function RecipientLine({ label, addresses }: { label: string; addresses: string[
   );
 }
 
+function OpaqueVerificationLink({ link }: { link: VerificationLinkInfo }) {
+  const [open, setOpen] = useState(false);
+  const { copy } = useCopy('原始验证链接已复制');
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-caution/40 bg-caution-soft px-4 py-3">
+      <p className="min-w-0 break-all text-sm text-ink">验证链接经过追踪跳转（{link.hostname}）。</p>
+      <Button type="button" variant="secondary" size="sm" onClick={() => setOpen(true)}>
+        复制原始验证链接
+      </Button>
+      <ConfirmDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="复制追踪跳转链接？"
+        description="访问这个链接可能让追踪服务记录本次点击和你的 IP。只有在你确认邮件来源可信且需要该链接时才继续。"
+        confirmLabel="继续复制"
+        onConfirm={() => {
+          setOpen(false);
+          void copy(link.href);
+        }}
+      />
+    </div>
+  );
+}
+
 function VerificationLinkBanner({ message }: { message: MessageDetail }) {
   const link = inspectVerificationLink(message.verificationLink);
-  if (!link) return null;
+  if (!link) {
+    const opaque = inspectOpaqueVerificationLink(message.verificationLink);
+    return opaque ? <OpaqueVerificationLink key={message.id} link={opaque} /> : null;
+  }
   const unverifiedSender = senderAuthFailed(message.auth);
   return (
     <div
@@ -125,7 +152,6 @@ function VerificationLinkBanner({ message }: { message: MessageDetail }) {
 }
 
 export function MessagePage() {
-  const currentUser = useCurrentUser();
   const { id } = useParams();
   const messageId = Number(id);
   const [searchParams] = useSearchParams();
@@ -234,7 +260,8 @@ export function MessagePage() {
   }, [message?.id, message?.isRead, readStateWritable]);
 
   // Permission is bound to the current message, so the next mail cannot render a remote image even for one frame.
-  const showRemoteImages = Boolean(message && (imagesAllowedFor === message.id || isTrustedSender(message.fromAddress, currentUser.id)));
+  const showRemoteImages = Boolean(message && imagesAllowedFor === message.id);
+  useEffect(() => setImagesAllowedFor(null), [messageId]);
 
   const deleteMutation = useDeleteMessages(mutationScope, () => goBack());
 
@@ -309,7 +336,7 @@ export function MessagePage() {
       'Shift+U': handleMarkUnread,
       Escape: goBack,
     },
-    Boolean(message),
+    Boolean(message) && !translation.consentRequired,
   );
 
   if (isLoading) {
@@ -366,6 +393,14 @@ export function MessagePage() {
 
   return (
     <div className="mx-auto max-w-3xl">
+      <ConfirmDialog
+        open={translation.consentRequired}
+        onOpenChange={(open) => { if (!open) translation.cancelConsent(); }}
+        title="发送邮件片段进行 AI 翻译？"
+        description="继续后，HPC Mail 会将邮件主题和需要翻译的正文片段发送给本站配置的 AI 服务。请确认你愿意将这些内容交给该服务处理。"
+        confirmLabel="同意并翻译"
+        onConfirm={translation.confirmConsent}
+      />
       {/* 操作栏吸顶；小屏贴边 */}
       <div className="sticky top-14 z-20 -mx-4 mb-3 flex flex-nowrap items-center gap-1 border-b border-line bg-canvas px-2 py-1.5 sm:mx-0 sm:mb-4 sm:border-b-0 sm:px-0">
         <IconButton aria-label="返回列表" title="返回列表（u / Esc）" onClick={goBack}>
@@ -554,27 +589,17 @@ export function MessagePage() {
           {otpCode && <OtpBanner code={otpCode} />}
           {!outbound && <VerificationLinkBanner message={message} />}
 
-          {remoteImageCount > 0 && !showRemoteImages && (
+          {remoteImageCount > 0 && (
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-line bg-canvas px-3 py-2 text-sm">
               <span className="flex items-center gap-2 text-ink-secondary">
                 <ImageOff className="size-4 shrink-0 text-ink-tertiary" />
-                已阻止 {remoteImageCount} 张远程图片以保护隐私
+                {showRemoteImages
+                  ? '已允许本封邮件的普通远程图片，已知追踪像素仍被拦截。'
+                  : '远程图片默认拦截。显示普通远程图片可能向图片服务器暴露本次打开和 IP。'}
               </span>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  className="text-sm text-ink-tertiary hover:text-ink hover:underline"
-                  onClick={() => {
-                    trustSender(message.fromAddress, currentUser.id);
-                    setImagesAllowedFor(message.id);
-                  }}
-                >
-                  始终信任该发件人
-                </button>
-                <Button variant="secondary" size="sm" onClick={() => setImagesAllowedFor(message.id)}>
-                  显示图片
-                </Button>
-              </div>
+              <Button variant="secondary" size="sm" onClick={() => setImagesAllowedFor(showRemoteImages ? null : message.id)}>
+                {showRemoteImages ? '阻止远程图片' : '显示图片'}
+              </Button>
             </div>
           )}
 

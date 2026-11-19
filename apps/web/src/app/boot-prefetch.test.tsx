@@ -142,12 +142,12 @@ describe('持久缓存恢复', () => {
     expect(await screen.findByText('上次看到的邮件')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText('user=me')).toBeInTheDocument());
     writeQueryCache(queryClient);
-    expect(localStorage.getItem(queryCacheStorageKey(1))).toContain('上次看到的邮件');
+    expect(localStorage.getItem(queryCacheStorageKey(1))).not.toContain('上次看到的邮件');
     first.unmount();
     queryClient.clear();
     Object.values(api).forEach((mock) => mock.mockClear());
 
-    // 再次打开：接口都还没返回时首屏已是上次的数据
+    // 再次打开：接口都还没返回时首屏已恢复不含正文敏感字段的列表元数据
     const pending = () => new Promise<never>(() => {});
     for (const mock of [api.me, api.list, api.mailboxes, api.shared, api.domains, api.unread, api.config]) {
       (mock as ReturnType<typeof vi.fn>).mockImplementationOnce(pending);
@@ -156,7 +156,8 @@ describe('持久缓存恢复', () => {
     expect(cachedHashes()).toContain(hashKey(defaultInboxListKey()));
     expect(cachedHashes()).toContain(hashKey(queryKeys.sessionForRevision(getAuthRevision())));
     renderInbox();
-    expect(screen.getByText('上次看到的邮件')).toBeInTheDocument();
+    expect(screen.getByText('a@example.com')).toBeInTheDocument();
+    expect(screen.queryByText('上次看到的邮件')).not.toBeInTheDocument();
     expect(screen.getByText('user=me')).toBeInTheDocument();
     expect(screen.getByText('同步中')).toBeInTheDocument();
     // 恢复的数据已过期：启动预取即后台刷新，挂载后不重复请求

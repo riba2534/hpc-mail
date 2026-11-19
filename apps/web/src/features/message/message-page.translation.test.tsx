@@ -75,6 +75,7 @@ function show(entry = '/mail/1') {
 }
 
 const translateButton = () => screen.queryByRole('button', { name: '翻译' });
+const confirmTranslation = async () => fireEvent.click(await screen.findByRole('button', { name: '同意并翻译' }));
 
 beforeEach(() => {
   mocks.post.mockReset();
@@ -92,6 +93,20 @@ describe('翻译按钮显示条件', () => {
     expect(translateButton()).toHaveClass('hidden', 'sm:inline-flex');
     fireEvent.pointerDown(screen.getByRole('button', { name: '更多操作' }), { button: 0, ctrlKey: false, pointerType: 'mouse' });
     expect(await screen.findByRole('menuitem', { name: '翻译' })).toBeInTheDocument();
+    client.clear();
+  });
+
+  it('键盘与按钮都要求知情确认，取消不会请求 AI', async () => {
+    const client = show();
+    await screen.findByText('Your order has shipped');
+    fireEvent.keyDown(window, { key: 't' });
+    expect(await screen.findByRole('heading', { name: '发送邮件片段进行 AI 翻译？' })).toBeInTheDocument();
+    expect(mocks.post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    expect(mocks.post).not.toHaveBeenCalled();
+    fireEvent.click(translateButton()!);
+    await confirmTranslation();
+    await waitFor(() => expect(mocks.post).toHaveBeenCalledTimes(1));
     client.clear();
   });
 
@@ -116,6 +131,7 @@ describe('纯文本邮件翻译', () => {
     const client = show();
     await screen.findByText('Your order has shipped');
     fireEvent.click(translateButton()!);
+    await confirmTranslation();
 
     expect(await screen.findByText('译:Your order has shipped')).toBeInTheDocument();
     expect(screen.getByText('原文：Your order has shipped')).toBeInTheDocument();
@@ -147,6 +163,7 @@ describe('纯文本邮件翻译', () => {
     const client = show();
     await screen.findByText('Your order has shipped');
     fireEvent.click(translateButton()!);
+    await confirmTranslation();
     expect(await screen.findByText('1 批翻译失败：今日翻译额度已用完')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '重试' }));
@@ -167,6 +184,7 @@ describe('HTML 邮件翻译', () => {
     await screen.findByText('Your order has shipped');
     const body = () => screen.getByTestId('email-html');
     fireEvent.click(translateButton()!);
+    await confirmTranslation();
     await waitFor(() => expect(body()).toHaveTextContent('译:Hello 译:world'));
     expect(body()).toHaveTextContent('npm install');
     expect(mocks.post.mock.calls[0]![1]).toEqual({ segments: ['Your order has shipped', 'Hello', 'world'] });
@@ -188,6 +206,7 @@ describe('只读视图', () => {
     const client = show();
     await screen.findByText('共享 · 只读');
     fireEvent.click(translateButton()!);
+    await confirmTranslation();
     expect(await screen.findByText(/译:Hello Alice,/)).toBeInTheDocument();
     client.clear();
   });
@@ -196,6 +215,7 @@ describe('只读视图', () => {
     const client = show('/mail/1?scope=unclaimed');
     await screen.findByText('Your order has shipped');
     fireEvent.keyDown(window, { key: 't' });
+    await confirmTranslation();
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith(
       '/messages/1/translate',
       expect.anything(),

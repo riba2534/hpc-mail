@@ -56,7 +56,7 @@ const FRAME_BASE_STYLES = `
 export function EmailHtml({
   html,
   trustedImageOrigins = [],
-  allowRemoteImages = true,
+  allowRemoteImages = false,
   className,
   onContentChange,
 }: EmailHtmlProps) {
@@ -146,8 +146,10 @@ export function EmailHtml({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [html, allowRemoteImages, trustedOriginsKey])
 
+  // A document keeps previous CSP policies after document.open(). Remount when the policy changes.
   return (
     <iframe
+      key={String(allowRemoteImages)}
       ref={frameRef}
       title="邮件正文"
       src="about:blank"

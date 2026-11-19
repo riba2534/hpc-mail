@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react'
+import { protectMailText } from '@hpc-mail/shared/mail-privacy'
 import { cn } from '@/lib/cn'
 import { linkify, splitQuoteBlocks } from './linkify'
 
 function LinkifiedText({ text }: { text: string }) {
-  const segments = useMemo(() => linkify(text), [text])
+  const segments = useMemo(() => linkify(protectMailText(text)), [text])
   return (
     <>
       {segments.map((segment, index) =>

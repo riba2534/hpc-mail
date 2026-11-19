@@ -16,7 +16,6 @@ import { draftKeyForUser } from '@/features/compose/compose-draft';
 import { DRAFT_MAX_AGE_MS } from '@/features/compose/draft-retention';
 import { sendAttemptKeyForUser } from '@/features/compose/send-attempt';
 import { clearAuthToken, setAuthToken } from '@/lib/auth-token';
-import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { AppShell } from './app-shell';
 
 const user: SessionUser = { id: 1, username: 'alice', role: 'user', createdAt: '', avatarUrl: null, twoFactorEnabled: false };
@@ -65,7 +64,7 @@ describe('退出登录清理本机数据', () => {
   it('有未发送草稿时先确认；取消则什么都不清，确认后删除该账户的草稿、发送凭据与信任的发件人', async () => {
     localStorage.setItem(draftKeyForUser(1, 'reply:9'), draft(Date.now()));
     localStorage.setItem(sendAttemptKeyForUser(1), '{"key":"k"}');
-    trustSender('friend@example.com', 1);
+    localStorage.setItem('hpc-trusted-image-senders:1', '["friend@example.com"]');
     localStorage.setItem(draftKeyForUser(2), draft(Date.now()));
     const { client, router } = renderShell();
 
@@ -85,19 +84,19 @@ describe('退出登录清理本机数据', () => {
     expect(localStorage.getItem('token')).toBeNull();
     expect(localStorage.getItem(draftKeyForUser(1, 'reply:9'))).toBeNull();
     expect(localStorage.getItem(sendAttemptKeyForUser(1))).toBeNull();
-    expect(isTrustedSender('friend@example.com', 1)).toBe(false);
+    expect(localStorage.getItem('hpc-trusted-image-senders:1')).toBeNull();
     // 其他账户的草稿不动
     expect(localStorage.getItem(draftKeyForUser(2))).not.toBeNull();
     client.clear();
   });
 
   it('没有草稿时直接退出并清理', async () => {
-    trustSender('friend@example.com', 1);
+    localStorage.setItem('hpc-trusted-image-senders:1', '["friend@example.com"]');
     const { client, router } = renderShell();
     await clickLogout();
     await waitFor(() => expect(router.state.location.pathname).toBe('/login'));
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(isTrustedSender('friend@example.com', 1)).toBe(false);
+    expect(localStorage.getItem('hpc-trusted-image-senders:1')).toBeNull();
     client.clear();
   });
 

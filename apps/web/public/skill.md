@@ -76,7 +76,7 @@ hpc "/messages/$MSG_ID/forward" -X POST -H 'Content-Type: application/json' -H "
   --data "$(jq -n '{to:["bob@example.net"], note:"请看下面这封"}')" | jq '.data | {id,status,recipientOutcomes}'
 ```
 
-- 回复默认回给原信 `replyTo`（没有时回发件人）；`replyAll:true` 另抄送原 To/Cc 里的其他人，去掉你自己，从不带原 Bcc；`quote` 默认附原文引用，`text`/`html` 至少一个。转发时 `note` 在前，`includeOriginal` 默认附原文，原附件总会带上。
+- 回复默认回给原信 `replyTo`（没有时回发件人）；`replyAll:true` 另抄送原 To/Cc 里的其他人，去掉你自己，从不带原 Bcc；`quote` 默认附原文引用，`text`/`html` 至少一个。转发时 `note` 在前，`includeOriginal` 默认附经过隐私处理的邮件。来信转发剔除远程资源及已知追踪跳转，保留原附件供下载。
 - `from` 缺省用原信的收件地址；原信在共享给你的邮箱里时返回 400 `from_required`，在 `from` 写自己的地址即可。来源看不到或原附件已丢失返回 404 `source_unavailable`。
 - 要自己定收件人、主题或正文时用配方②，带 `replyToMessageId`（只写线程头）或 `forwardAttachmentsFrom`（复制原附件和内嵌图），同样需要 `mail.read`。回复站外邮件（只知道对方 Message-ID）：不写 `replyToMessageId`，改写 `headers:{"In-Reply-To":"<id@example.net>","References":"<root@example.net> <id@example.net>"}`，两者同时给返回 400。
 

@@ -22,18 +22,19 @@ export async function writeClipboard(text: string): Promise<boolean> {
   } catch {
     // 降级到 execCommand
   }
+  let textarea: HTMLTextAreaElement | undefined;
   try {
-    const textarea = document.createElement('textarea');
+    textarea = document.createElement('textarea');
     textarea.value = text;
     textarea.style.position = 'fixed';
     textarea.style.opacity = '0';
     document.body.append(textarea);
     textarea.select();
-    const ok = document.execCommand('copy');
-    textarea.remove();
-    return ok;
+    return document.execCommand('copy');
   } catch {
     return false;
+  } finally {
+    textarea?.remove();
   }
 }
 

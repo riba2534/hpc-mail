@@ -14,6 +14,8 @@ workers_dev = true
 
 [observability]
 enabled = true
+# 搜索词和签名下载凭据可能出现在 URL 查询串；保留指标与脱敏后的日志。
+redact_query_string = true
 
 [observability.traces]
 enabled = true

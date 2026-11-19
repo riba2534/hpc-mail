@@ -86,6 +86,27 @@ describe('writeQueryCache', () => {
     client.clear();
   });
 
+  it('首屏缓存移除主题、摘要、验证码、验证链接和条件同步指纹', () => {
+    const client = newClient();
+    seedQueries(client, 1);
+    const data = listData([message(4, {
+      subject: 'Email secret 123456',
+      verificationCode: '123456',
+      verificationLink: 'https://example.test/auth?token=private',
+      preview: 'Email body token',
+    })]);
+    data.pages[0]!.head = 'previous-content-fingerprint';
+    client.setQueryData(defaultInboxListKey(), data);
+    writeQueryCache(client);
+    const raw = localStorage.getItem(queryCacheStorageKey(1))!;
+    for (const secret of ['123456', 'Email secret', 'token=private', 'Email body token', 'previous-content-fingerprint']) {
+      expect(raw).not.toContain(secret);
+    }
+    expect(stored(1).entries.inbox.data.pages[0].items[0]).toMatchObject({ id: 4, preview: '', subject: '', verificationCode: '' });
+    expect(data.pages[0]!.items[0]!.verificationCode).toBe('123456');
+    client.clear();
+  });
+
   it('会话用户与 token 不是同一账户、或会话尚未成功时不写', () => {
     const client = newClient();
     seedQueries(client, 2);
@@ -103,7 +124,7 @@ describe('writeQueryCache', () => {
     const client = newClient();
     seedQueries(client, 1);
     const huge = 'x'.repeat(QUERY_CACHE_MAX_BYTES);
-    client.setQueryData(defaultInboxListKey(), listData([message(1, { preview: huge })]));
+    client.setQueryData(defaultInboxListKey(), listData([message(1, { fromName: huge })]));
     writeQueryCache(client);
     const raw = localStorage.getItem(queryCacheStorageKey(1))!;
     expect(new TextEncoder().encode(raw).byteLength).toBeLessThanOrEqual(QUERY_CACHE_MAX_BYTES + 64);
@@ -119,6 +140,16 @@ describe('restoreQueryCache', () => {
     writeQueryCache(writer, now);
     writer.clear();
   }
+
+  it('升级时删除旧首屏缓存和持久化发件人信任', () => {
+    localStorage.setItem('hpc-query-cache:v1:1', '{"verificationCode":"123456"}');
+    localStorage.setItem('hpc-trusted-image-senders:1', '["sender@example.test"]');
+    const client = newClient();
+    expect(restoreQueryCache(client)).toBe(false);
+    expect(localStorage.getItem('hpc-query-cache:v1:1')).toBeNull();
+    expect(localStorage.getItem('hpc-trusted-image-senders:1')).toBeNull();
+    expect(client.getQueryData(defaultInboxListKey())).toBeUndefined();
+  });
 
   it('恢复到与页面相同的 queryKey，保留原 updatedAt 并标记为过期', () => {
     persistFor(1);

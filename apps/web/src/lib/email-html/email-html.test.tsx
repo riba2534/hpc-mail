@@ -39,6 +39,23 @@ afterEach(() => vi.unstubAllGlobals())
 const WIDE_TEMPLATE = '<table style="min-width:600px"><tr><td>订单金额</td><td>¥ 1,280.00</td></tr></table>'
 
 describe('EmailHtml', () => {
+  it('默认拦截远程图片并在每次更改图片策略时重建 iframe', () => {
+    const html = '<img src="https://images.example.test/logo.png">'
+    const { container, rerender } = render(<EmailHtml html={html} />)
+    const blocked = container.querySelector('iframe')!
+    expect(blocked.contentDocument?.querySelector('img')).toBeNull()
+    expect(blocked.contentDocument?.querySelector('meta[http-equiv="Content-Security-Policy"]'))
+      .toHaveAttribute('content', expect.stringContaining("img-src 'self' data:"))
+    rerender(<EmailHtml html={html} allowRemoteImages />)
+    const allowed = container.querySelector('iframe')!
+    expect(allowed).not.toBe(blocked)
+    expect(allowed.contentDocument?.querySelector('img')).toHaveAttribute('src', 'https://images.example.test/logo.png')
+    rerender(<EmailHtml html={html} />)
+    const blockedAgain = container.querySelector('iframe')!
+    expect(blockedAgain).not.toBe(allowed)
+    expect(blockedAgain.contentDocument?.querySelector('img')).toBeNull()
+  })
+
   it('写死最小宽度的模板在窄屏上可以横向滚动，不被裁掉', () => {
     const { container } = render(<EmailHtml html={WIDE_TEMPLATE} />)
     const iframe = container.querySelector('iframe')!

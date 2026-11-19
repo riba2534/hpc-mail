@@ -13,7 +13,8 @@ export const registerModeSchema = z.enum(REGISTRATION_MODES);
 
 export const gmailForwardSettingSchema = z.object({
   enabled: z.boolean(),
-  /** 转发目标邮箱；已验证 destination 走原生 forward，其余走 no-reply 中转 */
+  contentMode: z.enum(['protected', 'notice']).optional(),
+  /** 已确认的转发目标邮箱；发送前按 contentMode 构建邮件 */
   addresses: z.array(emailAddressSchema).max(5),
 });
 
@@ -229,7 +230,7 @@ export type Settings = {
 
 export const DEFAULT_SETTINGS: Settings = {
   register_mode: 'closed',
-  code_extract: { enabled: true, aiEnabled: true },
+  code_extract: { enabled: true, aiEnabled: false },
   site: { title: 'HPC Mail' },
   api: { enabled: true },
   domains: { list: [] },

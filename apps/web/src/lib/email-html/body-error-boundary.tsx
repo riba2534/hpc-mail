@@ -1,24 +1,9 @@
 import { Component, type ReactNode } from 'react'
 
-const BLOCK_SELECTOR = 'p, div, tr, li, h1, h2, h3, h4, h5, h6, blockquote, pre, table'
+import { protectMailText } from '@hpc-mail/shared/mail-privacy'
+import { htmlToPlainText } from './html-to-plain-text'
 
-/** HTML 正文的文字（不执行脚本、不加载资源）：没有纯文本正文时的降级显示用 */
-export function htmlToPlainText(html: string): string {
-  try {
-    const parsed = new DOMParser().parseFromString(html, 'text/html')
-    parsed.querySelectorAll('script, style, template, noscript').forEach((node) => node.remove())
-    parsed.querySelectorAll('br').forEach((node) => node.replaceWith('\n'))
-    parsed.querySelectorAll(BLOCK_SELECTOR).forEach((node) => node.append('\n'))
-    return (parsed.body?.textContent ?? '')
-      .split('\n')
-      .map((line) => line.replace(/[ \t\u00a0]+/g, ' ').trim())
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim()
-  } catch {
-    return ''
-  }
-}
+export { htmlToPlainText } from './html-to-plain-text'
 
 export interface EmailBodyBoundaryProps {
   /** 换一封邮件时重新按原格式渲染 */
@@ -69,7 +54,7 @@ export class EmailBodyBoundary extends Component<EmailBodyBoundaryProps, EmailBo
           )}
         </div>
         <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-ink">
-          {fallback || '（无法提取正文文字）'}
+          {fallback ? protectMailText(fallback) : '（无法提取正文文字）'}
         </div>
       </div>
     )

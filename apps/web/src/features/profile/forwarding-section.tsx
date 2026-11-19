@@ -81,7 +81,7 @@ export function toDraft(view: NotifyPrefsView): UserNotifyPrefs {
     feishu: view.feishu,
     webhook: view.webhook,
     pushdeer: view.pushdeer,
-    forward: { enabled: view.forward.enabled, addresses: [...view.forward.addresses, ...pending] },
+    forward: { ...view.forward, addresses: [...view.forward.addresses, ...pending] },
   };
 }
 
@@ -98,7 +98,7 @@ export function ForwardingSection({ id }: { id?: string }) {
   const [validationError, setValidationError] = useState<string | null>(null);
   const [draft, setDraft] = useState<UserNotifyPrefs | null>(null);
   const [testing, setTesting] = useState<TestChannel | null>(null);
-  // 新增转发目标或打开转发时服务端要求当前密码：先不带密码保存，收到 reauth_required 再弹窗补上
+  // 新增转发目标、开启转发或扩大转发范围时服务端要求当前密码：先不带密码保存，收到 reauth_required 再弹窗补上
   const [reauthOpen, setReauthOpen] = useState(false);
   const [reauthPassword, setReauthPassword] = useState('');
   const [reauthError, setReauthError] = useState<string | null>(null);
@@ -232,10 +232,23 @@ export function ForwardingSection({ id }: { id?: string }) {
             ))}
           </ul>
         )}
+        <SegmentedControl
+          aria-label="转发内容"
+          className="w-fit"
+          value={draft.forward.contentMode ?? 'protected'}
+          onValueChange={(contentMode) => patch((d) => void (d.forward.contentMode = contentMode))}
+          options={[
+            { value: 'protected', label: '隐私保护转发' },
+            { value: 'notice', label: '仅通知' },
+          ]}
+        />
         <p className="text-xs text-ink-tertiary">
-          新加的地址会先收到一封确认邮件，对方点确认后才开始转发；新增地址或打开转发需要输入当前密码。
-          已在 Cloudflare Email Routing 验证过的地址走原生转发（原样保留邮件）；
-          其余地址由系统以 no-reply@收件域名 中转重发（标注原始发件人，直接回复即回给对方）。
+          {draft.forward.contentMode === 'notice'
+            ? '只发送邮件主题和本站查看入口。打开入口后需登录 HPC Mail。'
+            : '发送移除远程图片和已知追踪跳转的副本。缺失的图片和大附件可登录 HPC Mail 查看。'}
+        </p>
+        <p className="text-xs text-ink-tertiary">
+          新加的地址会先收到确认邮件，对方确认后开始转发。新增地址、开启转发或从仅通知切换为发送副本时，需要输入当前密码。
         </p>
       </ChannelBlock>
 
@@ -415,7 +428,7 @@ export function ForwardingSection({ id }: { id?: string }) {
 
       <Dialog open={reauthOpen} onOpenChange={(next) => !next && setReauthOpen(false)}>
         <DialogContent className="max-w-sm">
-          <DialogHeader title="确认当前密码" description="新增转发目标或打开转发会把来信发往外部邮箱，请输入当前密码确认。" />
+          <DialogHeader title="确认当前密码" description="这次修改会开启转发、新增外部目标或扩大转发内容，请输入当前密码确认。" />
           <form
             onSubmit={(event) => {
               event.preventDefault();

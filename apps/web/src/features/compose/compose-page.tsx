@@ -414,6 +414,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
   // 原邮件已删除或不可见时，用户可以去掉回复关联 / 原邮件附件，再作为新邮件发送
   const [replyToMessageId, setReplyToMessageId] = useState(initial.replyToMessageId);
   const [forwardAttachmentsFrom, setForwardAttachmentsFrom] = useState(initial.forwardAttachmentsFrom);
+  const forwardSourceDetached = useRef(draft?.forwardSourceDetached === true);
 
   const clearFieldError = (key: FieldKey) =>
     setFieldErrors((current) => (current[key] ? { ...current, [key]: undefined } : current));
@@ -509,6 +510,7 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
       ...initial,
       replyToMessageId,
       forwardAttachmentsFrom,
+      ...(forwardSourceDetached.current ? { forwardSourceDetached: true } : {}),
       fromAddress: validMailbox ? mailboxes?.find((box) => box.id === mailboxId)?.address : customAllowed ? `${localPart}@${adminDomain}` : undefined,
       to, cc, bcc, subject, body, isHtml, mailboxId, localPart, adminDomain, attachments: savedAttachments, savedAt: Date.now(),
     });
@@ -1022,7 +1024,10 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
   const goneSource = sendError?.kind === 'reply' || sendError?.kind === 'forward' ? sendError.kind : null;
   const detachSource = (source: SendSource) => {
     if (source === 'reply') setReplyToMessageId(undefined);
-    else setForwardAttachmentsFrom(undefined);
+    else {
+      forwardSourceDetached.current = true;
+      setForwardAttachmentsFrom(undefined);
+    }
     setSendError(null);
     toast({ title: SOURCE_GONE[source].detached });
   };
@@ -1250,7 +1255,9 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
             />
           </div>
           {forwardAttachmentsFrom && (
-            <p className="text-sm text-ink-secondary">将保留原邮件附件（来源邮件 #{forwardAttachmentsFrom}）。</p>
+            <p className="text-sm text-ink-secondary">
+              转发来源为邮件 #{forwardAttachmentsFrom}。发送时会处理追踪内容并带上可转发的原附件。
+            </p>
           )}
           {attachments.length > 0 && (
             <ul className="flex flex-col gap-1.5">

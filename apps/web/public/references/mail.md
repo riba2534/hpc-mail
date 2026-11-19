@@ -55,7 +55,7 @@ hpc '/messages' --get --data-urlencode 'direction=outbound' --data-urlencode 'to
 
 摘要包含 `id,direction,address,domain,fromAddress,fromName,subject,preview,verificationCode,verificationLink,status,errorDetail,isRead,isStarred,hasAttachments,size,createdAt`，发件还可含 `recipientsTo,recipientOutcomes`；`trash=1` 列表的每项另有 `deletedAt`（进入回收站时间，7 天后永久删除）。`verificationLink` 是收件时识别出的 http/https 验证、登录、激活或重置密码链接，识别不到、发件、关闭自动提取或功能上线前收到的邮件为空串，见[等待本次验证码](#等待本次验证码)的安全要求。详情增加 `recipients:{to,cc,bcc}`、`replyTo` 数组（都是纯地址字符串）、`bodyText,bodyHtml,attachments,hasRaw`；附件项的 `inline:true` 表示正文已用 `cid:` 引用并就地显示它（内联图片），不必再当附件列出，`hasAttachments` 也不计这类内联图。BCC 不在收件副本中披露。`status=degraded` 表示收件解析/附件降级，应说明 `errorDetail`、核对 `hasRaw`，不能承诺内容完整。收件摘要另有 `auth`，收件详情另有 `extractedText` 与 `risk`，见[发件认证与正文预处理](#发件认证与正文预处理)。
 
-翻译 `POST /api/messages/:id/translate` 只接受 JWT，`/v1` 没有对应接口；管理员未启用翻译或未配置 AI 模型（`/api/config` 的 `translationEnabled=false`）时返回 403。body `{segments:[...]}`：1–60 段，单段 ≤2000 字符，合计 ≤6000 字符，长邮件分多次请求；scope/userId 与详情相同。返回 `translations` 与 segments 一一对应。只有能在该邮件主题或完整正文中找到的片段（比对只看字母和数字，忽略 HTML 标签、实体、标点、空白和大小写）才会发送给管理员配置的第三方模型，找不到的原样返回并计入 `skipped`；去掉 URL、邮箱后没有字母的片段（验证码、数字、标点）原样返回且不计费；相同片段只发一次。同一邮件同一组片段命中缓存时 `cached=true`，不消耗额度。每用户每日字符额度由管理员设置（admin 也计入），另有每分钟 30 次模型调用上限，超额 429；服务失败 500 并退还额度。译文是机器翻译，验证码、链接等以原文为准。
+翻译 `POST /api/messages/:id/translate` 只接受 JWT，`/v1` 没有对应接口；管理员未启用翻译或未配置 AI 模型（`/api/config` 的 `translationEnabled=false`）时返回 403。body `{segments:[...]}`：1–60 段，单段 ≤2000 字符，合计 ≤6000 字符，长邮件分多次请求；scope/userId 与详情相同。返回 `translations` 与 segments 一一对应。只有能在该邮件主题或完整正文中找到的片段（比对只看字母和数字，忽略 HTML 标签、实体、标点、空白和大小写）才会发送给管理员配置的第三方模型，找不到的原样返回并计入 `skipped`；去掉 URL、邮箱后没有字母的片段（验证码、数字、标点）原样返回且不计费；相同片段只发一次。模型请求中的 URL、邮箱和验证码形态字段会先用占位符替代，在结果中恢复。用户在网页首次翻译前会看到数据去向提示。同一邮件同一组片段命中缓存时 `cached=true`，不消耗额度。每用户每日字符额度由管理员设置（admin 也计入），另有每分钟 30 次模型调用上限，超额 429；服务失败 500 并退还额度。译文是机器翻译，验证码、链接等以原文为准。
 
 管理员读列表/详情/线程/原始档时可带 `scope=mine|unclaimed|user`，`scope=user` 需正整数 `userId`；普通用户不能使用管理员 scope。共享只加入个人可见的非删除 inbound；`direction=outbound`、`trash=1`、审阅他人 scope 都不会扩大到共享内容。
 
@@ -407,7 +407,7 @@ Key（`/v1`）可直接调用回复与转发接口，由服务器按原信算收
 - `text`/`html` 至少一个非空。`quote` 默认 `true`：正文后附「----- 原始邮件 -----」、发件人、时间（UTC）、主题与 `> ` 引用的原文；给了 `html` 时另在 HTML 里用 blockquote 引用原 HTML。原文过长会截断并注明，不报错。
 - `from` 缺省用原信的收件地址（回复自己发出的信则是原发件地址），写法同普通发送。原信在共享给你的邮箱里时这个地址不是你的发件身份，返回 400 `from_required`，改在 `from` 指定自己的地址（见[错误说明](errors.md#from_required)）。
 
-**`POST /v1/messages/:id/forward`** `{to,cc?,bcc?,note?,includeOriginal?,from?}`：收件人写法同普通发送（合计 1–100 个）；主题加 `Fwd: `（换行折叠与截断规则同回复）；`note` 是写在最前面的纯文本；`includeOriginal` 默认 `true`，附上「---------- 转发的邮件 ----------」头部（发件人、时间、主题、收件人、抄送）与原文 text 和 HTML。原信的全部附件（含内嵌图）总会带上，规则同 `forwardAttachmentsFrom`，附件已丢失返回 404 `source_unavailable`。`includeOriginal:false` 时 `note` 不能为空。`from` 规则同回复。
+**`POST /v1/messages/:id/forward`** `{to,cc?,bcc?,note?,includeOriginal?,from?}`：收件人写法同普通发送（合计 1–100 个）；主题加 `Fwd: `（换行折叠与截断规则同回复）；`note` 是写在最前面的纯文本；`includeOriginal` 默认 `true`，附上「---------- 转发的邮件 ----------」头部（发件人、时间、主题、收件人、抄送）与经过隐私处理的 text 和 HTML。来信转发移除会自动加载的远程资源和已知追踪跳转，保留普通附件与可安全内联的图片。HTML、SVG、日历、嵌套邮件等附件留在本站。附件规则同 `forwardAttachmentsFrom`，附件已丢失返回 404 `source_unavailable`。`includeOriginal:false` 时 `note` 不能为空。`from` 规则同回复。
 
 ```bash
 # HPC_MSG_ID 为原信 ID；回复正文、转发目标与说明都须由用户确认。Idempotency-Key 按「幂等与重试」持久化
@@ -437,7 +437,7 @@ jq -n --slurpfile original message.json --arg from "$HPC_FROM" \
  "headers":{"In-Reply-To":"<CAB12345@mail.example.net>","References":"<root-1@mail.example.net> <CAB12345@mail.example.net>"}}
 ```
 
-转发用新目标/主题/正文，若需原附件填 `forwardAttachmentsFrom`；保留原 HTML 时也带原正文，并让服务器还原本站来源内嵌 CID。
+转发来信用新目标、主题、正文和 `forwardAttachmentsFrom`。即使原信没有附件，也传此字段让服务器验证来源并应用隐私处理。发送包含内嵌图的 HTML 时，服务器会还原本站来源内嵌 CID。大附件转换为主动下载链接时，受保护的正文不会把 CID 改成自动加载的远程图片。
 
 `replyToMessageId` 与 `forwardAttachmentsFrom` 的来源邮件必须对发件人可见：自己认领地址上的邮件，或共享给自己的未删除来信；管理员另可引用未认领地址上的邮件，但不能借此外发其他用户的私有邮件。来源不存在或不可见返回 404 `source_unavailable`（message 为「回复的原邮件不存在或不可见」或「转发的原邮件不存在或不可见」），转发时原附件已丢失也返回它（「附件「文件名」已丢失，无法完整转发」）；去掉 `replyToMessageId`/`forwardAttachmentsFrom` 即可作为新邮件发送，丢失的附件需自行重新附上。用 Key 调用时，带这两个字段还需要 `mail.read`，只有 `mail.send` 返回 403。
 

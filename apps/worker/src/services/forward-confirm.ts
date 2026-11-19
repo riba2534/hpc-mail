@@ -10,7 +10,7 @@ import { bytesToHex, sha256Hex } from '../lib/crypto.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
-import { getUserNotifyPrefs, updateUserNotifyPrefs } from './notify-prefs.js';
+import { getUserNotifyPrefs, readNotifyPrefsSnapshot, updateUserNotifyPrefs } from './notify-prefs.js';
 import { counterResult, counterStatement, counterWithinGuard, dayWindow } from './rate-counter.js';
 import { verifyReauthPassword } from './reauth.js';
 import { sendSystemMail } from './system-mail.js';
@@ -44,7 +44,7 @@ function confirmationMail(username: string, address: string, link: string) {
 /**
  * 网页会话修改个人偏好（含转发）。forward.addresses 是期望的目标列表：已确认的（当前 forward.addresses 里的）保留；
  * 新增的先不生效，记入 forward_confirmations 并向该地址发确认信，目标邮箱的主人确认后才加入；
- * 不在列表里的待确认记录一并撤销。新增目标或把转发从关改为开时先重新验证当前密码。
+ * 不在列表里的待确认记录一并撤销。新增目标、启用转发或扩大转发内容时重新验证当前密码。
  * 升级前已配置的目标视为已确认。
  */
 export async function updatePrefsWithForwardConfirmation(
@@ -59,7 +59,9 @@ export async function updatePrefsWithForwardConfirmation(
     const [prefs, pending] = await Promise.all([updateUserNotifyPrefs(env, user.id, patch), listPendingForwards(env, user.id)]);
     return { prefs, pending };
   }
-  const current = await getUserNotifyPrefs(env, user.id);
+  const snapshot = await readNotifyPrefsSnapshot(env, user.id);
+  if (!snapshot) throw new AppError('not_found', '用户不存在');
+  const current = snapshot.prefs;
   const confirmed = new Set(current.forward.addresses.map(normalizeEmail));
   const desired = [...new Set(patch.forward.addresses.map(normalizeEmail).filter(Boolean))];
   const keep = desired.filter((address) => confirmed.has(address));
@@ -70,8 +72,9 @@ export async function updatePrefsWithForwardConfirmation(
   const stillPending = new Set(existing.filter((row) => Number(row.expires_at) > now).map((row) => row.address));
   // 已在等待确认且未过期的不重发；过期或新加的重新生成 token 并发信
   const toSend = added.filter((address) => !stillPending.has(address));
-  // 要发新确认信，或把转发从关改为开时重新验证密码；只是保留已在等待确认的地址不需要
-  if (toSend.length || (patch.forward.enabled && !current.forward.enabled)) {
+  const contentMode = patch.forward.contentMode ?? current.forward.contentMode;
+  const expandsContent = current.forward.contentMode === 'notice' && contentMode === 'protected';
+  if (toSend.length || (patch.forward.enabled && (!current.forward.enabled || expandsContent))) {
     await verifyReauthPassword(env, { userId: user.id, sessionId }, patch.password);
   }
   if (toSend.length) {
@@ -85,36 +88,40 @@ export async function updatePrefsWithForwardConfirmation(
     }
   }
 
+  // D1 batch 原子提交待确认目标与偏好。所有语句检查同一份旧快照，冲突时旧目标、令牌与外发均不变化。
+  const targetGuard = "EXISTS (SELECT 1 FROM users WHERE id = ? AND role = ? AND notify_prefs IS ? AND status = ?)";
+  const snapshotParams = [user.id, snapshot.role, snapshot.raw, snapshot.status];
+  const tokens = await Promise.all(toSend.map(async address => {
+    const token = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+    return { address, token, hash: await sha256Hex(token) };
+  }));
+  const beforeSave = [
+    env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ? AND address NOT IN (SELECT value FROM json_each(?)) AND ' + targetGuard)
+      .bind(user.id, JSON.stringify(added), ...snapshotParams),
+    ...tokens.map(({ address, hash }) => env.db.prepare(
+      'INSERT INTO forward_confirmations (user_id, address, token_hash, expires_at) SELECT ?, ?, ?, ? WHERE ' + targetGuard
+      + ' ON CONFLICT(user_id, address) DO UPDATE SET token_hash = excluded.token_hash, expires_at = excluded.expires_at',
+    ).bind(user.id, address, hash, now + TTL_MS, ...snapshotParams)),
+  ];
+  const prefs = await updateUserNotifyPrefs(
+    env, user.id, { ...patch, forward: { ...patch.forward, contentMode, addresses: keep } },
+    { allowEmptyForward: added.length > 0, snapshot, beforeSave },
+  );
+
   const base = origin.replace(/\/+$/, '');
-  for (const address of toSend) {
-    const bytes = new Uint8Array(32);
-    crypto.getRandomValues(bytes);
-    const token = bytesToHex(bytes);
-    await env.db.prepare(`INSERT INTO forward_confirmations (user_id, address, token_hash, expires_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT(user_id, address) DO UPDATE SET token_hash = excluded.token_hash, expires_at = excluded.expires_at`)
-      .bind(user.id, address, await sha256Hex(token), now + TTL_MS).run();
+  for (const [index, { address, token }] of tokens.entries()) {
     try {
-      await sendSystemMail(env, confirmationMail(user.username, address, `${base}/forward/confirm#token=${token}`));
+      await sendSystemMail(env, confirmationMail(user.username, address, base + '/forward/confirm#token=' + token));
     } catch (error) {
-      await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ? AND address = ?').bind(user.id, address).run();
+      const unsent = tokens.slice(index).map(item => item.hash);
+      await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ? AND token_hash IN (SELECT value FROM json_each(?))')
+        .bind(user.id, JSON.stringify(unsent)).run();
       if (error instanceof AppError) throw error;
-      console.error('转发确认邮件发送失败:', error instanceof Error ? error.message : error);
-      throw new AppError('internal', `确认邮件发送到 ${address} 失败，请稍后重试`);
+      console.error('转发确认邮件发送失败');
+      throw new AppError('internal', '发送转发确认邮件失败，请稍后重试');
     }
   }
-
-  // 撤销不在期望列表里的待确认记录（已确认的目标不会有待确认记录）
-  const dropped = existing.map((row) => row.address).filter((address) => !added.includes(address));
-  if (dropped.length) {
-    await env.db.prepare(`DELETE FROM forward_confirmations WHERE user_id = ? AND address IN (SELECT value FROM json_each(?))`)
-      .bind(user.id, JSON.stringify(dropped)).run();
-  }
-  const [prefs, pending] = await Promise.all([
-    updateUserNotifyPrefs(env, user.id, { ...patch, forward: { enabled: patch.forward.enabled, addresses: keep } },
-      { allowEmptyForward: added.length > 0 }),
-    listPendingForwards(env, user.id),
-  ]);
-  return { prefs, pending };
+  return { prefs, pending: await listPendingForwards(env, user.id) };
 }
 
 /**

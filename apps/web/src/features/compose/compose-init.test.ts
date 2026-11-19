@@ -30,6 +30,24 @@ function makeDetail(overrides: Partial<MessageDetail> = {}): MessageDetail {
 }
 
 describe('buildReply / buildForward', () => {
+  it('转发无附件的邮件时也携带来源，离线移除追踪链接', () => {
+    const forward = buildForward(makeDetail({
+      bodyText: 'Continue at https://news.example.test/ls/click?tracking=sample',
+      attachments: [],
+    }));
+    expect(forward.forwardAttachmentsFrom).toBe(42);
+    expect(forward.body).toContain('追踪链接已移除');
+    expect(forward.body).not.toContain('tracking=sample');
+  });
+
+  it('从只有 HTML 的原信取出直达链接并保留签名', () => {
+    const forward = buildForward(makeDetail({
+      bodyText: '',
+      bodyHtml: '<p><a href="https://example.test/login?token=a%2Fb">Verify</a></p>',
+    }));
+    expect(forward.body).toContain('Verify (https://example.test/login?token=a%2Fb)');
+  });
+
   it('回复预填收件人、Re: 主题、引用块、发件身份与 replyToMessageId', () => {
     const reply = buildReply(makeDetail());
     expect(reply.to).toEqual(['alice@example.com']);

@@ -1,4 +1,6 @@
 import type { MessageDetail } from '@hpc-mail/shared';
+import { protectMailText } from '@hpc-mail/shared/mail-privacy';
+import { htmlToPlainText } from '@/lib/email-html/html-to-plain-text';
 import { isFailedOutcome } from '@/features/message/delivery-outcomes';
 import { formatDateTime } from '@/lib/format';
 
@@ -32,17 +34,6 @@ function withPrefix(subject: string, prefix: 'Re' | 'Fwd'): string {
   return pattern.test(trimmed) ? trimmed : `${prefix}: ${trimmed}`;
 }
 
-/** 浏览器端 HTML→纯文本：用于 HTML-only 邮件的引用降级，避免丢失原文 */
-function htmlToPlainText(html: string): string {
-  try {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    doc.querySelectorAll('style, script').forEach((el) => el.remove());
-    return (doc.body.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
-  } catch {
-    return '';
-  }
-}
-
 function quotedBody(message: MessageDetail): string {
   const from = message.fromName ? `${message.fromName} <${message.fromAddress}>` : message.fromAddress;
   const header = [
@@ -55,8 +46,8 @@ function quotedBody(message: MessageDetail): string {
     '',
   ].join('\n');
   // 纯文本优先；HTML-only 邮件降级为从 HTML 提取的纯文本，而不是丢弃原文
-  const source = message.bodyText.trim() || (message.bodyHtml ? htmlToPlainText(message.bodyHtml) : '');
-  const quoted = source
+  const source = message.bodyText.trim() || (message.bodyHtml ? htmlToPlainText(message.bodyHtml, true) : '');
+  const quoted = protectMailText(source)
     .split('\n')
     .map((line) => `> ${line}`)
     .join('\n');
@@ -111,7 +102,7 @@ export function buildForward(message: MessageDetail): ComposeInitial {
     subject: withPrefix(message.subject, 'Fwd'),
     body: attachmentNote + quotedBody(message),
     isHtml: false,
-    forwardAttachmentsFrom: hasAttachments ? message.id : undefined,
+    forwardAttachmentsFrom: message.id,
     mode: 'forward',
     sourceMessageId: message.id,
   };

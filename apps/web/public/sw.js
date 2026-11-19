@@ -3,7 +3,7 @@
  *
  * - 只接管同源、GET 的页面导航；/api、/v1、/assets/、Agent 文档、/cdn-cgi/ 与任何带扩展名的文件路径一律不拦截。
  * - 策略 stale-while-revalidate：有缓存的外壳立即返回，同时后台取网络版本更新缓存；没有缓存时走网络。
- *   只缓存 200、text/html 且确实是本应用外壳的响应。绝不缓存 API 响应或任何用户数据。
+ *   只缓存 200、text/html 且带防注入响应头的本应用外壳。绝不缓存 API 响应或任何用户数据。
  * - 缓存的外壳所引用的 /assets/ 文件必须都还在浏览器 HTTP 缓存里才使用它，否则改走网络：
  *   发版后旧文件已从服务器删除，HTTP 缓存又被清掉时，旧外壳只会得到一张白屏。
  *   旧外壳能启动时，之后缺失的 chunk 由页面的 chunk-reload 自动刷新一次换到新版本；
@@ -24,7 +24,7 @@
  *   });
  */
 
-const SHELL_CACHE = 'hpc-shell-v1';
+const SHELL_CACHE = 'hpc-shell-v2';
 const SHELL_CACHE_PREFIX = 'hpc-shell-';
 const SHELL_KEY = '/';
 const BYPASS_EXACT = ['/api', '/v1', '/skill.md', '/llms.txt', '/sw.js'];
@@ -43,18 +43,27 @@ function isShellNavigation(request, origin) {
   return !/\.[^/]*$/.test(path);
 }
 
-async function isShellResponse(response) {
-  // 200 已排除 opaque / opaqueredirect；经过重定向的响应不能用来应答导航
-  if (response.status !== 200 || response.redirected) return false;
-  if (!(response.headers.get('content-type') || '').includes('text/html')) return false;
-  // 只认本应用的外壳，不把网关错误页、登录拦截页之类的 HTML 当外壳缓存
-  return (await response.clone().text()).includes('<div id="root">');
+async function shellKind(response) {
+  // 200 已排除 opaque / opaqueredirect；仅检查本应用外壳，普通重定向和错误页照常返回
+  if (response.status !== 200 || response.redirected) return 'other';
+  if (!(response.headers.get('content-type') || '').includes('text/html')) return 'other';
+  const html = await response.clone().text();
+  if (!html.includes('<div id="root">')) return 'other';
+  const preventInjection = (response.headers.get('cache-control') || '')
+    .split(',').some((value) => value.trim().toLowerCase() === 'no-transform');
+  return preventInjection && !/data-cf-beacon|static\.cloudflareinsights\.com/i.test(html) ? 'safe' : 'unsafe';
 }
 
 async function storeShell(response) {
-  if (!(await isShellResponse(response))) return;
   const cache = await caches.open(SHELL_CACHE);
   await cache.put(SHELL_KEY, response);
+}
+
+function blockedShell() {
+  return new Response('应用正在更新，请刷新后重试。', {
+    status: 503,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store, no-transform' },
+  });
 }
 
 /** 外壳引用的 /assets/ 文件是否都已在 HTTP 缓存里（只查本地缓存，不发网络请求） */
@@ -79,7 +88,7 @@ async function shellAssetsCached(shell) {
 async function cachedShell() {
   const cache = await caches.open(SHELL_CACHE);
   const shell = await cache.match(SHELL_KEY, { ignoreVary: true });
-  if (!shell) return null;
+  if (!shell || await shellKind(shell) !== 'safe') return null;
   return (await shellAssetsCached(shell)) ? shell : null;
 }
 
@@ -89,7 +98,9 @@ let pendingUpdate = null;
 self.addEventListener('install', (event) => {
   self.skipWaiting();
   // 预先缓存外壳，下一次打开即可命中；失败（如离线）不影响安装
-  event.waitUntil(fetch(SHELL_KEY, { cache: 'no-cache' }).then(storeShell).catch(() => {}));
+  event.waitUntil(fetch(SHELL_KEY, { cache: 'no-cache' }).then(async (response) => {
+    if (await shellKind(response) === 'safe') await storeShell(response);
+  }).catch(() => {}));
 });
 
 self.addEventListener('activate', (event) => {
@@ -108,8 +119,11 @@ self.addEventListener('fetch', (event) => {
   if (!isShellNavigation(event.request, self.location.origin)) return;
   const previousUpdate = pendingUpdate;
   const network = fetch(event.request);
-  // 先于页面消费响应体复制一份：这个回调注册在前，网络响应到达时先执行
-  const update = network.then((response) => storeShell(response.clone())).catch(() => {});
+  const kind = network.then(shellKind);
+  // 缓存前先审查响应，并先于页面消费响应体复制一份。
+  const update = kind.then(async (value) => {
+    if (value === 'safe') await storeShell((await network).clone());
+  }).catch(() => {});
   pendingUpdate = update;
   update.then(() => {
     if (pendingUpdate === update) pendingUpdate = null;
@@ -120,7 +134,9 @@ self.addEventListener('fetch', (event) => {
       if (previousUpdate) {
         await Promise.race([previousUpdate, new Promise((resolve) => setTimeout(resolve, PREVIOUS_UPDATE_WAIT_MS))]);
       }
-      return (await cachedShell().catch(() => null)) || network;
+      const cached = await cachedShell().catch(() => null);
+      if (cached) return cached;
+      return await kind === 'unsafe' ? blockedShell() : network;
     })(),
   );
 });

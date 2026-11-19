@@ -2,6 +2,7 @@ import {
   EXTERNAL_MESSAGE_MAX_BYTES,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_TOTAL_BYTES,
+  isSafeInlineImageType,
   OUTBOUND_DELIVERY_CONCURRENCY,
   type MailAddress,
   type RecipientOutcome,
@@ -41,9 +42,11 @@ import {
   sanitizeMimeType,
 } from '../lib/mime.js';
 import { mailText } from '../lib/text.js';
+import { isDefiniteSendRejection } from '../lib/send-rejection.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
+import { hasRasterSignature, isRestrictedForwardAttachment, protectMailBody, safeMailContentId } from './protected-mail.js';
 import { assertHostedSendable, getRoutableDomains } from './domain.js';
 import { HOSTED_SEND_CLAIM_SQL, resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
@@ -137,39 +140,7 @@ export async function releaseDeliveryLeases(env: Env, leaseToken: string): Promi
   catch (error) { console.error('发送租约释放延迟:', error); }
 }
 
-/**
- * Cloudflare send_email 明确表示没有接受这封信的错误码（官方错误码表）：请求校验、发信域或收件人受限、账户暂停、
- * 内容与头部超限、频率与日配额，以及收件服务器拒收（E_DELIVERY_FAILED）。E_INTERNAL_SERVER_ERROR 与表外的码
- * 不算：服务端可能已经接受。
- */
-const REJECTED_SEND_CODES = new Set([
-  'E_VALIDATION_ERROR', 'E_FIELD_MISSING', 'E_TOO_MANY_RECIPIENTS', 'E_TOO_MANY_ATTACHMENTS',
-  'E_SENDER_NOT_VERIFIED', 'E_RECIPIENT_NOT_ALLOWED', 'E_RECIPIENT_SUPPRESSED', 'E_ACCOUNT_SUSPENDED',
-  'E_SENDER_DOMAIN_NOT_AVAILABLE', 'E_CONTENT_TOO_LARGE', 'E_DELIVERY_FAILED', 'E_RATE_LIMIT_EXCEEDED',
-  'E_DAILY_LIMIT_EXCEEDED', 'E_HEADER_NOT_ALLOWED', 'E_HEADER_USE_API_FIELD', 'E_HEADER_VALUE_INVALID',
-  'E_HEADER_VALUE_TOO_LONG', 'E_HEADER_NAME_INVALID', 'E_HEADERS_TOO_LARGE', 'E_HEADERS_TOO_MANY',
-]);
-
-/** 没有错误码的报错（旧版 EmailMessage 路径）按文案识别明确拒收：目标或发信域未验证、地址非法、发信域未开通、超出频率或配额 */
-const REJECTED_SEND_MESSAGES = [
-  /\bnot (?:a )?verified\b/i,
-  /\binvalid (?:e-?mail |sender |recipient |destination |from |to )?address\b/i,
-  /\bdomain (?:is )?not (?:available|enabled|onboarded)\b/i,
-  /\brecipient (?:is )?(?:not in (?:the )?allowed|suppressed)\b/i,
-  /\b(?:rate|daily|sending) limit exceeded\b/i,
-  /\bquota (?:exceeded|reached)\b/i,
-];
-
-/**
- * send_email 抛错时邮件是否确定没有被接受。只有能确定的拒收才记 failed（可修正后换 Key 重发）；超时、断连、
- * 内部错误等结果不明的一律 unknown，宁可让调用方先核对，也不诱导重复投递。
- */
-export function isDefiniteSendRejection(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null)?.code;
-  if (typeof code === 'string') return REJECTED_SEND_CODES.has(code);
-  const message = errorText(error).slice(0, 500);
-  return REJECTED_SEND_MESSAGES.some((pattern) => pattern.test(message));
-}
+export { isDefiniteSendRejection };
 
 /** 地址写法：路由传入已解析的 MailAddress；服务内部与测试也可直接传地址字符串 */
 type AddressInput = string | MailAddress;
@@ -393,19 +364,21 @@ async function loadForwardedAttachments(
   alreadyBytes: number,
   leaseToken: string,
   verified?: VerifiedSource,
-): Promise<StoredAttachment[]> {
+): Promise<{ inbound: boolean; omitted: number; attachments: StoredAttachment[] }> {
   const unavailable = '转发的原邮件不存在或不可见';
   if (verified?.id !== sourceMessageId) await loadSourceMessage(env, sender, sourceMessageId, unavailable, 'forward');
   const ofSource = eq(attachmentsTable.messageId, sourceMessageId);
-  const [, rows, source] = await db.batch([
+  const [, sourceRows, source] = await db.batch([
     db.insert(deliveryObjectLeases)
       .select(db.select(leaseColumns(attachmentsTable.r2Key, leaseToken)).from(attachmentsTable).where(ofSource))
       .onConflictDoNothing(),
     db.select().from(attachmentsTable).where(ofSource),
     // 与读附件行同一事务复核原邮件仍在：永久删除时附件行与邮件同批删除，不会只带走一半附件
-    db.select({ id: messages.id }).from(messages).where(eq(messages.id, sourceMessageId)),
+    db.select({ direction: messages.direction }).from(messages).where(eq(messages.id, sourceMessageId)),
   ]);
   if (!source.length) throw new AppError('source_unavailable', unavailable, { details: { source: 'forward' } });
+  const inbound = source[0]!.direction === 'inbound';
+  const rows = inbound ? sourceRows.filter(row => !isRestrictedForwardAttachment(row.mimeType, row.filename)) : sourceRows;
   if (alreadyCount + rows.length > MAX_ATTACHMENTS) {
     throw new AppError('validation_failed', `原邮件附件与新增附件合计最多 ${MAX_ATTACHMENTS} 个，请先移除部分附件`);
   }
@@ -418,7 +391,7 @@ async function loadForwardedAttachments(
   // 保留原始 contentId/disposition：此前硬编码成 ''/attachment，转发一封带内嵌图片的
   // 富文本邮件时，HTML 里的 <img src="cid:xxx"> 在 MIME 里再也找不到对应 part，
   // 收件端图片全裂、还平白多出一堆附件
-  return rows.map((a) => ({
+  return { inbound, omitted: sourceRows.length - rows.length, attachments: rows.map((a) => ({
     filename: a.filename,
     mimeType: a.mimeType,
     contentId: a.contentId,
@@ -426,7 +399,7 @@ async function loadForwardedAttachments(
     sourceAttachmentId: a.id,
     r2Key: a.r2Key,
     size: a.size,
-  }));
+  })) };
 }
 
 /** 请求自带字节的附件同时上传几个（字节已在内存里，并发不增加占用） */
@@ -521,6 +494,7 @@ async function prepareOutboundMime(
   env: Env,
   input: OutboundMimeInput,
   atts: DecodedAttachment[],
+  protectedForward: boolean,
 ): Promise<(target: string) => string> {
   // 动态 import：mimetext 在 vitest workerd 里静态加载会崩，且集成测试不发外部邮件
   const { createMimeMessage } = await import('mimetext/browser');
@@ -532,13 +506,16 @@ async function prepareOutboundMime(
     // 折行成 76 字符/行：不折行时整个附件是一整行，超 SMTP 998 字节行限会被下游 MTA 拒收。
     // filename/mimeType 走清洗：mimetext 是裸拼进头的，值里的引号/CRLF 会改写 part 头结构
     const base64 = 'bytes' in a && a.base64 ? a.base64 : bytesToBase64(await attachmentBytes(env, a));
+    const contentId = safeMailContentId(a.contentId);
+    const inline = a.disposition === 'inline' && (!protectedForward || (isSafeInlineImageType(a.mimeType)
+      && hasRasterSignature(a.mimeType, base64ToBytes(base64.slice(0, 48)))));
     parts.push({
       filename: sanitizeFilename(a.filename),
       contentType: sanitizeMimeType(a.mimeType),
       data: foldBase64(base64),
       // Content-ID 来自请求校验或入站解析；只放行可见 ASCII，避免改写 part 头
-      contentId: /^[\x21-\x3b\x3d\x3f-\x7e]+$/.test(a.contentId) ? a.contentId : '',
-      inline: a.disposition === 'inline',
+      contentId: (!protectedForward || inline) ? contentId ?? '' : '',
+      inline,
     });
   }
   const build = (to: MailAddress[]): string => {
@@ -638,6 +615,7 @@ async function buildExternalPayload(
   html: string,
   atts: DecodedAttachment[],
   attRows: { id: number; r2Key: string; filename: string; mimeType: string; size: number; contentId: string }[],
+  protectedForward: boolean,
 ): Promise<{ text: string; html: string; atts: DecodedAttachment[] }> {
   const encodedBytes = Math.ceil(bodyBytes(text, html) * 1.38) +
     atts.reduce((sum, a) => sum + Math.ceil(attachmentSize(a) * 1.38), 0);
@@ -651,10 +629,11 @@ async function buildExternalPayload(
       filename: r.filename,
       size: r.size,
       url: retained.get(r.id)!,
-      contentId: r.contentId,
+      contentId: protectedForward ? undefined : r.contentId,
     });
   }
-  const injected = injectAttachmentLinks(text, html, links);
+  const safeBody = protectedForward ? await protectMailBody({ text, html }) : { text, html };
+  const injected = injectAttachmentLinks(safeBody.text, safeBody.html, links);
   return { text: injected.text, html: injected.html, atts: [] };
 }
 
@@ -764,9 +743,15 @@ export async function sendMail(
   const from = resolveFrom(sender, req, domains, fromBox);
   await assertHostedSendable(env, settings, from.domain);
   let forwarded: DecodedAttachment[] = [];
+  let protectedForward = false;
+  let omittedSourceAttachments = 0;
   if (req.forwardAttachmentsFrom) {
-    forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
+    const source = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
       attachments.length + (late?.count ?? 0), attachments.reduce((sum, att) => sum + attachmentSize(att), 0), leaseToken, req.verifiedSource);
+    protectedForward = source.inbound;
+    omittedSourceAttachments = source.omitted;
+    forwarded = source.attachments.map(attachment => protectedForward && !isSafeInlineImageType(attachment.mimeType)
+      ? { ...attachment, disposition: 'attachment', contentId: '' } : attachment);
     attachments = [...attachments, ...forwarded];
     const siteOrigin = env.site_origin ?? origin;
     // 补发/重发沿用的正文里有上次注入的下载区块：这些附件会重新带上，先去掉旧区块再判断是否重新注入，
@@ -781,6 +766,29 @@ export async function sendMail(
         if (!cid || new URL(original, siteOrigin).origin !== new URL(siteOrigin).origin) return original;
         return `cid:${cid}`;
       });
+  }
+  if (protectedForward) {
+    const idCounts = new Map<string, number>();
+    for (const attachment of attachments) {
+      const id = safeMailContentId(attachment.contentId);
+      if (id) idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+    }
+    attachments = attachments.map(attachment => {
+      const id = safeMailContentId(attachment.contentId);
+      return id && (idCounts.get(id) !== 1 || !isSafeInlineImageType(attachment.mimeType))
+        ? { ...attachment, disposition: 'attachment', contentId: '' } : attachment;
+    });
+    ({ text, html } = await protectMailBody({
+      text, html,
+      inlineContentIds: attachments.filter(attachment => attachment.disposition === 'inline').map(attachment => attachment.contentId),
+    }));
+    if (!text && !html) text = '原邮件中的远程内容已移除。';
+    if (omittedSourceAttachments) {
+      const note = '原邮件的部分附件仅在 HPC Mail 可查看。';
+      text = text ? text + '\n\n' + note : note;
+      if (html) html += '<p>' + note + '</p>';
+    }
+    assertSendBodySize(text, html);
   }
   if (attachments.length + (late?.count ?? 0) > MAX_ATTACHMENTS) {
     throw new AppError('validation_failed', `附件最多 ${MAX_ATTACHMENTS} 个`);
@@ -895,7 +903,7 @@ export async function sendMail(
       const sendable = externalTargets.filter(target => !suppressed.has(target));
       if (!sendable.length) return;
       try {
-        const payload = await buildExternalPayload(env, origin, text, html, attachments, outboundAtts);
+        const payload = await buildExternalPayload(env, origin, text, html, attachments, outboundAtts, protectedForward);
         // 展示正文必须在首次外发前保存，发送成功后不再依赖正文持久化。
         if (payload.text !== text || payload.html !== html) {
           const originalKey = storedBody!.bodyR2Key;
@@ -910,7 +918,7 @@ export async function sendMail(
         const rawFor = await prepareOutboundMime(env, {
           from, to, cc, replyTo, headerLines, subject: req.subject, text: payload.text, html: payload.html,
           messageId: outgoingMessageId,
-        }, payload.atts);
+        }, payload.atts, protectedForward);
         const send = await cloudflareSender(env, from.address);
         await runLimited(sendable, OUTBOUND_DELIVERY_CONCURRENCY, async (target) => {
           let handedOver = false;
