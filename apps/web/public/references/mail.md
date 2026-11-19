@@ -407,7 +407,7 @@ Key（`/v1`）可直接调用回复与转发接口，由服务器按原信算收
 - `text`/`html` 至少一个非空。`quote` 默认 `true`：正文后附「----- 原始邮件 -----」、发件人、时间（UTC）、主题与 `> ` 引用的原文；给了 `html` 时另在 HTML 里用 blockquote 引用原 HTML。原文过长会截断并注明，不报错。
 - `from` 缺省用原信的收件地址（回复自己发出的信则是原发件地址），写法同普通发送。原信在共享给你的邮箱里时这个地址不是你的发件身份，返回 400 `from_required`，改在 `from` 指定自己的地址（见[错误说明](errors.md#from_required)）。
 
-**`POST /v1/messages/:id/forward`** `{to,cc?,bcc?,note?,includeOriginal?,from?}`：收件人写法同普通发送（合计 1–100 个）；主题加 `Fwd: `（换行折叠与截断规则同回复）；`note` 是写在最前面的纯文本；`includeOriginal` 默认 `true`，附上「---------- 转发的邮件 ----------」头部（发件人、时间、主题、收件人、抄送）与经过隐私处理的 text 和 HTML。来信转发移除会自动加载的远程资源和已知追踪跳转，保留可安全内联的附件。附件规则同 `forwardAttachmentsFrom`，附件已丢失返回 404 `source_unavailable`。`includeOriginal:false` 时 `note` 不能为空。`from` 规则同回复。
+**`POST /v1/messages/:id/forward`** `{to,cc?,bcc?,note?,includeOriginal?,from?}`：收件人写法同普通发送（合计 1–100 个）；主题加 `Fwd: `（换行折叠与截断规则同回复）；`note` 是写在最前面的纯文本；`includeOriginal` 默认 `true`，附上「---------- 转发的邮件 ----------」头部（发件人、时间、主题、收件人、抄送）与经过隐私处理的 text 和 HTML。来信转发移除会自动加载的远程资源和已知追踪跳转，保留普通附件与可安全内联的图片。HTML、SVG、日历、嵌套邮件等附件留在本站。附件规则同 `forwardAttachmentsFrom`，附件已丢失返回 404 `source_unavailable`。`includeOriginal:false` 时 `note` 不能为空。`from` 规则同回复。
 
 ```bash
 # HPC_MSG_ID 为原信 ID；回复正文、转发目标与说明都须由用户确认。Idempotency-Key 按「幂等与重试」持久化

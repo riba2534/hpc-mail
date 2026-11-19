@@ -10,7 +10,7 @@ import { bytesToHex, sha256Hex } from '../lib/crypto.js';
 import { normalizeEmail } from '../lib/email-address.js';
 import { AppError } from '../lib/errors.js';
 import type { Env } from '../types.js';
-import { getUserNotifyPrefs, updateUserNotifyPrefs } from './notify-prefs.js';
+import { getUserNotifyPrefs, readNotifyPrefsSnapshot, updateUserNotifyPrefs } from './notify-prefs.js';
 import { counterResult, counterStatement, counterWithinGuard, dayWindow } from './rate-counter.js';
 import { verifyReauthPassword } from './reauth.js';
 import { sendSystemMail } from './system-mail.js';
@@ -59,7 +59,9 @@ export async function updatePrefsWithForwardConfirmation(
     const [prefs, pending] = await Promise.all([updateUserNotifyPrefs(env, user.id, patch), listPendingForwards(env, user.id)]);
     return { prefs, pending };
   }
-  const current = await getUserNotifyPrefs(env, user.id);
+  const snapshot = await readNotifyPrefsSnapshot(env, user.id);
+  if (!snapshot) throw new AppError('not_found', '用户不存在');
+  const current = snapshot.prefs;
   const confirmed = new Set(current.forward.addresses.map(normalizeEmail));
   const desired = [...new Set(patch.forward.addresses.map(normalizeEmail).filter(Boolean))];
   const keep = desired.filter((address) => confirmed.has(address));
@@ -112,7 +114,7 @@ export async function updatePrefsWithForwardConfirmation(
   }
   const [prefs, pending] = await Promise.all([
     updateUserNotifyPrefs(env, user.id, { ...patch, forward: { ...patch.forward, contentMode, addresses: keep } },
-      { allowEmptyForward: added.length > 0 }),
+      { allowEmptyForward: added.length > 0, snapshot }),
     listPendingForwards(env, user.id),
   ]);
   return { prefs, pending };

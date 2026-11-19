@@ -12,7 +12,7 @@ import { bumpCounter, dayWindow } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
 import { confirmForward } from '../src/services/forward-confirm.js';
-import { updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
+import { readNotifyPrefsSnapshot, updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import type { Env } from '../src/types.js';
 import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
 
@@ -199,6 +199,17 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
       .toEqual({ enabled: false, addresses: [target], contentMode: 'protected' });
     // 重新打开需要密码
     expect((await request('/api/me/notify-prefs', json(user.jwt, { forward: { enabled: true, addresses: [target] } }, 'PUT'))).status).toBe(403);
+  });
+
+  it('用旧偏好提交时不会覆盖并发保存的仅通知模式', async () => {
+    const user = await account('forward-stale');
+    const forward = { enabled: true, addresses: ['stale@example.net'] };
+    await updateUserNotifyPrefs(runtime, user.id, { forward });
+    const snapshot = (await readNotifyPrefsSnapshot(runtime, user.id))!;
+    await updateUserNotifyPrefs(runtime, user.id, { forward: { ...forward, contentMode: 'notice' } });
+    await expect(updateUserNotifyPrefs(runtime, user.id, { forward }, { snapshot }))
+      .rejects.toMatchObject({ code: 'conflict' });
+    expect((await readNotifyPrefsSnapshot(runtime, user.id))?.prefs.forward.contentMode).toBe('notice');
   });
 
   it('撤销与确认同时发生：撤销先落库时确认失败，地址不会写回转发目标（A16）', async () => {
