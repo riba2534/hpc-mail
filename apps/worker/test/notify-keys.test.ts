@@ -11,7 +11,7 @@ import { createApiKey } from '../src/services/api-key.js';
 import { bumpCounter, dayWindow } from '../src/services/rate-counter.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
-import { confirmForward } from '../src/services/forward-confirm.js';
+import { confirmForward, updatePrefsWithForwardConfirmation } from '../src/services/forward-confirm.js';
 import { readNotifyPrefsSnapshot, updateUserNotifyPrefs } from '../src/services/notify-prefs.js';
 import type { Env } from '../src/types.js';
 import { grantLegacyAdminScope, TEST_PASSWORD, testPasswordHash } from './key-helpers.js';
@@ -210,6 +210,45 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
     await expect(updateUserNotifyPrefs(runtime, user.id, { forward }, { snapshot }))
       .rejects.toMatchObject({ code: 'conflict' });
     expect((await readNotifyPrefsSnapshot(runtime, user.id))?.prefs.forward.contentMode).toBe('notice');
+  });
+
+  it('新目标与仅通知偏好保存冲突时不发送确认信或保留确认令牌', async () => {
+    const user = await account('forward-conflict');
+    const old = 'confirmed@example.net';
+    const target = 'conflicting@example.net';
+    await updateUserNotifyPrefs(runtime, user.id, { forward: { enabled: true, addresses: [old] } });
+    const sessionId = await createSession(runtime, user.id);
+    const db = new Proxy(runtime.db, {
+      get(database, property) {
+        if (property === 'prepare') return (query: string) => {
+          const statement = database.prepare(query);
+          if (!query.startsWith('UPDATE users SET notify_prefs = ? WHERE id = ? AND role = ?')) return statement;
+          return new Proxy(statement, {
+            get(original, key) {
+              if (key !== 'bind') return Reflect.get(original, key, original);
+              return (...params: unknown[]) => new Proxy(original.bind(...params), {
+                get(bound, method) {
+                  if (method !== 'first') return Reflect.get(bound, method, bound);
+                  return async () => {
+                    await updateUserNotifyPrefs(runtime, user.id, { forward: { enabled: false, addresses: [old] } });
+                    return bound.first();
+                  };
+                },
+              });
+            },
+          });
+        };
+        const value = Reflect.get(database, property, database);
+        return typeof value === 'function' ? value.bind(database) : value;
+      },
+    });
+    await expect(updatePrefsWithForwardConfirmation({ ...runtime, db }, user, {
+      forward: { enabled: true, addresses: [old, target], contentMode: 'notice' }, password: TEST_PASSWORD,
+    }, 'https://hpc.email', sessionId)).rejects.toMatchObject({ code: 'conflict' });
+    expect(captured.some(mail => mail.to === target)).toBe(false);
+    const pending = await runtime.db.prepare('SELECT count(*) AS count FROM forward_confirmations WHERE user_id = ?')
+      .bind(user.id).first<{ count: number }>();
+    expect(pending?.count).toBe(0);
   });
 
   it('撤销与确认同时发生：撤销先落库时确认失败，地址不会写回转发目标（A16）', async () => {

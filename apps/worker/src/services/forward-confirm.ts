@@ -88,36 +88,40 @@ export async function updatePrefsWithForwardConfirmation(
     }
   }
 
+  // 保存经过密码验证的模式后才允许发出新确认链接。旧会话写入发生冲突时不产生可确认的外部目标。
+  const prefs = await updateUserNotifyPrefs(
+    env, user.id, { ...patch, forward: { ...patch.forward, contentMode, addresses: keep } },
+    { allowEmptyForward: added.length > 0, snapshot },
+  );
+  const saved = JSON.stringify(prefs);
+  const guard = "EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active' AND notify_prefs = ?)";
+  const dropped = existing.map((row) => row.address).filter((address) => !added.includes(address));
+  if (dropped.length) {
+    await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ? AND address IN (SELECT value FROM json_each(?)) AND ' + guard)
+      .bind(user.id, JSON.stringify(dropped), user.id, saved).run();
+  }
+
   const base = origin.replace(/\/+$/, '');
   for (const address of toSend) {
     const bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
     const token = bytesToHex(bytes);
-    await env.db.prepare(`INSERT INTO forward_confirmations (user_id, address, token_hash, expires_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT(user_id, address) DO UPDATE SET token_hash = excluded.token_hash, expires_at = excluded.expires_at`)
-      .bind(user.id, address, await sha256Hex(token), now + TTL_MS).run();
+    const hash = await sha256Hex(token);
+    const pending = await env.db.prepare(
+      'INSERT INTO forward_confirmations (user_id, address, token_hash, expires_at) SELECT ?, ?, ?, ? WHERE ' + guard
+      + ' ON CONFLICT(user_id, address) DO UPDATE SET token_hash = excluded.token_hash, expires_at = excluded.expires_at RETURNING id',
+    ).bind(user.id, address, hash, now + TTL_MS, user.id, saved).first<{ id: number }>();
+    if (!pending) throw new AppError('conflict', '通知偏好已变化，请刷新后重试');
     try {
-      await sendSystemMail(env, confirmationMail(user.username, address, `${base}/forward/confirm#token=${token}`));
+      await sendSystemMail(env, confirmationMail(user.username, address, base + '/forward/confirm#token=' + token));
     } catch (error) {
-      await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ? AND address = ?').bind(user.id, address).run();
+      await env.db.prepare('DELETE FROM forward_confirmations WHERE id = ? AND token_hash = ?').bind(pending.id, hash).run();
       if (error instanceof AppError) throw error;
-      console.error('转发确认邮件发送失败:', error instanceof Error ? error.message : error);
-      throw new AppError('internal', `确认邮件发送到 ${address} 失败，请稍后重试`);
+      console.error('转发确认邮件发送失败');
+      throw new AppError('internal', '发送转发确认邮件失败，请稍后重试');
     }
   }
-
-  // 撤销不在期望列表里的待确认记录（已确认的目标不会有待确认记录）
-  const dropped = existing.map((row) => row.address).filter((address) => !added.includes(address));
-  if (dropped.length) {
-    await env.db.prepare(`DELETE FROM forward_confirmations WHERE user_id = ? AND address IN (SELECT value FROM json_each(?))`)
-      .bind(user.id, JSON.stringify(dropped)).run();
-  }
-  const [prefs, pending] = await Promise.all([
-    updateUserNotifyPrefs(env, user.id, { ...patch, forward: { ...patch.forward, contentMode, addresses: keep } },
-      { allowEmptyForward: added.length > 0, snapshot }),
-    listPendingForwards(env, user.id),
-  ]);
-  return { prefs, pending };
+  return { prefs, pending: await listPendingForwards(env, user.id) };
 }
 
 /**
