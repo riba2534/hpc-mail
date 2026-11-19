@@ -110,7 +110,7 @@ export async function updatePrefsWithForwardConfirmation(
       .bind(user.id, JSON.stringify(dropped)).run();
   }
   const [prefs, pending] = await Promise.all([
-    updateUserNotifyPrefs(env, user.id, { ...patch, forward: { enabled: patch.forward.enabled, addresses: keep } },
+    updateUserNotifyPrefs(env, user.id, { ...patch, forward: { ...patch.forward, addresses: keep } },
       { allowEmptyForward: added.length > 0 }),
     listPendingForwards(env, user.id),
   ]);
