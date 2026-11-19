@@ -185,7 +185,7 @@ describe('email HTML safety boundary', () => {
            srcset="https://images.apple.example/hero.png 1x, https://images.apple.example/hero-2x.png 2x">
       <img src="http://insecure.example/pixel.gif">
       <img src="relative-tracker.gif">
-    `)
+    `, { allowRemoteImages: true })
 
     expect(clean).toContain('src="https://images.apple.example/hero.png"')
     expect(clean).toContain('srcset="https://images.apple.example/hero.png 1x, https://images.apple.example/hero-2x.png 2x"')
@@ -297,7 +297,7 @@ describe('email HTML safety boundary', () => {
 
   it('renders sanitized markup inside a sandboxed iframe', async () => {
     const { container } = render(
-      <EmailHtml html={'<p id="message">Hello</p><script>alert(1)</script><img src="https://images.example.test/logo.png" onerror="alert(2)">'} />,
+      <EmailHtml allowRemoteImages html={'<p id="message">Hello</p><script>alert(1)</script><img src="https://images.example.test/logo.png" onerror="alert(2)">'} />,
     )
     const frame = container.querySelector<HTMLIFrameElement>('iframe')
     expect(frame).not.toBeNull()

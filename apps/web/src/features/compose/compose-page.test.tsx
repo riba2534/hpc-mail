@@ -513,18 +513,18 @@ describe('source mail no longer available', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('原邮件已不存在，无法关联回复线程');
     fireEvent.click(screen.getByRole('button', { name: '作为新邮件发送' }));
-    expect(screen.getByText(/将保留原邮件附件/)).toBeInTheDocument();
+    expect(screen.getByText(/转发来源为邮件/)).toBeInTheDocument();
     client.clear();
   });
 
   it('a forward whose source attachments are gone can drop them and resend on the next click', async () => {
     mocks.send.mockRejectedValueOnce(new ApiError('转发的原邮件附件不可用', { code: 'source_unavailable', httpStatus: 404 })).mockResolvedValueOnce(sent);
     const client = show({ fromAddress: 'first@one.example', to: ['friend@example.com'], subject: 'Fwd: hi', body: 'fyi', mode: 'forward', forwardAttachmentsFrom: 8, sourceMessageId: 8 });
-    expect(screen.getByText(/将保留原邮件附件/)).toBeInTheDocument();
+    expect(screen.getByText(/转发来源为邮件/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('原邮件的附件已不可用，无法一起转发');
     fireEvent.click(screen.getByRole('button', { name: '去掉原邮件附件' }));
-    expect(screen.queryByText(/将保留原邮件附件/)).toBeNull();
+    expect(screen.queryByText(/转发来源为邮件/)).toBeNull();
     expect(mocks.send).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));

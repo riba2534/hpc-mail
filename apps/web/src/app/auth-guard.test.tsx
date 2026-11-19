@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryKeys } from '@/api/query-keys';
 import { draftKeyForUser } from '@/features/compose/compose-draft';
 import { getAuthRevision, setAuthToken } from '@/lib/auth-token';
-import { isTrustedSender, trustSender } from '@/lib/trusted-senders';
 import { readTokenClaims } from '@/lib/token-claims';
 import { useCurrentUser } from '@/lib/use-session';
 
@@ -111,7 +110,7 @@ describe('AuthGuard 使用恢复的会话', () => {
 describe('守卫错误页的退出登录', () => {
   const seed = () => {
     localStorage.setItem(draftKeyForUser(1, 'reply:9'), '{}');
-    trustSender('friend@example.com', 1);
+    localStorage.setItem('hpc-trusted-image-senders:1', '["friend@example.com"]');
     localStorage.setItem(draftKeyForUser(2), '{}');
   };
   const logoutCalls = (fetchMock: ReturnType<typeof vi.fn>) =>
@@ -129,7 +128,7 @@ describe('守卫错误页的退出登录', () => {
     expect(logoutCalls(fetchMock)).toHaveLength(1);
     expect(localStorage.getItem('token')).toBeNull();
     expect(localStorage.getItem(draftKeyForUser(1, 'reply:9'))).toBeNull();
-    expect(isTrustedSender('friend@example.com', 1)).toBe(false);
+    expect(localStorage.getItem('hpc-trusted-image-senders:1')).toBeNull();
     expect(localStorage.getItem(draftKeyForUser(2))).not.toBeNull();
   });
 

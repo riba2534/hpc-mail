@@ -101,4 +101,35 @@ describe('被拦截的远程图片', () => {
     const html = sanitizeEmailHtml('<img src="https://cdn.example/logo.png" alt="x">', { allowRemoteImages: true })
     expect(html).toContain('src="https://cdn.example/logo.png"')
   })
+
+  it('允许远程图片后仍拦截已知像素、srcset 像素和微小远程图片', () => {
+    const html = sanitizeEmailHtml(`
+      <img src="https://example.test/wf/open?recipient=sample">
+      <img srcset="https://x.intercom-mail.com/via/o?id=sample 2x">
+      <img src="https://example.test/custom.gif" style="height:1px">
+      <img src="https://example.test/concealed.gif" hidden>
+      <img src="https://example.test/cover.png" width="320" height="240">
+    `, { allowRemoteImages: true })
+    expect(html).not.toMatch(/recipient=sample|id=sample|custom\.gif|concealed\.gif/)
+    expect(html).toContain('https://example.test/cover.png')
+  })
+
+  it('只对本站附件路径发起同源图片请求', () => {
+    const html = sanitizeEmailHtml(`
+      <img src="/api/attachments/42?expires=123">
+      <img src="https://mail.example.test/api/config?marker=sample">
+    `, { baseOrigin: 'https://mail.example.test', trustedImageOrigins: ['https://mail.example.test'], allowRemoteImages: true })
+    expect(html).toContain('/api/attachments/42?expires=123')
+    expect(html).not.toContain('marker=sample')
+  })
+
+  it('屏蔽无法离线还原的追踪链接并保留有签名的直达链接', () => {
+    const host = reparse(`
+      <a href="https://news.example.test/ls/click?key=sample">Continue</a>
+      <a href="https://account.example.test/login?token=a%2Fb">Verify</a>
+    `)
+    expect(host.querySelectorAll('a[href]')).toHaveLength(1)
+    expect(host.querySelector('a[href]')).toHaveAttribute('href', 'https://account.example.test/login?token=a%2Fb')
+  })
+
 })

@@ -13,7 +13,8 @@ import { isObject, readTokenClaims } from '@/lib/token-claims';
  * 只存首屏必需的少量查询；邮件详情、正文、附件链接与管理视图一律不落盘。
  */
 export const QUERY_CACHE_PREFIX = 'hpc-query-cache:';
-const QUERY_CACHE_VERSION = 'v1';
+const QUERY_CACHE_VERSION = 'v2';
+const LEGACY_IMAGE_TRUST_PREFIX = 'hpc-trusted-image-senders:';
 /** 数据写入（取到）超过 7 天即作废 */
 export const QUERY_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 /** 整体上限（UTF-8 字节）：超出时按重要性只保留排在前面的几项 */
@@ -44,11 +45,23 @@ const PERSISTED_QUERIES: readonly PersistedQuery[] = [
     key: defaultInboxListKey,
     pick: (data) => {
       const list = data as MessageListData;
-      return { pages: list.pages.slice(0, 1), pageParams: list.pageParams.slice(0, 1) };
+      const first = list.pages[0];
+      if (!first) return { pages: [], pageParams: [] };
+      // Persist only the metadata required for the initial layout. The fresh response
+      // supplies subject lines, previews and verification actions after session validation.
+      const items = first.items.map((item) => ({
+        id: item.id, direction: item.direction, address: item.address, domain: item.domain,
+        fromAddress: item.fromAddress, fromName: item.fromName, subject: '', preview: '',
+        verificationCode: '', status: item.status, errorDetail: '', isRead: item.isRead,
+        isStarred: item.isStarred, hasAttachments: item.hasAttachments, size: item.size, createdAt: item.createdAt,
+      }));
+      // Strip head too, so sync always replaces the privacy-reduced page from the server.
+      return { pages: [{ items, nextCursor: first.nextCursor }], pageParams: list.pageParams.slice(0, 1) };
     },
     valid: (data) =>
       isObject(data) && Array.isArray(data.pages) && data.pages.length === 1 && isObject(data.pages[0])
-      && Array.isArray(data.pages[0].items) && Array.isArray(data.pageParams) && data.pageParams.length === 1,
+      && Array.isArray(data.pages[0].items) && data.pages[0].items.every(isObject)
+      && Array.isArray(data.pageParams) && data.pageParams.length === 1,
   },
   { name: 'unread', key: () => queryKeys.messages.unreadCount, valid: isObject },
   { name: 'mailboxes', key: () => queryKeys.mailboxes.list('mine'), valid: Array.isArray },
@@ -85,13 +98,14 @@ const restoredQueries = new WeakMap<QueryClient, Map<string, number>>();
  * 数据保留原 updatedAt 并标记失效：页面立即渲染缓存，挂载/预取时照常后台刷新。返回是否恢复了会话用户。
  */
 export function restoreQueryCache(client: QueryClient, now = Date.now()): boolean {
+  const store = safeStorage();
+  for (const key of storageKeys((key) => key.startsWith(LEGACY_IMAGE_TRUST_PREFIX))) store?.removeItem(key);
   const claims = readTokenClaims(getAuthToken());
   if (!claims) {
     clearPersistedQueryCache();
     return false;
   }
   const storageKey = queryCacheStorageKey(claims.sub);
-  const store = safeStorage();
   // 其他账户与旧版本的残留一并清掉
   for (const key of persistedKeys()) if (key !== storageKey) store?.removeItem(key);
   // token 已过期时服务端必然 401：不先闪现旧收件箱再跳登录页
@@ -121,7 +135,7 @@ export function restoreQueryCache(client: QueryClient, now = Date.now()): boolea
     const queryKey = query.key(revision);
     if (client.getQueryData(queryKey) !== undefined) continue;
     const updatedAt = Math.min(entry.updatedAt, now);
-    client.setQueryData(queryKey, entry.data, { updatedAt });
+    client.setQueryData(queryKey, query.pick ? query.pick(entry.data) : entry.data, { updatedAt });
     const cached = client.getQueryCache().find({ queryKey, exact: true });
     // 失效标记让 staleTime 较长的查询（如公开配置）也会在挂载/预取时刷新
     cached?.invalidate();

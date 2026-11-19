@@ -41,14 +41,16 @@ function DraftBody({ draft }: { draft: Draft }) {
   if (!draft.html) return <PlainTextBody text={draft.text || '（无正文）'} />;
   return (
     <div className="flex flex-col gap-3">
-      {remoteImages > 0 && !showImages && (
+      {remoteImages > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-line bg-canvas px-3 py-2 text-sm">
           <span className="flex items-center gap-2 text-ink-secondary">
             <ImageOff className="size-4 shrink-0 text-ink-tertiary" />
-            已阻止 {remoteImages} 张远程图片
+            {showImages
+              ? '已允许普通远程图片，已知追踪像素仍被拦截。'
+              : '远程图片默认拦截。显示普通远程图片可能向图片服务器暴露本次打开和 IP。'}
           </span>
-          <Button variant="secondary" size="sm" onClick={() => setShowImages(true)}>
-            显示图片
+          <Button variant="secondary" size="sm" onClick={() => setShowImages(!showImages)}>
+            {showImages ? '阻止远程图片' : '显示图片'}
           </Button>
         </div>
       )}
@@ -99,7 +101,7 @@ function DraftDetail({ draft, mailboxes }: { draft: Draft; mailboxes: Mailbox[] 
             <Link to={`/mail/${draft.replyToMessageId}`} className="text-accent hover:underline">邮件 #{draft.replyToMessageId}</Link>
           </Field>
         )}
-        {draft.forwardAttachmentsFrom !== null && <Field label="转发">带上邮件 #{draft.forwardAttachmentsFrom} 的附件</Field>}
+        {draft.forwardAttachmentsFrom !== null && <Field label="转发">来源邮件 #{draft.forwardAttachmentsFrom}</Field>}
         {headers.length > 0 && (
           <Field label="邮件头">
             {headers.map(([name, value]) => (
@@ -110,7 +112,7 @@ function DraftDetail({ draft, mailboxes }: { draft: Draft; mailboxes: Mailbox[] 
         <Field label="更新时间">{formatDateTime(draft.updatedAt)}</Field>
       </dl>
       <div className="border-t border-line pt-4">
-        <DraftBody draft={draft} />
+        <DraftBody key={draft.id} draft={draft} />
       </div>
       {draft.attachments.length > 0 && (
         <div className="border-t border-line pt-4">

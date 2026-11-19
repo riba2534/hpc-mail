@@ -84,6 +84,21 @@ describe('转发与通知', () => {
     client.clear();
   });
 
+  it('旧设置默认启用隐私保护副本，并保存仅通知的选择', async () => {
+    const view = { ...prefs(), forward: { enabled: true, addresses: ['ok@example.net'] } };
+    mocks.get.mockResolvedValue(view);
+    mocks.update.mockImplementation(async (body: UserNotifyPrefs) => ({ ...body, forwardPending: [] }));
+    const { client } = renderSection();
+    expect(await screen.findByRole('radio', { name: '隐私保护转发' })).toHaveAttribute('aria-checked', 'true');
+    fireEvent.click(screen.getByRole('radio', { name: '仅通知' }));
+    expect(screen.getByText(/打开入口后需登录/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
+      forward: { enabled: true, addresses: ['ok@example.net'], contentMode: 'notice' },
+    })));
+    client.clear();
+  });
+
   it('通道开关打开才展开配置项', async () => {
     mocks.get.mockResolvedValue(prefs());
     const { client } = renderSection();

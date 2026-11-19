@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { draftKeyForUser, identityKeyForUser, lastIdentityKeyForUser, legacyDraftKeyForUser } from '@/features/compose/compose-draft';
 import { sendAttemptKeyForUser } from '@/features/compose/send-attempt';
-import { trustSender } from '@/lib/trusted-senders';
 import { queryCacheStorageKey } from './query-persistence';
 import { clearUserLocalData } from './user-local-data';
 
@@ -15,7 +14,7 @@ function seedUser(userId: number) {
   localStorage.setItem(identityKeyForUser(userId), '{}');
   localStorage.setItem(lastIdentityKeyForUser(userId), '{}');
   localStorage.setItem(queryCacheStorageKey(userId), '{}');
-  trustSender('friend@example.com', userId);
+  localStorage.setItem(`hpc-trusted-image-senders:${userId}`, '["friend@example.com"]');
 }
 
 describe('clearUserLocalData', () => {
