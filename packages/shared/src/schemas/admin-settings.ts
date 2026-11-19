@@ -14,7 +14,7 @@ export const registerModeSchema = z.enum(REGISTRATION_MODES);
 export const gmailForwardSettingSchema = z.object({
   enabled: z.boolean(),
   contentMode: z.enum(['protected', 'notice']).optional(),
-  /** 转发目标邮箱；已验证 destination 走原生 forward，其余走 no-reply 中转 */
+  /** 已确认的转发目标邮箱；发送前按 contentMode 构建邮件 */
   addresses: z.array(emailAddressSchema).max(5),
 });
 

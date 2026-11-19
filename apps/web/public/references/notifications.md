@@ -50,7 +50,7 @@ jq '{feishu:(.data.feishu + {contentLevel:"code_only"})}' <<< "$CURRENT_PREFS" |
 - **飞书**：HTTPS 飞书/Lark 自定义机器人 URL（服务器检查平台 host 与 hook 路径），可带机器人签名 secret。`code_only` 推送元信息与提取到的验证码，不含正文；没有提取码的邮件仍可通知。summary 正文最多 200 字符，full 最多约 4000 字符，并非原始 `.eml` 传输。测试会发送外部卡片，测试成功需平台 HTTP 与业务 code 均成功。
 - **PushDeer**：官方 `https://api2.pushdeer.com` 或自建实例端点及有效 PushKey；启用时需非空 PushKey。端点空串回落官方，当前服务接受 HTTP 或 HTTPS 的公网 origin、拒绝常见内网 host；建议 HTTPS。服务只取 URL 的 origin，路径/query/URL 用户密码不作为 PushDeer 认证配置；实际请求为该 origin 的 `/message/push`，认证用 pushkey。用掩码沿用已存 PushKey 时，端点的 origin 与路径必须与已保存的一致（末尾斜杠视为相同，空串视为官方端点），否则返回 400 `validation_failed`，需要重新填写 PushKey。
 - **通用 Webhook**：HTTPS 公网接收端，不能内网或 URL 用户密码。固定 HPC Mail 事件格式，Bark/ntfy 等需自建适配，不能宣称其原生接口直接兼容。
-- **邮箱转发**：最多 5 个目标，启用时至少一个（已确认或等待确认）。**新目标要目标邮箱确认后才生效**：`forward.addresses` 里新出现的地址不会立即写入，而是向它发一封确认信（`no-reply@系统域名` 发出，72 小时有效），出现在 `forwardPending`；目标邮箱的主人打开信里的链接点确认后才加入 `forward.addresses` 并开始转发。已确认的地址保留，列表里去掉的待确认地址撤销确认；同一地址在有效期内重复保存不重发。每个用户每天最多发 20 封确认信（429）。新增目标或把转发从关改为开时，请求体要带当前密码 `password`（403 `reauth_required`/`reauth_failed`）；关闭转发、删除目标不需要。升级前已配置的目标视为已确认。Cloudflare 已验证 destination 可以原样 forward；未验证目标会用收件域 `no-reply@domain` 中转重发（带 `Auto-Submitted: auto-forwarded`，Reply-To 指回原发件人），邮件呈现/附件可能不同；不是保证保留全部原始 MIME。中转重发另受管理员设置的全站与每位归属人每日上限约束（未认领地址的来信共用一个全站额度），超限时该次转发跳过；归属人账户停用后不再转发。配置中目标仍应是用户授权的地址。外发大附件可能变下载链接，详见附件参考。
+- **邮箱转发**：最多 5 个目标，启用时至少一个（已确认或等待确认）。**新目标要目标邮箱确认后才生效**：`forward.addresses` 里新出现的地址不会立即写入，而是向它发一封确认信（`no-reply@系统域名` 发出，72 小时有效），出现在 `forwardPending`；目标邮箱的主人打开信里的链接点确认后才加入 `forward.addresses` 并开始转发。已确认的地址保留，列表里去掉的待确认地址撤销确认；同一地址在有效期内重复保存不重发。每个用户每天最多发 20 封确认信（429）。新增目标或把转发从关改为开时，请求体要带当前密码 `password`（403 `reauth_required`/`reauth_failed`）；关闭转发、删除目标不需要。升级前已配置的目标视为已确认。`forward.contentMode` 可选 `protected`（含旧配置默认）或 `notice`。隐私转发由本站重建 MIME 后发送，去除远程图片、追踪像素、远程样式和已知追踪跳转。可安全提取目标的链接转为直达；无法离线解开的追踪链接可回本站查看。`notice` 仅发送邮件通知与本站登录入口。大附件可在本站登录后下载。所有自动转发均计入全站与归属人每日中转额度（未认领地址共用额度），超限时跳过；停用账户不再转发。
 
 ## Webhook 接收契约
 
@@ -76,7 +76,7 @@ createdAt, updatedAt, nextAttemptAt, lastAttemptAt
 
 status 为 `pending|processing|succeeded|failed|skipped|unknown`。pending/processing 是待处理；succeeded 是本通道已确认成功；skipped 常为当前策略/配置导致不发送；unknown 是处理超时或副作用结果待确认，不能当作已失败。`pendingCount` 包括 processing，`failedCount` 包括 unknown。健康仅提供各通道最近一次与汇总，不是所有 job 的分页查询接口；测试结果也会记录。
 
-中转转发（`no-reply@收件域名` 重发）交给 Cloudflare 后记为 `succeeded`；收件域名有投递回执订阅时，若之后在 Cloudflare 侧最终退信、失败或被拒，该 forward 任务会改为 `failed`，`lastError` 为「Cloudflare 侧最终投递失败：<SMTP 应答或原因>」，`forward` 通道的 `latest` 与 `failedCount` 随之体现。回执通常在几秒到几分钟内到达，刚显示 `succeeded` 的中转转发之后仍可能变为 `failed`。原样 forward（已验证 destination）没有这类回执，`succeeded` 只表示已交给 Cloudflare。
+隐私转发交给 Cloudflare 后记为 `succeeded`；发信域名有投递回执订阅时，若之后在 Cloudflare 侧最终退信、失败或被拒，该 forward 任务会改为 `failed`，`lastError` 为「Cloudflare 侧最终投递失败：<SMTP 应答或原因>」，`forward` 通道的 `latest` 与 `failedCount` 随之体现。回执通常在几秒到几分钟内到达，刚显示 `succeeded` 的中转转发之后仍可能变为 `failed`。历史原生转发的 `succeeded` 仅表示已交给 Cloudflare。
 
 飞书/PushDeer 每条最多 3 次自动尝试，失败退避；Webhook 默认 1 次且不自动重试，避免不支持幂等的接收端重复执行。队列/通知失败不回滚已成功收件。新 IP 登录告警按个人飞书/PushDeer 配置发送，是系统事件，并非所有渠道同样适用。
 

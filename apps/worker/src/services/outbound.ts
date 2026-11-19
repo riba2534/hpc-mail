@@ -2,6 +2,7 @@ import {
   EXTERNAL_MESSAGE_MAX_BYTES,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_TOTAL_BYTES,
+  isSafeInlineImageType,
   OUTBOUND_DELIVERY_CONCURRENCY,
   type MailAddress,
   type RecipientOutcome,
@@ -44,6 +45,7 @@ import { mailText } from '../lib/text.js';
 import type { Env, ExecCtx } from '../types.js';
 import { extractCodeByRegex } from './code-extract.js';
 import { extractVerificationLink } from './link-extract.js';
+import { protectMailBody } from './protected-mail.js';
 import { assertHostedSendable, getRoutableDomains } from './domain.js';
 import { HOSTED_SEND_CLAIM_SQL, resolveDeliveryOwners } from './mailbox.js';
 import { loadSourceMessage } from './message.js';
@@ -393,7 +395,7 @@ async function loadForwardedAttachments(
   alreadyBytes: number,
   leaseToken: string,
   verified?: VerifiedSource,
-): Promise<StoredAttachment[]> {
+): Promise<{ inbound: boolean; attachments: StoredAttachment[] }> {
   const unavailable = '转发的原邮件不存在或不可见';
   if (verified?.id !== sourceMessageId) await loadSourceMessage(env, sender, sourceMessageId, unavailable, 'forward');
   const ofSource = eq(attachmentsTable.messageId, sourceMessageId);
@@ -403,7 +405,7 @@ async function loadForwardedAttachments(
       .onConflictDoNothing(),
     db.select().from(attachmentsTable).where(ofSource),
     // 与读附件行同一事务复核原邮件仍在：永久删除时附件行与邮件同批删除，不会只带走一半附件
-    db.select({ id: messages.id }).from(messages).where(eq(messages.id, sourceMessageId)),
+    db.select({ direction: messages.direction }).from(messages).where(eq(messages.id, sourceMessageId)),
   ]);
   if (!source.length) throw new AppError('source_unavailable', unavailable, { details: { source: 'forward' } });
   if (alreadyCount + rows.length > MAX_ATTACHMENTS) {
@@ -418,7 +420,7 @@ async function loadForwardedAttachments(
   // 保留原始 contentId/disposition：此前硬编码成 ''/attachment，转发一封带内嵌图片的
   // 富文本邮件时，HTML 里的 <img src="cid:xxx"> 在 MIME 里再也找不到对应 part，
   // 收件端图片全裂、还平白多出一堆附件
-  return rows.map((a) => ({
+  return { inbound: source[0]!.direction === 'inbound', attachments: rows.map((a) => ({
     filename: a.filename,
     mimeType: a.mimeType,
     contentId: a.contentId,
@@ -426,7 +428,7 @@ async function loadForwardedAttachments(
     sourceAttachmentId: a.id,
     r2Key: a.r2Key,
     size: a.size,
-  }));
+  })) };
 }
 
 /** 请求自带字节的附件同时上传几个（字节已在内存里，并发不增加占用） */
@@ -638,6 +640,7 @@ async function buildExternalPayload(
   html: string,
   atts: DecodedAttachment[],
   attRows: { id: number; r2Key: string; filename: string; mimeType: string; size: number; contentId: string }[],
+  protectedForward: boolean,
 ): Promise<{ text: string; html: string; atts: DecodedAttachment[] }> {
   const encodedBytes = Math.ceil(bodyBytes(text, html) * 1.38) +
     atts.reduce((sum, a) => sum + Math.ceil(attachmentSize(a) * 1.38), 0);
@@ -651,10 +654,11 @@ async function buildExternalPayload(
       filename: r.filename,
       size: r.size,
       url: retained.get(r.id)!,
-      contentId: r.contentId,
+      contentId: protectedForward ? undefined : r.contentId,
     });
   }
-  const injected = injectAttachmentLinks(text, html, links);
+  const safeBody = protectedForward ? await protectMailBody({ text, html }) : { text, html };
+  const injected = injectAttachmentLinks(safeBody.text, safeBody.html, links);
   return { text: injected.text, html: injected.html, atts: [] };
 }
 
@@ -764,9 +768,13 @@ export async function sendMail(
   const from = resolveFrom(sender, req, domains, fromBox);
   await assertHostedSendable(env, settings, from.domain);
   let forwarded: DecodedAttachment[] = [];
+  let protectedForward = false;
   if (req.forwardAttachmentsFrom) {
-    forwarded = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
+    const source = await loadForwardedAttachments(env, db, sender, req.forwardAttachmentsFrom,
       attachments.length + (late?.count ?? 0), attachments.reduce((sum, att) => sum + attachmentSize(att), 0), leaseToken, req.verifiedSource);
+    protectedForward = source.inbound;
+    forwarded = source.attachments.map(attachment => protectedForward && !isSafeInlineImageType(attachment.mimeType)
+      ? { ...attachment, disposition: 'attachment', contentId: '' } : attachment);
     attachments = [...attachments, ...forwarded];
     const siteOrigin = env.site_origin ?? origin;
     // 补发/重发沿用的正文里有上次注入的下载区块：这些附件会重新带上，先去掉旧区块再判断是否重新注入，
@@ -781,6 +789,14 @@ export async function sendMail(
         if (!cid || new URL(original, siteOrigin).origin !== new URL(siteOrigin).origin) return original;
         return `cid:${cid}`;
       });
+  }
+  if (protectedForward) {
+    ({ text, html } = await protectMailBody({
+      text, html,
+      inlineContentIds: attachments.filter(attachment => attachment.disposition === 'inline' && isSafeInlineImageType(attachment.mimeType))
+        .map(attachment => attachment.contentId),
+    }));
+    if (!text && !html) text = '原邮件中的远程内容已移除。';
   }
   if (attachments.length + (late?.count ?? 0) > MAX_ATTACHMENTS) {
     throw new AppError('validation_failed', `附件最多 ${MAX_ATTACHMENTS} 个`);
@@ -895,7 +911,7 @@ export async function sendMail(
       const sendable = externalTargets.filter(target => !suppressed.has(target));
       if (!sendable.length) return;
       try {
-        const payload = await buildExternalPayload(env, origin, text, html, attachments, outboundAtts);
+        const payload = await buildExternalPayload(env, origin, text, html, attachments, outboundAtts, protectedForward);
         // 展示正文必须在首次外发前保存，发送成功后不再依赖正文持久化。
         if (payload.text !== text || payload.html !== html) {
           const originalKey = storedBody!.bodyR2Key;

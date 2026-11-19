@@ -15,6 +15,7 @@ import { AppError } from '../lib/errors.js';
 import { escapeHtml, htmlToText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { bodyBytes, readMailBody } from './mail-body.js';
+import { protectMailBody } from './protected-mail.js';
 import { loadSourceContent, type SourceViewer } from './message.js';
 import type { SendMailInput } from './outbound.js';
 
@@ -223,7 +224,8 @@ export async function composeReply(
   let text = req.text ?? '';
   let html = req.html ?? '';
   if (body) {
-    const quote = quoteSource(body, [`发件人：${formatSender(source)}`, `时间：${formatTime(source.createdAt)}`, `主题：${source.subject}`]);
+    const clean = await protectMailBody({ text: body.bodyText, html: body.bodyHtml });
+    const quote = quoteSource({ bodyText: clean.text, bodyHtml: clean.html }, [`发件人：${formatSender(source)}`, `时间：${formatTime(source.createdAt)}`, `主题：${source.subject}`]);
     ({ text, html } = attachQuote({ text, html }, quote, Boolean(html), 'reply'));
     // 只给了 html 时不生成只有引用、没有回复内容的纯文本部分
     if (!req.text) text = '';

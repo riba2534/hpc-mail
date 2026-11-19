@@ -196,6 +196,22 @@ describe('POST /v1/messages/:id/forward', () => {
       .toEqual([{ filename: 'plan.pdf' }]);
   });
 
+  it('removes tracking resources and opaque links even when the source has no attachments', async () => {
+    const w = await world('rfprivacy');
+    const click = 'https://mail.example/ls/click?upn=test';
+    const src = await source({
+      address: w.mine.address,
+      bodyText: 'Read: ' + click,
+      bodyHtml: '<img src="https://mail.example/wf/open"><a href="' + click + '">Login</a>',
+    });
+    const sent = await result<MessageSummary>(await request('/v1/messages/' + src.id + '/forward',
+      post(w.alice.key, { to: [w.peer.address] })), 201);
+    const out = await row(sent.id);
+    expect(out.bodyText).toContain('追踪链接已移除');
+    expect(out.bodyHtml).toContain('<a>Login</a>');
+    expect(out.bodyHtml + out.bodyText).not.toContain('mail.example');
+  });
+
   it('includeOriginal=false 只发 note；两者都没有时 400；附件对象丢失为 source_unavailable', async () => {
     const w = await world('rf9');
     const src = await source({ address: w.mine.address, fromAddress: w.boss, subject: 'Fwd: already' });

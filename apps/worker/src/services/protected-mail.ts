@@ -31,7 +31,7 @@ function imageCid(source: string | undefined, allowedIds: ReadonlySet<string>): 
   if (!source || !/^cid:/i.test(source)) return null;
   try {
     const id = safeMailContentId(decodeURIComponent(source.slice(4)));
-    return id && allowedIds.has(id) ? 'cid:' + encodeURIComponent(id) : null;
+    return id && allowedIds.has(id) ? 'cid:' + encodeURIComponent(id).replace(/%40/g, '@') : null;
   } catch {
     return null;
   }
