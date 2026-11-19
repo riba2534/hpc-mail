@@ -1,4 +1,5 @@
 import createDOMPurify from 'dompurify'
+import { cleanMailLink, isKnownTrackingImage, protectMailText } from '@hpc-mail/shared'
 
 const ALLOWED_TAGS = [
   'a', 'abbr', 'address', 'article', 'aside', 'b', 'blockquote', 'br', 'caption',
@@ -13,7 +14,7 @@ const ALLOWED_TAGS = [
 
 const ALLOWED_ATTR = [
   'abbr', 'align', 'alt', 'aria-label', 'aria-labelledby', 'bgcolor', 'checked',
-  'class', 'cols', 'colspan', 'dir', 'disabled', 'for', 'height', 'href', 'id', 'lang',
+  'class', 'cols', 'colspan', 'dir', 'disabled', 'for', 'height', 'hidden', 'href', 'id', 'lang',
   'label', 'max', 'maxlength', 'min', 'minlength', 'multiple', 'name', 'placeholder',
   'readonly', 'rel', 'required', 'role', 'rows', 'rowspan', 'scope', 'selected',
   'size', 'span', 'src', 'srcset', 'start', 'step', 'style', 'summary', 'target',
@@ -202,23 +203,12 @@ function extractStyleBlocks(html: string): string[] {
   return styles
 }
 
-function isSafeLink(value: string | null, baseOrigin: string): boolean {
-  const source = String(value || '').trim()
-  if (!source) return false
-  if (source.startsWith('#')) return true
-  if (!/^[a-z][a-z\d+.-]*:/i.test(source)) return false
-  try {
-    return ['http:', 'https:', 'mailto:', 'tel:'].includes(new URL(source, baseOrigin).protocol)
-  } catch {
-    return false
-  }
-}
-
 function isSafeImage(
   value: string | null,
   baseOrigin: string,
   trustedOrigins: ReadonlySet<string>,
   allowRemoteImages: boolean,
+  pixel: boolean,
 ): boolean {
   const source = String(value || '').trim()
   if (!source) return false
@@ -229,10 +219,10 @@ function isSafeImage(
   if (!/^(?:https:|\/)/i.test(source)) return false
   try {
     const parsed = new URL(source, baseOrigin)
-    if (parsed.protocol !== 'https:') return false
-    if (allowRemoteImages) return true
-    if (parsed.origin === baseOrigin) return parsed.pathname.startsWith('/api/attachments/')
-    return trustedOrigins.has(parsed.origin)
+    if (parsed.username || parsed.password) return false
+    if (parsed.origin === baseOrigin) return /^\/api\/attachments\/\d+$/.test(parsed.pathname)
+    if (parsed.protocol !== 'https:' || pixel || isKnownTrackingImage(parsed.href)) return false
+    return allowRemoteImages || trustedOrigins.has(parsed.origin)
   } catch {
     return false
   }
@@ -243,12 +233,13 @@ function sanitizeSourceSet(
   baseOrigin: string,
   trustedOrigins: ReadonlySet<string>,
   allowRemoteImages: boolean,
+  pixel: boolean,
 ): string {
   const candidates = String(value || '').split(',').map((candidate) => candidate.trim()).filter(Boolean)
   if (!candidates.length) return ''
   const safeCandidates = candidates.filter((candidate) => {
-    const [source = '', descriptor = ''] = candidate.split(/\s+/, 2)
-    return isSafeImage(source, baseOrigin, trustedOrigins, allowRemoteImages)
+    const [source = '', descriptor = '', ...extra] = candidate.split(/\s+/)
+    return extra.length === 0 && isSafeImage(source, baseOrigin, trustedOrigins, allowRemoteImages, pixel)
       && (!descriptor || /^(?:\d+(?:\.\d+)?x|\d+w)$/i.test(descriptor))
   })
   return safeCandidates.length === candidates.length ? safeCandidates.join(', ') : ''
@@ -307,14 +298,14 @@ function replaceWithPlaceholder(windowObject: Window, image: HTMLImageElement): 
 
 /**
  * Sanitizes hostile email markup for an isolated rendering surface.
- * HTTPS images render by default without a referrer; callers may disable
- * third-party images while retaining CID, data, blob and trusted-origin media.
+ * The default retains embedded images and blocks ordinary remote images.
+ * Known tracking images stay blocked when the reader allows remote content.
  */
 export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOptions = {}): string {
   const windowObject = options.window || globalThis.window
   if (!windowObject?.document) throw new TypeError('A DOM window is required to sanitize email HTML')
   const baseOrigin = options.baseOrigin || windowObject.location?.origin || 'https://localhost'
-  const allowRemoteImages = options.allowRemoteImages !== false
+  const allowRemoteImages = options.allowRemoteImages === true
   const trustedOrigins = new Set((options.trustedImageOrigins || []).map((value) => {
     try { return new URL(value, baseOrigin).origin } catch { return '' }
   }).filter(Boolean))
@@ -364,27 +355,43 @@ export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOption
   })
 
   template.content.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((link) => {
-    if (!isSafeLink(link.getAttribute('href'), baseOrigin)) {
-      link.removeAttribute('href')
+    const original = link.getAttribute('href')?.trim() ?? ''
+    if (original.startsWith('#')) {
       link.removeAttribute('target')
+      link.removeAttribute('rel')
       return
     }
-    if (!String(link.getAttribute('href') || '').startsWith('#')) {
+    // Permit only absolute URLs and local fragment links in an email body.
+    const href = /^[a-z][a-z\d+.-]*:/i.test(original) ? cleanMailLink(original) : null
+    if (href) {
+      link.setAttribute('href', href)
       link.target = '_blank'
       link.rel = 'noopener noreferrer'
     } else {
+      link.removeAttribute('href')
       link.removeAttribute('target')
       link.removeAttribute('rel')
     }
+    if (link.textContent?.trim() === original && href !== original) link.textContent = protectMailText(original)
   })
 
   template.content.querySelectorAll<HTMLImageElement>('img').forEach((image) => {
-    const sourceAllowed = isSafeImage(image.getAttribute('src'), baseOrigin, trustedOrigins, allowRemoteImages)
+    const dimensions = [image.getAttribute('width'), image.getAttribute('height'),
+      image.style.width, image.style.height, image.style.maxWidth, image.style.maxHeight]
+    const pixel = dimensions.some((value) => {
+      const size = pixelDimension(value)
+      return size !== null && size <= 2
+    })
+    const concealed = image.hidden || image.style.display === 'none' || image.style.visibility === 'hidden'
+      || (image.style.opacity !== '' && Number(image.style.opacity) === 0)
+    const tracking = pixel || concealed
+    const sourceAllowed = isSafeImage(image.getAttribute('src'), baseOrigin, trustedOrigins, allowRemoteImages, tracking)
     const sourceSet = sanitizeSourceSet(
       image.getAttribute('srcset'),
       baseOrigin,
       trustedOrigins,
       allowRemoteImages,
+      tracking,
     )
     if (!sourceAllowed && !sourceSet) {
       replaceWithPlaceholder(windowObject, image)

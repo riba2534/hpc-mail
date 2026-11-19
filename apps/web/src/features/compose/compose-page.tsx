@@ -1250,7 +1250,9 @@ function ComposeEditor({ initial, restored, draftKey, autosave, serverDraft }: C
             />
           </div>
           {forwardAttachmentsFrom && (
-            <p className="text-sm text-ink-secondary">将保留原邮件附件（来源邮件 #{forwardAttachmentsFrom}）。</p>
+            <p className="text-sm text-ink-secondary">
+              转发来源为邮件 #{forwardAttachmentsFrom}。发送时会处理追踪内容并带上可转发的原附件。
+            </p>
           )}
           {attachments.length > 0 && (
             <ul className="flex flex-col gap-1.5">

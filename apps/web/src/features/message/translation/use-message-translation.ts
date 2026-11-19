@@ -33,7 +33,10 @@ export interface MessageTranslationState {
   subject: string | undefined;
   /** 纯文本正文的文字块 → 译文（交给 PlainTextBody） */
   transformText: ((text: string) => string) | undefined;
+  consentRequired: boolean;
   toggle(): void;
+  confirmConsent(): void;
+  cancelConsent(): void;
   retry(): void;
 }
 
@@ -55,6 +58,8 @@ export function useMessageTranslation(
   const key = message ? `${message.id}|${view?.scope ?? ''}|${view?.userId ?? ''}` : '';
 
   const [session, setSession] = useState<Session | null>(null);
+  const [consentFor, setConsentFor] = useState<string | null>(null);
+  const consentRequired = available && consentFor === key;
   const runRef = useRef<{ key: string; run: TranslationRun } | null>(null);
   const keyRef = useRef(key);
   keyRef.current = key;
@@ -102,11 +107,7 @@ export function useMessageTranslation(
     else abort(sessionKey, '没有需要翻译的内容');
   };
 
-  const toggle = () => {
-    if (!available) return;
-    if (translated) return update(key, { mode: 'original' });
-    // 本封已有翻译进度：直接切回译文
-    if (current && runRef.current?.key === key) return update(key, { mode: 'translated' });
+  const start = () => {
     const sessionKey = key;
     setSession({ key: sessionKey, mode: 'translated', snapshot: null });
     if (translator) return begin(translator, sessionKey);
@@ -114,6 +115,15 @@ export function useMessageTranslation(
       (loaded) => begin(loaded, sessionKey),
       () => abort(sessionKey, '翻译模块加载失败，请检查网络后重试'),
     );
+  };
+
+  const toggle = () => {
+    if (!available) return;
+    if (translated) return update(key, { mode: 'original' });
+    // 本封已有翻译进度：直接切回译文
+    if (current && runRef.current?.key === key) return update(key, { mode: 'translated' });
+    if (current) return start();
+    setConsentFor(key);
   };
 
   // HTML 正文：切换译文/原文，或 iframe 换了新文档时，把映射套到当前文档上
@@ -134,7 +144,14 @@ export function useMessageTranslation(
     snapshot: translated ? current.snapshot : null,
     subject: message ? translations?.get(message.subject.trim()) : undefined,
     transformText,
+    consentRequired,
     toggle,
+    confirmConsent: () => {
+      if (!consentRequired) return;
+      setConsentFor(null);
+      start();
+    },
+    cancelConsent: () => setConsentFor(null),
     retry: () => {
       if (runRef.current?.key === key) runRef.current.run.retry();
     },

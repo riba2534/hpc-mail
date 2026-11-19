@@ -243,6 +243,27 @@ describe('MessagePage content', () => {
     client.clear();
   });
 
+  it('only copies an opaque verification link after explicit confirmation', async () => {
+    const tracked = 'https://mail.example.test/ls/click?token=private';
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const clipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, 'clipboard');
+    Object.defineProperty(globalThis.navigator, 'clipboard', { value: { writeText }, configurable: true });
+    mocks.overrides[1] = { verificationLink: tracked, bodyHtml: '', bodyText: tracked };
+    const client = show();
+    try {
+      fireEvent.click(await screen.findByRole('button', { name: '复制原始验证链接' }));
+      expect(screen.getByText(/记录本次点击/)).toBeInTheDocument();
+      expect(writeText).not.toHaveBeenCalled();
+      expect(document.body.innerHTML).not.toContain(tracked);
+      fireEvent.click(screen.getByRole('button', { name: '继续复制' }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(tracked));
+    } finally {
+      if (clipboard) Object.defineProperty(globalThis.navigator, 'clipboard', clipboard);
+      else Reflect.deleteProperty(globalThis.navigator, 'clipboard');
+      client.clear();
+    }
+  });
+
   it('shows a verification link on another domain without any mismatch warning', async () => {
     mocks.overrides[1] = { fromAddress: 'security@bank.example', verificationLink: 'https://bank-example.verify.io/confirm' };
     const client = show();

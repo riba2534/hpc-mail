@@ -4,7 +4,7 @@ import { clearAuthToken } from '@/lib/auth-token';
 import { safeStorage, storageKeys } from '@/lib/local-storage';
 
 /**
- * 本机按账户保存的数据：`hpc-<名称>:<uid>[:...]`（写信草稿、发送凭据、信任显示图片的发件人、
+ * 本机按账户保存的数据：`hpc-<名称>:<uid>[:...]`（写信草稿、发送凭据、
  * 默认与上次使用的发件身份）以及首屏查询缓存 `hpc-query-cache:<版本>:<uid>`。
  */
 const userKeyPattern = (userId: number) => new RegExp(`^hpc-[a-z-]+:(?:v\\d+:)?${userId}(?::|$)`);
