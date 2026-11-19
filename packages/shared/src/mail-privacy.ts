@@ -67,7 +67,10 @@ export function protectMailText(value: string): string {
   return value.replace(/https?:\/\/[^\s<>"'\u0000-\u001f]+/gi, (match) => {
     const original = match.replace(/[.,;!]+$/, '');
     let url = original;
-    while (url.endsWith(')') && url.split(')').length > url.split('(').length) url = url.slice(0, -1);
+    const imbalance = (url.match(/\)/g)?.length ?? 0) - (url.match(/\(/g)?.length ?? 0);
+    const trailing = /\)+$/.exec(url)?.[0].length ?? 0;
+    const remove = Math.min(Math.max(imbalance, 0), trailing);
+    if (remove) url = url.slice(0, -remove);
     const cleaned = cleanMailLink(url);
     return (cleaned ?? TRACKING_LINK_PLACEHOLDER) + match.slice(url.length);
   });
