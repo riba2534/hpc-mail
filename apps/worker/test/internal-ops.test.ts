@@ -226,9 +226,11 @@ describe('email handler 识别金丝雀', () => {
 
     // 对照：同一地址的普通来信照常落库并按管理员偏好转发
     const ordinary = inboundMail('canary@mid.test');
-    await deliver(ordinary);
+    const { runtime, sent } = probeEnv();
+    await deliver(ordinary, runtime);
     expect(await createDb(env).select().from(messages).where(eq(messages.address, 'canary@mid.test')).all()).toHaveLength(1);
-    expect(ordinary.forward).toHaveBeenCalledWith('ops@example.net');
+    expect(ordinary.forward).not.toHaveBeenCalled();
+    expect(sent.map((message) => message.to)).toEqual(['ops@example.net']);
   });
 
   // 每个用例用独立 nonce：KV 里没有对应回执，且邮件按普通来信落在投递地址上
