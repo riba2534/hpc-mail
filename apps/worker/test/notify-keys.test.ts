@@ -272,6 +272,21 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
     await expect(confirmForward(runtime, token)).rejects.toMatchObject({ code: 'not_found' });
   });
 
+  it('发送确认信失败时清理本次尚未发送的所有确认令牌', async () => {
+    const user = await account('forward-send-failed');
+    const sessionId = await createSession(runtime, user.id);
+    const send = vi.fn().mockRejectedValue(new Error('synthetic delivery failure'));
+    const failed = { ...runtime, email: { send } } as Env;
+    await expect(updatePrefsWithForwardConfirmation(failed, user, {
+      forward: { enabled: true, addresses: ['first-failure@example.net', 'unsent@example.net'] },
+      password: TEST_PASSWORD,
+    }, 'https://hpc.email', sessionId)).rejects.toMatchObject({ code: 'internal' });
+    expect(send).toHaveBeenCalledTimes(1);
+    const pending = await runtime.db.prepare('SELECT count(*) AS count FROM forward_confirmations WHERE user_id = ?')
+      .bind(user.id).first<{ count: number }>();
+    expect(pending?.count).toBe(0);
+  });
+
   it('撤销与确认同时发生：撤销先落库时确认失败，地址不会写回转发目标（A16）', async () => {
     const user = await account('forward-race');
     const target = `nk-race-${seq}@example.net`;

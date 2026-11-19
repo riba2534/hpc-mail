@@ -89,8 +89,8 @@ export async function updatePrefsWithForwardConfirmation(
   }
 
   // D1 batch 原子提交待确认目标与偏好。所有语句检查同一份旧快照，冲突时旧目标、令牌与外发均不变化。
-  const targetGuard = "EXISTS (SELECT 1 FROM users WHERE id = ? AND role = ? AND notify_prefs IS ? AND status = 'active')";
-  const snapshotParams = [user.id, snapshot.role, snapshot.raw];
+  const targetGuard = "EXISTS (SELECT 1 FROM users WHERE id = ? AND role = ? AND notify_prefs IS ? AND status = ?)";
+  const snapshotParams = [user.id, snapshot.role, snapshot.raw, snapshot.status];
   const tokens = await Promise.all(toSend.map(async address => {
     const token = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
     return { address, token, hash: await sha256Hex(token) };
@@ -109,11 +109,13 @@ export async function updatePrefsWithForwardConfirmation(
   );
 
   const base = origin.replace(/\/+$/, '');
-  for (const { address, token, hash } of tokens) {
+  for (const [index, { address, token }] of tokens.entries()) {
     try {
       await sendSystemMail(env, confirmationMail(user.username, address, base + '/forward/confirm#token=' + token));
     } catch (error) {
-      await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ? AND address = ? AND token_hash = ?').bind(user.id, address, hash).run();
+      const unsent = tokens.slice(index).map(item => item.hash);
+      await env.db.prepare('DELETE FROM forward_confirmations WHERE user_id = ? AND token_hash IN (SELECT value FROM json_each(?))')
+        .bind(user.id, JSON.stringify(unsent)).run();
       if (error instanceof AppError) throw error;
       console.error('转发确认邮件发送失败');
       throw new AppError('internal', '发送转发确认邮件失败，请稍后重试');

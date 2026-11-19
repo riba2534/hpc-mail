@@ -85,12 +85,13 @@ async function readLegacyGlobalNotify(env: Env): Promise<UserNotifyPrefs | null>
 interface NotifyPrefsSnapshot {
   raw: string | null;
   role: string;
+  status: string;
   prefs: UserNotifyPrefs;
 }
 
 export async function readNotifyPrefsSnapshot(env: Env, userId: number): Promise<NotifyPrefsSnapshot | null> {
-  const row = await env.db.prepare('SELECT notify_prefs AS raw, role FROM users WHERE id = ?')
-    .bind(userId).first<{ raw: string | null; role: string }>();
+  const row = await env.db.prepare('SELECT notify_prefs AS raw, role, status FROM users WHERE id = ?')
+    .bind(userId).first<{ raw: string | null; role: string; status: string }>();
   if (!row) return null;
   if (row.raw === null) {
     const legacy = row.role === 'admin' ? await readLegacyGlobalNotify(env) : null;
@@ -236,8 +237,8 @@ export async function updateUserNotifyPrefs(
   }
 
   // 确认或其他会话可能已收紧转发、撤销目标；只能写入本次实际验证过的配置。
-  const save = env.db.prepare("UPDATE users SET notify_prefs = ? WHERE id = ? AND role = ? AND notify_prefs IS ? AND status = 'active' RETURNING id")
-    .bind(JSON.stringify(next), userId, snapshot.role, snapshot.raw);
+  const save = env.db.prepare("UPDATE users SET notify_prefs = ? WHERE id = ? AND role = ? AND notify_prefs IS ? AND status = ? RETURNING id")
+    .bind(JSON.stringify(next), userId, snapshot.role, snapshot.raw, snapshot.status);
   // 附带的语句用相同的快照条件，只能在这一批偏好写入成功时变更待确认目标。
   const saved = opts.beforeSave?.length
     ? (await env.db.batch<{ id: number }>([...opts.beforeSave, save])).at(-1)?.results[0]
