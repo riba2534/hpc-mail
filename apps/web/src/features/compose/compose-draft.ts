@@ -22,6 +22,8 @@ export interface ComposeDraft extends ComposeInitial {
   localPart?: string;
   adminDomain?: string;
   attachments?: SavedAttachment[];
+  /** 用户明确移除原信引用后，恢复草稿时不重新关联。 */
+  forwardSourceDetached?: boolean;
   /** 最后保存时间（ms），用于恢复提示 */
   savedAt?: number;
 }
@@ -57,12 +59,17 @@ function parseDraft(raw: string | null): ComposeDraft | null {
       || (draft.localPart !== undefined && typeof draft.localPart !== 'string')
       || (draft.adminDomain !== undefined && typeof draft.adminDomain !== 'string')
       || (draft.mode !== undefined && !['reply', 'forward', 'resend'].includes(draft.mode))
+      || (draft.forwardSourceDetached !== undefined && typeof draft.forwardSourceDetached !== 'boolean')
       || (draft.savedAt !== undefined && !Number.isFinite(draft.savedAt))
       || [draft.replyToMessageId, draft.forwardAttachmentsFrom, draft.sourceMessageId, draft.mailboxId]
         .some((id) => id !== undefined && id !== null && (!Number.isInteger(id) || id <= 0))) return null;
     if (draft.attachments && (!Array.isArray(draft.attachments) || !draft.attachments.every((a) =>
       a && typeof a.filename === 'string' && typeof a.key === 'string' && typeof a.mimeType === 'string'
       && typeof a.size === 'number' && ['ready', 'uploading', 'error'].includes(a.status)))) return null;
+    // 旧版只在有附件时保存转发来源。为无附件的旧草稿补上来源，发送仍经过服务端清洗。
+    if (draft.mode === 'forward' && draft.sourceMessageId && !draft.forwardAttachmentsFrom && !draft.forwardSourceDetached) {
+      return { ...draft, forwardAttachmentsFrom: draft.sourceMessageId };
+    }
     return draft;
   } catch {
     return null;

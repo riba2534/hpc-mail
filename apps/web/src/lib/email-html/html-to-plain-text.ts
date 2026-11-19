@@ -1,4 +1,4 @@
-import { cleanMailLink, isKnownTrackingLink } from '@hpc-mail/shared'
+import { cleanMailLink, isKnownTrackingLink } from '@hpc-mail/shared/mail-privacy'
 
 const BLOCK_SELECTOR = 'p, div, tr, li, h1, h2, h3, h4, h5, h6, blockquote, pre, table'
 

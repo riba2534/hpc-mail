@@ -1,4 +1,5 @@
-import { protectMailText, type MessageDetail } from '@hpc-mail/shared';
+import type { MessageDetail } from '@hpc-mail/shared';
+import { protectMailText } from '@hpc-mail/shared/mail-privacy';
 import { htmlToPlainText } from '@/lib/email-html/html-to-plain-text';
 import { isFailedOutcome } from '@/features/message/delivery-outcomes';
 import { formatDateTime } from '@/lib/format';

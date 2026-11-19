@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { protectMailText } from '@hpc-mail/shared'
+import { protectMailText } from '@hpc-mail/shared/mail-privacy'
 import { cn } from '@/lib/cn'
 import { linkify, splitQuoteBlocks } from './linkify'
 
