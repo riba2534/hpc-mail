@@ -218,23 +218,26 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
     const target = 'conflicting@example.net';
     await updateUserNotifyPrefs(runtime, user.id, { forward: { enabled: true, addresses: [old] } });
     const sessionId = await createSession(runtime, user.id);
+    const writes = new WeakSet<D1PreparedStatement>();
     const db = new Proxy(runtime.db, {
       get(database, property) {
+        if (property === 'batch') return async (statements: D1PreparedStatement[]) => {
+          if (statements.some(statement => writes.has(statement))) {
+            await updateUserNotifyPrefs(runtime, user.id, { forward: { enabled: false, addresses: [old] } });
+          }
+          return database.batch(statements);
+        };
         if (property === 'prepare') return (query: string) => {
           const statement = database.prepare(query);
           if (!query.startsWith('UPDATE users SET notify_prefs = ? WHERE id = ? AND role = ?')) return statement;
           return new Proxy(statement, {
             get(original, key) {
               if (key !== 'bind') return Reflect.get(original, key, original);
-              return (...params: unknown[]) => new Proxy(original.bind(...params), {
-                get(bound, method) {
-                  if (method !== 'first') return Reflect.get(bound, method, bound);
-                  return async () => {
-                    await updateUserNotifyPrefs(runtime, user.id, { forward: { enabled: false, addresses: [old] } });
-                    return bound.first();
-                  };
-                },
-              });
+              return (...params: unknown[]) => {
+                const bound = original.bind(...params);
+                writes.add(bound);
+                return bound;
+              };
             },
           });
         };
@@ -249,6 +252,24 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
     const pending = await runtime.db.prepare('SELECT count(*) AS count FROM forward_confirmations WHERE user_id = ?')
       .bind(user.id).first<{ count: number }>();
     expect(pending?.count).toBe(0);
+  });
+
+  it('保存模式时一起撤销未保留的确认令牌', async () => {
+    const user = await account('forward-revoke-with-mode');
+    const target = 'revoke-with-mode@example.net';
+    const retainedTarget = 'kept-with-mode@example.net';
+    await updateUserNotifyPrefs(runtime, user.id, { forward: { enabled: true, addresses: [retainedTarget] } });
+    const sessionId = await createSession(runtime, user.id);
+    await updatePrefsWithForwardConfirmation(runtime, user, {
+      forward: { enabled: true, addresses: [retainedTarget, target] }, password: TEST_PASSWORD,
+    }, 'https://hpc.email', sessionId);
+    const token = tokenOf(captured.find(mail => mail.to === target)!.text)!;
+    const saved = await updatePrefsWithForwardConfirmation(runtime, user, {
+      forward: { enabled: true, addresses: [retainedTarget], contentMode: 'notice' },
+    }, 'https://hpc.email', sessionId);
+    expect(saved.pending).toEqual([]);
+    expect(saved.prefs.forward.contentMode).toBe('notice');
+    await expect(confirmForward(runtime, token)).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('撤销与确认同时发生：撤销先落库时确认失败，地址不会写回转发目标（A16）', async () => {

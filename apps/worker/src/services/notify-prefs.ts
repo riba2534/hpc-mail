@@ -189,7 +189,7 @@ export async function updateUserNotifyPrefs(
   env: Env,
   userId: number,
   patch: UpdateNotifyPrefsRequest,
-  opts: { allowEmptyForward?: boolean; snapshot?: NotifyPrefsSnapshot } = {},
+  opts: { allowEmptyForward?: boolean; snapshot?: NotifyPrefsSnapshot; beforeSave?: D1PreparedStatement[] } = {},
 ): Promise<UserNotifyPrefs> {
   const snapshot = opts.snapshot ?? await readNotifyPrefsSnapshot(env, userId);
   if (!snapshot) throw new AppError('not_found', '用户不存在');
@@ -236,8 +236,12 @@ export async function updateUserNotifyPrefs(
   }
 
   // 确认或其他会话可能已收紧转发、撤销目标；只能写入本次实际验证过的配置。
-  const saved = await env.db.prepare('UPDATE users SET notify_prefs = ? WHERE id = ? AND role = ? AND notify_prefs IS ? RETURNING id')
-    .bind(JSON.stringify(next), userId, snapshot.role, snapshot.raw).first<{ id: number }>();
+  const save = env.db.prepare("UPDATE users SET notify_prefs = ? WHERE id = ? AND role = ? AND notify_prefs IS ? AND status = 'active' RETURNING id")
+    .bind(JSON.stringify(next), userId, snapshot.role, snapshot.raw);
+  // 附带的语句用相同的快照条件，只能在这一批偏好写入成功时变更待确认目标。
+  const saved = opts.beforeSave?.length
+    ? (await env.db.batch<{ id: number }>([...opts.beforeSave, save])).at(-1)?.results[0]
+    : await save.first<{ id: number }>();
   if (!saved) throw new AppError('conflict', '通知偏好已变化，请刷新后重试');
   return next;
 }
