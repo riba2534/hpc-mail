@@ -4,7 +4,7 @@ import { and, eq } from 'drizzle-orm';
 import PostalMime from 'postal-mime';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../src/db/client.js';
-import { emailDeliveryRefs, mailboxes, notificationJobs, users } from '../src/db/schema.js';
+import { emailDeliveryRefs, mailboxes, messages, notificationJobs, users } from '../src/db/schema.js';
 import { FORWARD_RELAY_SCOPE, FORWARD_RELAY_USER_SCOPE, forwardReceivedMail, type ForwardMail } from '../src/services/forwarding.js';
 import { handleInbound } from '../src/services/inbound.js';
 import { FORWARD_TARGET_DAILY_LIMIT } from '../src/services/notification-jobs.js';
@@ -48,16 +48,20 @@ function relayEnv() {
   return { env: { ...env, email: { send }, site_origin: 'https://mail.example.test' } as unknown as Env, sent, send };
 }
 
-function mail(ownerIds: number[], toAddress = `fq-${++sequence}@quota.test`): ForwardMail {
+async function mail(ownerIds: number[], toAddress = `fq-${++sequence}@quota.test`): Promise<ForwardMail> {
+  const domain = toAddress.split('@')[1]!;
+  const [row] = await db.insert(messages).values({
+    address: toAddress, domain, direction: 'inbound', status: 'received', notifyOwnerIds: ownerIds,
+  }).returning({ id: messages.id });
   return {
-    messageId: 900_000 + ++sequence, ownerIds, fromAddress: 'sender@example.net', fromName: 'Sender',
-    toAddress, domain: toAddress.split('@')[1]!, subject: 'quota subject', text: 'quota body', html: '', replyTo: [], attachments: [],
+    messageId: row!.id, ownerIds, fromAddress: 'sender@example.net', fromName: 'Sender',
+    toAddress, domain, subject: 'quota subject', text: 'quota body', html: '', replyTo: [], attachments: [],
   };
 }
 
 /** 已认领地址的来信：地址归 owner，归属人快照只有 owner */
 async function claimedMail(ownerId: number): Promise<ForwardMail> {
-  const item = mail([ownerId]);
+  const item = await mail([ownerId]);
   await db.insert(mailboxes).values({ address: item.toAddress, domain: item.domain, userId: ownerId });
   return item;
 }
@@ -135,7 +139,7 @@ describe('转发中转配额（R06）', () => {
     const a1 = await seedUser('fq-unclaimed-a1', ['un-a1@ext.test', 'un-shared@ext.test'], 'active', 'admin');
     const a2 = await seedUser('fq-unclaimed-a2', ['un-a2@ext.test', 'un-shared@ext.test'], 'active', 'admin');
     const relay = relayEnv();
-    await forwardReceivedMail(relay.env, mail([a1.id, a2.id]), await owners(a1, a2));
+    await forwardReceivedMail(relay.env, await mail([a1.id, a2.id]), await owners(a1, a2));
     expect(relay.sent.map((item) => item.to).sort()).toEqual(['un-a1@ext.test', 'un-a2@ext.test', 'un-shared@ext.test']);
     expect(await count(FORWARD_RELAY_SCOPE, 'unclaimed')).toBe(3);
     expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(3);
@@ -143,7 +147,7 @@ describe('转发中转配额（R06）', () => {
 
     // 共用额度用尽：再来的信全部跳过，计数不再累加，已占的域名与目标计数退回
     const domainBefore = await count('fwd-domain', 'quota.test');
-    await forwardReceivedMail(relay.env, mail([a1.id, a2.id]), await owners(a1, a2));
+    await forwardReceivedMail(relay.env, await mail([a1.id, a2.id]), await owners(a1, a2));
     expect(relay.sent).toHaveLength(3);
     expect(await count(FORWARD_RELAY_SCOPE, 'unclaimed')).toBe(3);
     expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(3);
@@ -154,7 +158,7 @@ describe('转发中转配额（R06）', () => {
     // 收信后地址已由其他用户认领，旧管理员的转发权限立即失效
     const other = await seedUser('fq-unclaimed-later', ['un-later@ext.test']);
     await setRelayQuota(0, 1, 0);
-    const later = mail([a1.id]);
+    const later = await mail([a1.id]);
     await db.insert(mailboxes).values({ address: later.toAddress, domain: later.domain, userId: other.id });
     await forwardReceivedMail(relay.env, later, await owners(a1));
     expect(await count(FORWARD_RELAY_SCOPE, 'unclaimed')).toBe(3);
@@ -189,7 +193,7 @@ describe('转发中转配额（R06）', () => {
     const owner = await seedUser('fq-refund', ['fq-refund@ext.test']);
     const relay = relayEnv();
     const refundMail = async (local: string, domain: string) => {
-      const item = mail([owner.id], `${local}@${domain}`);
+      const item = await mail([owner.id], `${local}@${domain}`);
       await db.insert(mailboxes).values({ address: item.toAddress, domain: item.domain, userId: owner.id });
       return item;
     };
@@ -217,7 +221,7 @@ describe('转发中转配额（R06）', () => {
     const owner = await seedUser('fq-target-full', ['fq-full@ext.test']);
     await bumpCounter(env, 'fwd-target', 'fq-full@ext.test', dayWindow(), FORWARD_TARGET_DAILY_LIMIT);
     const relay = relayEnv();
-    const target = mail([owner.id], 'fq-target-full@quota-full.test');
+    const target = await mail([owner.id], 'fq-target-full@quota-full.test');
     await db.insert(mailboxes).values({ address: target.toAddress, domain: target.domain, userId: owner.id });
     await forwardReceivedMail(relay.env, target, await owners(owner));
     expect(relay.sent).toHaveLength(0);
@@ -233,9 +237,9 @@ describe('停用归属人不转发（R27）', () => {
     const disabled = await seedUser('fq-disabled', ['fq-off@ext.test', 'fq-both@ext.test'], 'disabled', 'admin');
     const active = await seedUser('fq-enabled', ['fq-both@ext.test'], 'active', 'admin');
     const relay = relayEnv();
-    await forwardReceivedMail(relay.env, mail([disabled.id]), await owners(disabled));
+    await forwardReceivedMail(relay.env, await mail([disabled.id]), await owners(disabled));
     expect(relay.sent).toHaveLength(0);
-    await forwardReceivedMail(relay.env, mail([disabled.id, active.id]), await owners(disabled, active));
+    await forwardReceivedMail(relay.env, await mail([disabled.id, active.id]), await owners(disabled, active));
     expect(relay.sent.map((item) => item.to)).toEqual(['fq-both@ext.test']);
     expect(await forwardRows(disabled.id)).toEqual([]);
     expect((await forwardRows(active.id)).map((row) => row.status)).toEqual(['succeeded']);
@@ -292,7 +296,7 @@ describe('自动转发隐私', () => {
     const parsed = await PostalMime.parse(relay.sent[0]!.raw);
     expect(parsed.html).not.toContain('tracking.example.test');
     expect(parsed.html).not.toContain('cid:invalid');
-    expect(parsed.html).toContain('cid:good%40inline.test');
+    expect(parsed.html).toContain('cid:good@inline.test');
     expect(parsed.html).toContain(login);
     expect(parsed.html).toContain(`href="https://mail.example.test/mail/${item.messageId}"`);
     expect(parsed.text).not.toContain(tracked);
@@ -344,6 +348,22 @@ describe('自动转发隐私', () => {
     expect(parsed.attachments).toHaveLength(0);
     expect(parsed.text).toContain(`https://mail.example.test/mail/${item.messageId}`);
     expect(parsed.text).not.toMatch(/492719|original\.example|sender@example\.net/);
+  });
+
+  it.each(['trash', 'purge', 'address', 'direction'] as const)('转发前源邮件失效（%s）时不发信也不占额度', async (condition) => {
+    await setRelayQuota(0, 0);
+    const owner = await seedUser(`fq-private-source-${condition}`, [`source-${condition}@gmail.com`]);
+    const item = await claimedMail(owner.id);
+    const where = eq(messages.id, item.messageId);
+    if (condition === 'purge') await db.delete(messages).where(where);
+    else await db.update(messages).set(condition === 'trash' ? { deletedAt: new Date() }
+      : condition === 'address' ? { address: 'another@quota.test' } : { direction: 'outbound' }).where(where);
+
+    const relay = relayEnv();
+    await forwardReceivedMail(relay.env, item, await owners(owner));
+    expect(relay.send).not.toHaveBeenCalled();
+    expect(await forwardRows(owner.id)).toEqual([]);
+    expect(await count(FORWARD_RELAY_SCOPE, 'instance')).toBe(0);
   });
 
   it('结果不明时保留额度与唯一记录，并发与重复交付均不重发', async () => {

@@ -5,6 +5,7 @@ import PostalMime from 'postal-mime';
 import { createDb } from '../src/db/client.js';
 import { attachments, deliveryObjectLeases, idempotencyRecords, mailboxes, messages, users } from '../src/db/schema.js';
 import { handleInbound } from '../src/services/inbound.js';
+import { base64ToBytes, bytesToBase64, foldBase64 } from '../src/lib/mime.js';
 import { beginIdempotentSend } from '../src/services/idempotency.js';
 import { finalWriteRetry, sendMail } from '../src/services/outbound.js';
 import { getMessageDetail, purgeMessages } from '../src/services/message.js';
@@ -37,23 +38,25 @@ function incoming(to: string, raw: string, forward = vi.fn(async () => {})) {
   return { to, from: 'sender@example.net', headers: new Headers(), raw: new Response(raw).body!, forward, setReject: vi.fn() } as any;
 }
 
-function captureEnv() {
+function captureEnv(siteOrigin?: string) {
   const captured: { to: string; raw: string; mail: any }[] = [];
   const send = vi.fn(async (mail: any) => {
     const raw = await new Response(mail.raw).text();
     captured.push({ to: mail.to, raw, mail: await PostalMime.parse(raw) });
   });
-  return { customEnv: { ...env, email: { send } } as any, send, captured };
+  return { customEnv: { ...env, email: { send }, ...(siteOrigin ? { site_origin: siteOrigin } : {}) } as any, send, captured };
 }
 
 const background = collectBackground();
+
+const PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=';
 
 const cidMime = (to: string, subject: string) => [
   'From: Sender <sender@example.net>', `To: ${to}`, `Subject: ${subject}`, 'MIME-Version: 1.0',
   'Content-Type: multipart/related; boundary="review-cid"', '',
   '--review-cid', 'Content-Type: text/html; charset=UTF-8', '', '<p>Inline picture</p><img src="cid:review-image">',
   '--review-cid', 'Content-Type: image/png; name="picture.png"', 'Content-Disposition: inline; filename="picture.png"',
-  'Content-ID: <review-image>', 'Content-Transfer-Encoding: base64', '', 'aW1hZ2UtYnl0ZXM=',
+  'Content-ID: <review-image>', 'Content-Transfer-Encoding: base64', '', PNG_BASE64,
   '--review-cid--', '',
 ].join('\r\n');
 
@@ -98,7 +101,8 @@ describe('收发件功能与故障恢复', () => {
     const ctx2 = createExecutionContext();
     await handleInbound(incoming('functional-forward-receiver@hpc.email', 'From: sender@example.net\r\nTo: functional-forward-receiver@hpc.email\r\nSubject: functional-external-forward\r\n\r\nExternal delivery', forward), customEnv, ctx2);
     await waitOnExecutionContext(ctx2);
-    expect(forward).toHaveBeenCalledWith('archive@example.net');
+    expect(forward).not.toHaveBeenCalled();
+    expect(send.mock.calls.map(([mail]) => mail.to)).toEqual(['archive@example.net', 'archive@example.net']);
   });
 
   it('中转转发保留内联图片 Content-ID 和 inline disposition', async () => {
@@ -399,15 +403,16 @@ describe('收发件功能与故障恢复', () => {
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
+    const { customEnv, captured } = captureEnv();
     const failed = createExecutionContext();
-    await expect(handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), { ...env, r2 }, failed)).rejects.toThrow('attachment R2 unavailable');
+    await expect(handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), { ...customEnv, r2 }, failed)).rejects.toThrow('attachment R2 unavailable');
     await waitOnExecutionContext(failed);
     const pending = await createDb(env).select().from(messages).where(eq(messages.subject, 'functional-repair-attachment')).get();
     expect(pending?.status).toBe('pending');
     const ctx1 = createExecutionContext(), ctx2 = createExecutionContext();
     await Promise.all([
-      handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), env, ctx1),
-      handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), env, ctx2),
+      handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), customEnv, ctx1),
+      handleInbound(incoming('functional-repair-attachment@hpc.email', raw, forward), customEnv, ctx2),
     ]);
     await Promise.all([waitOnExecutionContext(ctx1), waitOnExecutionContext(ctx2)]);
     const rows = await createDb(env).select().from(messages).where(eq(messages.subject, 'functional-repair-attachment')).all();
@@ -415,7 +420,8 @@ describe('收发件功能与故障恢复', () => {
     expect(rows[0]!.id).toBe(pending?.id);
     expect(rows[0]!.status).toBe('received');
     expect(await createDb(env).select().from(attachments).where(eq(attachments.messageId, rows[0]!.id)).all()).toHaveLength(1);
-    expect(forward).toHaveBeenCalledOnce();
+    expect(forward).not.toHaveBeenCalled();
+    expect(captured.map((item) => item.to)).toEqual(['repaired@example.net']);
   });
 
   it('Reply-To 地址组完整保存到详情，中转转发也使用全部 Reply-To', async () => {
@@ -458,7 +464,7 @@ describe('收发件功能与故障恢复', () => {
     expect(rows[0]!.recipientOutcomes[0]?.status).toBe('failed');
   });
 
-  it('超长 HTML 中转转发：纯文本只含开头并在末尾说明截断，HTML 完整转发；普通邮件不加说明', async () => {
+  it('超长 HTML 中转转发：纯文本说明截断，净化版 HTML 保留完整内容', async () => {
     const receiver = await seedUser('functional-long-relay', 'user');
     await updateUserNotifyPrefs(env, receiver.userId, { forward: { enabled: true, addresses: ['long-relay@example.net'] } });
     const mime = (subject: string, body: string) => ['From: sender@example.net', 'To: functional-long-relay@hpc.email',
@@ -476,26 +482,30 @@ describe('收发件功能与故障恢复', () => {
     const [long, short] = captured.map((entry) => entry.mail);
     expect(long.text).toContain('START');
     expect(long.text).not.toContain('END-OF-MAIL');
-    expect(long.text.trimEnd()).toMatch(/纯文本版本只包含开头部分，完整内容请查看 HTML 版本）$/);
+    expect(long.text).toContain('纯文本版本只包含开头部分，完整内容请查看 HTML 版本');
+    expect(long.text).toContain('登录 HPC Mail 查看原信');
     expect(long.html).toContain('END-OF-MAIL');
     expect(short.text).toContain('short body');
     expect(short.text).not.toContain('纯文本版本只包含开头部分');
   });
 
-  it('SMTP 中转的大内联图片转独立链接，正文 CID 一同替换', async () => {
+  it('SMTP 中转的大内联图片只保留站内查看入口', async () => {
     const receiver = await seedUser('functional-large-relay', 'user');
     await updateUserNotifyPrefs(env, receiver.userId, { forward: { enabled: true, addresses: ['large-relay@example.net'] } });
+    const largePng = new Uint8Array(4 * 1024 * 1024);
+    largePng.set(base64ToBytes(PNG_BASE64));
     const raw = cidMime('functional-large-relay@hpc.email', 'functional-large-relay')
-      .replace('aW1hZ2UtYnl0ZXM=', 'AAAA'.repeat(Math.ceil(4 * 1024 * 1024 / 3)));
-    const { customEnv, captured } = captureEnv();
+      .replace(PNG_BASE64, foldBase64(bytesToBase64(largePng)));
+    const { customEnv, captured } = captureEnv('https://mail.example.test');
     const ctx = createExecutionContext();
     await handleInbound(incoming('functional-large-relay@hpc.email', raw, vi.fn(async () => { throw new Error('unverified'); })), customEnv, ctx);
     await waitOnExecutionContext(ctx);
     expect(captured).toHaveLength(1);
     expect(captured[0]!.mail.attachments).toHaveLength(0);
     expect(captured[0]!.mail.html).not.toContain('cid:review-image');
-    expect(captured[0]!.mail.html).toContain('<img src="https://hpc.email/api/attachments/');
-    expect(captured[0]!.mail.html).toContain('90 天');
+    expect(captured[0]!.mail.html).not.toMatch(/<img|\/api\/attachments/);
+    expect(captured[0]!.mail.html).toContain('部分附件仅在 HPC Mail 可查看');
+    expect(captured[0]!.mail.html).toContain('https://mail.example.test/mail/');
   });
 
   it('从含内联图的详情重发时，将本站临时下载 URL 恢复为 CID 并保留原附件', async () => {

@@ -9,7 +9,7 @@ import { deriveSubkey, hmacSha256Base64 } from '../lib/crypto.js';
 import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
 import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, formatAddressHeader, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
 import { isDefiniteSendRejection } from '../lib/send-rejection.js';
-import { escapeHtml, type MailText } from '../lib/text.js';
+import { convertHtmlToText, escapeHtml, type MailText } from '../lib/text.js';
 import type { Env } from '../types.js';
 import { deliveryEventsQueue, deliveryRefInserts } from './delivery-refs.js';
 import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
@@ -123,6 +123,7 @@ async function protectedBody(mail: ForwardMail, link: string): Promise<RelayBody
     body = await protectMailBody({ text: mail.text, html: mail.html });
   }
   if (relaySize(body.text, body.html, attachments) > EXTERNAL_MESSAGE_MAX_BYTES) return noticeBody(link);
+  const textTruncated = !mail.text && convertHtmlToText(body.html || mail.html).truncated;
   const note = [
     ...(attachments.length < mail.attachments.length ? ['部分附件仅在 HPC Mail 可查看。'] : []),
   ];
@@ -131,7 +132,11 @@ async function protectedBody(mail: ForwardMail, link: string): Promise<RelayBody
     `原收件地址：${mail.toAddress}`,
   ];
   return {
-    text: [...meta, '', body.text, '', ...note, readInMail(link)].join('\n'),
+    text: [...meta, '', body.text, '', ...note,
+      ...(textTruncated ? [body.html ? '（正文过长，纯文本版本只包含开头部分，完整内容请查看 HTML 版本）'
+        : '（正文过长，完整内容请登录 HPC Mail 查看）'] : []),
+      readInMail(link),
+    ].join('\n'),
     html: body.html ? `<p>${meta.map(escapeHtml).join('<br>')}</p>${body.html}<p>`
       + [...note.map(escapeHtml), link ? `<a href="${escapeHtml(link)}">登录 HPC Mail 查看原信</a>` : escapeHtml(readInMail(''))].join('<br>')
       + '</p>' : '',
@@ -236,7 +241,9 @@ interface TargetForward {
 
 /** 在提交 SMTP 前原子占用整组。在进程中断后，现有通知巡检会把陈旧的 processing 标为 unknown。 */
 async function claimForward(env: Env, mail: ForwardMail, target: string, policy: TargetForward) {
-  const keyOf = (userId: number) => `mail:${mail.messageId}:${userId}:forward:${target}`;
+  // D1 会把数值绑定格式化为 1.0，字符串前缀与去重和回执使用同一口径。
+  const keyPrefix = `mail:${mail.messageId}:`;
+  const keyOf = (userId: number) => `${keyPrefix}${userId}:forward:${target}`;
   const now = Date.now();
   const result = await env.db.prepare(`WITH eligible AS MATERIALIZED (
       SELECT id, CASE WHEN json_valid(notify_prefs) THEN json_extract(notify_prefs, '$.forward.contentMode') END AS mode
@@ -249,6 +256,11 @@ async function claimForward(env: Env, mail: ForwardMail, target: string, policy:
             WHERE trim(lower(value)) = ?4
           )
         ELSE 0 END
+      AND EXISTS (
+        SELECT 1 FROM messages
+        WHERE id = ?3 AND address = ?1 AND direction = 'inbound'
+          AND status IN ('received', 'degraded') AND deleted_at IS NULL AND purge_token IS NULL
+      )
       AND NOT EXISTS (
         SELECT 1 FROM notification_jobs WHERE dedupe_key IN (SELECT value FROM json_each(?6))
       )
@@ -258,11 +270,11 @@ async function claimForward(env: Env, mail: ForwardMail, target: string, policy:
       next_attempt_at, created_at, updated_at, last_attempt_at, forward_mode, dedupe_key
     )
     SELECT ?3, id, 'forward', ?4, '{}', 'processing', 1, 1, ?2, ?2, ?2, ?2, 'relay',
-      'mail:' || ?3 || ':' || id || ':forward:' || ?4 FROM eligible
+      ?8 || id || ':forward:' || ?4 FROM eligible
     WHERE ?7 = 1 OR NOT EXISTS (SELECT 1 FROM eligible WHERE mode = 'notice')
     ON CONFLICT(dedupe_key) DO NOTHING RETURNING id, user_id`)
     .bind(mail.toAddress, now, mail.messageId, target, JSON.stringify(policy.userIds),
-      JSON.stringify(mail.ownerIds.map(keyOf)), Number(policy.notice)).all<{ id: number; user_id: number }>();
+      JSON.stringify(mail.ownerIds.map(keyOf)), Number(policy.notice), keyPrefix).all<{ id: number; user_id: number }>();
   return result.results;
 }
 
