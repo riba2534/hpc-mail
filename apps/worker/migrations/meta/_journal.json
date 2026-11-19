@@ -232,6 +232,13 @@
       "when": 1795420800004,
       "tag": "0033_claude_receipts",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1795420800005,
+      "tag": "0034_disable_automatic_ai_code",
+      "breakpoints": true
     }
   ]
 }

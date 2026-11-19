@@ -1,6 +1,6 @@
 import { createApp, isApiPath } from './app.js';
 import { routeLabel } from './lib/http.js';
-import { SECURITY_HEADERS } from './lib/security-headers.js';
+import { APP_SHELL_CACHE_CONTROL, SECURITY_HEADERS } from './lib/security-headers.js';
 import { handleDeliveryEventBatch } from './services/delivery-events.js';
 import { handleInbound } from './services/inbound.js';
 import { DRAFT_DISPATCH_CRON, MAINTENANCE_CRON, runDraftDispatch, runScheduled } from './services/scheduled.js';
@@ -91,6 +91,8 @@ export default {
         'Content-Type': url.pathname.endsWith('.md') ? 'text/markdown; charset=utf-8' : 'text/plain; charset=utf-8',
       });
     }
+    const isHtml = (res.headers.get('content-type') || '').includes('text/html');
+    if (isHtml) return withSecurityHeaders(res, { 'Cache-Control': APP_SHELL_CACHE_CONTROL });
     const hashedAsset = /^\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\.(js|css|woff2?|png|svg|webp)$/.test(url.pathname);
     return withSecurityHeaders(res, hashedAsset && res.ok ? { 'Cache-Control': 'public, max-age=31536000, immutable' } : { 'Cache-Control': 'no-cache' });
   },
