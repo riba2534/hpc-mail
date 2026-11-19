@@ -44,7 +44,7 @@ function confirmationMail(username: string, address: string, link: string) {
 /**
  * 网页会话修改个人偏好（含转发）。forward.addresses 是期望的目标列表：已确认的（当前 forward.addresses 里的）保留；
  * 新增的先不生效，记入 forward_confirmations 并向该地址发确认信，目标邮箱的主人确认后才加入；
- * 不在列表里的待确认记录一并撤销。新增目标或把转发从关改为开时先重新验证当前密码。
+ * 不在列表里的待确认记录一并撤销。新增目标、启用转发或扩大转发内容时重新验证当前密码。
  * 升级前已配置的目标视为已确认。
  */
 export async function updatePrefsWithForwardConfirmation(
@@ -70,8 +70,9 @@ export async function updatePrefsWithForwardConfirmation(
   const stillPending = new Set(existing.filter((row) => Number(row.expires_at) > now).map((row) => row.address));
   // 已在等待确认且未过期的不重发；过期或新加的重新生成 token 并发信
   const toSend = added.filter((address) => !stillPending.has(address));
-  // 要发新确认信，或把转发从关改为开时重新验证密码；只是保留已在等待确认的地址不需要
-  if (toSend.length || (patch.forward.enabled && !current.forward.enabled)) {
+  const contentMode = patch.forward.contentMode ?? current.forward.contentMode;
+  const expandsContent = current.forward.contentMode === 'notice' && contentMode === 'protected';
+  if (toSend.length || (patch.forward.enabled && (!current.forward.enabled || expandsContent))) {
     await verifyReauthPassword(env, { userId: user.id, sessionId }, patch.password);
   }
   if (toSend.length) {
@@ -110,7 +111,7 @@ export async function updatePrefsWithForwardConfirmation(
       .bind(user.id, JSON.stringify(dropped)).run();
   }
   const [prefs, pending] = await Promise.all([
-    updateUserNotifyPrefs(env, user.id, { ...patch, forward: { ...patch.forward, addresses: keep } },
+    updateUserNotifyPrefs(env, user.id, { ...patch, forward: { ...patch.forward, contentMode, addresses: keep } },
       { allowEmptyForward: added.length > 0 }),
     listPendingForwards(env, user.id),
   ]);

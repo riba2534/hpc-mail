@@ -186,9 +186,17 @@ describe('新增转发目标要重新验证密码并经目标邮箱确认', () =
     expect(after.forward).toEqual({ enabled: true, addresses: [target] });
     expect(after.forwardPending).toEqual([]);
     expect((await request('/api/forward-confirmations/confirm', json('', { token }))).status).toBe(404);
+    const changeMode = (mode?: 'notice' | 'protected', password?: string) =>
+      request('/api/me/notify-prefs', json(user.jwt, {
+        forward: { enabled: true, addresses: [target], ...(mode ? { contentMode: mode } : {}) }, password,
+      }, 'PUT'));
+    expect((await data<NotifyPrefsView>(await changeMode('notice'))).forward.contentMode).toBe('notice');
+    expect((await data<NotifyPrefsView>(await changeMode())).forward.contentMode).toBe('notice');
+    expect(await errorCode(await changeMode('protected'))).toEqual({ status: 403, code: 'reauth_required' });
+    expect((await data<NotifyPrefsView>(await changeMode('protected', TEST_PASSWORD))).forward.contentMode).toBe('protected');
     // 已确认的目标保留，关闭转发不需要密码
     expect((await data<NotifyPrefsView>(await request('/api/me/notify-prefs', json(user.jwt, { forward: { enabled: false, addresses: [target] } }, 'PUT')))).forward)
-      .toEqual({ enabled: false, addresses: [target] });
+      .toEqual({ enabled: false, addresses: [target], contentMode: 'protected' });
     // 重新打开需要密码
     expect((await request('/api/me/notify-prefs', json(user.jwt, { forward: { enabled: true, addresses: [target] } }, 'PUT'))).status).toBe(403);
   });
