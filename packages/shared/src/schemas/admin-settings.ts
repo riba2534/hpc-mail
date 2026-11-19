@@ -230,7 +230,7 @@ export type Settings = {
 
 export const DEFAULT_SETTINGS: Settings = {
   register_mode: 'closed',
-  code_extract: { enabled: true, aiEnabled: true },
+  code_extract: { enabled: true, aiEnabled: false },
   site: { title: 'HPC Mail' },
   api: { enabled: true },
   domains: { list: [] },

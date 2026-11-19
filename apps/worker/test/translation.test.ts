@@ -200,6 +200,42 @@ describe('POST /api/messages/:id/translate', () => {
     expect(await usedChars(owner.id)).toBe(sent.join('').length);
   });
 
+  it('对模型和缓存隐藏同一片段中的地址、链接与验证码，返回时恢复原值', async () => {
+    await configure();
+    const fetchMock = echoProvider();
+    const owner = await account('tr-privacy');
+    const addr = address();
+    await own(owner.id, addr);
+    const secrets = ['personal@example.test', 'https://example.test/reset?token=private', 'A1B2C3', '4 8 2 9 1 3'];
+    const segment = `Contact ${secrets[0]} at ${secrets[1]} and enter ${secrets[2]} or ${secrets[3]}.`;
+    const id = await mail(addr, { bodyText: segment });
+
+    const first = await data<MessageTranslation>(await translate(owner.jwt, id, [segment]));
+    expect(first).toMatchObject({ translations: [`译：${segment}`], cached: false });
+    const stored = JSON.stringify((await cacheRows(id))[0]!.translations);
+    expect(stored).toContain('HPC_PRIVATE');
+    for (const secret of secrets) {
+      expect(segmentsOf(fetchMock.mock.calls[0]![1])[0]).not.toContain(secret);
+      expect(stored).not.toContain(secret);
+    }
+    const second = await data<MessageTranslation>(await translate(owner.jwt, id, [segment]));
+    expect(second).toMatchObject({ translations: first.translations, cached: true });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('模型重复、删除或跨片段复用占位符时拒绝结果', async () => {
+    const config = { ...aiModel };
+    const inputs = ['Open https://one.example/reset/private', 'Write to person@example.test'];
+    const fetchMock = vi.fn(async (...args: FetchArgs) => {
+      const incoming = segmentsOf(args[1]);
+      const marker = incoming[0]!.match(/\[\[HPC_PRIVATE_[^\]]+\]\]/)?.[0] ?? '';
+      return completion(incoming.map((_, i) => i === 0 ? marker + marker : marker));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(translateSegments(config, inputs)).rejects.toBeInstanceOf(AiProviderError);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it('纯文本片段保留换行，只折叠行内空白', async () => {
     await configure();
     const fetchMock = echoProvider();
