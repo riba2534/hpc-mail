@@ -15,7 +15,7 @@ import { deliveryEventsQueue, deliveryRefInserts } from './delivery-refs.js';
 import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
 import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT } from './notification-jobs.js';
 import { LEGACY_NOTIFY_KEYS, notifyOwnersFromRows, type NotifyOwner, type NotifyOwnerRawRow } from './notify-prefs.js';
-import { protectMailBody, safeMailContentId } from './protected-mail.js';
+import { hasRasterSignature, isRestrictedForwardAttachment, protectMailBody, safeMailContentId } from './protected-mail.js';
 import { dayWindow, releaseCounters, reserveCounters, type CounterLimit } from './rate-counter.js';
 import { getSettings } from './setting.js';
 import { lookupSuppressions, suppressedFor, suppressionMessage } from './suppression.js';
@@ -83,27 +83,6 @@ function cleanTitle(value: string): string {
   return Array.from(title).slice(0, 240).join('') || '(无主题)';
 }
 
-function hasRasterSignature(attachment: ForwardAttachment): boolean {
-  const bytes = attachment.content;
-  const head = String.fromCharCode(...bytes.subarray(0, 32));
-  switch (normalizeMimeType(attachment.mimeType)) {
-    case 'image/png':
-      return head.startsWith('\x89PNG\r\n\x1a\n');
-    case 'image/jpeg':
-      return head.startsWith('\xff\xd8\xff');
-    case 'image/gif':
-      return head.startsWith('GIF87a') || head.startsWith('GIF89a');
-    case 'image/webp':
-      return head.startsWith('RIFF') && head.slice(8, 12) === 'WEBP';
-    case 'image/avif':
-      return head.slice(4, 8) === 'ftyp' && /(?:avif|avis)/.test(head.slice(8));
-    default:
-      return false;
-  }
-}
-
-const RESTRICTED_ATTACHMENT_TYPES = new Set(['text/html', 'application/xhtml+xml', 'image/svg+xml', 'text/calendar']);
-
 function relayAttachments(attachments: ForwardAttachment[]): RelayAttachment[] {
   const counts = new Map<string, number>();
   for (const attachment of attachments) {
@@ -112,11 +91,10 @@ function relayAttachments(attachments: ForwardAttachment[]): RelayAttachment[] {
   }
   return attachments.flatMap((attachment): RelayAttachment[] => {
     const type = normalizeMimeType(attachment.mimeType);
-    if (/^(?:message|multipart)\//.test(type) || RESTRICTED_ATTACHMENT_TYPES.has(type)
-      || /\.(?:eml|mht|mhtml|html?|xhtml|svg|svgz|ics)$/i.test(attachment.filename.trim())) return [];
+    if (isRestrictedForwardAttachment(type, attachment.filename)) return [];
     const id = safeMailContentId(attachment.contentId);
     const inlineId = id && counts.get(id) === 1 && attachment.disposition === 'inline'
-      && isSafeInlineImageType(type) && hasRasterSignature(attachment) ? id : null;
+      && isSafeInlineImageType(type) && hasRasterSignature(type, attachment.content) ? id : null;
     return [{ ...attachment, mimeType: inlineId ? type : attachment.mimeType, inlineId }];
   });
 }

@@ -11,18 +11,28 @@ function mailUrl(value: string): URL | null {
   }
 }
 
+function trackingPath(url: URL): string {
+  try {
+    return decodeURIComponent(url.pathname).toLowerCase();
+  } catch {
+    return url.pathname.toLowerCase();
+  }
+}
+
+const trackingHost = (url: URL): string => url.hostname.toLowerCase().replace(/\.$/, '');
+
 export function isKnownTrackingImage(value: string): boolean {
   const url = mailUrl(value.trim());
   if (!url) return false;
-  const path = url.pathname.toLowerCase();
+  const path = trackingPath(url);
   if (/(?:^|\/)(?:wf\/open|open-pixel|tracking-pixel)(?:\/|$)/.test(path)) return true;
-  return (url.hostname.endsWith('.intercom-mail.com') || url.hostname === 'clicks.e.link.com')
+  return (trackingHost(url).endsWith('.intercom-mail.com') || trackingHost(url) === 'clicks.e.link.com')
     && (path === '/via/o' || path.startsWith('/q/'));
 }
 
 function recognizedClick(url: URL): boolean {
-  const host = url.hostname.toLowerCase();
-  const path = url.pathname.toLowerCase();
+  const host = trackingHost(url);
+  const path = trackingPath(url);
   return /(?:^|\/)ls\/click(?:\/|$)/.test(path)
     || ((host === 'links.email.claude.com' || host === 'ilinks.anthropic.com'
       || /(?:^|\.)iterable\.com$/.test(host)) && /^\/(?:s\/[cu]|a\/sc)(?:\/|$)/.test(path))
@@ -38,7 +48,7 @@ export function isKnownTrackingLink(value: string): boolean {
 
 /** Resolve only wrapper formats whose destination is explicitly present in the received URL. */
 function explicitDestination(url: URL): string | null {
-  if (!/(?:^|\.)(?:awstrack\.me|email\.stripe\.com)$/.test(url.hostname)) return null;
+  if (!/(?:^|\.)(?:awstrack\.me|email\.stripe\.com)$/.test(trackingHost(url))) return null;
   const match = /^\/CL[01]\/([^/]+)(?:\/|$)/i.exec(url.pathname);
   if (!match) return null;
   try {
@@ -64,14 +74,16 @@ export function cleanMailLink(value: string): string | null {
 
 /** Mail clients may auto-link URLs in either text/plain or visible HTML text. */
 export function protectMailText(value: string): string {
-  return value.replace(/https?:\/\/[^\s<>"'\u0000-\u001f]+/gi, (match) => {
+  return value.replace(/(^|[^\p{L}\p{N}@/_.:-])((?:https?:\/\/|\/\/)[^\s<>"'\u0000-\u001f]+|(?:[a-z0-9-]{1,63}\.)+[a-z]{2,63}\.?\/[^\s<>"'\u0000-\u001f]*)/giu, (whole, prefix: string, match: string) => {
     const original = match.replace(/[.,;!]+$/, '');
     let url = original;
     const imbalance = (url.match(/\)/g)?.length ?? 0) - (url.match(/\(/g)?.length ?? 0);
     const trailing = /\)+$/.exec(url)?.[0].length ?? 0;
     const remove = Math.min(Math.max(imbalance, 0), trailing);
     if (remove) url = url.slice(0, -remove);
-    const cleaned = cleanMailLink(url);
-    return (cleaned ?? TRACKING_LINK_PLACEHOLDER) + match.slice(url.length);
+    const absolute = /^(?:https?:|\/\/)/i.test(url) ? url : "https://" + url;
+    if (!isKnownTrackingLink(absolute)) return whole;
+    const cleaned = cleanMailLink(absolute);
+    return prefix + (cleaned ?? TRACKING_LINK_PLACEHOLDER) + match.slice(url.length);
   });
 }

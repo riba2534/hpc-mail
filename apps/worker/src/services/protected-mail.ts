@@ -1,4 +1,4 @@
-import { cleanMailLink, protectMailText } from '@hpc-mail/shared';
+import { cleanMailLink, normalizeMimeType, protectMailText } from '@hpc-mail/shared';
 import { defaultTreeAdapter, parseFragment, type DefaultTreeAdapterTypes } from 'parse5';
 import { escapeHtml, htmlToText } from '../lib/text.js';
 
@@ -25,6 +25,33 @@ const LAYOUT_ATTRIBUTES = new Set([
 export function safeMailContentId(value: string): string | null {
   const id = value.replace(/^<|>$/g, '');
   return /^[\x21-\x3b\x3d\x3f-\x7e]{1,254}$/.test(id) ? id : null;
+}
+
+export function hasRasterSignature(mimeType: string, bytes: Uint8Array): boolean {
+  const head = String.fromCharCode(...bytes.subarray(0, 32));
+  switch (normalizeMimeType(mimeType)) {
+    case 'image/png':
+      return head.startsWith('\x89PNG\r\n\x1a\n');
+    case 'image/jpeg':
+      return head.startsWith('\xff\xd8\xff');
+    case 'image/gif':
+      return head.startsWith('GIF87a') || head.startsWith('GIF89a');
+    case 'image/webp':
+      return head.startsWith('RIFF') && head.slice(8, 12) === 'WEBP';
+    case 'image/avif':
+      return head.slice(4, 8) === 'ftyp' && /(?:avif|avis)/.test(head.slice(8));
+    default:
+      return false;
+  }
+}
+
+const RESTRICTED_ATTACHMENT_TYPES = new Set(['text/html', 'application/xhtml+xml', 'image/svg+xml', 'text/calendar']);
+
+/** Keep active and nested originals in the mailbox, outside the recipient's preview. */
+export function isRestrictedForwardAttachment(mimeType: string, filename: string): boolean {
+  const type = normalizeMimeType(mimeType);
+  return /^(?:message|multipart)\//.test(type) || RESTRICTED_ATTACHMENT_TYPES.has(type)
+    || /\.(?:eml|mht|mhtml|html?|xhtml|svg|svgz|ics)$/i.test(filename.trim());
 }
 
 function imageCid(source: string | undefined, allowedIds: ReadonlySet<string>): string | null {

@@ -7,6 +7,7 @@ describe('mail privacy URLs', () => {
     expect(cleanMailLink(login)).toBe(login);
     expect(cleanMailLink('https://alerts.example/ls/click?upn=example')).toBeNull();
     expect(cleanMailLink('https://links.email.claude.com/s/c/example')).toBeNull();
+    expect(protectMailText('//links.email.claude.com/s/c/example, links.email.claude.com./s/c/example')).not.toContain('example');
     expect(isKnownTrackingImage('https://mail.example/wf/open?upn=example')).toBe(true);
     expect(isKnownTrackingImage('https://provider.intercom-mail.com/via/o?h=example')).toBe(true);
     expect(cleanMailLink('https://login.example@other.example/a')).toBeNull();

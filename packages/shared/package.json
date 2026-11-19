@@ -8,6 +8,7 @@
     ".": "./src/index.ts",
     "./constants": "./src/constants.ts",
     "./mail-address": "./src/mail-address.ts",
+    "./mail-privacy": "./src/mail-privacy.ts",
     "./mcp": "./src/schemas/mcp.ts"
   },
   "scripts": {

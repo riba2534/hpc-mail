@@ -204,10 +204,15 @@ describe('POST /v1/messages/:id/forward', () => {
       bodyText: 'Read: ' + click,
       bodyHtml: '<img src="https://mail.example/wf/open"><a href="' + click + '">Login</a>',
     });
+    await env.r2.put('att/' + src.id + '/nested', 'test');
+    await db.insert(attachments).values({ messageId: src.id, r2Key: 'att/' + src.id + '/nested',
+      filename: 'original.eml', mimeType: 'message/rfc822', size: 4 });
     const sent = await result<MessageSummary>(await request('/v1/messages/' + src.id + '/forward',
       post(w.alice.key, { to: [w.peer.address] })), 201);
     const out = await row(sent.id);
     expect(out.bodyText).toContain('追踪链接已移除');
+    expect(out.bodyText).toContain('部分附件仅在 HPC Mail');
+    expect(sent.hasAttachments).toBe(false);
     expect(out.bodyHtml).toContain('<a>Login</a>');
     expect(out.bodyHtml + out.bodyText).not.toContain('mail.example');
   });
