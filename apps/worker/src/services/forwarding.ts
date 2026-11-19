@@ -1,19 +1,24 @@
-import { EXTERNAL_MESSAGE_MAX_BYTES, type Settings, type UserNotifyPrefs } from '@hpc-mail/shared';
-import { eq } from 'drizzle-orm';
+import {
+  EXTERNAL_MESSAGE_MAX_BYTES, emailAddressSchema, isSafeInlineImageType, normalizeMimeType,
+  protectMailText, type Settings,
+} from '@hpc-mail/shared';
+import { and, inArray, sql } from 'drizzle-orm';
 import { createDb } from '../db/client.js';
-import { attachments } from '../db/schema.js';
+import { notificationJobs } from '../db/schema.js';
 import { deriveSubkey, hmacSha256Base64 } from '../lib/crypto.js';
-import { normalizeEmail } from '../lib/email-address.js';
-import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
-import { convertHtmlToText, escapeHtml, type MailText } from '../lib/text.js';
+import { getEmailDomain, normalizeEmail } from '../lib/email-address.js';
+import { bytesToBase64, encodeBodyBase64, foldBase64, foldMimeHeaders, formatAddressHeader, sanitizeFilename, sanitizeMimeType } from '../lib/mime.js';
+import { isDefiniteSendRejection } from '../lib/send-rejection.js';
+import { escapeHtml, type MailText } from '../lib/text.js';
 import type { Env } from '../types.js';
+import { deliveryEventsQueue, deliveryRefInserts } from './delivery-refs.js';
+import { NOTIFY_OWNER_IDS_SQL } from './mailbox.js';
+import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT } from './notification-jobs.js';
+import { LEGACY_NOTIFY_KEYS, notifyOwnersFromRows, type NotifyOwner, type NotifyOwnerRawRow } from './notify-prefs.js';
+import { protectMailBody, safeMailContentId } from './protected-mail.js';
 import { dayWindow, releaseCounters, reserveCounters, type CounterLimit } from './rate-counter.js';
-import { retainExternalAttachments } from './external-attachment.js';
-import { injectAttachmentLinks } from './attachment-links.js';
-import { saveDeliveryRefs } from './delivery-refs.js';
-import { FORWARD_DOMAIN_DAILY_LIMIT, FORWARD_TARGET_DAILY_LIMIT, recordDeliveryResult, type ForwardMode } from './notification-jobs.js';
-import type { NotifyOwner } from './notify-prefs.js';
 import { getSettings } from './setting.js';
+import { lookupSuppressions, suppressedFor, suppressionMessage } from './suppression.js';
 
 export interface ForwardAttachment {
   content: Uint8Array;
@@ -22,8 +27,6 @@ export interface ForwardAttachment {
   contentId: string;
   disposition: string;
 }
-
-const RELAY_TEXT_TRUNCATED = '（正文过长，纯文本版本只包含开头部分，完整内容请查看 HTML 版本）';
 
 export interface ForwardMail {
   messageId: number;
@@ -37,7 +40,6 @@ export interface ForwardMail {
   html: string;
   replyTo: string[];
   attachments: ForwardAttachment[];
-  /** 收件链路的正文视图：中转正文未改写时复用同一份 HTML → 纯文本转换结果 */
   mailText?: MailText;
 }
 
@@ -53,95 +55,146 @@ export async function isOwnRelay(env: Env, header: string | null | undefined): P
   return header === await hmacSha256Base64(new TextEncoder().encode(env.jwt_secret), 'hpc-mail-relay:v1');
 }
 
-/**
- * 中转转发：原生 forward() 仅对 Email Routing 已验证 destination 生效，目标未验证时
- * 降级为 send_email binding 以 no-reply@收件域名 重新打包发送——保留原始标题/正文/附件，
- * Reply-To 指回原发件人，正文顶部加转发元信息块。返回 send() 给出的 Cloudflare 消息 ID（投递回执据此关联）。
- */
-async function relayForward(env: Env, target: string, mail: ForwardMail): Promise<string | null> {
-  // 动态 import：`cloudflare:email`/`mimetext` 静态加载会让 vitest 的 workerd 崩（同 outbound.ts）
+interface RelayAttachment extends ForwardAttachment {
+  inlineId: string | null;
+}
+
+interface RelayBody {
+  text: string;
+  html: string;
+  attachments: RelayAttachment[];
+  reply: boolean;
+}
+
+function relayOrigin(env: Env): URL | null {
+  if (!env.site_origin) return null;
+  try {
+    const url = new URL(env.site_origin);
+    return url.protocol === 'https:' && !url.username && !url.password ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function cleanTitle(value: string): string {
+  const title = value.replace(/[\x00-\x1f\x7f]+/g, ' ')
+    .replace(/(?:https?:\/\/|(?<![\w:])\/\/|\bwww\.)[^\s<>]+/gi, '（链接已省略）')
+    .trim();
+  return Array.from(title).slice(0, 240).join('') || '(无主题)';
+}
+
+function hasRasterSignature(attachment: ForwardAttachment): boolean {
+  const bytes = attachment.content;
+  const head = String.fromCharCode(...bytes.subarray(0, 32));
+  switch (normalizeMimeType(attachment.mimeType)) {
+    case 'image/png':
+      return head.startsWith('\x89PNG\r\n\x1a\n');
+    case 'image/jpeg':
+      return head.startsWith('\xff\xd8\xff');
+    case 'image/gif':
+      return head.startsWith('GIF87a') || head.startsWith('GIF89a');
+    case 'image/webp':
+      return head.startsWith('RIFF') && head.slice(8, 12) === 'WEBP';
+    case 'image/avif':
+      return head.slice(4, 8) === 'ftyp' && /(?:avif|avis)/.test(head.slice(8));
+    default:
+      return false;
+  }
+}
+
+const RESTRICTED_ATTACHMENT_TYPES = new Set(['text/html', 'application/xhtml+xml', 'image/svg+xml', 'text/calendar']);
+
+function relayAttachments(attachments: ForwardAttachment[]): RelayAttachment[] {
+  const counts = new Map<string, number>();
+  for (const attachment of attachments) {
+    const id = safeMailContentId(attachment.contentId);
+    if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return attachments.flatMap((attachment): RelayAttachment[] => {
+    const type = normalizeMimeType(attachment.mimeType);
+    if (/^(?:message|multipart)\//.test(type) || RESTRICTED_ATTACHMENT_TYPES.has(type)
+      || /\.(?:eml|mht|mhtml|html?|xhtml|svg|svgz|ics)$/i.test(attachment.filename.trim())) return [];
+    const id = safeMailContentId(attachment.contentId);
+    const inlineId = id && counts.get(id) === 1 && attachment.disposition === 'inline'
+      && isSafeInlineImageType(type) && hasRasterSignature(attachment) ? id : null;
+    return [{ ...attachment, mimeType: inlineId ? type : attachment.mimeType, inlineId }];
+  });
+}
+
+function relaySize(text: string, html: string, attachments: RelayAttachment[]): number {
+  return Math.ceil(new TextEncoder().encode(text + html).byteLength * 1.38)
+    + attachments.reduce((sum, attachment) => sum + Math.ceil(attachment.content.byteLength * 1.38), 0);
+}
+
+const readInMail = (link: string) => link ? `登录 HPC Mail 查看原信：${link}` : '请登录 HPC Mail 查看原信。';
+
+function noticeBody(link: string): RelayBody {
+  return { text: `HPC Mail 收到了一封新邮件。\n\n${readInMail(link)}`, html: '', attachments: [], reply: false };
+}
+
+/** 外部邮箱自己决定加载策略。正文净化发生在 MIME 组装前，大附件只提示去有权限的站内原信下载。 */
+async function protectedBody(mail: ForwardMail, link: string): Promise<RelayBody> {
+  let attachments = relayAttachments(mail.attachments);
+  let body = await protectMailBody({
+    text: mail.text,
+    html: mail.html,
+    inlineContentIds: attachments.flatMap((attachment) => attachment.inlineId ? [attachment.inlineId] : []),
+  });
+  if (relaySize(body.text, body.html, attachments) > EXTERNAL_MESSAGE_MAX_BYTES && attachments.length) {
+    attachments = [];
+    body = await protectMailBody({ text: mail.text, html: mail.html });
+  }
+  if (relaySize(body.text, body.html, attachments) > EXTERNAL_MESSAGE_MAX_BYTES) return noticeBody(link);
+  const note = [
+    ...(attachments.length < mail.attachments.length ? ['部分附件仅在 HPC Mail 可查看。'] : []),
+  ];
+  const meta = [
+    `原始发件人：${protectMailText([mail.fromName, mail.fromAddress].filter(Boolean).join(' '))}`,
+    `原收件地址：${mail.toAddress}`,
+  ];
+  return {
+    text: [...meta, '', body.text, '', ...note, readInMail(link)].join('\n'),
+    html: body.html ? `<p>${meta.map(escapeHtml).join('<br>')}</p>${body.html}<p>`
+      + [...note.map(escapeHtml), link ? `<a href="${escapeHtml(link)}">登录 HPC Mail 查看原信</a>` : escapeHtml(readInMail(''))].join('<br>')
+      + '</p>' : '',
+    attachments, reply: true,
+  };
+}
+
+async function relayMessage(env: Env, sender: string, target: string, mail: ForwardMail, body: RelayBody) {
+  // 静态 import cloudflare:email 和 mimetext 会导致本地 workerd 加载失败。
   const [{ EmailMessage }, { createMimeMessage }] = await Promise.all([
     import('cloudflare:email'),
     import('mimetext/browser'),
   ]);
-  const sender = `no-reply@${mail.domain}`;
-  const origin = mail.fromName ? `${mail.fromName} <${mail.fromAddress}>` : mail.fromAddress;
-  const metaLines = [
-    `原始发件人: ${origin}`,
-    `原收件地址: ${mail.toAddress}`,
-    '直接回复本邮件将发送给原始发件人。',
-  ];
-
-  let text = mail.text;
-  let html = mail.html;
-  let relayedAttachments = mail.attachments;
-  const encodedBytes = Math.ceil(new TextEncoder().encode(text + html).length * 1.38) +
-    mail.attachments.reduce((sum, attachment) => sum + Math.ceil(attachment.content.byteLength * 1.38), 0);
-  if (mail.attachments.length && encodedBytes > EXTERNAL_MESSAGE_MAX_BYTES) {
-    const rows = await createDb(env).select().from(attachments)
-      .where(eq(attachments.messageId, mail.messageId)).all();
-    if (rows.length !== mail.attachments.length) throw new Error('转发附件尚未完整保存，无法生成下载链接');
-    const retained = await retainExternalAttachments(env, rows, env.site_origin ?? 'https://hpc.email');
-    const linked = injectAttachmentLinks(text, html, rows.map(row => ({
-      filename: row.filename, size: row.size, contentId: row.contentId, url: retained.get(row.id)!,
-    })));
-    text = linked.text;
-    html = linked.html;
-    relayedAttachments = [];
-  }
-  if (Math.ceil(new TextEncoder().encode(text + html).length * 1.38) > EXTERNAL_MESSAGE_MAX_BYTES) {
-    throw new Error('转发正文超过外发大小上限，请在邮箱网站查看完整邮件');
-  }
-
-  // 附件改为下载链接时正文已改写，只能重新转换
-  const reused = mail.mailText && text === mail.text && html === mail.html ? mail.mailText : null;
-  const converted = reused ? { text: reused.plain, truncated: reused.plainTruncated }
-    : text ? { text, truncated: false } : convertHtmlToText(html);
-  // HTML 超长时纯文本只转换了开头，HTML 部分仍完整转发
-  const plainText = converted.truncated ? `${converted.text}\n\n${RELAY_TEXT_TRUNCATED}` : converted.text;
   const msg = createMimeMessage();
-  msg.setSender({ name: `${mail.fromName || mail.fromAddress} (via HPC Mail)`, addr: sender });
+  msg.setSender({ name: 'HPC Mail 转发', addr: sender });
   msg.setRecipient(target);
-  msg.setSubject(mail.subject || '(无主题)');
+  msg.setSubject(cleanTitle(mail.subject));
+  const messageId = `<${crypto.randomUUID()}@${getEmailDomain(sender)}>`;
+  msg.setHeader('Message-ID', messageId);
   msg.setHeader('X-HPC-Mail-Relay', await relayMarker(env));
-  // RFC 3834：自动转发的信，收件方不应再自动回复（假期回复、退信机器人）
   msg.setHeader('Auto-Submitted', 'auto-forwarded');
-  const replies = mail.replyTo.length ? mail.replyTo : [mail.fromAddress].filter(Boolean);
-  msg.addMessage({
-    contentType: 'text/plain',
-    charset: 'UTF-8',
-    encoding: 'base64',
-    data: encodeBodyBase64(
-      `———— HPC Mail 转发 ————\n${metaLines.join('\n')}\n————————————————\n\n${plainText}`,
-    ),
-  });
-  if (html) {
-    const metaHtml =
-      '<div style="margin:0 0 16px;padding:10px 14px;border-left:3px solid #8b8fa3;background:#f5f6f8;color:#4b4f5c;font-size:12px;line-height:1.9">' +
-      '<div style="font-weight:600">HPC Mail 转发</div>' +
-      metaLines.map((l) => `<div>${escapeHtml(l)}</div>`).join('') +
-      '</div>';
-    msg.addMessage({
-      contentType: 'text/html',
-      charset: 'UTF-8',
-      encoding: 'base64',
-      data: encodeBodyBase64(metaHtml + html),
-    });
+  msg.addMessage({ contentType: 'text/plain', charset: 'UTF-8', encoding: 'base64', data: encodeBodyBase64(body.text) });
+  if (body.html) {
+    msg.addMessage({ contentType: 'text/html', charset: 'UTF-8', encoding: 'base64', data: encodeBodyBase64(body.html) });
   }
-  for (const a of relayedAttachments) {
-    // 附件 Base64 与不可信 MIME 参数沿用统一编码、清洗规则。
+  for (const attachment of body.attachments) {
     msg.addAttachment({
-      filename: sanitizeFilename(a.filename),
-      contentType: sanitizeMimeType(a.mimeType),
-      data: foldBase64(bytesToBase64(a.content)),
-      ...(a.disposition === 'inline' && a.contentId
-        ? { inline: true, headers: { 'Content-ID': `<${a.contentId}>` } } : {}),
+      filename: sanitizeFilename(attachment.filename),
+      contentType: sanitizeMimeType(attachment.mimeType),
+      data: foldBase64(bytesToBase64(attachment.content)),
+      ...(attachment.inlineId ? { inline: true, headers: { 'Content-ID': `<${attachment.inlineId}>` } } : {}),
     });
   }
-  // mimetext 的 Reply-To Setter 只允许单个 Mailbox；最终原文添加完整地址列表。
-  const raw = msg.asRaw();
-  const replyHeader = replies.length ? `Reply-To: ${replies.map(normalizeEmail).join(', ')}\r\n` : '';
-  return (await env.email.send(new EmailMessage(sender, target, foldMimeHeaders(replyHeader + raw))))?.messageId || null;
+  const replies = body.reply ? (mail.replyTo.length ? mail.replyTo : [mail.fromAddress]).flatMap((address) => {
+    const parsed = emailAddressSchema.safeParse(address);
+    return parsed.success && !/[\x00-\x1f\x7f<>,()";:\\]/.test(parsed.data) ? [{ address: parsed.data, name: '' }] : [];
+  }) : [];
+  const replyHeader = replies.length ? formatAddressHeader('Reply-To', replies) + '\r\n' : '';
+  const raw = foldMimeHeaders(replyHeader + msg.asRaw());
+  if (new TextEncoder().encode(raw).byteLength > EXTERNAL_MESSAGE_MAX_BYTES) return null;
+  return { message: new EmailMessage(sender, target, raw), messageId };
 }
 
 /** 中转转发的日计数：全站一格（subject `instance`），未认领地址的来信另共用一格（subject `unclaimed`），按天窗口 */
@@ -150,34 +203,33 @@ export const FORWARD_RELAY_SCOPE = 'fwd-relay';
 export const FORWARD_RELAY_USER_SCOPE = 'fwd-relay-user';
 
 interface Forwarders {
-  list: { userId: number; prefs: UserNotifyPrefs }[];
-  /** 来信时地址未被认领（归属人是全体管理员） */
+  list: Map<number, NotifyOwner>;
   unclaimed: boolean;
 }
 
-/**
- * 开启转发且仍启用的归属人（owners 为 loadNotifyOwners 读出的状态与偏好），以及来信时地址是否未认领。
- * 有人开启转发时才查一次地址当前的认领人（在 waitUntil 里，不在收件 Ack 前）。已停用的归属人原生与中转都不转发。
- * 已认领地址的归属快照只有认领人一个；快照里有多人（全体管理员），或唯一那人不是当前认领人，按未认领计。
- */
+/** 发信前刷新归属与偏好。只允许收信时及现在都有权读取原信的用户转发该信。 */
 async function loadForwarders(env: Env, mail: ForwardMail, owners: Map<number, NotifyOwner>): Promise<Forwarders> {
-  const list = mail.ownerIds.flatMap((userId) => {
-    const owner = owners.get(userId);
-    return owner?.active && owner.prefs.forward.enabled ? [{ userId, prefs: owner.prefs }] : [];
-  });
-  if (!list.length) return { list: [], unclaimed: false };
-  const claim = await env.db.prepare('SELECT user_id AS id FROM mailboxes WHERE address = ?1').bind(mail.toAddress).first<{ id: number }>();
-  const unclaimed = !(mail.ownerIds.length === 1 && claim !== null && Number(claim.id) === mail.ownerIds[0]);
-  return { list, unclaimed };
+  const list = new Map<number, NotifyOwner>();
+  if (![...owners.values()].some((owner) => owner.active && owner.prefs.forward.enabled && owner.prefs.forward.addresses.length)) {
+    return { list, unclaimed: false };
+  }
+  const [result, legacy] = await env.db.batch([
+    env.db.prepare(`SELECT id, status, role, notify_prefs,
+      NOT EXISTS (SELECT 1 FROM mailboxes WHERE address = ?1) AS unclaimed
+      FROM users WHERE status = 'active' AND id IN (${NOTIFY_OWNER_IDS_SQL})
+      AND id IN (SELECT value FROM json_each(?2))`).bind(mail.toAddress, JSON.stringify(mail.ownerIds)),
+    env.db.prepare('SELECT key, value FROM settings WHERE key IN (?1, ?2, ?3)').bind(...LEGACY_NOTIFY_KEYS),
+  ]);
+  const rows = result!.results as (NotifyOwnerRawRow & { unclaimed: number })[];
+  return {
+    list: notifyOwnersFromRows(rows, legacy!.results as { key: string; value: string }[]),
+    unclaimed: rows[0]?.unclaimed === 1,
+  };
 }
 
 type RelayQuota = Pick<Settings['quota'], 'relayDaily' | 'relayPerUserDaily' | 'relayUnclaimedDaily'>;
 
-/**
- * 中转额度：全站一格，再加来信地址那一格——已认领地址计在认领人名下；未认领地址（归全体管理员）共用
- * `unclaimed` 一格：catch-all 谁都能灌信，不能按管理员人数叠加。返回跳过原因（有额度时为空串）
- * 与占到的格子（中转失败时退还）。
- */
+/** 认领地址的中转计入归属人限额，catch-all 的来信共享未认领额度。 */
 async function reserveRelay(
   env: Env, window: number, forwarders: Forwarders, ownerId: number, quota: RelayQuota,
 ): Promise<{ skipped: string; taken: CounterLimit[] }> {
@@ -191,20 +243,52 @@ async function reserveRelay(
   return { skipped: '', taken: [site, own] };
 }
 
-/** 退还没用上的额度；退还失败只记日志，不改变这次转发的结果 */
 async function releaseQuota(env: Env, items: CounterLimit[]): Promise<void> {
   try {
     await releaseCounters(env, items);
-  } catch (error) {
-    console.error('转发额度退还失败:', error);
+  } catch {
+    console.error('转发额度退还失败');
   }
 }
 
-/**
- * 原生收件与站内互投使用同一归属偏好、限额及环路保护。
- * 每个目标先占域名与目标两个日计数（已满不再累加），再试原生 forward()；原生失败才走中转并占中转额度。
- * 中转因额度跳过时退还域名与目标计数（这次什么也没发出去）；中转抛错时退还中转额度。
- */
+interface TargetForward {
+  userIds: number[];
+  notice: boolean;
+}
+
+/** 在提交 SMTP 前原子占用整组。在进程中断后，现有通知巡检会把陈旧的 processing 标为 unknown。 */
+async function claimForward(env: Env, mail: ForwardMail, target: string, policy: TargetForward) {
+  const keyOf = (userId: number) => `mail:${mail.messageId}:${userId}:forward:${target}`;
+  const now = Date.now();
+  const result = await env.db.prepare(`WITH eligible AS MATERIALIZED (
+      SELECT id, CASE WHEN json_valid(notify_prefs) THEN json_extract(notify_prefs, '$.forward.contentMode') END AS mode
+      FROM users WHERE status = 'active' AND id IN (${NOTIFY_OWNER_IDS_SQL}) AND id IN (SELECT value FROM json_each(?5))
+      AND CASE
+        WHEN notify_prefs IS NULL THEN role = 'admin'
+        WHEN json_valid(notify_prefs) THEN json_extract(notify_prefs, '$.forward.enabled') = 1
+          AND EXISTS (
+            SELECT 1 FROM json_each(notify_prefs, '$.forward.addresses')
+            WHERE trim(lower(value)) = ?4
+          )
+        ELSE 0 END
+      AND NOT EXISTS (
+        SELECT 1 FROM notification_jobs WHERE dedupe_key IN (SELECT value FROM json_each(?6))
+      )
+    )
+    INSERT INTO notification_jobs (
+      message_id, user_id, channel, target, payload, status, attempts, max_attempts,
+      next_attempt_at, created_at, updated_at, last_attempt_at, forward_mode, dedupe_key
+    )
+    SELECT ?3, id, 'forward', ?4, '{}', 'processing', 1, 1, ?2, ?2, ?2, ?2, 'relay',
+      'mail:' || ?3 || ':' || id || ':forward:' || ?4 FROM eligible
+    WHERE ?7 = 1 OR NOT EXISTS (SELECT 1 FROM eligible WHERE mode = 'notice')
+    ON CONFLICT(dedupe_key) DO NOTHING RETURNING id, user_id`)
+    .bind(mail.toAddress, now, mail.messageId, target, JSON.stringify(policy.userIds),
+      JSON.stringify(mail.ownerIds.map(keyOf)), Number(policy.notice)).all<{ id: number; user_id: number }>();
+  return result.results;
+}
+
+/** 收件、站内转发与所有目标邮箱均通过净化后的 MIME 中转。 */
 export async function forwardReceivedMail(
   env: Env,
   mail: ForwardMail,
@@ -213,68 +297,101 @@ export async function forwardReceivedMail(
 ): Promise<void> {
   if (await isOwnRelay(env, native?.headers.get('x-hpc-mail-relay'))) return;
   const forwarders = await loadForwarders(env, mail, owners);
-  const ownersByTarget = new Map<string, Set<number>>();
-  for (const { userId, prefs } of forwarders.list) {
-    for (const rawTarget of prefs.forward.addresses) {
+  const targets = new Map<string, TargetForward>();
+  for (const [userId, owner] of forwarders.list) {
+    if (!owner.active || !owner.prefs.forward.enabled) continue;
+    for (const rawTarget of owner.prefs.forward.addresses) {
       const target = normalizeEmail(rawTarget);
-      if (!target || target === mail.toAddress) continue;
-      ownersByTarget.set(target, (ownersByTarget.get(target) ?? new Set()).add(userId));
+      if (!target || target === normalizeEmail(mail.toAddress)) continue;
+      const group = targets.get(target) ?? { userIds: [], notice: false };
+      group.userIds.push(userId);
+      group.notice ||= owner.prefs.forward.contentMode === 'notice';
+      targets.set(target, group);
     }
   }
+  if (!targets.size) return;
+
+  const site = relayOrigin(env);
+  const sender = `no-reply@${site?.hostname ?? mail.domain}`;
+  const originalLink = site ? new URL(`/mail/${mail.messageId}`, site).href : '';
+  const recordReceipts = deliveryEventsQueue(env) !== null;
+  const quota = await getSettings(env).then((settings) => settings.quota);
+  const blocked = recordReceipts
+    ? suppressedFor(await lookupSuppressions(env, [...targets.keys()]), getEmailDomain(sender)) : null;
   const window = dayWindow();
-  let quota: Promise<RelayQuota> | undefined;
-  for (const [target, owned] of ownersByTarget) {
-    const userIds = [...owned];
-    let status: 'succeeded' | 'failed' | 'skipped' = 'succeeded';
+  const db = createDb(env);
+  let protectedCopy: Promise<RelayBody> | undefined;
+  for (const [target, group] of targets) {
+    let status: 'succeeded' | 'failed' | 'skipped' | 'unknown' = 'succeeded';
     let detail = '';
-    let forwardMode: ForwardMode = '';
-    let providerMessageId: string | null = null;
+    let handedOver = false;
+    let sent: { providerMessageId: string | null; rfcMessageId: string } | undefined;
+    let takenLimits: CounterLimit[] = [];
+    let takenRelay: CounterLimit[] = [];
+    const claimed = await claimForward(env, mail, target, group).catch(() => {
+      console.error('转发任务认领失败');
+      return [];
+    });
+    if (!claimed.length) continue;
     try {
-      const limits: CounterLimit[] = [
-        { scope: 'fwd-domain', subject: mail.domain, window, limit: FORWARD_DOMAIN_DAILY_LIMIT },
-        { scope: 'fwd-target', subject: target, window, limit: FORWARD_TARGET_DAILY_LIMIT },
-      ];
-      const [domainFull, targetFull] = await reserveCounters(env, limits);
-      if (domainFull || targetFull) {
+      const suppression = blocked?.get(target);
+      if (suppression) {
         status = 'skipped';
-        detail = '今日转发额度已用尽';
+        detail = suppressionMessage(suppression);
       } else {
-        if (native) {
-          try { await native.forward(target); forwardMode = 'native'; }
-          catch { /* 未验证目标改用 Cloudflare 中转。 */ }
-        }
-        if (!forwardMode) {
-          quota ??= getSettings(env).then((settings) => settings.quota);
-          const relay = await reserveRelay(env, window, forwarders, userIds[0]!, await quota);
+        const limits: CounterLimit[] = [
+          { scope: 'fwd-domain', subject: mail.domain, window, limit: FORWARD_DOMAIN_DAILY_LIMIT },
+          { scope: 'fwd-target', subject: target, window, limit: FORWARD_TARGET_DAILY_LIMIT },
+        ];
+        const [domainFull, targetFull] = await reserveCounters(env, limits);
+        if (domainFull || targetFull) {
+          status = 'skipped';
+          detail = '今日转发额度已用尽';
+        } else {
+          takenLimits = limits;
+          const relay = await reserveRelay(env, window, forwarders, claimed[0]!.user_id, quota);
           if (relay.skipped) {
             status = 'skipped';
             detail = relay.skipped;
-            await releaseQuota(env, limits);
           } else {
-            forwardMode = 'relay';
-            try {
-              providerMessageId = await relayForward(env, target, mail);
-            } catch (error) {
-              await releaseQuota(env, relay.taken);
-              throw error;
-            }
+            takenRelay = relay.taken;
+            const body = group.notice ? noticeBody(originalLink)
+              : await (protectedCopy ??= protectedBody(mail, originalLink).catch(() => noticeBody(originalLink)));
+            const prepared = (await relayMessage(env, sender, target, mail, body))
+              ?? (await relayMessage(env, sender, target, mail, noticeBody(originalLink)));
+            if (!prepared) throw new Error('Safe forward exceeded MIME size limit');
+            const email = env.email;
+            if (!email) throw new Error('Email sending binding unavailable');
+            handedOver = true;
+            const result = await email.send(prepared.message);
+            sent = { providerMessageId: result?.messageId ?? null, rfcMessageId: prepared.messageId };
           }
         }
       }
     } catch (error) {
-      status = 'failed';
-      detail = error instanceof Error ? error.message : String(error);
-      console.error(`转发到 ${target} 失败:`, error);
+      status = handedOver && !isDefiniteSendRejection(error) ? 'unknown' : 'failed';
+      detail = status === 'unknown' ? '邮件服务返回的投递结果未确认'
+        : handedOver ? '邮件服务拒绝了转发，请检查目标地址及发送额度' : '无法生成安全的转发邮件';
+      console.error(JSON.stringify({ event: 'privacy_forward_failed', messageId: mail.messageId, status }));
     }
-    for (const userId of userIds) {
-      try { await recordDeliveryResult(env, { userId, messageId: mail.messageId,
-        channel: 'forward', target, status, error: detail, forwardMode }); }
-      catch (error) { console.error('转发结果记录失败:', error); }
-    }
-    // 中转在 Cloudflare 侧的最终结果（退信等）经投递回执回写到上面的转发记录；原生 forward() 没有回执
-    if (forwardMode === 'relay' && status === 'succeeded') {
-      await saveDeliveryRefs(env, { kind: 'forward', messageId: mail.messageId, sender: `no-reply@${mail.domain}`,
-        rfcMessageId: null, ownerIds: userIds, targets: [{ recipient: target, providerMessageId }] });
+    if ((status === 'failed' || status === 'skipped') && takenRelay.length) await releaseQuota(env, takenRelay);
+    if (!handedOver && takenLimits.length) await releaseQuota(env, takenLimits);
+
+    try {
+      const write = db.update(notificationJobs).set({
+        status, lastError: detail, updatedAt: new Date(), forwardMode: handedOver ? 'relay' : '',
+      }).where(and(sql`${notificationJobs.id} IN (SELECT value FROM json_each(${JSON.stringify(claimed.map((row) => row.id))}))`,
+        inArray(notificationJobs.status, ['processing', 'unknown'])));
+      if (recordReceipts && sent) {
+        await db.batch([write, ...deliveryRefInserts(db, {
+          kind: 'forward', messageId: mail.messageId, sender, rfcMessageId: sent.rfcMessageId,
+          ownerIds: claimed.map((row) => row.user_id), targets: [{ recipient: target, providerMessageId: sent.providerMessageId }],
+        })]);
+      } else {
+        await write;
+      }
+    } catch {
+      console.error('转发结果记录失败');
     }
   }
 }
