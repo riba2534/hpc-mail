@@ -1,4 +1,4 @@
-import { cleanMailLink, isKnownTrackingImage, isKnownTrackingLink } from '@hpc-mail/shared';
+import { cleanMailLink, isKnownTrackingImage, isKnownTrackingLink } from '@hpc-mail/shared/mail-privacy';
 
 export interface VerificationLinkInfo {
   href: string;

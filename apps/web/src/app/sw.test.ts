@@ -27,7 +27,7 @@ function fakeCaches() {
 }
 
 const html = (body: string, init: ResponseInit = {}) =>
-  new Response(body, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, ...init });
+  new Response(body, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=0, no-transform' }, ...init });
 
 /** 在隔离的作用域里执行 public/sw.js 本体，拿到事件监听与路由函数 */
 function loadWorker({ network, httpCached = () => true }: { network: (url: string) => Promise<Response>; httpCached?: (url: string) => boolean }) {
@@ -153,6 +153,25 @@ describe('fetch 事件', () => {
     }
   });
 
+  it.each([
+    ['无防注入响应头', () => html(SHELL, { headers: { 'content-type': 'text/html' } })],
+    ['仍含统计脚本', () => html(SHELL.replace('</head>', '<script data-cf-beacon="fixture"></script></head>'))],
+  ])('拒绝缓存和提供%s的旧外壳', async (_, unsafe) => {
+    const worker = loadWorker({ network: async () => unsafe() });
+    await worker.lifecycle('install');
+    expect(await worker.shellText()).toBeUndefined();
+    const response = await worker.navigate('/mail/1');
+    expect(response?.status).toBe(503);
+    expect(await worker.shellText()).toBeUndefined();
+  });
+
+  it('忽略已缓存的不安全外壳，返回经过检查的网络版本', async () => {
+    const worker = loadWorker({ network: async () => html(NEW_SHELL) });
+    const cache = await worker.caches.open(worker.SHELL_CACHE);
+    await cache.put('/', html(SHELL.replace('</head>', '<script data-cf-beacon="fixture"></script></head>')));
+    expect(await (await worker.navigate('/mail/1'))!.text()).toBe(NEW_SHELL);
+  });
+
   it('API、静态资源与 Agent 文档不调用 respondWith', async () => {
     const worker = loadWorker({ network: async () => html(SHELL) });
     expect(await worker.navigate('/skill.md')).toBeNull();
@@ -209,7 +228,7 @@ describe('fetch 事件', () => {
 
 describe('外壳识别', () => {
   it('index.html 带有 SW 识别外壳用的挂载点标记', () => {
-    // sw.js 只缓存含 <div id="root"> 的 HTML；改挂载点写法时同步修改 isShellResponse
+    // sw.js 只缓存含 <div id="root"> 的 HTML；改挂载点写法时同步修改 shellKind
     expect(indexHtml).toContain('<div id="root">');
     expect(swSource).toContain(`includes('<div id="root">')`);
   });
@@ -218,13 +237,13 @@ describe('外壳识别', () => {
 describe('生命周期', () => {
   it('安装时预先缓存外壳并立即接管；激活时清理旧版本缓存', async () => {
     const worker = loadWorker({ network: async () => html(SHELL) });
-    await worker.caches.open('hpc-shell-v0');
+    await worker.caches.open('hpc-shell-v1');
     await worker.caches.open('other-cache');
     await worker.lifecycle('install');
     expect(worker.self.skipWaiting).toHaveBeenCalled();
     expect(await worker.shellText()).toBe(SHELL);
     await worker.lifecycle('activate');
-    expect([...worker.caches.stores.keys()].sort()).toEqual(['hpc-shell-v1', 'other-cache']);
+    expect([...worker.caches.stores.keys()].sort()).toEqual(['hpc-shell-v2', 'other-cache']);
     expect(worker.self.clients.claim).toHaveBeenCalled();
   });
 

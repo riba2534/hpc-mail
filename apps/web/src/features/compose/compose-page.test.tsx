@@ -268,6 +268,22 @@ describe('scene drafts and leaving the page', () => {
     second.unmount(); second.client.clear();
   });
 
+  it.each([false, true])('恢复没有附件的转发草稿并保留主动断开来源的选择（detached=%s）', async (detached) => {
+    const state = { fromAddress: 'first@one.example', to: ['receiver@example.test'], subject: 'Fwd: hi', body: 'fyi',
+      mode: 'forward' as const, forwardAttachmentsFrom: 8, sourceMessageId: 8 };
+    localStorage.setItem(draftKeyForUser(1, 'forward:8'), JSON.stringify({
+      ...state, forwardAttachmentsFrom: undefined, forwardSourceDetached: detached || undefined, cc: [], bcc: [], isHtml: false,
+    }));
+    mocks.send.mockImplementation(() => new Promise(() => {}));
+    const { client, unmount } = mountRouter(state);
+    fireEvent.click(await screen.findByRole('button', { name: '继续编辑' }));
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    const sent = mocks.send.mock.calls[0]![0];
+    expect(sent.forwardAttachmentsFrom).toBe(detached ? undefined : 8);
+    unmount(); client.clear();
+  });
+
   it('cancel asks to save or discard; discarding clears the draft and leaves', async () => {
     const { client, router, unmount } = mountRouter();
     fireEvent.change(screen.getByLabelText(/主题/), { target: { value: 'typed' } });
@@ -525,6 +541,7 @@ describe('source mail no longer available', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('原邮件的附件已不可用，无法一起转发');
     fireEvent.click(screen.getByRole('button', { name: '去掉原邮件附件' }));
     expect(screen.queryByText(/转发来源为邮件/)).toBeNull();
+    expect(JSON.parse(localStorage.getItem(draftKeyForUser(1, 'forward:8'))!)).toMatchObject({ forwardSourceDetached: true });
     expect(mocks.send).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));

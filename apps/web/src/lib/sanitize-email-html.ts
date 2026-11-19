@@ -1,5 +1,5 @@
 import createDOMPurify from 'dompurify'
-import { cleanMailLink, isKnownTrackingImage, protectMailText } from '@hpc-mail/shared'
+import { cleanMailLink, isKnownTrackingImage, protectMailText } from '@hpc-mail/shared/mail-privacy'
 
 const ALLOWED_TAGS = [
   'a', 'abbr', 'address', 'article', 'aside', 'b', 'blockquote', 'br', 'caption',

@@ -1,6 +1,6 @@
 import { Component, type ReactNode } from 'react'
 
-import { protectMailText } from '@hpc-mail/shared'
+import { protectMailText } from '@hpc-mail/shared/mail-privacy'
 import { htmlToPlainText } from './html-to-plain-text'
 
 export { htmlToPlainText } from './html-to-plain-text'
