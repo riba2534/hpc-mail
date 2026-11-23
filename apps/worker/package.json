@@ -19,7 +19,7 @@
     "drizzle-orm": "^0.45.4",
     "hono": "^4.13.19",
     "mimetext": "^3.0.28",
-    "parse5": "8.0.1",
+    "parse5": "8.1.1",
     "postal-mime": "^4.2.1"
   },
   "devDependencies": {
