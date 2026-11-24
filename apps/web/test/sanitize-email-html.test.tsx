@@ -353,6 +353,10 @@ describe('shorthands declared with var()', () => {
     ['margin', '0 var(--gutter) 8px'],
     ['border', '1px solid var(--button-border)'],
     ['border-radius', 'var(--button-radius)'],
+    ['border-inline', '1px solid var(--accent)'],
+    ['border-block-start', '2px dashed var(--accent)'],
+    ['border-inline-width', 'var(--w)'],
+    ['overflow', 'var(--overflow)'],
   ]
   for (const [property, value] of kept) {
     it(`keeps ${property} on both style paths`, () => {

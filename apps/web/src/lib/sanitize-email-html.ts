@@ -80,6 +80,8 @@ const SAFE_CSS_PROPERTIES = new Set([
  * font 会引用字体且包含白名单外的长属性，都不收。border 还会把 border-image 重置为初始值，但无法经它赋值。
  */
 const BOX_SIDES = ['top', 'right', 'bottom', 'left']
+const LOGICAL_AXES = ['block', 'inline']
+const LOGICAL_SIDES = ['start', 'end']
 const BORDER_PARTS = ['width', 'style', 'color']
 const VAR_SHORTHANDS: ReadonlyArray<readonly [string, readonly string[]]> = ([
   ['padding', BOX_SIDES.map((side) => `padding-${side}`)],
@@ -91,10 +93,17 @@ const VAR_SHORTHANDS: ReadonlyArray<readonly [string, readonly string[]]> = ([
   ['border', BOX_SIDES.flatMap((side) => BORDER_PARTS.map((part) => `border-${side}-${part}`))],
   ...BOX_SIDES.map((side) => [`border-${side}`, BORDER_PARTS.map((part) => `border-${side}-${part}`)] as const),
   ...BORDER_PARTS.map((part) => [`border-${part}`, BOX_SIDES.map((side) => `border-${side}-${part}`)] as const),
+  ...LOGICAL_AXES.map((axis) => [`border-${axis}`,
+    LOGICAL_SIDES.flatMap((side) => BORDER_PARTS.map((part) => `border-${axis}-${side}-${part}`))] as const),
+  ...LOGICAL_AXES.flatMap((axis) => LOGICAL_SIDES.map((side) =>
+    [`border-${axis}-${side}`, BORDER_PARTS.map((part) => `border-${axis}-${side}-${part}`)] as const)),
+  ...LOGICAL_AXES.flatMap((axis) => BORDER_PARTS.map((part) =>
+    [`border-${axis}-${part}`, LOGICAL_SIDES.map((side) => `border-${axis}-${side}-${part}`)] as const)),
   ['border-radius', ['border-top-left-radius', 'border-top-right-radius',
     'border-bottom-right-radius', 'border-bottom-left-radius']],
   ['gap', ['row-gap', 'column-gap']],
   ['outline', ['outline-color', 'outline-style', 'outline-width']],
+  ['overflow', ['overflow-x', 'overflow-y']],
 ] as const).filter(([, longhands]) => longhands.every((longhand) => SAFE_CSS_PROPERTIES.has(longhand)))
 
 const UNSAFE_CSS_VALUE = /(?:\b(?:expression|javascript|vbscript|behavior)\b|@import|(?:url|image-set|cross-fade|paint)\s*\(|-moz-binding)/i
