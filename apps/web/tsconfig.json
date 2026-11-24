@@ -5,9 +5,8 @@
     "jsx": "react-jsx",
     "useDefineForClassFields": true,
     "types": ["vite/client"],
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["./src/*"]
     }
   },
   "include": ["src", "test", "vite.config.ts", "vitest.config.ts"]

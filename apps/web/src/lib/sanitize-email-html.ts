@@ -382,7 +382,8 @@ export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOption
       const size = pixelDimension(value)
       return size !== null && size <= 2
     })
-    const concealed = image.hidden || image.style.display === 'none' || image.style.visibility === 'hidden'
+    // hidden 也可能是 'until-found'，同样按隐藏处理
+    const concealed = image.hidden !== false || image.style.display === 'none' || image.style.visibility === 'hidden'
       || (image.style.opacity !== '' && Number(image.style.opacity) === 0)
     const tracking = pixel || concealed
     const sourceAllowed = isSafeImage(image.getAttribute('src'), baseOrigin, trustedOrigins, allowRemoteImages, tracking)
