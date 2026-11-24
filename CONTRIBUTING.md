@@ -4,7 +4,7 @@
 
 ## 开发环境
 
-- Node.js ≥ 22.12、pnpm ≥ 10
+- Node.js ^22.22.2 / ^24.15 / ≥ 26（web 测试用的 jsdom 31 的要求）、pnpm ≥ 10
 - `pnpm install` → `pnpm dev`（worker :8787 + web :3002，vite 已把 `/api` `/v1` 代理到 worker）
 - 本地收信模拟：`apps/worker/scripts/dev-send-mail.sh otp-plain hello@<你配置的域名>`
 
