@@ -24,6 +24,7 @@ import type { Env } from '../src/types.js';
 import { fakeRateLimits } from './fake-rate-limits.js';
 import wranglerToml from '../wrangler.toml?raw';
 import wranglerTestToml from '../wrangler.test.toml?raw';
+import { awayFromMinuteBoundary, MINUTE_EDGE_TIMEOUT } from './support/minute-boundary.js';
 
 const app = createApp();
 const IP = '198.51.100.61';
@@ -61,12 +62,6 @@ async function call(path: string, token: string, target: Env = env) {
 }
 
 const messageOf = async (response: Response) => ((await response.json()) as { error: { message: string } }).error.message;
-
-/** 按分钟计的断言在窗口边界附近会跨格，离整分钟不足 5 秒时等到下一分钟 */
-async function awayFromMinuteBoundary(): Promise<void> {
-  const left = 60_000 - (Date.now() % 60_000);
-  if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
-}
 
 describe('配置与 Key 档位', () => {
   it('wrangler.toml 的 [[ratelimits]] 与代码逐条一致：上限、60 秒周期、namespace_id 互不相同；测试配置不带 binding', () => {
@@ -123,7 +118,7 @@ describe('真实 Rate Limiting binding（miniflare）', () => {
     for (let i = 0; i < 4; i++) verdicts.push((await limitApiKeyRequest(target, apiKey)).rejectedBy);
     expect(verdicts).toEqual([null, null, null, 'key']);
     expect(fakes.rl_api_user.calls).toHaveLength(3);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 });
 
 describe('进程内替身（binding 缺失时）', () => {
@@ -151,7 +146,7 @@ describe('进程内替身（binding 缺失时）', () => {
     expect(remaining).toEqual(['2', '1', '0', '0']);
     expect(await messageOf(last!)).toBe('API 调用频率超限');
     expect(Number(last!.headers.get('X-RateLimit-Reset'))).toBe((Math.floor(Date.now() / 60_000) + 1) * 60);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 });
 
 describe('/api（JWT）限流（用户桶拒绝不进全站桶见 phase0-security 的 R04）', () => {

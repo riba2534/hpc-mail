@@ -9,7 +9,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.12",
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0",
     "pnpm": ">=10"
   },
   "packageManager": "pnpm@10.28.1",
@@ -21,7 +21,7 @@
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {
-    "concurrently": "^9.2.5",
-    "typescript": "^5.9.3"
+    "concurrently": "^10.0.7",
+    "typescript": "^7.0.2"
   }
 }

@@ -10,6 +10,7 @@ import { createApiKey } from '../src/services/api-key.js';
 import { writeApiRequestLog } from '../src/services/api-request-log.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { awayFromMinuteBoundary, MINUTE_EDGE_TIMEOUT } from './support/minute-boundary.js';
 
 const app = createApp();
 afterEach(() => { vi.restoreAllMocks(); });
@@ -27,12 +28,6 @@ const bearer = (token: string, extra: Record<string, string> = {}): RequestInit 
 const post = (token: string, body: unknown): RequestInit => ({
   method: 'POST', headers: { Authorization: `Bearer ${token}`, 'CF-Connecting-IP': IP, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 });
-
-/** 同一分钟内完成的用例才断言「合成一行」：离分钟边界不足 5 秒时先等到下一分钟 */
-async function awayFromMinuteBoundary(): Promise<void> {
-  const left = 60_000 - (Date.now() % 60_000);
-  if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
-}
 
 async function setup(prefix: string) {
   await updateSettings(env, { api: { enabled: true }, security: { require2fa: false } });
@@ -88,7 +83,7 @@ describe('/v1 请求日志按分钟聚合（R19）', () => {
     const page = (await listed.json() as { data: Page<ApiRequestLogEntry> }).data;
     expect(page.items.map((item) => item.count).sort()).toEqual([1, 1, 1, 1, 1, 2, 3]);
     expect(page.items.find((item) => item.count === 3)!.durationMs).toBe(detailRow.durationMs);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 
   it('不同分钟、不同 Key 各自成行；HEAD 与 GET 同样聚合', async () => {
     const { key } = await setup('agg-minute');

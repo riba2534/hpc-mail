@@ -125,7 +125,8 @@ describe('email HTML safety boundary', () => {
     expect(cta).toHaveAttribute('type', 'submit')
     expect(cta).toHaveAttribute('value', 'Continue')
     expect(cta).toHaveClass('button', 'primary')
-    expect(cta?.style.background).not.toBe('')
+    // 只剩 background-color 一个长属性时，简写 background 按规范读出空串，所以断言长属性。
+    expect(cta?.style.backgroundColor).toBe('rgb(17, 17, 17)')
     expect(cta).not.toHaveAttribute('formaction')
     expect(cta).not.toHaveAttribute('onclick')
   })
@@ -320,5 +321,109 @@ describe('email HTML safety boundary', () => {
     expect(frameDocument?.querySelector('script')).toBeNull()
     expect(frameDocument?.documentElement.innerHTML).not.toMatch(/\bonerror\s*=/i)
     expect(frameDocument?.querySelector('img')).toHaveAttribute('referrerpolicy', 'no-referrer')
+  })
+})
+
+describe('shorthands declared with var()', () => {
+  // 同一组声明分别放进 <style> 规则和内联 style，两条消毒路径各取一份结果。
+  function sanitizeBothPaths(declarations: string): Array<[path: string, text: string]> {
+    const content = sanitizeToElement(
+      `<style>.probe { ${declarations} }</style><p class="probe" style="${declarations}">x</p>`,
+    )
+    const rule = /\.probe\{([^}]*)\}/.exec(content.querySelector('style')?.textContent ?? '')?.[1] ?? ''
+    return [['<style>', rule], ['inline', content.querySelector('p.probe')?.getAttribute('style') ?? '']]
+  }
+
+  function parse(declarations: string): CSSStyleDeclaration {
+    const element = document.createElement('span')
+    element.style.cssText = declarations
+    return element.style
+  }
+
+  /** 两条路径上整条声明都被丢弃，同一段里的 color 不受影响 */
+  function expectDropped(declarations: string, forbidden: RegExp): void {
+    for (const [path, text] of sanitizeBothPaths(`${declarations}; color: red`)) {
+      expect(text, `${path}: ${declarations}`).not.toMatch(forbidden)
+      expect(parse(text).getPropertyValue('color'), path).toBe('red')
+    }
+  }
+
+  const kept: Array<[property: string, value: string]> = [
+    ['padding', 'var(--button-padding)'],
+    ['margin', '0 var(--gutter) 8px'],
+    ['border', '1px solid var(--button-border)'],
+    ['border-radius', 'var(--button-radius)'],
+    ['border-inline', '1px solid var(--accent)'],
+    ['border-block-start', '2px dashed var(--accent)'],
+    ['border-inline-width', 'var(--w)'],
+    ['overflow', 'var(--overflow)'],
+  ]
+  for (const [property, value] of kept) {
+    it(`keeps ${property} on both style paths`, () => {
+      for (const [path, text] of sanitizeBothPaths(`${property}: ${value}; color: red`)) {
+        expect(parse(text).getPropertyValue(property), path).toBe(value)
+        expect(parse(text).getPropertyValue('color'), path).toBe('red')
+      }
+    })
+  }
+
+  it('keeps the outcome of mixing var() shorthands with longhands', () => {
+    // 简写之后单独覆盖的长属性必须保留；简写其余部分随之读不出原值，只能放弃。
+    for (const [path, text] of sanitizeBothPaths('padding: var(--p); padding-left: 4px')) {
+      expect(parse(text).getPropertyValue('padding-left'), path).toBe('4px')
+    }
+    for (const [path, text] of sanitizeBothPaths('padding-left: 4px; padding: var(--p)')) {
+      expect(parse(text).getPropertyValue('padding'), path).toBe('var(--p)')
+    }
+    for (const [path, text] of sanitizeBothPaths('padding: var(--p) !important; padding-left: 4px')) {
+      expect(parse(text).getPropertyValue('padding'), path).toBe('var(--p)')
+      expect(parse(text).getPropertyPriority('padding'), path).toBe('important')
+    }
+    // 逻辑属性与物理属性按声明先后层叠，写回的简写要留在原位置。
+    for (const [path, text] of sanitizeBothPaths('padding-inline-start: 4px; padding: var(--p)')) {
+      expect(text.indexOf('padding-inline-start: 4px'), path).toBeGreaterThanOrEqual(0)
+      expect(text.indexOf('padding: var(--p)'), path).toBeGreaterThan(text.indexOf('padding-inline-start'))
+    }
+    for (const [path, text] of sanitizeBothPaths('padding: var(--p); padding-inline-start: 4px')) {
+      expect(text.indexOf('padding: var(--p)'), path).toBeGreaterThanOrEqual(0)
+      expect(text.indexOf('padding-inline-start: 4px'), path).toBeGreaterThan(text.indexOf('padding: var(--p)'))
+    }
+  })
+
+  it('blocks network values hidden in var() shorthands', () => {
+    for (const declarations of [
+      'padding: var(--p) url(https://tracker.test/plain)',
+      'margin: var(--m) URL(https://tracker.test/upper) !important',
+      'border: 1px solid var(--c) u\\72l(https://tracker.test/escaped)',
+      'border-radius: var(--r) \\75 rl(https://tracker.test/escaped-space)',
+      'outline: var(--o) u/**/rl(https://tracker.test/comment)',
+      'gap: var(--g) image-set(https://tracker.test/set 1x)',
+    ]) expectDropped(declarations, /tracker\.test|url|var\(/i)
+  })
+
+  it('blocks height-dependent units in var() shorthands', () => {
+    for (const declarations of [
+      'margin: calc(var(--x) + 10vh)',
+      'padding: var(--p) 5dvh',
+      'border-width: var(--w) 1\\76h',
+      'margin: var(--m) 10/**/vh',
+      'gap: var(--g) 2cqh',
+    ]) expectDropped(declarations, /var\(|vh|cqh/i)
+  })
+
+  it('caps the length of var() shorthand values like custom properties', () => {
+    const fallback = Array.from({ length: 1_100 }, () => '1px').join(' ')
+    expectDropped(`padding: var(--p, ${fallback})`, /var\(/)
+  })
+
+  it('drops var() shorthands outside the allowlist', () => {
+    for (const declarations of [
+      'background: var(--bg)',
+      'font: var(--font)',
+      'list-style: var(--list)',
+      'text-decoration: var(--decoration)',
+      'flex: var(--flex)',
+      'inset: var(--inset)',
+    ]) expectDropped(declarations, /var\(/)
   })
 })

@@ -72,10 +72,45 @@ const SAFE_CSS_PROPERTIES = new Set([
   'white-space', 'width', 'word-break', 'word-spacing', 'word-wrap',
 ])
 
+/**
+ * 简写里带 var() 时解析期无法展开，各长属性处于 pending-substitution 状态：CSSOM 只列出长属性，
+ * 逐项读到的都是空串，来信里的 `padding: var(--p)` 就会整条丢失。只有声明过的简写本身还能读回原值，
+ * 所以对下表里的简写整条写回。只收不会触发网络加载、展开后的长属性全部在 SAFE_CSS_PROPERTIES 里的
+ * 盒模型类简写，经简写写入等价于逐个长属性写 var()，不新增能力。background、list-style 能带图片，
+ * font 会引用字体且包含白名单外的长属性，都不收。border 还会把 border-image 重置为初始值，但无法经它赋值。
+ */
+const BOX_SIDES = ['top', 'right', 'bottom', 'left']
+const LOGICAL_AXES = ['block', 'inline']
+const LOGICAL_SIDES = ['start', 'end']
+const BORDER_PARTS = ['width', 'style', 'color']
+const VAR_SHORTHANDS: ReadonlyArray<readonly [string, readonly string[]]> = ([
+  ['padding', BOX_SIDES.map((side) => `padding-${side}`)],
+  ['padding-block', ['padding-block-start', 'padding-block-end']],
+  ['padding-inline', ['padding-inline-start', 'padding-inline-end']],
+  ['margin', BOX_SIDES.map((side) => `margin-${side}`)],
+  ['margin-block', ['margin-block-start', 'margin-block-end']],
+  ['margin-inline', ['margin-inline-start', 'margin-inline-end']],
+  ['border', BOX_SIDES.flatMap((side) => BORDER_PARTS.map((part) => `border-${side}-${part}`))],
+  ...BOX_SIDES.map((side) => [`border-${side}`, BORDER_PARTS.map((part) => `border-${side}-${part}`)] as const),
+  ...BORDER_PARTS.map((part) => [`border-${part}`, BOX_SIDES.map((side) => `border-${side}-${part}`)] as const),
+  ...LOGICAL_AXES.map((axis) => [`border-${axis}`,
+    LOGICAL_SIDES.flatMap((side) => BORDER_PARTS.map((part) => `border-${axis}-${side}-${part}`))] as const),
+  ...LOGICAL_AXES.flatMap((axis) => LOGICAL_SIDES.map((side) =>
+    [`border-${axis}-${side}`, BORDER_PARTS.map((part) => `border-${axis}-${side}-${part}`)] as const)),
+  ...LOGICAL_AXES.flatMap((axis) => BORDER_PARTS.map((part) =>
+    [`border-${axis}-${part}`, LOGICAL_SIDES.map((side) => `border-${axis}-${side}-${part}`)] as const)),
+  ['border-radius', ['border-top-left-radius', 'border-top-right-radius',
+    'border-bottom-right-radius', 'border-bottom-left-radius']],
+  ['gap', ['row-gap', 'column-gap']],
+  ['outline', ['outline-color', 'outline-style', 'outline-width']],
+  ['overflow', ['overflow-x', 'overflow-y']],
+] as const).filter(([, longhands]) => longhands.every((longhand) => SAFE_CSS_PROPERTIES.has(longhand)))
+
 const UNSAFE_CSS_VALUE = /(?:\b(?:expression|javascript|vbscript|behavior)\b|@import|(?:url|image-set|cross-fade|paint)\s*\(|-moz-binding)/i
 const HEIGHT_DEPENDENT_VALUE = /(?:^|[^a-z\d_-])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?:[dls]?v(?:h|b|min|max)|cq(?:h|b|min|max))\b/i
 const SAFE_CUSTOM_PROPERTY = /^--[a-z_][a-z\d_-]{0,127}$/i
-const MAX_CUSTOM_PROPERTY_VALUE_LENGTH = 4_096
+// 自定义属性和带 var() 的简写在解析期都不按属性语法校验，值是任意记号序列，额外限制长度。
+const MAX_UNVALIDATED_VALUE_LENGTH = 4_096
 
 export interface SanitizeEmailHtmlOptions {
   window?: Window
@@ -100,8 +135,25 @@ function normalizeCssValueForInspection(value: string): string {
   return decodeCssEscapes(value).replace(/\/\*[\s\S]*?\*\//g, '')
 }
 
-function isSafeCssValue(value: string): boolean {
-  return !UNSAFE_CSS_VALUE.test(normalizeCssValueForInspection(value))
+// 长属性、自定义属性和找回的简写共用这一道检查，不留绕过路径。
+function isAllowedCssValue(value: string, maxLength: number): boolean {
+  if (value.length > maxLength) return false
+  const inspectionValue = normalizeCssValueForInspection(value)
+  return !UNSAFE_CSS_VALUE.test(inspectionValue) && !HEIGHT_DEPENDENT_VALUE.test(inspectionValue)
+}
+
+/**
+ * 找回长属性所属的 var() 简写及其原值。简写的全部长属性都还处于 pending-substitution 时它才读得出原值；
+ * 其中某个长属性被后续声明单独覆盖过时读出空串（浏览器与 jsdom 一致），这时宁可丢掉也不整条写回，
+ * 以免盖掉那条后续声明。
+ */
+function declaredVarShorthand(style: CSSStyleDeclaration, longhand: string) {
+  for (const [shorthand, longhands] of VAR_SHORTHANDS) {
+    if (!longhands.includes(longhand)) continue
+    const value = style.getPropertyValue(shorthand)
+    if (value && longhands.every((part) => !style.getPropertyValue(part))) return { shorthand, longhands, value }
+  }
+  return undefined
 }
 
 function sanitizeStyleDeclaration(windowObject: Window, cssText: string | null | undefined): string {
@@ -109,18 +161,28 @@ function sanitizeStyleDeclaration(windowObject: Window, cssText: string | null |
   const parser = windowObject.document.createElement('span')
   parser.style.cssText = cssText
   const safe = windowObject.document.createElement('span')
+  // 已找回过简写的长属性：其余长属性不再重复查找，保证每个简写只写一次
+  const coveredLonghands = new Set<string>()
 
   for (const property of Array.from(parser.style)) {
-    const normalizedProperty = property.toLowerCase()
-    const value = parser.style.getPropertyValue(property)
     const isCustomProperty = SAFE_CUSTOM_PROPERTY.test(property)
-    if (!isCustomProperty && !SAFE_CSS_PROPERTIES.has(normalizedProperty)) continue
-    if (!isSafeCssValue(value)) continue
-    if (isCustomProperty && value.length > MAX_CUSTOM_PROPERTY_VALUE_LENGTH) continue
-    const inspectionValue = normalizeCssValueForInspection(value)
-    if (HEIGHT_DEPENDENT_VALUE.test(inspectionValue)) continue
     // CSS 自定义属性区分大小写；保留原名，避免 var(--ButtonColor) 失配。
-    safe.style.setProperty(isCustomProperty ? property : normalizedProperty, value, parser.style.getPropertyPriority(property))
+    let name = isCustomProperty ? property : property.toLowerCase()
+    let value = parser.style.getPropertyValue(property)
+    let maxLength = isCustomProperty ? MAX_UNVALIDATED_VALUE_LENGTH : Infinity
+    if (!isCustomProperty && !SAFE_CSS_PROPERTIES.has(name)) continue
+    if (!value && !isCustomProperty) {
+      if (coveredLonghands.has(name)) continue
+      const found = declaredVarShorthand(parser.style, name)
+      if (!found) continue
+      // 在简写第一个长属性的位置整条写回，与其他声明（如逻辑/物理属性）的先后顺序不变。
+      found.longhands.forEach((longhand) => coveredLonghands.add(longhand))
+      name = found.shorthand
+      value = found.value
+      maxLength = MAX_UNVALIDATED_VALUE_LENGTH
+    }
+    if (!isAllowedCssValue(value, maxLength)) continue
+    safe.style.setProperty(name, value, parser.style.getPropertyPriority(name))
   }
   return safe.style.cssText
 }
@@ -382,7 +444,7 @@ export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOption
       const size = pixelDimension(value)
       return size !== null && size <= 2
     })
-    const concealed = image.hidden || image.style.display === 'none' || image.style.visibility === 'hidden'
+    const concealed = image.hasAttribute('hidden') || image.style.display === 'none' || image.style.visibility === 'hidden'
       || (image.style.opacity !== '' && Number(image.style.opacity) === 0)
     const tracking = pixel || concealed
     const sourceAllowed = isSafeImage(image.getAttribute('src'), baseOrigin, trustedOrigins, allowRemoteImages, tracking)

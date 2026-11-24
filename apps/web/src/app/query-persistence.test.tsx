@@ -335,7 +335,12 @@ describe('useRestoredQueryRefreshing', () => {
     let resolvePage!: (page: Page<MessageSummary>) => void;
     const fetchPage = () => new Promise<Page<MessageSummary>>((done) => (resolvePage = done));
     const refresh = (): Promise<void> =>
-      client.prefetchInfiniteQuery({ queryKey: defaultInboxListKey(), queryFn: fetchPage, initialPageParam: '' });
+      client.prefetchInfiniteQuery({
+        queryKey: defaultInboxListKey(),
+        queryFn: fetchPage,
+        initialPageParam: '',
+        getNextPageParam: (last) => last.nextCursor ?? undefined,
+      });
 
     let pending!: Promise<void>;
     act(() => void (pending = refresh()));
