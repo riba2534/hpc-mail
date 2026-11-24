@@ -340,6 +340,14 @@ describe('shorthands declared with var()', () => {
     return element.style
   }
 
+  /** 两条路径上整条声明都被丢弃，同一段里的 color 不受影响 */
+  function expectDropped(declarations: string, forbidden: RegExp): void {
+    for (const [path, text] of sanitizeBothPaths(`${declarations}; color: red`)) {
+      expect(text, `${path}: ${declarations}`).not.toMatch(forbidden)
+      expect(parse(text).getPropertyValue('color'), path).toBe('red')
+    }
+  }
+
   const kept: Array<[property: string, value: string]> = [
     ['padding', 'var(--button-padding)'],
     ['margin', '0 var(--gutter) 8px'],
@@ -386,12 +394,7 @@ describe('shorthands declared with var()', () => {
       'border-radius: var(--r) \\75 rl(https://tracker.test/escaped-space)',
       'outline: var(--o) u/**/rl(https://tracker.test/comment)',
       'gap: var(--g) image-set(https://tracker.test/set 1x)',
-    ]) {
-      for (const [path, text] of sanitizeBothPaths(`${declarations}; color: red`)) {
-        expect(text, `${path}: ${declarations}`).not.toMatch(/tracker\.test|url|var\(/i)
-        expect(parse(text).getPropertyValue('color'), path).toBe('red')
-      }
-    }
+    ]) expectDropped(declarations, /tracker\.test|url|var\(/i)
   })
 
   it('blocks height-dependent units in var() shorthands', () => {
@@ -401,20 +404,12 @@ describe('shorthands declared with var()', () => {
       'border-width: var(--w) 1\\76h',
       'margin: var(--m) 10/**/vh',
       'gap: var(--g) 2cqh',
-    ]) {
-      for (const [path, text] of sanitizeBothPaths(`${declarations}; color: red`)) {
-        expect(text, `${path}: ${declarations}`).not.toMatch(/var\(|vh|cqh/i)
-        expect(parse(text).getPropertyValue('color'), path).toBe('red')
-      }
-    }
+    ]) expectDropped(declarations, /var\(|vh|cqh/i)
   })
 
   it('caps the length of var() shorthand values like custom properties', () => {
     const fallback = Array.from({ length: 1_100 }, () => '1px').join(' ')
-    for (const [path, text] of sanitizeBothPaths(`padding: var(--p, ${fallback}); color: red`)) {
-      expect(text, path).not.toContain('var(')
-      expect(parse(text).getPropertyValue('color'), path).toBe('red')
-    }
+    expectDropped(`padding: var(--p, ${fallback})`, /var\(/)
   })
 
   it('drops var() shorthands outside the allowlist', () => {
@@ -425,11 +420,6 @@ describe('shorthands declared with var()', () => {
       'text-decoration: var(--decoration)',
       'flex: var(--flex)',
       'inset: var(--inset)',
-    ]) {
-      for (const [path, text] of sanitizeBothPaths(`${declarations}; color: red`)) {
-        expect(text, `${path}: ${declarations}`).not.toContain('var(')
-        expect(parse(text).getPropertyValue('color'), path).toBe('red')
-      }
-    }
+    ]) expectDropped(declarations, /var\(/)
   })
 })
