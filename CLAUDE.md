@@ -8,7 +8,7 @@ HPC Mail 是部署在 Cloudflare 上的**多域名多用户邮箱系统**（线�
 
 ## 常用命令
 
-pnpm workspace monorepo，Node ≥22.12、pnpm 10。
+pnpm workspace monorepo，Node ^22.22.2 / ^24.15 / ≥26（web 测试用的 jsdom 31 的要求）、pnpm 10。
 
 ```bash
 pnpm install
@@ -72,7 +72,7 @@ pnpm --filter @hpc-mail/worker db:migrate:local  # 应用到本地 D1
 
 - 页面懒加载用 `src/app/route-modules.ts` 的 `preloadable` 登记、router 里 `page()` 注册，**不要用 `React.lazy`**（Suspense 300ms 揭示节流会拖慢热启动）；chunk 失败由 `chunk-reload.ts` 自动刷新一次。
 - **产物文件数受 `run_worker_first` 上限约束**，`vite.config.ts` 的 `codeSplitting.groups` 把登录页静态依赖并入入口，把外壳与收件箱首屏共用的小模块合成 `ui-kit`（`src/components`、`src/lib`）、`mail-list`（`features/inbox` 非页面模块）、`radix` 三块。新加只在个别页面用的重依赖（如 DOMPurify、Radix Select）要加进对应分组的排除，否则会进首屏。
-- 入口与登录页不静态引入 `@hpc-mail/shared` 运行时值或重依赖（登录路由 JS 约 109KB br）；新依赖按需动态加载。关键路径只需要常量时从零依赖子路径 `@hpc-mail/shared/constants` 导入（主入口会带上全部 zod）；web 构建后 `scripts/check-bundle.mjs` 断言入口、app-shell、inbox-page 不静态依赖 zod。Radix Tooltip 已移除，提示用原生 `title`。
+- 入口与登录页不静态引入 `@hpc-mail/shared` 运行时值或重依赖（登录路由 JS 约 120KB br，其中 vendor-react 约 92KB）；新依赖按需动态加载。关键路径只需要常量时从零依赖子路径 `@hpc-mail/shared/constants` 导入（主入口会带上全部 zod）；web 构建后 `scripts/check-bundle.mjs` 断言入口、app-shell、inbox-page 不静态依赖 zod。Radix Tooltip 已移除，提示用原生 `title`。
 - `boot-prefetch.ts` 启动时并行预取会话、外壳与路由 chunk、收件箱数据，queryKey 与页面共用 `messageListQueryOptions` 等定义（`boot-prefetch.test.tsx` 校验一致）。写操作后用 `features/inbox/message-cache.ts` 就地更新缓存，别整体 invalidate `messages.root`。列表每 20 秒只轮询 `GET /api/messages/sync`（`{unread, head}`），`head` 与已加载首页的 `head` 不同才重拉；有列表视图轮询时 unread-count 暂停自身轮询（`pauseUnreadCountPolling`）。详情页标已读带 `includeUnread`，直接写入返回的未读数；上一封/下一封只在 j/k 翻阅时预取同方向一封，列表悬停 250ms 才预取且只保留一个在途。批量认领与批量可用性检查各用一个请求（`/api/mailboxes/batch`、`/api/mailboxes/availability/batch`），不要在前端逐个调用单个接口。
 
 ## 测试注意事项
