@@ -21,7 +21,7 @@
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {
-    "concurrently": "^9.2.5",
-    "typescript": "^5.9.3"
+    "concurrently": "^10.0.7",
+    "typescript": "^7.0.2"
   }
 }
