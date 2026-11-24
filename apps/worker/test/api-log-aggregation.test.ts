@@ -34,6 +34,9 @@ async function awayFromMinuteBoundary(): Promise<void> {
   if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
 }
 
+/** 离整分钟不足 5 秒时最多等 5.1 秒，再加用例本身的耗时，超过 vitest 默认的 5 秒超时 */
+const MINUTE_EDGE_TIMEOUT = 15_000;
+
 async function setup(prefix: string) {
   await updateSettings(env, { api: { enabled: true }, security: { require2fa: false } });
   const username = `${prefix}-${rand()}`;
@@ -88,7 +91,7 @@ describe('/v1 请求日志按分钟聚合（R19）', () => {
     const page = (await listed.json() as { data: Page<ApiRequestLogEntry> }).data;
     expect(page.items.map((item) => item.count).sort()).toEqual([1, 1, 1, 1, 1, 2, 3]);
     expect(page.items.find((item) => item.count === 3)!.durationMs).toBe(detailRow.durationMs);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 
   it('不同分钟、不同 Key 各自成行；HEAD 与 GET 同样聚合', async () => {
     const { key } = await setup('agg-minute');

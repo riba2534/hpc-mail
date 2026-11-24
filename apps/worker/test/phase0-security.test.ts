@@ -96,6 +96,9 @@ async function awayFromMinuteBoundary(): Promise<void> {
   if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
 }
 
+/** 离整分钟不足 5 秒时最多等 5.1 秒，再加用例本身的耗时，超过 vitest 默认的 5 秒超时 */
+const MINUTE_EDGE_TIMEOUT = 15_000;
+
 /** 匹配的语句真正执行前先跑一次 hook，用来在「读校验」与「写」之间插入并发操作 */
 function beforeStatement(pattern: RegExp, hook: () => Promise<unknown>): Env {
   let triggered = false;
@@ -190,7 +193,7 @@ describe('R03 /v1 审计写入受控', () => {
     await db.update(users).set({ status: 'disabled' }).where(eq(users.id, stopped.id));
     for (let i = 0; i < 3; i++) expect((await call('/v1/status', stoppedKey.key)).status).toBe(403);
     expect(await logsOf(stoppedKey.id)).toHaveLength(1);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 
   it('Key 超限后 429 只写 1 行明细、不写 api_rate_limits；成功请求按分钟聚合', async () => {
     await enableApi();
@@ -203,7 +206,7 @@ describe('R03 /v1 审计写入受控', () => {
     expect(await createDb(env).select().from(apiRateLimits).where(eq(apiRateLimits.apiKeyId, key.id)).all()).toEqual([]);
     const logs = await logsOf(key.id);
     expect(logs.map((log) => [log.statusCode, log.requestCount]).sort()).toEqual([[200, 2], [429, 1]]);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 });
 
 describe('R04 全站限流桶不被单个用户打满', () => {

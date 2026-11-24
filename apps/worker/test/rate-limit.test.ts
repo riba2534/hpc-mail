@@ -68,6 +68,9 @@ async function awayFromMinuteBoundary(): Promise<void> {
   if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
 }
 
+/** 离整分钟不足 5 秒时最多等 5.1 秒，再加用例本身的耗时，超过 vitest 默认的 5 秒超时 */
+const MINUTE_EDGE_TIMEOUT = 15_000;
+
 describe('配置与 Key 档位', () => {
   it('wrangler.toml 的 [[ratelimits]] 与代码逐条一致：上限、60 秒周期、namespace_id 互不相同；测试配置不带 binding', () => {
     const source = wranglerToml as string;
@@ -123,7 +126,7 @@ describe('真实 Rate Limiting binding（miniflare）', () => {
     for (let i = 0; i < 4; i++) verdicts.push((await limitApiKeyRequest(target, apiKey)).rejectedBy);
     expect(verdicts).toEqual([null, null, null, 'key']);
     expect(fakes.rl_api_user.calls).toHaveLength(3);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 });
 
 describe('进程内替身（binding 缺失时）', () => {
@@ -151,7 +154,7 @@ describe('进程内替身（binding 缺失时）', () => {
     expect(remaining).toEqual(['2', '1', '0', '0']);
     expect(await messageOf(last!)).toBe('API 调用频率超限');
     expect(Number(last!.headers.get('X-RateLimit-Reset'))).toBe((Math.floor(Date.now() / 60_000) + 1) * 60);
-  });
+  }, MINUTE_EDGE_TIMEOUT);
 });
 
 describe('/api（JWT）限流（用户桶拒绝不进全站桶见 phase0-security 的 R04）', () => {
