@@ -18,18 +18,21 @@ updates:
       prefix: "chore(deps)"
       prefix-development: "chore(deps-dev)"
     groups:
-      # vitest 与 Workers 测试插件有 peer 约束，放同一组；依赖按第一个匹配的组归类
+      # 归组不是按顺序取第一个匹配：「@scope/*」通配会输给只按 dependency-type 分的 production/development 组
+      # （2026-11 的 #35、#36 实测 @radix-ui、@tanstack、@tailwindcss、@vitejs、@testing-library、@cloudflare 都被分走），
+      # 所以那两组用 exclude-patterns 排除下面各组的作用域。
+      # vitest 与 Workers 测试插件有 peer 约束；插件又精确锁定 wrangler/miniflare 版本，wrangler 同组升级，测试与部署共用一套 workerd
       test-tooling:
         patterns:
           - "vitest"
           - "@vitest/*"
           - "@cloudflare/vitest-plugin"
+          - "wrangler"
           - "@testing-library/*"
           - "jsdom"
         update-types: [minor, patch]
       cloudflare:
         patterns:
-          - "wrangler"
           - "@cloudflare/*"
         update-types: [minor, patch]
       frontend:
@@ -48,9 +51,25 @@ updates:
         update-types: [minor, patch]
       production:
         dependency-type: production
+        exclude-patterns:
+          - "@vitest/*"
+          - "@testing-library/*"
+          - "@cloudflare/*"
+          - "@radix-ui/*"
+          - "@tanstack/*"
+          - "@vitejs/*"
+          - "@tailwindcss/*"
         update-types: [minor, patch]
       development:
         dependency-type: development
+        exclude-patterns:
+          - "@vitest/*"
+          - "@testing-library/*"
+          - "@cloudflare/*"
+          - "@radix-ui/*"
+          - "@tanstack/*"
+          - "@vitejs/*"
+          - "@tailwindcss/*"
         update-types: [minor, patch]
 
   - package-ecosystem: github-actions
@@ -66,3 +85,4 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+        update-types: [minor, patch]
