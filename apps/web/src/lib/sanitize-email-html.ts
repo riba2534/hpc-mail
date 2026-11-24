@@ -97,13 +97,6 @@ const VAR_SHORTHANDS: ReadonlyArray<readonly [string, readonly string[]]> = ([
   ['outline', ['outline-color', 'outline-style', 'outline-width']],
 ] as const).filter(([, longhands]) => longhands.every((longhand) => SAFE_CSS_PROPERTIES.has(longhand)))
 
-const VAR_SHORTHANDS_BY_LONGHAND = new Map<string, Array<readonly [string, readonly string[]]>>()
-for (const entry of VAR_SHORTHANDS) {
-  for (const longhand of entry[1]) {
-    VAR_SHORTHANDS_BY_LONGHAND.set(longhand, [...VAR_SHORTHANDS_BY_LONGHAND.get(longhand) ?? [], entry])
-  }
-}
-
 const UNSAFE_CSS_VALUE = /(?:\b(?:expression|javascript|vbscript|behavior)\b|@import|(?:url|image-set|cross-fade|paint)\s*\(|-moz-binding)/i
 const HEIGHT_DEPENDENT_VALUE = /(?:^|[^a-z\d_-])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?:[dls]?v(?:h|b|min|max)|cq(?:h|b|min|max))\b/i
 const SAFE_CUSTOM_PROPERTY = /^--[a-z_][a-z\d_-]{0,127}$/i
@@ -141,13 +134,17 @@ function isAllowedCssValue(value: string, maxLength: number): boolean {
 }
 
 /**
- * 找回长属性所属的 var() 简写。简写的全部长属性都还处于 pending-substitution 时它才读得出原值；
+ * 找回长属性所属的 var() 简写及其原值。简写的全部长属性都还处于 pending-substitution 时它才读得出原值；
  * 其中某个长属性被后续声明单独覆盖过时读出空串（浏览器与 jsdom 一致），这时宁可丢掉也不整条写回，
  * 以免盖掉那条后续声明。
  */
-function declaredVarShorthand(style: CSSStyleDeclaration, longhand: string): string | undefined {
-  return VAR_SHORTHANDS_BY_LONGHAND.get(longhand)?.find(([shorthand, longhands]) =>
-    style.getPropertyValue(shorthand) && longhands.every((part) => !style.getPropertyValue(part)))?.[0]
+function declaredVarShorthand(style: CSSStyleDeclaration, longhand: string) {
+  for (const [shorthand, longhands] of VAR_SHORTHANDS) {
+    if (!longhands.includes(longhand)) continue
+    const value = style.getPropertyValue(shorthand)
+    if (value && longhands.every((part) => !style.getPropertyValue(part))) return { shorthand, longhands, value }
+  }
+  return undefined
 }
 
 function sanitizeStyleDeclaration(windowObject: Window, cssText: string | null | undefined): string {
@@ -155,27 +152,28 @@ function sanitizeStyleDeclaration(windowObject: Window, cssText: string | null |
   const parser = windowObject.document.createElement('span')
   parser.style.cssText = cssText
   const safe = windowObject.document.createElement('span')
-  const handledShorthands = new Set<string>()
+  // 已找回过简写的长属性：其余长属性不再重复查找，保证每个简写只写一次
+  const coveredLonghands = new Set<string>()
 
   for (const property of Array.from(parser.style)) {
-    const normalizedProperty = property.toLowerCase()
-    const value = parser.style.getPropertyValue(property)
     const isCustomProperty = SAFE_CUSTOM_PROPERTY.test(property)
-    if (!isCustomProperty && !SAFE_CSS_PROPERTIES.has(normalizedProperty)) continue
-    if (!value && !isCustomProperty) {
-      // 在简写第一个长属性的位置整条写回一次，与其他声明（如逻辑/物理属性）的先后顺序不变。
-      const shorthand = declaredVarShorthand(parser.style, normalizedProperty)
-      if (!shorthand || handledShorthands.has(shorthand)) continue
-      handledShorthands.add(shorthand)
-      const shorthandValue = parser.style.getPropertyValue(shorthand)
-      if (isAllowedCssValue(shorthandValue, MAX_UNVALIDATED_VALUE_LENGTH)) {
-        safe.style.setProperty(shorthand, shorthandValue, parser.style.getPropertyPriority(shorthand))
-      }
-      continue
-    }
-    if (!isAllowedCssValue(value, isCustomProperty ? MAX_UNVALIDATED_VALUE_LENGTH : Infinity)) continue
     // CSS 自定义属性区分大小写；保留原名，避免 var(--ButtonColor) 失配。
-    safe.style.setProperty(isCustomProperty ? property : normalizedProperty, value, parser.style.getPropertyPriority(property))
+    let name = isCustomProperty ? property : property.toLowerCase()
+    let value = parser.style.getPropertyValue(property)
+    let maxLength = isCustomProperty ? MAX_UNVALIDATED_VALUE_LENGTH : Infinity
+    if (!isCustomProperty && !SAFE_CSS_PROPERTIES.has(name)) continue
+    if (!value && !isCustomProperty) {
+      if (coveredLonghands.has(name)) continue
+      const found = declaredVarShorthand(parser.style, name)
+      if (!found) continue
+      // 在简写第一个长属性的位置整条写回，与其他声明（如逻辑/物理属性）的先后顺序不变。
+      found.longhands.forEach((longhand) => coveredLonghands.add(longhand))
+      name = found.shorthand
+      value = found.value
+      maxLength = MAX_UNVALIDATED_VALUE_LENGTH
+    }
+    if (!isAllowedCssValue(value, maxLength)) continue
+    safe.style.setProperty(name, value, parser.style.getPropertyPriority(name))
   }
   return safe.style.cssText
 }
@@ -437,8 +435,7 @@ export function sanitizeEmailHtml(html: string, options: SanitizeEmailHtmlOption
       const size = pixelDimension(value)
       return size !== null && size <= 2
     })
-    // hidden 也可能是 'until-found'，同样按隐藏处理
-    const concealed = image.hidden !== false || image.style.display === 'none' || image.style.visibility === 'hidden'
+    const concealed = image.hasAttribute('hidden') || image.style.display === 'none' || image.style.visibility === 'hidden'
       || (image.style.opacity !== '' && Number(image.style.opacity) === 0)
     const tracking = pixel || concealed
     const sourceAllowed = isSafeImage(image.getAttribute('src'), baseOrigin, trustedOrigins, allowRemoteImages, tracking)
