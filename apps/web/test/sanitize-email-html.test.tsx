@@ -125,7 +125,8 @@ describe('email HTML safety boundary', () => {
     expect(cta).toHaveAttribute('type', 'submit')
     expect(cta).toHaveAttribute('value', 'Continue')
     expect(cta).toHaveClass('button', 'primary')
-    expect(cta?.style.background).not.toBe('')
+    // 只剩 background-color 一个长属性时，简写 background 按规范读出空串，所以断言长属性。
+    expect(cta?.style.backgroundColor).toBe('rgb(17, 17, 17)')
     expect(cta).not.toHaveAttribute('formaction')
     expect(cta).not.toHaveAttribute('onclick')
   })
