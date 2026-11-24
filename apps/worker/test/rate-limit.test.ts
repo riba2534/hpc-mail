@@ -24,6 +24,7 @@ import type { Env } from '../src/types.js';
 import { fakeRateLimits } from './fake-rate-limits.js';
 import wranglerToml from '../wrangler.toml?raw';
 import wranglerTestToml from '../wrangler.test.toml?raw';
+import { awayFromMinuteBoundary, MINUTE_EDGE_TIMEOUT } from './support/minute-boundary.js';
 
 const app = createApp();
 const IP = '198.51.100.61';
@@ -61,15 +62,6 @@ async function call(path: string, token: string, target: Env = env) {
 }
 
 const messageOf = async (response: Response) => ((await response.json()) as { error: { message: string } }).error.message;
-
-/** 按分钟计的断言在窗口边界附近会跨格，离整分钟不足 5 秒时等到下一分钟 */
-async function awayFromMinuteBoundary(): Promise<void> {
-  const left = 60_000 - (Date.now() % 60_000);
-  if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
-}
-
-/** 离整分钟不足 5 秒时最多等 5.1 秒，再加用例本身的耗时，超过 vitest 默认的 5 秒超时 */
-const MINUTE_EDGE_TIMEOUT = 15_000;
 
 describe('配置与 Key 档位', () => {
   it('wrangler.toml 的 [[ratelimits]] 与代码逐条一致：上限、60 秒周期、namespace_id 互不相同；测试配置不带 binding', () => {

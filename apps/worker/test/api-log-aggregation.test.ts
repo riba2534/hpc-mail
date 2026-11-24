@@ -10,6 +10,7 @@ import { createApiKey } from '../src/services/api-key.js';
 import { writeApiRequestLog } from '../src/services/api-request-log.js';
 import { createSession } from '../src/services/session.js';
 import { updateSettings } from '../src/services/setting.js';
+import { awayFromMinuteBoundary, MINUTE_EDGE_TIMEOUT } from './support/minute-boundary.js';
 
 const app = createApp();
 afterEach(() => { vi.restoreAllMocks(); });
@@ -27,15 +28,6 @@ const bearer = (token: string, extra: Record<string, string> = {}): RequestInit 
 const post = (token: string, body: unknown): RequestInit => ({
   method: 'POST', headers: { Authorization: `Bearer ${token}`, 'CF-Connecting-IP': IP, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 });
-
-/** 同一分钟内完成的用例才断言「合成一行」：离分钟边界不足 5 秒时先等到下一分钟 */
-async function awayFromMinuteBoundary(): Promise<void> {
-  const left = 60_000 - (Date.now() % 60_000);
-  if (left < 5_000) await new Promise((resolve) => setTimeout(resolve, left + 100));
-}
-
-/** 离整分钟不足 5 秒时最多等 5.1 秒，再加用例本身的耗时，超过 vitest 默认的 5 秒超时 */
-const MINUTE_EDGE_TIMEOUT = 15_000;
 
 async function setup(prefix: string) {
   await updateSettings(env, { api: { enabled: true }, security: { require2fa: false } });
